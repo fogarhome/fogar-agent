@@ -155,6 +155,7 @@ dependencies = [
  "fogar-ports",
  "fogar-proto",
  "futures-util",
+ "serde_json",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
