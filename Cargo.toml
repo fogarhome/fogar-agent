@@ -1,0 +1,69 @@
+# fogar-agent workspace. Started from the fogar-hexagonal-slices example workspace (2026-11-13).
+# Dependency rules are enforced mechanically by crates/fogar-archtest and deny.toml (CLAUDE.md).
+[workspace]
+resolver = "3"
+members = [
+  "crates/fogar-proto",
+  "crates/fogar-ports",
+  "crates/fogar-core",
+  "crates/fogar-testkit",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.95" # cfg_select! is stable since 1.95; the toolchain is pinned in rust-toolchain.toml
+license = "MIT OR Apache-2.0"
+publish = false
+
+# One place for versions (verified on crates.io 2026-11-13; Cargo.lock is committed and the
+# gates build with --locked). New third-party deps go through the architecture owner (CLAUDE.md).
+[workspace.dependencies]
+fogar-proto = { path = "crates/fogar-proto", default-features = false }
+fogar-ports = { path = "crates/fogar-ports" }
+fogar-core = { path = "crates/fogar-core" }
+fogar-testkit = { path = "crates/fogar-testkit" }
+fogar-host = { path = "crates/fogar-host" }
+fogar-agent-linux = { path = "crates/fogar-agent-linux" }
+fogar-agent-macos = { path = "crates/fogar-agent-macos" }
+
+serde = { version = "1.0.229", default-features = false }
+serde_json = { version = "1.0.154", default-features = false }
+thiserror = { version = "2.0.21", default-features = false }
+secrecy = { version = "0.10.3", default-features = false }
+# tokio: every crate opts into the minimum feature set it needs.
+tokio = { version = "1.54.1", default-features = false }
+tokio-util = { version = "0.7.20", default-features = false }
+tokio-tungstenite = { version = "0.30.0", default-features = false }
+futures-util = { version = "0.3.34", default-features = false }
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
+loom = { version = "0.7.3" }
+
+[workspace.lints.rust]
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+# `--cfg loom` is used by the loom gate (scripts/gates.sh) for fogar-core's custom primitive.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
+[workspace.lints.clippy]
+# clippy.toml next to each inner crate holds the disallowed-* lists; these make them errors.
+disallowed_methods = "deny"
+disallowed_types = "deny"
+undocumented_unsafe_blocks = "deny"
+await_holding_lock = "deny"
+# No unwrap/expect outside tests (clippy.toml: allow-*-in-tests = true; testkit opts out).
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[profile.release]
+# Long-running daemon: size + predictable perf; crash = abort + supervised restart (ADR-0003).
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = "line-tables-only"
+split-debuginfo = "packed"

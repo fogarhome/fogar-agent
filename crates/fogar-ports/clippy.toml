@@ -1,0 +1,14 @@
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+# fogar-ports: plain contracts, no ambient OS access. (Errors via [workspace.lints.clippy].)
+disallowed-methods = [
+  { path = "std::time::Instant::now", reason = "ports carry no behaviour that touches the OS" },
+  { path = "std::time::SystemTime::now", reason = "ports carry no behaviour that touches the OS" },
+  { path = "std::thread::sleep", reason = "ports carry no behaviour that touches the OS" },
+  { path = "std::thread::spawn", reason = "ports carry no behaviour that touches the OS" },
+  { path = "std::env::var", reason = "ports carry no behaviour that touches the OS" },
+]
+disallowed-types = [
+  { path = "std::fs::File", reason = "ports carry no behaviour that touches the OS" },
+  { path = "std::net::TcpStream", reason = "ports carry no behaviour that touches the OS" },
+]

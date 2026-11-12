@@ -1,0 +1,30 @@
+# Core reaches the outside world ONLY through ports. Clippy reads this file from the crate's own
+# directory; the lints are `deny` via [workspace.lints.clippy]. Agents must not edit this file to
+# get green (CLAUDE.md).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+disallowed-methods = [
+  { path = "std::time::Instant::now", reason = "use the Clock port (testable, paused time)" },
+  { path = "std::time::SystemTime::now", reason = "use a Clock port" },
+  { path = "std::thread::sleep", reason = "blocks the executor; use Clock::sleep" },
+  { path = "std::thread::spawn", reason = "the composition root owns threads" },
+  { path = "std::env::var", reason = "configuration is injected by the composition root" },
+  { path = "std::env::var_os", reason = "configuration is injected by the composition root" },
+  { path = "std::process::Command::new", reason = "process control belongs to an adapter" },
+  { path = "std::fs::read", reason = "storage is a port" },
+  { path = "std::fs::write", reason = "storage is a port" },
+  { path = "std::fs::read_to_string", reason = "storage is a port" },
+  { path = "tokio::spawn", reason = "spawn only through an owned TaskTracker/JoinSet (structured concurrency)" },
+  { path = "tokio::task::spawn", reason = "spawn only through an owned TaskTracker/JoinSet" },
+  { path = "tokio::task::spawn_blocking", reason = "no blocking work in core" },
+  { path = "tokio::sync::mpsc::unbounded_channel", reason = "every queue is bounded" },
+  { path = "tokio::time::sleep", reason = "use the Clock port" },
+  { path = "tokio::time::timeout", reason = "use crate::time::deadline over the Clock port" },
+  { path = "tokio::time::interval", reason = "use the Clock port" },
+]
+disallowed-types = [
+  { path = "std::fs::File", reason = "storage is a port" },
+  { path = "std::net::TcpStream", reason = "network is the GatewayLink port" },
+  { path = "std::time::Instant", reason = "use fogar_ports::clock::Mono" },
+  { path = "tokio::sync::mpsc::UnboundedSender", reason = "every queue is bounded" },
+]

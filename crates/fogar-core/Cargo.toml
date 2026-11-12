@@ -1,0 +1,27 @@
+[package]
+name = "fogar-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Engine: protocol-v1 session/turn state machine, supervisor, policies. No OS APIs, no cfg(target_os)."
+
+[dependencies]
+fogar-ports = { workspace = true }
+fogar-proto = { workspace = true, features = ["std"] }
+# Structured concurrency only: channels, select!, task ownership. NO tokio time/net/fs/signal:
+# time comes from the Clock port (clippy.toml bans the ambient APIs).
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+tokio-util = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+fogar-testkit = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "test-util"] }
+
+# loom is only built for the loom gate (RUSTFLAGS="--cfg loom"); see src/heartbeat.rs.
+[target.'cfg(loom)'.dev-dependencies]
+loom = { workspace = true }
+
+[lints]
+workspace = true

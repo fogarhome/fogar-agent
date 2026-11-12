@@ -1,0 +1,24 @@
+[package]
+name = "fogar-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Gateway protocol v1 ('v1 with fixes') types + codecs. no_std + alloc, sans-I/O."
+
+[features]
+default = ["std"]
+# Conveniences only; every type and codec is available without it (gate: build with
+# --no-default-features).
+std = ["serde/std", "serde_json/std"]
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "alloc"] }
+serde_json = { workspace = true, features = ["alloc"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
