@@ -90,3 +90,46 @@ async fn shutdown_while_parked_or_backing_off_is_prompt() {
         "{report:?}"
     );
 }
+
+/// Review code#2: a peer that never completes the WebSocket close handshake (gateway hung,
+/// network gone) must not make an ordinary stop unclean within the daemon's 4 s budget.
+mod hung_close {
+    use fogar_ports::gateway::{Frame, GatewayLink, LinkError, LinkEvent, LinkSession};
+    use fogar_testkit::FakeGatewayLink;
+
+    #[derive(Clone)]
+    pub(super) struct HungClose(pub(super) FakeGatewayLink);
+    pub(super) struct HungSess(<FakeGatewayLink as GatewayLink>::Session);
+
+    impl LinkSession for HungSess {
+        fn max_frame(&self) -> usize {
+            self.0.max_frame()
+        }
+        async fn send(&mut self, f: Frame) -> Result<(), LinkError> {
+            self.0.send(f).await
+        }
+        async fn recv(&mut self) -> Option<LinkEvent> {
+            self.0.recv().await
+        }
+        async fn close(&mut self, _c: u16, _r: &str) -> Result<(), LinkError> {
+            std::future::pending().await
+        }
+    }
+
+    impl GatewayLink for HungClose {
+        type Session = HungSess;
+        async fn connect(&self) -> Result<HungSess, LinkError> {
+            Ok(HungSess(self.0.connect().await?))
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn hung_peer_close_still_fits_the_daemon_budget() {
+    let link = hung_close::HungClose(fogar_testkit::FakeGatewayLink::new(MockConfig::default()));
+    let mut rig = RigBuilder::with_link(link, &MockConfig::default().client_key).start();
+    wait_ready(&mut rig.health).await;
+    // fogar-agentd's SHUTDOWN_BUDGET.
+    let r = rig.agent.shutdown(Duration::from_secs(4)).await;
+    assert!(r.clean, "{r:?}");
+}

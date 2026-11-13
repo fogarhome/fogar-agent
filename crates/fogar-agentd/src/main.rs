@@ -108,11 +108,10 @@ fn run(opts: cli::RunOpts) -> ExitCode {
         .unwrap_or_else(platform::default_state_dir);
     crash::install_hook(&state_dir);
     let ledger = ledger::Ledger::new(&state_dir);
-    let boot = ledger.begin_boot();
-    eprintln!("fogar-agentd: boot mode {}", boot.label());
 
     // One runtime thread (current_thread: lowest idle cost, fogar-energy-budget). The main thread
     // only waits; on macOS it becomes the CFRunLoop thread when Apple frameworks need it (S2/S4).
+    let rt_ledger = ledger.clone();
     let rt_thread = std::thread::Builder::new()
         .name("fogar-rt".into())
         .spawn(move || {
@@ -126,22 +125,38 @@ fn run(opts: cli::RunOpts) -> ExitCode {
                 Ok(rt) => rt,
                 Err(e) => {
                     eprintln!("fogar-agentd: runtime: {e}");
-                    return false;
+                    return None;
                 }
             };
-            let clean = rt.block_on(serve(opts, state_dir, ws, boot));
+            let stopped = rt.block_on(async move {
+                // Review code#7b: the SIGTERM/SIGINT handlers are installed BEFORE this boot is
+                // recorded as `start` (and before the platform adapters and the engine are
+                // built), so any stop after the `start` line is an ordinary stop, not a crash.
+                // A signal before this point kills the process before `start` is written, which
+                // the breaker does not count either.
+                let stop = StopSignal::install();
+                let boot = rt_ledger.begin_boot();
+                eprintln!("fogar-agentd: boot mode {}", boot.label());
+                serve(opts, state_dir, ws, boot, stop).await
+            });
             // A stuck blocking task must not hold the exit (fogar-longrun shutdown step 4).
             rt.shutdown_timeout(Duration::from_secs(1));
-            clean
+            Some(stopped)
         });
-    let clean = match rt_thread {
-        Ok(h) => h.join().unwrap_or(false),
+    let stopped = match rt_thread {
+        Ok(h) => h.join().ok().flatten(),
         Err(e) => {
             eprintln!("fogar-agentd: cannot start runtime thread: {e}");
-            false
+            None
         }
     };
-    if clean {
+    if let Some(stopped) = stopped {
+        // Review code#2: a stop asked for by a signal is an ordinary stop for the crash-loop
+        // breaker even if a shutdown phase overran its deadline; the overrun is reported here
+        // (and in the shutdown report line) instead of being counted as a crash.
+        if let Some(r) = stopped.report.filter(|r| !r.clean) {
+            eprintln!("fogar-agentd: shutdown overran its budget (not a crash): {r:?}");
+        }
         ledger.mark_clean();
     }
     // Exit 0 even after an unclean stop: a non-zero exit after SIGTERM would make launchd/systemd
@@ -149,13 +164,21 @@ fn run(opts: cli::RunOpts) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// How `serve` ended. It only ever returns after a stop signal; `report` is `None` when the
+/// engine never started (SafeMode delay interrupted, adapters unavailable).
+#[derive(Debug)]
+struct Stopped {
+    report: Option<fogar_core::ShutdownReport>,
+}
+
 async fn serve(
     opts: cli::RunOpts,
     state_dir: std::path::PathBuf,
     ws: WsConfig,
     boot: crashloop::BootMode,
-) -> bool {
-    let mut stop = Box::pin(shutdown_signal());
+    mut stop: StopSignal,
+) -> Stopped {
+    let stopped = Stopped { report: None };
     if let crashloop::BootMode::SafeMode {
         delay,
         recent_crashes,
@@ -165,7 +188,7 @@ async fn serve(
             "fogar-agentd: {recent_crashes} recent crashes; safe mode, starting in {delay:?}"
         );
         tokio::select! {
-            () = &mut stop => return true,
+            () = stop.recv() => return stopped,
             () = tokio::time::sleep(delay) => {}
         }
     }
@@ -174,8 +197,8 @@ async fn serve(
         Err(e) => {
             // Stay alive degraded rather than exit (launchd would respawn in a loop).
             eprintln!("fogar-agentd: platform adapters unavailable: {e}; waiting for SIGTERM");
-            stop.await;
-            return true;
+            stop.recv().await;
+            return stopped;
         }
     };
     let clock = TokioClock::new();
@@ -207,7 +230,7 @@ async fn serve(
     loop {
         tokio::select! {
             biased;
-            () = &mut stop => break,
+            () = stop.recv() => break,
             v = health.wait_link(|v| v.state.label() != last) => {
                 last = v.state.label().to_owned();
                 match limiter.check(std::time::Instant::now()) {
@@ -234,30 +257,62 @@ async fn serve(
     let report = agent.shutdown(SHUTDOWN_BUDGET).await;
     watchdog.stop();
     eprintln!("fogar-agentd: shutdown {report:?}");
-    report.clean
+    Stopped {
+        report: Some(report),
+    }
 }
 
-/// SIGTERM (launchd/systemd stop) or SIGINT (dev).
-async fn shutdown_signal() {
+/// SIGTERM (launchd/systemd stop) or SIGINT (dev), registered eagerly by `install` (a lazily
+/// polled `signal()` future would leave the default "terminate" action in place until the first
+/// poll; review code#7b).
+struct StopSignal {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        match (
-            signal(SignalKind::terminate()),
-            signal(SignalKind::interrupt()),
-        ) {
-            (Ok(mut term), Ok(mut int)) => {
-                tokio::select! {
-                    _ = term.recv() => {}
-                    _ = int.recv() => {}
+    streams: Option<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)>,
+}
+
+impl StopSignal {
+    /// Must run inside the runtime.
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            match (
+                signal(SignalKind::terminate()),
+                signal(SignalKind::interrupt()),
+            ) {
+                (Ok(t), Ok(i)) => Self {
+                    streams: Some((t, i)),
+                },
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("fogar-agentd: cannot install signal handlers: {e}");
+                    Self { streams: None }
                 }
             }
-            _ => std::future::pending().await,
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+
+    /// Cancel-safe: resolves on the next SIGTERM/SIGINT.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            match self.streams.as_mut() {
+                Some((term, int)) => {
+                    tokio::select! {
+                        _ = term.recv() => {}
+                        _ = int.recv() => {}
+                    }
+                }
+                None => std::future::pending().await,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 }
 

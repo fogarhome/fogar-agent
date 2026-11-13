@@ -8,9 +8,11 @@
 //! | `io` | link supervisor | `egress` |
 //! | `ops` | liveness heartbeat | `ops` |
 //!
-//! Shutdown: (1) cancel `ingress` -> engine stops capture/playback, IPC stops; wait `data`+`edge`.
-//! (2) cancel `egress` -> the session sends a close frame (bounded) and the supervisor stops; wait
-//! `io`. (3) cancel `ops`; wait. Each wait has its own deadline; the report says what overran.
+//! Shutdown: (1) cancel `ingress` -> engine stops capture/playback, IPC stops; wait `data`+`edge`
+//! (budget/4). (2) cancel `egress` -> the session sends a close frame (bounded by
+//! `close_timeout`) and the supervisor stops; wait `io` (the rest minus budget/4, so >= budget/2).
+//! (3) cancel `ops`; wait (budget/4). Each wait has its own deadline; the report says what overran.
+//! Invariant: `Config::close_timeout` < budget/2 (1 s vs 2 s for the daemon's 4 s budget).
 
 use crate::{
     config::Config,
@@ -235,18 +237,24 @@ impl<C: Clock> Agent<C> {
     pub async fn shutdown(self, budget: Duration) -> ShutdownReport {
         self.view_tx
             .send_modify(|v| v.state = LinkState::ShuttingDown);
-        let phase = budget / 3;
+        // Phase split (review code#2): ingress and ops get a quarter each; egress gets the
+        // rest (>= half), because it contains the WebSocket close handshake, bounded by
+        // `Config::close_timeout` (1 s default) so a hung peer still fits the budget.
+        let started = self.clock.now();
+        let quarter = budget / 4;
         self.ingress.cancel();
         let ingress_ok = self
-            .wait(phase, async {
+            .wait(quarter, async {
                 self.data.wait().await;
                 self.edge.wait().await;
             })
             .await;
         self.egress.cancel();
-        let egress_ok = self.wait(phase, self.io.wait()).await;
+        let spent = self.clock.now().saturating_since(started);
+        let egress_phase = budget.saturating_sub(spent).saturating_sub(quarter);
+        let egress_ok = self.wait(egress_phase, self.io.wait()).await;
         self.ops_token.cancel();
-        let ops_ok = self.wait(phase, self.ops.wait()).await;
+        let ops_ok = self.wait(quarter, self.ops.wait()).await;
         self.view_tx.send_modify(|v| v.state = LinkState::Stopped);
         let tasks_left = self.live_tasks();
         ShutdownReport {

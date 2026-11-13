@@ -8,6 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[derive(Debug, Clone)]
 pub(crate) struct Ledger {
     path: PathBuf,
 }

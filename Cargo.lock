@@ -158,7 +158,9 @@ dependencies = [
  "fogar-ports",
  "fogar-proto",
  "fogar-testkit",
+ "futures-util",
  "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

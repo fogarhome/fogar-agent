@@ -16,7 +16,8 @@ pub struct Config {
     pub ready_timeout: Duration,
     /// Each transport write and each enqueue of a must-deliver uplink message.
     pub write_timeout: Duration,
-    /// Graceful close handshake on shutdown.
+    /// Graceful close handshake on shutdown. Must stay below half the shutdown budget (the egress
+    /// phase, see `Agent::shutdown`): a hung peer must not turn an ordinary stop into "unclean".
     pub close_timeout: Duration,
     /// Session -> engine enqueue deadline for JSON events; must stay below the gateway's
     /// CLIENT_SEND_TIMEOUT_S (10 s) or the gateway closes us with 1013.
@@ -43,7 +44,7 @@ impl Default for Config {
             connect_timeout: Duration::from_secs(10),
             ready_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(5),
-            close_timeout: Duration::from_secs(2),
+            close_timeout: Duration::from_secs(1),
             inbound_deadline: Duration::from_secs(5),
             keepalive_after: Some(Duration::from_secs(u64::from(limits::KEEPALIVE_EVERY_S))),
             backoff: BackoffPolicy::default(),
