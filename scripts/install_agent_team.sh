@@ -4,9 +4,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 scripts/check_vendored.sh
-mkdir -p .claude/skills .claude/agents
-cp -R agent-team/skills/. .claude/skills/
-cp agent-team/VENDORED.md agent-team/VENDORED.sha256 .claude/skills/
-cp agent-team/agents/*.md agent-team/AGENTS.sha256 .claude/agents/
+# .claude/agents and .claude/skills must be byte-identical copies of agent-team/ (the checker
+# diffs them); the hash lists stay in agent-team/ only.
+rm -rf .claude/skills .claude/agents
+mkdir -p .claude
+cp -R agent-team/skills .claude/skills
+cp -R agent-team/agents .claude/agents
 scripts/check_vendored.sh
 echo "installed agent-team into .claude/"
