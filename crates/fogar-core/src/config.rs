@@ -26,6 +26,9 @@ pub struct Config {
     /// close). The gateway closes idle sessions after 300 s with 1000 and no warning.
     pub keepalive_after: Option<Duration>,
     pub backoff: BackoffPolicy,
+    /// A local UI connection that sends no complete request for this long is closed, so silent
+    /// clients cannot hold the `IPC_MAX_CONNS` slots (review code#3/sec#5).
+    pub ipc_idle_timeout: Duration,
     pub vad: VadConfig,
     pub turn: TurnTimeouts,
     /// Capture rate the engine streams as-is (f32le 16 kHz mono is all v1 accepts). Captures at
@@ -48,6 +51,7 @@ impl Default for Config {
             inbound_deadline: Duration::from_secs(5),
             keepalive_after: Some(Duration::from_secs(u64::from(limits::KEEPALIVE_EVERY_S))),
             backoff: BackoffPolicy::default(),
+            ipc_idle_timeout: Duration::from_secs(30),
             vad: VadConfig::default(),
             turn: TurnTimeouts::default(),
             upload_rate_hz: fogar_proto::audio::UPLOAD_RATE_HZ,

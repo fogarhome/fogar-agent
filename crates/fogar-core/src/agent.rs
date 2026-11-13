@@ -189,7 +189,10 @@ impl<C: Clock> Agent<C> {
                 server,
                 ports.clock.clone(),
                 health.clone(),
-                cfg.write_timeout,
+                crate::ipc::Limits {
+                    write_timeout: cfg.write_timeout,
+                    idle_timeout: cfg.ipc_idle_timeout,
+                },
                 ingress.clone(),
             ));
         }

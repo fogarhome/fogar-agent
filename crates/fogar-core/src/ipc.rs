@@ -10,11 +10,22 @@ use std::{sync::Arc, time::Duration};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+/// Per-connection deadlines.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Limits {
+    /// Each response write.
+    pub(crate) write_timeout: Duration,
+    /// Waiting for the next complete request; on expiry the connection is closed and its slot
+    /// freed (review code#3/sec#5: `IPC_MAX_CONNS` silent clients would otherwise lock the
+    /// service out forever).
+    pub(crate) idle_timeout: Duration,
+}
+
 pub(crate) async fn run<C: Clock, S: IpcServer>(
     server: S,
     clock: Arc<C>,
     health: HealthProbe,
-    write_timeout: Duration,
+    limits: Limits,
     ingress: CancellationToken,
 ) {
     let mut conns = JoinSet::new();
@@ -29,7 +40,7 @@ pub(crate) async fn run<C: Clock, S: IpcServer>(
                 Ok((_peer, conn)) => {
                     fail_delay = Duration::from_millis(250);
                     Stats::inc(&health.stats.ipc_connections);
-                    conns.spawn(serve(conn, clock.clone(), health.clone(), write_timeout, ingress.child_token()));
+                    conns.spawn(serve(conn, clock.clone(), health.clone(), limits, ingress.child_token()));
                 }
                 Err(_) => {
                     tokio::select! {
@@ -49,14 +60,18 @@ async fn serve<C: Clock, K: IpcConn>(
     mut conn: K,
     clock: Arc<C>,
     health: HealthProbe,
-    write_timeout: Duration,
+    limits: Limits,
     cancel: CancellationToken,
 ) {
     loop {
         let req = tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            r = conn.recv() => r,
+            r = deadline(&*clock, limits.idle_timeout, conn.recv()) => match r {
+                Some(r) => r,
+                // Idle: close the connection (dropping it) and free the slot.
+                None => return,
+            },
         };
         let resp = match req {
             Ok(Some(IpcRequest::Hello { version })) if version == IPC_VERSION => {
@@ -82,7 +97,7 @@ async fn serve<C: Clock, K: IpcConn>(
             Ok(None) | Err(_) => return,
         };
         if !matches!(
-            deadline(&*clock, write_timeout, conn.send(resp)).await,
+            deadline(&*clock, limits.write_timeout, conn.send(resp)).await,
             Some(Ok(()))
         ) {
             return;

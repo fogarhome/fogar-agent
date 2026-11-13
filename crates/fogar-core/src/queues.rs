@@ -11,7 +11,7 @@
 //! | inbound TTS audio | link session -> engine | shares `INBOUND` | shed NEWEST, count `inbound_audio_shed` (`try_send`); the session never waits on audio |
 //! | playback buffer | engine -> audio sink adapter | adapter-owned, bounded | `ActivePlayback::write` accepts what fits; engine counts the rest in `tts_samples_dropped` |
 //! | link state / health | many -> readers | `watch` (1) | coalesce: latest value wins |
-//! | IPC connections | IPC adapter -> service | `IPC_MAX_CONNS` concurrent | further accepts wait (the accept branch is disabled while full) |
+//! | IPC connections | IPC adapter -> service | `IPC_MAX_CONNS` concurrent | further accepts wait (the accept branch is disabled while full); a connection idle for `Config::ipc_idle_timeout` (30 s) is closed, so silent clients cannot hold the slots |
 //!
 //! Stale uplink frames left in the `out` channel when a session dies are discarded (and counted)
 //! before the next session starts: they belonged to a turn that no longer exists.
