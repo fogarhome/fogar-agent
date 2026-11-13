@@ -1,0 +1,19 @@
+[package]
+name = "fogar-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Benchmark harness PLACEHOLDER: std-only micro-benchmarks of hot paths (no criterion yet). Numbers from this box are NOT the M2 energy gate."
+
+[dependencies]
+fogar-proto = { workspace = true, features = ["std"] }
+fogar-core = { workspace = true }
+
+[[bench]]
+name = "hot_paths"
+harness = false
+
+[lints]
+workspace = true

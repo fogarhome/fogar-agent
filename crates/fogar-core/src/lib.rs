@@ -2,7 +2,7 @@
 //! orchestration over ports (link supervisor, engine, IPC service, ordered shutdown).
 //!
 //! **Architecture invariants** (mechanically enforced: archtest R1/R4/R5, clippy.toml):
-//! - no OS APIs, no `cfg(target_os)`, no ambient time; time only via the `Clock` port;
+//! - no OS APIs, no platform cfg, no ambient time; time only via the `Clock` port;
 //! - every task is spawned through an owned `TaskTracker` (one per shutdown phase) or a drained
 //!   `JoinSet`, and takes a `CancellationToken`;
 //! - every queue is bounded and has a written full-policy ([`queues`]).

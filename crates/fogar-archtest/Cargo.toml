@@ -1,0 +1,14 @@
+[package]
+name = "fogar-archtest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Architecture fitness tests: dependency and layering rules as plain cargo tests. Owned by the architecture owner; agents never edit it to get green."
+
+[dev-dependencies]
+serde_json = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

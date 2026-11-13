@@ -12,6 +12,8 @@ members = [
   "crates/fogar-agent-linux",
   "crates/fogar-agent-macos",
   "crates/fogar-agentd",
+  "crates/fogar-archtest",
+  "crates/fogar-bench",
 ]
 
 [workspace.package]

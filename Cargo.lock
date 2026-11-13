@@ -162,6 +162,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fogar-archtest"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "fogar-bench"
+version = "0.0.1"
+dependencies = [
+ "fogar-core",
+ "fogar-proto",
+]
+
+[[package]]
 name = "fogar-core"
 version = "0.0.1"
 dependencies = [
