@@ -7,6 +7,6 @@ scripts/check_vendored.sh
 mkdir -p .claude/skills .claude/agents
 cp -R agent-team/skills/. .claude/skills/
 cp agent-team/VENDORED.md agent-team/VENDORED.sha256 .claude/skills/
-cp agent-team/agents/*.md .claude/agents/
+cp agent-team/agents/*.md agent-team/AGENTS.sha256 .claude/agents/
 scripts/check_vendored.sh
 echo "installed agent-team into .claude/"

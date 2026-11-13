@@ -2,7 +2,7 @@
 name: tester
 description: "Writes acceptance, contract, paused-time, fault-injection and soak tests for a slice. Use when a slice needs tests or a test is flaky."
 model: sonnet
-tools: Read, Grep, Glob, Edit, Write, Bash
+tools: Read, Grep, Glob, Edit, Write, Bash(cargo:*), Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(git add:*), Bash(git commit:*), Bash(scripts/gates.sh:*)
 disallowedTools: Skill
 skills: [fogar-hexagonal-slices, fogar-longrun-reliability]
 maxTurns: 60

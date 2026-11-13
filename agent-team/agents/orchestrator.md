@@ -2,6 +2,7 @@
 name: orchestrator
 description: "Lead/orchestrator notes for fogar-agent slice work: plans a vertical slice, fans out implementers in worktrees, sequences contract-first PRs, runs gates, dispatches independent reviewers. Use at the start and integration of every slice."
 model: opus
+# unrestricted-bash: runs scripts/gates.sh, creates/removes git worktrees, merges branches and dispatches agents; integration needs the whole git CLI
 tools: Read, Grep, Glob, Bash
 disallowedTools: Skill
 skills: [fogar-hexagonal-slices]

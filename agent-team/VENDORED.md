@@ -20,6 +20,7 @@ Notes:
   The upstream README's `npx skills add` installer is NOT used.
 - The fogar skills contain reference Rust projects (`references/example-workspace`,
   `references/examples`). They are not workspace members and are never built by the gates.
+- See ADR-0007 for the full integrity rules (agent hashes, frontmatter allowlists, root hash).
 - No vendored directory may contain `hooks/`, `.mcp.json`, `settings*.json` or broad
   `allowed-tools` (enforced). Updating a skill = re-vendor + regenerate `VENDORED.sha256` in a
   reviewed PR.

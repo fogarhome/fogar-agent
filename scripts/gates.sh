@@ -34,6 +34,7 @@ run_gate "test --workspace"       cargo test --workspace --locked
 run_gate "proto no_std build"     cargo build -p fogar-proto --no-default-features --locked
 run_gate "archtest"               cargo test -p fogar-archtest --locked
 run_gate "vendored skills hygiene" scripts/check_vendored.sh
+run_gate "vendored hygiene self-test" scripts/test_check_vendored.sh
 
 if cargo deny --version >/dev/null 2>&1; then
   run_gate "cargo deny check"     cargo deny --locked check

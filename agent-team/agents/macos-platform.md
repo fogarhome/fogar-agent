@@ -2,7 +2,7 @@
 name: macos-platform
 description: "Implements fogar-agent-macos adapters (Keychain, UDS IPC with audit-token/SecCode, QoS, probes, launchd/SMAppService packaging). Use for any macOS-specific code."
 model: opus
-tools: Read, Grep, Glob, Edit, Write, Bash
+tools: Read, Grep, Glob, Edit, Write, Bash(cargo:*), Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(git add:*), Bash(git commit:*), Bash(scripts/gates.sh:*)
 disallowedTools: Skill
 skills: [fogar-macos-daemon, fogar-secure-rust]
 maxTurns: 80

@@ -2,7 +2,7 @@
 name: security-reviewer
 description: "Independent security reviewer for unsafe/FFI, IPC peer auth, secrets, network/TLS, parsing of untrusted gateway input, supply chain. Mandatory for diffs touching those areas."
 model: opus
-tools: Read, Grep, Glob, Bash
+tools: Read, Grep, Glob, Bash(cargo test:*), Bash(cargo clippy:*), Bash(git diff:*), Bash(git log:*), Bash(git show:*)
 disallowedTools: Skill
 skills: [fogar-secure-rust, security-audit]
 maxTurns: 40

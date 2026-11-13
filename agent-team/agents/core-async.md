@@ -2,7 +2,7 @@
 name: core-async
 description: "Implements fogar-core: protocol/turn state machines, supervisor, link session loop, bounded queues, cancellation and shutdown ordering. Use for any change under crates/fogar-core."
 model: opus
-tools: Read, Grep, Glob, Edit, Write, Bash
+tools: Read, Grep, Glob, Edit, Write, Bash(cargo:*), Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(git add:*), Bash(git commit:*), Bash(scripts/gates.sh:*)
 disallowedTools: Skill
 skills: [fogar-longrun-reliability, fogar-hexagonal-slices]
 maxTurns: 80

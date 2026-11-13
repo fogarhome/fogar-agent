@@ -2,7 +2,7 @@
 name: audio
 description: "Implements audio capture/playback adapters and the audio path (RT callback rules, SPSC ring, resampling, VAD/wake word, energy). Use for AudioSource/AudioSink work."
 model: opus
-tools: Read, Grep, Glob, Edit, Write, Bash
+tools: Read, Grep, Glob, Edit, Write, Bash(cargo:*), Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(git add:*), Bash(git commit:*), Bash(scripts/gates.sh:*)
 disallowedTools: Skill
 skills: [fogar-realtime-audio, fogar-energy-budget]
 maxTurns: 80

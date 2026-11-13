@@ -2,7 +2,7 @@
 name: code-reviewer
 description: "Independent reviewer of a diff for architecture, correctness, concurrency, cancellation, bounded resources and test quality. Use on every PR before merge; must not be the author."
 model: opus
-tools: Read, Grep, Glob, Bash
+tools: Read, Grep, Glob, Bash(cargo test:*), Bash(cargo clippy:*), Bash(git diff:*), Bash(git log:*), Bash(git show:*)
 disallowedTools: Skill
 skills: [fogar-hexagonal-slices, fogar-longrun-reliability]
 maxTurns: 40
