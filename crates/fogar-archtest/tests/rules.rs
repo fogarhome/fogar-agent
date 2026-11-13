@@ -7,12 +7,14 @@
 //!  R3 only adapter crates and the composition root declare target-specific deps
 //!     (exception: `cfg(fogar_loom)` dev-dependencies, used by the loom gate)
 //!  R4 inner crates never reach OS-binding or I/O-driver crates, even transitively
-//!  R5 no platform cfg (`target_os`, `cfg(unix)`, `cfg_select!`...) in inner crates' sources
+//!  R5 no platform cfg (`target_os`, `cfg(unix)`, `cfg_select`, macro-generated `cfg($p)`,
+//!     `std::env::consts`) in inner crates' sources (token-based)
 //!  R6 fogar-proto: dependency allowlist, every dep with default-features = false
 //!  R7 every inner crate has a clippy.toml banning ambient time/threads/env/fs
 //!  R8 no `unsafe` in inner crates, and each declares `#![forbid(unsafe_code)]`
 //!  R9 adapter crates (fogar-host, fogar-agent-*) never reach fogar-core
-//!  R10 fogar-core sources never name the `tokio::time` module at all
+//!  R10 fogar-core sources never name the `tokio::time` module at all, nor rename `tokio`
+//!     (token-based)
 //!
 //! Every checker has a self-test (`selftest_*`) that plants the violation in a temporary
 //! fixture and asserts the rule fires (review code#4: a rule that cannot fail proves nothing).
@@ -235,86 +237,252 @@ fn r4_inner_never_reaches_os_crates() {
     }
 }
 
-/// Every `cfg(...)`, `cfg!(...)` and `cfg_attr(...)` predicate in `text` (balanced parentheses).
-fn cfg_predicates(text: &str) -> Vec<&str> {
+/// One Rust token, as far as the source rules need: comments and literal contents are gone
+/// (round-2 review F7: the line/text scans saw `cfg(unix)` inside strings, missed `cfg ! (`,
+/// `cfg/* */(`, multi-line `use` groups and comments inside paths).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Tok {
+    /// Identifier or keyword (`r#ident` is reported without its `r#`).
+    Ident(String),
+    Punct(char),
+    /// Any literal (string, raw string, byte string, char, number): contents dropped.
+    Lit,
+}
+
+/// Tokenizes Rust source into (token, 1-based line). Good enough for lint-style rules: nested
+/// block comments, raw strings with any number of `#`, byte/C strings, char literals vs
+/// lifetimes.
+fn tokens(text: &str) -> Vec<(Tok, usize)> {
+    let c: Vec<char> = text.chars().collect();
     let mut out = Vec::new();
-    let b = text.as_bytes();
-    let mut i = 0;
-    while let Some(off) = text[i..].find("cfg") {
-        let start = i + off;
-        i = start + 3;
-        // Identifier boundary on the left (`xcfg(` is not a cfg).
-        if start > 0 && (b[start - 1].is_ascii_alphanumeric() || b[start - 1] == b'_') {
-            continue;
-        }
-        let mut j = i;
-        for kw in ["_attr", "!"] {
-            if text[j..].starts_with(kw) {
-                j += kw.len();
+    let (mut i, mut line) = (0usize, 1usize);
+    let ident_start = |ch: char| ch.is_alphabetic() || ch == '_';
+    let ident_cont = |ch: char| ch.is_alphanumeric() || ch == '_';
+    while i < c.len() {
+        let ch = c[i];
+        let next = c.get(i + 1).copied();
+        if ch == '\n' {
+            line += 1;
+            i += 1;
+        } else if ch.is_whitespace() {
+            i += 1;
+        } else if ch == '/' && next == Some('/') {
+            while i < c.len() && c[i] != '\n' {
+                i += 1;
             }
-        }
-        while j < b.len() && b[j].is_ascii_whitespace() {
-            j += 1;
-        }
-        if j >= b.len() || b[j] != b'(' {
-            continue;
-        }
-        let mut depth = 0usize;
-        let mut k = j;
-        while k < b.len() {
-            match b[k] {
-                b'(' => depth += 1,
-                b')' => {
+        } else if ch == '/' && next == Some('*') {
+            let mut depth = 0usize;
+            while i < c.len() {
+                if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    i += 2;
+                } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
                     depth -= 1;
+                    i += 2;
                     if depth == 0 {
                         break;
                     }
+                } else {
+                    if c[i] == '\n' {
+                        line += 1;
+                    }
+                    i += 1;
                 }
-                _ => {}
             }
-            k += 1;
+        } else if ch == '"'
+            || ((ch == 'b' || ch == 'c') && next == Some('"'))
+            || ((ch == 'r' || ch == 'b' || ch == 'c')
+                && matches!(next, Some('"' | '#' | 'r'))
+                && raw_string_at(&c, i).is_some())
+        {
+            let start_line = line;
+            if let Some(end) = raw_string_at(&c, i) {
+                line += c[i..end].iter().filter(|&&x| x == '\n').count();
+                i = end;
+            } else {
+                i += if ch == '"' { 1 } else { 2 };
+                while i < c.len() && c[i] != '"' {
+                    if c[i] == '\\' {
+                        i += 1;
+                    }
+                    if c.get(i) == Some(&'\n') {
+                        line += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            out.push((Tok::Lit, start_line));
+        } else if ch == '\'' || (ch == 'b' && next == Some('\'')) {
+            let q = if ch == 'b' { i + 1 } else { i };
+            // Char literal: 'x' or '\..'; otherwise a lifetime / label.
+            if c.get(q + 1) == Some(&'\\') {
+                let mut j = q + 2;
+                while j < c.len() && c[j] != '\'' {
+                    j += 1;
+                }
+                out.push((Tok::Lit, line));
+                i = j + 1;
+            } else if c.get(q + 2) == Some(&'\'') {
+                out.push((Tok::Lit, line));
+                i = q + 3;
+            } else {
+                out.push((Tok::Punct('\''), line));
+                i = q + 1;
+            }
+        } else if ch == 'r' && next == Some('#') && c.get(i + 2).is_some_and(|&x| ident_start(x)) {
+            let mut j = i + 2;
+            while j < c.len() && ident_cont(c[j]) {
+                j += 1;
+            }
+            out.push((Tok::Ident(c[i + 2..j].iter().collect()), line));
+            i = j;
+        } else if ident_start(ch) {
+            let mut j = i;
+            while j < c.len() && ident_cont(c[j]) {
+                j += 1;
+            }
+            out.push((Tok::Ident(c[i..j].iter().collect()), line));
+            i = j;
+        } else if ch.is_ascii_digit() {
+            while i < c.len() && ident_cont(c[i]) {
+                i += 1;
+            }
+            out.push((Tok::Lit, line));
+        } else {
+            out.push((Tok::Punct(ch), line));
+            i += 1;
         }
-        out.push(&text[j..k.min(b.len())]);
-        i = k.min(b.len());
     }
     out
 }
 
-/// Identifiers in a cfg predicate, string literals removed (`feature = "unix"` is not platform).
-fn cfg_idents(pred: &str) -> Vec<String> {
-    let mut idents = Vec::new();
-    let mut cur = String::new();
-    let mut in_str = false;
-    for ch in pred.chars() {
-        if ch == '"' {
-            in_str = !in_str;
-            continue;
+/// If a raw string literal (`r"…"`, `r#"…"#`, `br##"…"##`, `cr"…"`) starts at `i`, the index
+/// just past it.
+fn raw_string_at(c: &[char], i: usize) -> Option<usize> {
+    let mut j = i;
+    if matches!(c.get(j), Some('b' | 'c')) {
+        j += 1;
+    }
+    if c.get(j) != Some(&'r') {
+        return None;
+    }
+    j += 1;
+    let mut hashes = 0;
+    while c.get(j) == Some(&'#') {
+        hashes += 1;
+        j += 1;
+    }
+    if c.get(j) != Some(&'"') {
+        return None;
+    }
+    j += 1;
+    while j < c.len() {
+        if c[j] == '"' && (1..=hashes).all(|k| c.get(j + k) == Some(&'#')) {
+            return Some(j + 1 + hashes);
         }
-        if !in_str && (ch.is_ascii_alphanumeric() || ch == '_') {
-            cur.push(ch);
-        } else if !cur.is_empty() {
-            idents.push(std::mem::take(&mut cur));
+        j += 1;
+    }
+    Some(c.len())
+}
+
+fn is_ident(t: Option<&(Tok, usize)>, name: &str) -> bool {
+    matches!(t, Some((Tok::Ident(s), _)) if s == name)
+}
+
+fn is_punct(t: Option<&(Tok, usize)>, ch: char) -> bool {
+    matches!(t, Some((Tok::Punct(p), _)) if *p == ch)
+}
+
+/// Index just past `::` at `i`, if there is one.
+fn path_sep(t: &[(Tok, usize)], i: usize) -> Option<usize> {
+    (is_punct(t.get(i), ':') && is_punct(t.get(i + 1), ':')).then_some(i + 2)
+}
+
+/// The tokens of the bracketed group opening at `i` (`(`, `[` or `{`), without the brackets.
+fn group(t: &[(Tok, usize)], i: usize) -> &[(Tok, usize)] {
+    let mut depth = 0usize;
+    for (k, (tok, _)) in t.iter().enumerate().skip(i) {
+        match tok {
+            Tok::Punct('(' | '[' | '{') => depth += 1,
+            Tok::Punct(')' | ']' | '}') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return &t[i + 1..k];
+                }
+            }
+            _ => {}
         }
     }
-    if !cur.is_empty() {
-        idents.push(cur);
+    &t[(i + 1).min(t.len())..]
+}
+
+/// `seg` is named right after `::` at `i`, either directly (`::seg`) or as an entry of a use
+/// group (`::{a, seg::x}`, any nesting).
+fn names_segment(t: &[(Tok, usize)], i: usize, seg: &str) -> bool {
+    let Some(j) = path_sep(t, i) else {
+        return false;
+    };
+    if is_ident(t.get(j), seg) {
+        return true;
     }
-    idents
+    if is_punct(t.get(j), '{') {
+        let g = group(t, j);
+        return g.iter().enumerate().any(|(k, (tok, _))| {
+            matches!(tok, Tok::Ident(s) if s == seg)
+                && (k == 0 || matches!(g[k - 1].0, Tok::Punct('{' | ',')))
+        });
+    }
+    false
 }
 
 /// R5 checker: platform predicates anywhere inside a cfg (`unix`, `windows`, any `target_*`,
-/// including under `not(..)`, `any(..)`, `all(..)`, `cfg_attr`, `cfg!`), and `cfg_select!`.
+/// including under `not(..)`, `any(..)`, `all(..)`, `cfg_attr`, `cfg!`), any mention of
+/// `cfg_select`, a cfg whose predicate is a macro metavariable (`#[cfg($p)]`: macro-generated
+/// cfgs), and `std::env::consts` (the runtime spelling of `target_os`). Token-based.
 fn platform_cfg_violations(sources: &[(PathBuf, String)]) -> Vec<String> {
     let mut bad = Vec::new();
     for (p, text) in sources {
-        if text.contains("cfg_select!") {
-            bad.push(format!("{}: cfg_select!", p.display()));
-        }
-        for pred in cfg_predicates(text) {
-            for id in cfg_idents(pred) {
-                if id == "unix" || id == "windows" || id.starts_with("target_") {
-                    bad.push(format!("{}: `{id}` in cfg{pred}", p.display()));
+        let t = tokens(text);
+        for (i, (tok, line)) in t.iter().enumerate() {
+            let Tok::Ident(id) = tok else { continue };
+            let at = format!("{}:{line}", p.display());
+            match id.as_str() {
+                "cfg_select" => bad.push(format!("{at}: cfg_select")),
+                "cfg" | "cfg_attr" => {
+                    let mut j = i + 1;
+                    if is_punct(t.get(j), '!') {
+                        j += 1;
+                    }
+                    if !is_punct(t.get(j), '(') {
+                        continue;
+                    }
+                    for (g, _) in group(&t, j) {
+                        match g {
+                            Tok::Ident(x)
+                                if x == "unix" || x == "windows" || x.starts_with("target_") =>
+                            {
+                                bad.push(format!("{at}: `{x}` in {id}(..)"));
+                            }
+                            Tok::Punct('$') => {
+                                bad.push(format!("{at}: macro-generated {id}($..)"));
+                            }
+                            _ => {}
+                        }
+                    }
                 }
+                "env" if names_segment(&t, i + 1, "consts") => {
+                    bad.push(format!("{at}: std::env::consts"));
+                }
+                "consts"
+                    if path_sep(&t, i + 1).is_some()
+                        && ["OS", "FAMILY", "ARCH"]
+                            .iter()
+                            .any(|c| names_segment(&t, i + 1, c)) =>
+                {
+                    bad.push(format!("{at}: consts::.."));
+                }
+                _ => {}
             }
         }
     }
@@ -356,21 +524,33 @@ fn r9_adapters_never_depend_on_core() {
 }
 
 /// R10 checker: the whole `tokio::time` module is banned in core sources (clippy.toml bans the
-/// individual items; this catches anything it does not list, e.g. `use tokio::time;`).
+/// individual items; this catches anything it does not list, e.g. `use tokio::time;`). Token-based
+/// (round-2 review F7): multi-line `use tokio::{ .., time, }` groups and comments inside paths are
+/// seen; renaming `tokio` (`use tokio as t`, `extern crate tokio as t`, `tokio::{self as t}`) is
+/// rejected outright, since an alias would hide every later path.
 fn tokio_time_uses(sources: &[(PathBuf, String)]) -> Vec<String> {
     let mut bad = Vec::new();
     for (p, text) in sources {
-        for (i, line) in text.lines().enumerate() {
-            let code = line.split("//").next().unwrap_or_default();
-            let squashed: String = code.chars().filter(|c| !c.is_whitespace()).collect();
-            let in_group = squashed.match_indices("tokio::{").any(|(at, m)| {
-                squashed[at + m.len()..]
-                    .split(['{', '}', ','])
-                    .take_while(|seg| !seg.ends_with(';'))
-                    .any(|seg| seg == "time" || seg.starts_with("time::"))
-            });
-            if squashed.contains("tokio::time") || in_group {
-                bad.push(format!("{}:{}", p.display(), i + 1));
+        let t = tokens(text);
+        for (i, (tok, line)) in t.iter().enumerate() {
+            if !matches!(tok, Tok::Ident(s) if s == "tokio") {
+                continue;
+            }
+            let at = format!("{}:{line}", p.display());
+            if names_segment(&t, i + 1, "time") {
+                bad.push(format!("{at}: tokio::time"));
+            }
+            if is_ident(t.get(i + 1), "as") {
+                bad.push(format!("{at}: tokio renamed"));
+            }
+            if path_sep(&t, i + 1).is_some_and(|j| is_punct(t.get(j), '{')) {
+                let g = group(&t, i + 3);
+                if g.windows(2).any(|w| {
+                    matches!(&w[0].0, Tok::Ident(s) if s == "self")
+                        && matches!(&w[1].0, Tok::Ident(s) if s == "as")
+                }) {
+                    bad.push(format!("{at}: tokio renamed"));
+                }
             }
         }
     }
@@ -506,6 +686,17 @@ fn selftest_r5_fires_on_every_platform_predicate_shape() {
         "fn a() -> bool { cfg!(not(target_vendor = \"apple\")) }",
         "#[cfg(all(feature = \"std\",\n    any(unix)))] fn a() {}",
         "std::cfg_select! { _ => {} }",
+        // Round-2 review F7: shapes the text scan missed.
+        "std::cfg_select ! { _ => {} }",
+        "use std::cfg_select; cfg_select! { _ => {} }",
+        "fn a() -> bool { cfg ! (unix) }",
+        "#[cfg/* hidden */(unix)] fn a() {}",
+        "macro_rules! plat { ($p:meta) => { #[cfg($p)] fn a() {} } } plat!(any());",
+        "macro_rules! plat { ($p:ident) => { #[cfg_attr($p, allow(dead_code))] fn a() {} } }",
+        "fn a() -> &'static str { std::env::consts::OS }",
+        "use std::env::consts; fn a() -> &'static str { consts::FAMILY }",
+        "use std::env::{\n    args,\n    consts::ARCH,\n};",
+        "fn a() -> bool { r#cfg!(unix) }",
     ];
     let dir = fixture_dir("r5");
     for (i, src) in planted.iter().enumerate() {
@@ -522,6 +713,11 @@ fn selftest_r5_fires_on_every_platform_predicate_shape() {
         "#[cfg(feature = \"unix\")] fn a() {}",
         "#[cfg_attr(test, allow(dead_code))] fn a() {}",
         "fn a() { let config = 1; let _ = config; }",
+        "fn a() -> &'static str { \"#[cfg(unix)] cfg_select! std::env::consts::OS\" }",
+        "// #[cfg(unix)] cfg_select!\nfn a() {}",
+        "/* #[cfg(windows)] /* nested */ std::env::consts::OS */ fn a() {}",
+        "fn a<'a>(x: &'a str) -> (char, &'a str) { ('u', x) }",
+        "fn a() -> &'static str { r##\"cfg(unix) \"# still raw\"## }",
     ] {
         let lib = dir.join("crates/fogar-core/src/lib.rs");
         write(&lib, ok);
@@ -581,6 +777,13 @@ fn selftest_r10_fires_on_any_tokio_time_use() {
         "use tokio::{sync, time::Instant};",
         "fn f() { let _ = tokio::time::Instant::now(); }",
         "async fn f() { tokio :: time :: sleep_until(x).await }",
+        // Round-2 review F7: multi-line groups, comments inside paths, aliases.
+        "use tokio::{\n    sync,\n    time,\n};",
+        "use tokio::{\n    sync::mpsc,\n    time::{\n        Instant,\n    },\n};",
+        "use ::tokio::/* x */time::Instant;",
+        "use tokio as tk; fn f() { let _ = tk::time::Instant::now(); }",
+        "extern crate tokio as tk;",
+        "use tokio::{self as tk}; fn f() {}",
     ] {
         write(&dir.join("crates/fogar-core/src/lib.rs"), src);
         assert!(
@@ -588,11 +791,17 @@ fn selftest_r10_fires_on_any_tokio_time_use() {
             "R10 missed {src}"
         );
     }
-    write(
-        &dir.join("crates/fogar-core/src/lib.rs"),
+    for ok in [
         "// tokio::time is banned\nfn f() {}",
-    );
-    assert!(tokio_time_uses(&rust_sources_in(&dir, "fogar-core")).is_empty());
+        "/* use tokio::time; */ fn f() {}",
+        "fn f() -> &'static str { \"tokio::time\" }",
+        "use tokio::{sync::mpsc, task::JoinSet}; fn time() {}",
+        "use tokio_util::time::DelayQueue;",
+    ] {
+        write(&dir.join("crates/fogar-core/src/lib.rs"), ok);
+        let bad = tokio_time_uses(&rust_sources_in(&dir, "fogar-core"));
+        assert!(bad.is_empty(), "R10 false positive on {ok}: {bad:?}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
