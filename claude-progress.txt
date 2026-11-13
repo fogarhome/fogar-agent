@@ -1,5 +1,49 @@
 fogar-agent — progress log (honest status; update at the end of every agent session)
 ================================================================================
+2026-11-13  slice-0 review fixes (code + security reviewers), branch slice-0, no remote, not pushed
+-----------------------------------------------------------------------------------------------
+Every fix: regression test written first and seen FAILING on the old code (or, for new types /
+the cancel-safety contract, a planted bad implementation shown to pass the old check), then fixed.
+scripts/gates.sh after the fixes: fmt, clippy, test --workspace (165 passed, 1 ignored), proto
+no_std, archtest (R1-R10 + self-tests), vendored hygiene + its new self-test gate, cargo deny,
+cargo audit, loom (gate now fails on zero matched tests; 1 loom test ran), bench: PASS.
+Miri: NOT RUN (same reason as below).
+
+FIXED:
+- code#1/sec#2 reconnect storm: attempt reset only after a session stable >= stable_after; all
+  reconnectable closes use delay(attempt). stderr link lines rate-limited (20/min + summary).
+- code#2 + code#7b: close_timeout 1 s, egress phase >= budget/2; a signal-initiated stop always
+  writes `clean` (overrun logged); SIGTERM/SIGINT registered before `start` is recorded.
+- code#3/sec#5: IPC idle/read deadline 30 s per connection.
+- code#4: archtest R5 rewritten (cfg predicate parser), R9 adapters never reach core, R10 no
+  tokio::time in core + clippy bans; self-tests plant every violation (incl. real clippy run).
+- sec#1: no /tmp fallback; state dir validated (owner/0700/not symlink); O_NOFOLLOW, create_new.
+- sec#6: agent hashes, frontmatter/tool allowlists, scoped reviewer/implementer Bash, root hash
+  in ADR-0007. LIMIT: same-PR regeneration possible; CI must compare ROOT_HASH with main (not
+  implemented, no CI yet).
+- code#5: lenient `ready`. sec#4: two-pass decode (1 MiB frame peaked at 32 MiB before; now
+  <= 3x), args/extras skipped, inbound queue byte cap 4 MiB.
+- code#6: link drains the uplink while waiting for inbound room.
+- code#7a: run-based crash-loop escalation reaches 32 min; ADR-0003 aligned.
+- code#8: cancel-safety contract cancels with frames in flight; loom gate zero-test guard.
+- sec#7: RLIMIT_CORE=0 (Linux; macOS same call, UNVERIFIED), redacting Debug for user content,
+  Zeroizing for the key where we read it, forbid(unsafe_code) in agentd/bench/archtest.
+- sec#3: loud WARNING for loopback ws:// at every start; TLS stays S1.
+
+PARTIAL / OPEN (honest):
+- sec#7: the handshake String with the key goes into tungstenite un-zeroized (needs a port change;
+  S1). macOS core-dump behaviour unverified.
+- sec#6: ROOT_HASH comparison against main must be a CI step (S1 roadmap). Reviewers keep
+  Bash(git diff|log|show) (read-only) in addition to cargo test/clippy; `cargo test` still runs
+  the code under review -> sandbox it.
+- code#7b: a SIGTERM in the few ms between process start and handler registration still kills the
+  process, but before `start` is written, so the breaker does not count it.
+- sec#1: a planted *regular* ledger inside our own 0700 dir is indistinguishable from ours.
+- Not for now (roadmap): capture-consent choke point = S2 hard requirement (+ TODO in
+  engine.rs); cargo vet / cargo geiger / fuzz targets = S1 gates.
+- New deps: rustix 1.1.6 (agentd, cfg(unix)), zeroize 1.9.1 (agentd, agent-linux); verified on
+  crates.io 2026-11-13.
+
 2026-11-13  slice-0 walking skeleton, branch slice-0 (no remote; nothing pushed)
 
 PASSES (automated, on Linux x86_64, rustc 1.97.0):

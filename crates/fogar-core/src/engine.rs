@@ -79,6 +79,9 @@ impl<C: Clock> Engine<C> {
         // Dropping the capture stops the device; dropping playback closes the output.
     }
 
+    // TODO(S2, review sec#8, HARD requirement): route every capture start through ONE consent
+    // choke point (local consent state, never a gateway message) before real capture ships;
+    // see docs/ROADMAP.md "Requirements carried from the slice-0 review".
     fn open_capture(&self) -> Option<Capture> {
         if !self.audio_in.capabilities().capture.is_available() {
             return None;
