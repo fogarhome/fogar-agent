@@ -170,8 +170,8 @@ fn run(opts: cli::RunOpts) -> ExitCode {
                 // built), so any stop after the `start` line is an ordinary stop, not a crash.
                 // A signal before this point kills the process before `start` is written, which
                 // the breaker does not count either.
-                let stop = StopSignal::install();
-                let boot = rt_ledger.begin_boot();
+                let (stop, armed) = StopSignal::install();
+                let boot = rt_ledger.begin_boot(&armed);
                 eprintln!("fogar-agentd: boot mode {}", boot.label());
                 serve(opts, state_dir, ws, boot, stop).await
             });
@@ -186,18 +186,34 @@ fn run(opts: cli::RunOpts) -> ExitCode {
             None
         }
     };
-    if let Some(stopped) = stopped {
-        // Review code#2: a stop asked for by a signal is an ordinary stop for the crash-loop
-        // breaker even if a shutdown phase overran its deadline; the overrun is reported here
-        // (and in the shutdown report line) instead of being counted as a crash.
-        if let Some(r) = stopped.report.filter(|r| !r.clean) {
-            eprintln!("fogar-agentd: shutdown overran its budget (not a crash): {r:?}");
-        }
+    if let Some(r) = stopped.as_ref().and_then(|s| s.report).filter(|r| !r.clean) {
+        eprintln!("fogar-agentd: shutdown overran its budget (not a crash): {r:?}");
+    }
+    if records_clean(stopped.as_ref()) {
         ledger.mark_clean();
     }
     // Exit 0 even after an unclean stop: a non-zero exit after SIGTERM would make launchd/systemd
     // restart a process that was asked to stop. The ledger keeps the truth.
     ExitCode::SUCCESS
+}
+
+/// Review code#2: a stop asked for by a signal is an ordinary stop for the crash-loop breaker,
+/// even if a shutdown phase overran its deadline (the overrun is reported, not counted as a
+/// crash). Only a runtime thread that did not come back (panic, could not start) is unclean.
+fn records_clean(stopped: Option<&Stopped>) -> bool {
+    stopped.is_some()
+}
+
+/// Proof that the stop-signal handlers were installed; `Ledger::begin_boot` requires it, so the
+/// boot cannot be recorded as `start` before them (review code#7b, round-2 F6: a test of the
+/// order through the binary cannot see a microsecond window; the type system can).
+pub(crate) struct SignalsArmed(());
+
+#[cfg(test)]
+impl SignalsArmed {
+    pub(crate) fn for_tests() -> Self {
+        Self(())
+    }
 }
 
 /// How `serve` ended. It only ever returns after a stop signal; `report` is `None` when the
@@ -329,9 +345,9 @@ struct StopSignal {
 
 impl StopSignal {
     /// Must run inside the runtime.
-    fn install() -> Self {
+    fn install() -> (Self, SignalsArmed) {
         #[cfg(unix)]
-        {
+        let me = {
             use tokio::signal::unix::{SignalKind, signal};
             match (
                 signal(SignalKind::terminate()),
@@ -345,11 +361,10 @@ impl StopSignal {
                     Self { streams: None }
                 }
             }
-        }
+        };
         #[cfg(not(unix))]
-        {
-            Self {}
-        }
+        let me = Self {};
+        (me, SignalsArmed(()))
     }
 
     /// Cancel-safe: resolves on the next SIGTERM/SIGINT.
@@ -417,5 +432,30 @@ impl Watchdog {
             h.thread().unpark();
             let _ = h.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round-2 review F6: an overrun shutdown (report not clean) is still an ordinary stop.
+    #[test]
+    fn a_signal_stop_is_clean_for_the_ledger_even_if_shutdown_overran() {
+        let overran = Stopped {
+            report: Some(fogar_core::ShutdownReport {
+                clean: false,
+                ingress_ok: true,
+                egress_ok: false,
+                ops_ok: false,
+                tasks_left: 3,
+            }),
+        };
+        assert!(records_clean(Some(&overran)));
+        assert!(records_clean(Some(&Stopped { report: None })));
+        assert!(
+            !records_clean(None),
+            "a runtime thread that never came back is a crash"
+        );
     }
 }

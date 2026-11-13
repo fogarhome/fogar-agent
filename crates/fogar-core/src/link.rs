@@ -488,3 +488,164 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
         }
     }
 }
+
+/// Round-2 review F6: the link must charge every queued inbound frame (TTS audio and JSON)
+/// against `INBOUND_BYTES`. These tests drive `LinkCtx::run` with an engine that never consumes
+/// and read the shared budget directly; a link that charged 0 (or 1) byte per frame would let
+/// the queue hold 128 x 1 MiB.
+#[cfg(test)]
+mod budget_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crate::queues::{INBOUND, INBOUND_BYTES};
+    use fogar_ports::gateway::LinkError;
+    use fogar_testkit::{MemorySecretStore, SeededRandom, TestClock};
+    use std::{collections::VecDeque, sync::Mutex};
+
+    const READY: &str = r#"{"type":"ready","session_id":"c:1"}"#;
+
+    /// One session: `ready`, then the scripted frames, then silence.
+    #[derive(Clone)]
+    struct Scripted(Arc<Mutex<Option<VecDeque<Frame>>>>);
+    struct Sess(VecDeque<Frame>);
+
+    impl LinkSession for Sess {
+        fn max_frame(&self) -> usize {
+            fogar_proto::limits::WS_MAX_FRAME_BYTES
+        }
+        async fn send(&mut self, _: Frame) -> Result<(), LinkError> {
+            Ok(())
+        }
+        async fn recv(&mut self) -> Option<LinkEvent> {
+            match self.0.pop_front() {
+                Some(f) => Some(LinkEvent::Frame(f)),
+                None => std::future::pending().await,
+            }
+        }
+        async fn close(&mut self, _: u16, _: &str) -> Result<(), LinkError> {
+            Ok(())
+        }
+    }
+
+    impl GatewayLink for Scripted {
+        type Session = Sess;
+        async fn connect(&self) -> Result<Sess, LinkError> {
+            let taken = self.0.lock().unwrap().take();
+            match taken {
+                Some(frames) => Ok(Sess(frames)),
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    struct Run {
+        budget: ByteBudget,
+        stats: Arc<Stats>,
+        clock: Arc<TestClock>,
+        in_rx: mpsc::Receiver<Inbound>,
+        egress: CancellationToken,
+        tasks: tokio_util::task::TaskTracker,
+        /// Held so the uplink stays open (no `EngineGone`).
+        _out_tx: mpsc::Sender<Frame>,
+    }
+
+    fn start(frames: Vec<Frame>) -> Run {
+        let mut script: VecDeque<Frame> = VecDeque::new();
+        script.push_back(Frame::Text(READY.into()));
+        script.extend(frames);
+        let clock = Arc::new(TestClock::new());
+        let stats = Arc::new(Stats::default());
+        let budget = ByteBudget::new(INBOUND_BYTES);
+        let (view, _) = watch::channel(LinkView {
+            state: LinkState::Starting,
+            last_close: None,
+        });
+        let ctx = LinkCtx {
+            clock: clock.clone(),
+            link: Scripted(Arc::new(Mutex::new(Some(script)))),
+            secrets: Arc::new(MemorySecretStore::with_client_key("k")),
+            random: Arc::new(SeededRandom::new(7)),
+            cfg: Arc::new(Config::default()),
+            stats: stats.clone(),
+            view,
+            budget: budget.clone(),
+        };
+        let (out_tx, out_rx) = mpsc::channel(8);
+        let (in_tx, in_rx) = mpsc::channel(INBOUND);
+        let egress = CancellationToken::new();
+        let tasks = tokio_util::task::TaskTracker::new();
+        tasks.spawn(ctx.run(out_rx, in_tx, egress.clone()));
+        tasks.close();
+        Run {
+            budget,
+            stats,
+            clock,
+            in_rx,
+            egress,
+            tasks,
+            _out_tx: out_tx,
+        }
+    }
+
+    async fn settle(r: &Run) {
+        // Well below `inbound_deadline` (5 s): the link has done all it can without waiting.
+        r.clock.sleep(Duration::from_millis(500)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn audio_frames_are_charged_and_shed_when_the_budget_is_full() {
+        let mib = 1 << 20;
+        let r = start((0..10).map(|_| Frame::Binary(vec![0xA1; mib])).collect());
+        settle(&r).await;
+        assert_eq!(
+            r.budget.in_use(),
+            INBOUND_BYTES,
+            "4 x 1 MiB queued and charged"
+        );
+        assert_eq!(r.stats.snapshot().inbound_audio_shed, 6, "the rest is shed");
+        let queued = r.in_rx.len();
+        assert_eq!(queued, 1 + 4, "SessionUp + 4 audio frames");
+        r.egress.cancel();
+        drop(r.in_rx);
+        r.tasks.wait().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn json_frames_are_charged_and_wait_for_room() {
+        // Just under 1 MiB each: 4 fit into the 4 MiB budget, the 5th must wait.
+        let text = |i: usize| {
+            let head = format!(r#"{{"type":"token","turn_id":"t-{i}","text":""#);
+            let n = (1 << 20) - head.len() - 100;
+            format!("{head}{}\"}}", "x".repeat(n))
+        };
+        let frames: Vec<String> = (0..6).map(text).collect();
+        let len = frames[0].len();
+        assert!(5 * len > INBOUND_BYTES && 4 * len < INBOUND_BYTES);
+        let mut r = start(frames.into_iter().map(Frame::Text).collect());
+        settle(&r).await;
+        // 4 frames charged by their length; the waiting 5th already holds the remainder (tokio's
+        // semaphore hands permits to the queued waiter as they come free).
+        assert_eq!(r.budget.in_use(), INBOUND_BYTES);
+        assert_eq!(r.in_rx.len(), 1 + 4, "the 5th waits for room");
+        assert!(matches!(r.in_rx.recv().await, Some(Inbound::SessionUp)));
+        let first = r.in_rx.recv().await;
+        assert!(matches!(first, Some(Inbound::Server(..))));
+        settle(&r).await;
+        assert_eq!(r.in_rx.len(), 3, "a dequeued frame still holds its charge");
+        drop(first); // releases `len` bytes: now the 5th fits
+        settle(&r).await;
+        assert_eq!(
+            r.in_rx.len(),
+            4,
+            "the 5th was queued once its bytes were free"
+        );
+        assert_eq!(
+            r.budget.in_use(),
+            INBOUND_BYTES,
+            "and the 6th waits in turn"
+        );
+        r.egress.cancel();
+        drop(r.in_rx);
+        r.tasks.wait().await;
+    }
+}

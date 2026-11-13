@@ -57,7 +57,10 @@ impl Ledger {
 
     /// Decides this boot's mode, then records `start` (+ `safe` in SafeMode: the persisted trip,
     /// round-2 review F4), rewriting the file with the current run only (`crashloop::retain`).
-    pub(crate) fn begin_boot(&self) -> BootMode {
+    ///
+    /// Takes the proof that the SIGTERM/SIGINT handlers are installed (review code#7b, round-2
+    /// F6): recording `start` before them does not compile.
+    pub(crate) fn begin_boot(&self, _armed: &crate::SignalsArmed) -> BootMode {
         let policy = BreakerPolicy::default();
         let now = now_ms();
         // A symlinked ledger is ignored (and replaced below), never followed (review sec#1).
@@ -133,7 +136,10 @@ mod tests {
         std::os::unix::fs::symlink(&v2, dir.join("boot.ledger")).unwrap();
         let l = Ledger::new(&dir);
         // A symlinked ledger is not trusted: it cannot trip SafeMode.
-        assert_eq!(l.begin_boot(), BootMode::Normal);
+        assert_eq!(
+            l.begin_boot(&crate::SignalsArmed::for_tests()),
+            BootMode::Normal
+        );
         l.mark_clean();
         assert_eq!(std::fs::read_to_string(&v1).unwrap(), "DO NOT TOUCH\n");
         assert_eq!(std::fs::read_to_string(&v2).unwrap(), planted);
