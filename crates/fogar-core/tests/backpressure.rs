@@ -84,3 +84,94 @@ async fn full_speaker_buffer_drops_and_counts_without_stalling_the_session() {
     assert_eq!(rig.speaker.snapshot().accepted, 1000);
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
+
+/// Review code#6: the link must never block on the inbound queue while it is the only reader of
+/// the outbound queue. Slow uplink + busy downlink: the engine waits for outbound room to send
+/// `end` while the link waits for inbound room; before the fix both sat out their 5 s deadlines,
+/// `end` was dropped and the session was torn down as a local fault.
+mod busy_downlink {
+    use fogar_ports::gateway::{Frame, GatewayLink, LinkError, LinkEvent, LinkSession};
+    use fogar_testkit::FakeGatewayLink;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
+
+    #[derive(Clone)]
+    pub(super) struct FloodLink {
+        pub(super) inner: FakeGatewayLink,
+        pub(super) rx: Arc<Mutex<Option<mpsc::Receiver<String>>>>,
+    }
+    pub(super) struct FloodSess {
+        inner: <FakeGatewayLink as GatewayLink>::Session,
+        rx: Option<mpsc::Receiver<String>>,
+    }
+
+    impl LinkSession for FloodSess {
+        fn max_frame(&self) -> usize {
+            self.inner.max_frame()
+        }
+        async fn send(&mut self, f: Frame) -> Result<(), LinkError> {
+            self.inner.send(f).await
+        }
+        async fn recv(&mut self) -> Option<LinkEvent> {
+            match self.rx.as_mut() {
+                Some(rx) => tokio::select! {
+                    biased;
+                    Some(t) = rx.recv() => Some(LinkEvent::Frame(Frame::Text(t))),
+                    ev = self.inner.recv() => ev,
+                },
+                None => self.inner.recv().await,
+            }
+        }
+        async fn close(&mut self, c: u16, r: &str) -> Result<(), LinkError> {
+            self.inner.close(c, r).await
+        }
+    }
+
+    impl GatewayLink for FloodLink {
+        type Session = FloodSess;
+        async fn connect(&self) -> Result<FloodSess, LinkError> {
+            let inner = self.inner.connect().await?;
+            let rx = self.rx.lock().unwrap().take();
+            Ok(FloodSess { inner, rx })
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn link_and_engine_never_wait_on_each_other() {
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(20_000);
+    let inner = fogar_testkit::FakeGatewayLink::new(MockConfig::default());
+    let link = busy_downlink::FloodLink {
+        inner: inner.clone(),
+        rx: std::sync::Arc::new(std::sync::Mutex::new(Some(rx))),
+    };
+    let b = RigBuilder::with_link(link, &MockConfig::default().client_key);
+    let mut rig = b.start();
+    wait_ready(&mut rig.health).await;
+    inner.set_uplink_delay(Some(Duration::from_millis(200)));
+    // Downlink: one status event per millisecond for 15 s (buffered by the transport).
+    let flood = tokio::spawn(async move {
+        for _ in 0..15_000 {
+            if tx
+                .send(r#"{"type":"status","service":"tts","state":"restored"}"#.to_owned())
+                .await
+                .is_err()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    speak(&rig.mic, 100).await;
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    flood.abort();
+    inner.set_uplink_delay(None);
+    let s = rig.health.snapshot().stats;
+    assert_eq!(
+        s.uplink_control_dropped, 0,
+        "`end` dropped: link and engine waited on each other"
+    );
+    assert_eq!(s.sessions_started, 1, "session torn down as a local fault");
+    eventually(Duration::from_secs(30), || inner.log().count("end") == 1).await;
+    assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
+}

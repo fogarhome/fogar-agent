@@ -336,10 +336,9 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                     Some(LinkEvent::Frame(Frame::Text(t))) => match decode_server(&t) {
                         Ok(ServerMsg::Unknown) => {}
                         Ok(msg) => {
-                            let delivered = match self.charge(t.len(), egress).await {
-                                Some(charge) => self.forward(in_tx, Inbound::Server(msg, charge), egress).await,
-                                None => false,
-                            };
+                            let delivered = self
+                                .deliver_draining(sess, out_rx, in_tx, msg, t.len(), egress, &mut last_sent)
+                                .await;
                             if !delivered {
                                 if egress.is_cancelled() {
                                     self.close_quietly(sess, CLOSE_NORMAL).await;
@@ -409,6 +408,50 @@ async fn sleep_until_opt<C: Clock>(clock: &C, at: Option<Mono>) {
 }
 
 impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
+    /// Must-deliver enqueue of one JSON event (byte charge + queue slot, each under
+    /// `inbound_deadline`) that KEEPS DRAINING the uplink queue while it waits (review code#6).
+    /// The link is the only reader of `out_rx`; if it waited for inbound room without draining,
+    /// an engine waiting for outbound room (must-deliver control) and the link would wait on each
+    /// other until both deadlines fired. `false` = not delivered (shutdown, engine gone, engine
+    /// stalled, or an uplink write failed / timed out); the caller classifies and closes.
+    #[allow(clippy::too_many_arguments)]
+    async fn deliver_draining(
+        &self,
+        sess: &mut L::Session,
+        out_rx: &mut mpsc::Receiver<Frame>,
+        in_tx: &mpsc::Sender<Inbound>,
+        msg: ServerMsg,
+        bytes: usize,
+        egress: &CancellationToken,
+        last_sent: &mut Mono,
+    ) -> bool {
+        let enqueue = async {
+            match self.charge(bytes, egress).await {
+                Some(c) => self.forward(in_tx, Inbound::Server(msg, c), egress).await,
+                None => false,
+            }
+        };
+        tokio::pin!(enqueue);
+        let mut out_open = true;
+        loop {
+            tokio::select! {
+                biased;
+                ok = &mut enqueue => return ok,
+                out = out_rx.recv(), if out_open => match out {
+                    // Engine gone: the enqueue notices (closed channel) and returns false.
+                    None => out_open = false,
+                    Some(frame) => {
+                        if !matches!(deadline(&*self.clock, self.cfg.write_timeout, sess.send(frame)).await, Some(Ok(()))) {
+                            return false;
+                        }
+                        Stats::inc(&self.stats.frames_sent);
+                        *last_sent = self.clock.now();
+                    }
+                },
+            }
+        }
+    }
+
     /// Charges a must-deliver JSON frame's bytes against `INBOUND_BYTES`, waiting up to
     /// `inbound_deadline`. `None` = shutdown or the engine stalled past the deadline.
     async fn charge(&self, bytes: usize, egress: &CancellationToken) -> Option<Charge> {
