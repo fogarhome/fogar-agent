@@ -1,0 +1,17 @@
+# Roadmap — ordered vertical slices
+
+Each slice crosses every ring it needs, ships acceptance + contract + soak tests, and passes a
+**measurement gate** (fogar-energy-budget acceptance gate, on the M2 once a macOS adapter is real:
+idle CPU <= 1 %, wakeups <= 0.5/s target / 2/s hard, phys_footprint <= 50 MB, no growth slope).
+
+| # | Slice | User-visible outcome | Measurement gate |
+|---|---|---|---|
+| S0 | Walking skeleton (this) | E2E with fakes + mock gateway over a real WS; daemon binary on Linux | Linux only: soak flat in simulated 72 h; no M2 numbers |
+| S1 | Real WS client robustness + SQLite sessions | Survives gateway restarts, network flaps, sleep/wake; wss via rustls; WS pings + half-open detection; pairing (`/.well-known`, `POST /pair`) storing the key in Keychain; conversation/session log in SQLite (one writer thread, WAL) | 24 h real-time churn soak on Linux CI + 24 h on the M2: RSS/fd/tasks flat, WAL bounded, idle wakeups from timers declared |
+| S2 | Real mic capture + VAD on the Mac | Speaking to the Mac opens a turn; replies play on the speaker | Mic-open idle CPU/wakeups on the M2, xrun/drop counters, TCC prompt attribution, 72 h RSS |
+| S3 | Wake word with our own model | "Hey Fogar" opens a turn hands-free | False accepts/h, false rejects, duty-cycled CPU on battery |
+| S4 | UI IPC over Unix socket + Swift app skeleton | Menu-bar app shows status, toggles listening | Peer code-signature check verified; IPC idle cost 0 wakeups |
+| S5 | Optional system-probe / monitoring module + load state to gateway | Gateway sees libre/ocupado/no_molestar (needs a gateway contract change) | Probe < 0.1 % CPU, < 1 wake/s; module off = zero threads |
+| S6 | Screenshots / ScreenCaptureKit | Agent can capture the screen on request | TCC re-approval handled; capture cost per frame |
+| S7 | Packaging: SMAppService/.app, signing, notarization, 72 h soak on a Mac | Installable, auto-starting, updatable agent | 72 h soak on the M2 (sleep/wake cycles, battery/AC), idle gate vs baseline |
+| S8 | Windows / Linux adapters | Same features on a second OS via new adapter crates, no core change | Per-OS idle gate (ETW/powercfg, perf/PSI) |

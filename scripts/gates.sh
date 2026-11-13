@@ -58,11 +58,11 @@ done
 echo; echo "=== crates with unsafe compiled here: ${UNSAFE_CRATES[*]:-none}"
 if [ "${#UNSAFE_CRATES[@]}" -eq 0 ]; then
   record "miri" PASS "no crate with unsafe is compiled on this host"
-elif cargo +nightly miri --version >/dev/null 2>&1; then
+elif cargo "+${MIRI_TOOLCHAIN:-nightly}" miri --version >/dev/null 2>&1; then
   ok=PASS
   for c in "${UNSAFE_CRATES[@]}"; do
-    echo "+ cargo +nightly miri test -p $c"
-    RUSTUP_TOOLCHAIN= cargo +nightly miri test -p "$c" || ok=FAIL
+    echo "+ cargo +${MIRI_TOOLCHAIN:-nightly} miri test -p $c"
+    env -u RUSTUP_TOOLCHAIN cargo "+${MIRI_TOOLCHAIN:-nightly}" miri test -p "$c" || ok=FAIL
   done
   record "miri (${UNSAFE_CRATES[*]})" "$ok"
 else

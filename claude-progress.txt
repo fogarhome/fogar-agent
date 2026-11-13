@@ -1,0 +1,45 @@
+fogar-agent — progress log (honest status; update at the end of every agent session)
+================================================================================
+2026-11-13  slice-0 walking skeleton, branch slice-0 (no remote; nothing pushed)
+
+PASSES (automated, on Linux x86_64, rustc 1.97.0):
+- scripts/gates.sh: fmt, clippy -D warnings, 131 tests, proto no_std build, archtest R1-R8,
+  vendored-skill hygiene, cargo deny 0.20.2, cargo audit 0.23.0, loom, bench placeholder.
+- E2E over a REAL WebSocket to the protocol-v1 mock gateway: handshake (no `type`), status before
+  ready, end -> transcription -> send, turn_start/token/turn_end, 0xA1 PCM16 bit-exact to the fake
+  player; barge-in; close codes; keepalive vs idle close; gateway down then up.
+- Paused-time core tests: all spec §11 close rows + 1006, backoff bounds (incl. 500 failures),
+  keepalive 30/h, not-paired, locked keychain, backpressure, shutdown to task baseline.
+- 72 simulated hours with hourly drops: tasks and queues flat, live heap growth 0 B after
+  hour 1; leak canary (planted leak) detected (~31 KB / 23 h).
+- loom: heartbeat primitive, 21808 iterations; a planted lost-update race fails as expected.
+- fogar-agentd binary on Linux: connects, status over Unix socket, SIGTERM -> exit 0 < 5 s,
+  close frame sent, ledger start/clean, key absent from stderr.
+
+NOT RUN:
+- Miri (fogar-testalloc is the only crate with unsafe compiled on Linux): nightly/miri could not
+  be installed (static.rust-lang.org unreachable from the sandbox). CI job `miri` defined.
+- .github/workflows/ci.yml: written, never executed (actions/checkout pinned by verified SHA).
+- Pinned toolchain download: 1.97.0 not downloadable; gates used installed stable == 1.97.0.
+
+STUBBED / UNTESTED:
+- fogar-agent-macos: every adapter is a stub (Unsupported) except getloadavg and thread QoS via
+  pthread_set_qos_class_self_np. Never compiled for a darwin target; only type-checked on Linux
+  with the cfg gate removed. platform_macos.rs in fogar-agentd never compiled.
+- No real audio anywhere (Linux reports Unsupported). VAD is a toy RMS threshold.
+- OS-thread watchdog abort path: implemented, not exercised by a test.
+- Crash-loop SafeMode: decision unit-tested; never exercised by real crashes.
+- No TLS (wss refused), no WS ping/half-open detection, no pairing, no SQLite, no UI.
+
+NEEDS A MAC (M2):
+- macOS CI green for fogar-agent-macos + its contract suites (first compile ever).
+- TCC mic prompt attribution, LaunchAgent/SMAppService, Keychain, LOCAL_PEERTOKEN/SecCode.
+- Energy gate: idle CPU, wakeups/s, phys_footprint (targets are unmeasured).
+- Instant/tokio time across sleep/wake; QoS placement.
+
+ACTION FOR A HUMAN:
+- Writing .claude/ needed approval that was not given in the build session. Review agent-team/
+  and run scripts/install_agent_team.sh to install the 8 skills + 9 subagents into .claude/.
+
+NEXT: S1 (docs/ROADMAP.md) — contract PR first: WS ping/idle deadline in LinkSession, TLS config,
+pairing port, SQLite storage port; then real-gateway golden fixtures for fogar-proto.
