@@ -260,6 +260,11 @@ async fn serve(
     let mut health = agent.health();
     let mut last = String::new();
     let mut limiter = status_log::LogLimiter::new(STATUS_LOG_WINDOW, STATUS_LOG_BURST);
+    // Round-2 review F3: armed when a line is first suppressed; reports the count one window
+    // later even if no further line is ever printed. Unarmed it costs no wakeups.
+    let flush = tokio::time::sleep(STATUS_LOG_WINDOW);
+    tokio::pin!(flush);
+    let mut flush_armed = false;
     let stable = tokio::time::sleep(STABLE_AFTER);
     tokio::pin!(stable);
     let mut stable_done = false;
@@ -269,8 +274,15 @@ async fn serve(
             () = stop.recv() => break,
             v = health.wait_link(|v| v.state.label() != last) => {
                 last = v.state.label().to_owned();
-                match limiter.check(std::time::Instant::now()) {
-                    status_log::Verdict::Suppress => continue,
+                let important = status_log::always_log(&v.state);
+                match limiter.check(std::time::Instant::now(), important) {
+                    status_log::Verdict::Suppress => {
+                        if !flush_armed {
+                            flush_armed = true;
+                            flush.as_mut().reset(tokio::time::Instant::now() + STATUS_LOG_WINDOW);
+                        }
+                        continue;
+                    }
                     status_log::Verdict::Print(Some(n)) => {
                         eprintln!("fogar-agentd: ({n} link status lines suppressed)");
                     }
@@ -283,11 +295,20 @@ async fn serve(
                     _ => eprintln!("fogar-agentd: link {last}"),
                 }
             }
+            () = &mut flush, if flush_armed => {
+                flush_armed = false;
+                if let Some(n) = limiter.take_suppressed() {
+                    eprintln!("fogar-agentd: ({n} link status lines suppressed)");
+                }
+            }
             () = &mut stable, if !stable_done => {
                 stable_done = true;
                 ledger::Ledger::new(&state_dir).mark_stable();
             }
         }
+    }
+    if let Some(n) = limiter.take_suppressed() {
+        eprintln!("fogar-agentd: ({n} link status lines suppressed)");
     }
     eprintln!("fogar-agentd: shutting down");
     let report = agent.shutdown(SHUTDOWN_BUDGET).await;

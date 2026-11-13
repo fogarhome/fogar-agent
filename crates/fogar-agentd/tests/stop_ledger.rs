@@ -167,3 +167,84 @@ fn plain_ws_gateway_prints_a_loud_warning() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Round-2 review F3: the stderr rate limit must never swallow a terminal state. The gateway
+/// flaps (`ready`, then a normal 1000 close) until the burst is used up, then revokes the key
+/// (1008 `revoked` -> Parked/Repair). The `link parked` line must still appear, and the count of
+/// suppressed lines must be reported (here: at the latest when the daemon stops).
+#[test]
+fn rate_limit_never_swallows_parked_and_reports_suppressed_lines() {
+    const FLAPS: u32 = 7;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let listener = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    rt.spawn(async move {
+        let mut n = 0u32;
+        loop {
+            let Ok((s, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(s).await else {
+                continue;
+            };
+            let _ = ws.next().await;
+            let _ = ws.send(Message::Text(READY.into())).await;
+            n += 1;
+            let (code, reason) = if n <= FLAPS {
+                (1000u16, "")
+            } else {
+                (1008u16, "revoked")
+            };
+            let _ = ws
+                .close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                    code: code.into(),
+                    reason: reason.into(),
+                }))
+                .await;
+            while ws.next().await.is_some() {}
+        }
+    });
+    let dir = state_dir("ratelimit");
+    store_key(&dir);
+    let (mut child, rx) = spawn(&dir, &format!("ws://127.0.0.1:{port}/ws/stream"));
+    // Lines with their arrival time (the backoff grows exponentially, so the flaps take ~30 s).
+    let mut all: Vec<(Instant, String)> = Vec::new();
+    let t0 = Instant::now();
+    loop {
+        let left = Duration::from_secs(150).saturating_sub(t0.elapsed());
+        let Ok(l) = rx.recv_timeout(left) else {
+            let _ = child.kill();
+            panic!("no `link parked` line: {all:#?}");
+        };
+        let parked = l.contains("link parked");
+        all.push((Instant::now(), l));
+        // Before the fix this line never came once the flaps had used up the burst.
+        if parked {
+            break;
+        }
+    }
+    term_and_wait(&mut child);
+    all.extend(rx.try_iter().map(|l| (Instant::now(), l)));
+    let link: Vec<Instant> = all
+        .iter()
+        .filter(|(_, l)| l.contains("fogar-agentd: link "))
+        .map(|(t, _)| *t)
+        .collect();
+    // The daemon's window is 60 s with a burst of 20; if 21 link lines came within 55 s of the
+    // first (margin for pipe latency), lines were suppressed and the count must be reported.
+    if link.len() > 20 && link[20].duration_since(link[0]) < Duration::from_secs(55) {
+        assert!(
+            all.iter()
+                .any(|(_, l)| l.contains("link status lines suppressed")),
+            "burst exceeded and no suppressed summary: {all:#?}"
+        );
+    } else {
+        eprintln!("note: flaps spread over > 55 s; suppressed-summary assertion not applicable");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    rt.shutdown_background();
+}
