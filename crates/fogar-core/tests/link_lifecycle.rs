@@ -9,6 +9,9 @@ use fogar_proto::CloseAction;
 use fogar_testkit::{MockConfig, gateway::Ctl};
 use std::time::Duration;
 
+/// (scripted close or `None` = abrupt drop, expected classification, expected reaction)
+type Case = (Option<(u16, &'static str)>, CloseAction, Expect);
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Expect {
     Reconnects,
@@ -18,7 +21,7 @@ enum Expect {
 /// Every row of spec §11, plus an unknown code and an abrupt drop (1006).
 #[tokio::test(start_paused = true)]
 async fn every_close_code_is_classified_and_acted_on() {
-    let cases: &[(Option<(u16, &str)>, CloseAction, Expect)] = &[
+    let cases: &[Case] = &[
         (
             Some((1008, "Handshake timeout")),
             CloseAction::RetryBackoff,

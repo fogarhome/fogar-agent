@@ -119,6 +119,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
+name = "fogar-agent-linux"
+version = "0.0.1"
+dependencies = [
+ "fogar-ports",
+ "fogar-testkit",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "fogar-core"
 version = "0.0.1"
 dependencies = [
@@ -129,6 +140,18 @@ dependencies = [
  "loom",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "fogar-host"
+version = "0.0.1"
+dependencies = [
+ "fogar-ports",
+ "fogar-proto",
+ "fogar-testkit",
+ "futures-util",
+ "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

@@ -1,0 +1,21 @@
+[package]
+name = "fogar-agent-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "ILLUSTRATIVE Linux adapters for slice 0: /proc probe, Unix-socket IPC with SO_PEERCRED, 0600-file secret store, explicit Unsupported audio/power. Compiles to an empty crate elsewhere."
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fogar-ports = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util"] }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+fogar-testkit = { workspace = true }
+fogar-ports = { workspace = true }
+
+[lints]
+workspace = true

@@ -8,6 +8,8 @@ members = [
   "crates/fogar-core",
   "crates/fogar-testkit",
   "crates/fogar-testalloc",
+  "crates/fogar-host",
+  "crates/fogar-agent-linux",
 ]
 
 [workspace.package]
