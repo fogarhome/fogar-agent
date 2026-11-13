@@ -1,5 +1,46 @@
 fogar-agent — progress log (honest status; update at the end of every agent session)
 ================================================================================
+2026-11-13  slice-0 review ROUND 2 fixes (independent reviewer F1-F8), branch slice-0, not pushed
+-----------------------------------------------------------------------------------------------
+Each fix: regression test / self-test seen FAILING on the old code first, then the fix.
+scripts/gates.sh: fmt, clippy, test --workspace (175 passed, 1 ignored), proto no_std, archtest,
+vendored hygiene + self-test (65 cases), cargo deny, cargo audit, loom, bench: PASS.
+Miri: NOT RUN (nightly unreachable). Toolchain: installed stable == 1.97.0.
+
+FIXED:
+- F1 check_vendored.sh: rejects any symlink/special file (working tree + tracked 120000), any
+  .claude* outside the root .claude/ (hidden dirs, .claude-plugin, sub/.claude), anything in
+  .claude/ but agents/ + skills/, installed copies not byte-identical to agent-team/; hash lists
+  must name exactly the file set. install_agent_team.sh now copies plain directories.
+- F2 scripts/check_frontmatter.py (python3 stdlib, gate FAILS without python3): strict non-YAML
+  grammar; reviewer role from the FILE NAME, name == stem, explicit Bash scope allowlist,
+  skills must be vendored. 39 new planted cases (+1 installed-copy pass case); 31 passed
+  the old checker (the F1 commit message says "all failed before": wrong, this is the count).
+- F3 agentd: Parked/NotPaired/ShuttingDown/Stopped never rate-limited; suppressed count flushed by
+  a timer armed on first suppression and at shutdown. Binary test (7 flaps + 1008 revoked):
+  before, no 'link parked' line in 150 s.
+- F4 crashloop: SafeMode trip persisted ('safe' ledger line); run ends only on clean/stable or a
+  quiet gap > 3 h; pruning moved to crashloop::retain (current run, <= 64 lines). 40-boot
+  simulation showed the 1920 s -> 0 s sawtooth before.
+- F5 proto: 'ready' lenient fields decoded by visitors (no serde_json::Value): 16 MiB -> < 3 MiB
+  for 1 MiB; amplification test covers all 12 server types.
+- F6 link::budget_tests (audio + JSON byte charge), records_clean() unit test, SignalsArmed token
+  (begin_boot cannot run before the signal handlers: compile-time). 5 mutations applied in a
+  scratch copy: all killed (4 tests, 1 compile error).
+- F7 archtest: token-based R5/R10 (+ cfg_select !, cfg ! (, cfg($p), std::env::consts,
+  multi-line tokio groups, comments in paths, tokio aliases), self-tests incl. negatives.
+- F8 PR_SET_DUMPABLE=0 on Linux via rustix's safe wrapper (no new unsafe).
+
+OPEN / LIMITS (honest):
+- ROOT_HASH can still be regenerated in the same PR; CI must compare it with main (ADR-0007).
+- CLAUDE.md files (any depth) are not checked by the vendored gate (instructions, not config).
+- F3 binary test takes ~30 s (exponential backoff); its suppressed-summary assertion is skipped
+  (with a note) if the flaps spread over > 55 s on a slow runner.
+- F6 signal order is enforced by types, not by a black-box test (the race window is microseconds).
+- F7 R5/R10 are still lexical: a cfg produced by a proc-macro in a dependency is not visible.
+- F8: macOS still only RLIMIT_CORE (PT_DENY_ATTACH / get-task-allow: TODO macos S2). macOS
+  compile of the changed agentd code: UNTESTED (no macOS runner).
+
 2026-11-13  slice-0 review fixes (code + security reviewers), branch slice-0, no remote, not pushed
 -----------------------------------------------------------------------------------------------
 Every fix: regression test written first and seen FAILING on the old code (or, for new types /

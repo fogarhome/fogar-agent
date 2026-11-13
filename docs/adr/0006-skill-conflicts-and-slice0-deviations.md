@@ -42,12 +42,14 @@ Items 2, 3 and 6 are macOS behaviour: verify in S2 (audio), S1 (sleep/wake) and 
 10. **State directory (review sec#1)**: no predictable fallback when `HOME` is unset (the daemon
     refuses to start and asks for `--state-dir`); the state dir is validated (absolute, owner =
     getuid, real dir, 0700) before use; ledger/crash files `O_NOFOLLOW`, temp files `create_new`.
-    The composition root uses `rustix` (safe wrappers) for getuid / O_NOFOLLOW / RLIMIT_CORE, so
+    The composition root uses `rustix` (safe wrappers) for getuid / O_NOFOLLOW / RLIMIT_CORE and,
+    on Linux, PR_SET_DUMPABLE=0 (round-2 review F8), so
     it stays `#![forbid(unsafe_code)]`. macOS: same code path, UNTESTED until macOS CI.
 11. **Inbound queue byte cap (review sec#4)**: `queues::INBOUND_BYTES` = 4 MiB in addition to
     the 128-message cap; `decode_server` is two-pass (tag, then variant struct) instead of
     serde's buffering internally-tagged enum; unused GUESSED fields (`tool_call.args`,
-    `pipeline_event` extras) are skipped, not kept. `ready` is decoded leniently (review code#5).
+    `pipeline_event` extras) are skipped, not kept. `ready` is decoded leniently (review code#5)
+    by visitors that never build a `serde_json::Value` (round-2 review F5: it peaked at 16x).
 12. **Capture consent (review sec#8)**: not in slice 0 (no capture exists). Hard requirement for
     S2 in docs/ROADMAP.md: one choke point in core through which every capture start passes,
     checking local consent state; gateway messages can never start capture by themselves.
