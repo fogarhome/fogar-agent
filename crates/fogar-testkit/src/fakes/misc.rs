@@ -43,7 +43,11 @@ pub struct MemorySecretStore {
 impl MemorySecretStore {
     pub fn with_client_key(key: &str) -> Self {
         let s = Self::default();
-        s.put(SecretKey::GatewayClientKey, SecretString::from(key.to_owned())).unwrap();
+        s.put(
+            SecretKey::GatewayClientKey,
+            SecretString::from(key.to_owned()),
+        )
+        .unwrap();
         s
     }
     pub fn fail_next(&self, n: u32) {
@@ -98,10 +102,18 @@ impl FakePowerPolicy {
         let mut caps = PowerCaps::NONE;
         caps.thread_class = Support::Native;
         caps.process_baseline = Support::Native;
-        Self { caps, calls: Mutex::default(), baseline_calls: AtomicU64::new(0) }
+        Self {
+            caps,
+            calls: Mutex::default(),
+            baseline_calls: AtomicU64::new(0),
+        }
     }
     pub fn minimal() -> Self {
-        Self { caps: PowerCaps::NONE, calls: Mutex::default(), baseline_calls: AtomicU64::new(0) }
+        Self {
+            caps: PowerCaps::NONE,
+            calls: Mutex::default(),
+            baseline_calls: AtomicU64::new(0),
+        }
     }
 }
 
@@ -111,10 +123,18 @@ impl PowerPolicy for FakePowerPolicy {
     }
     fn apply_process_baseline(&self) -> Result<Applied, PowerError> {
         self.baseline_calls.fetch_add(1, Ordering::Relaxed);
-        Ok(if self.caps.process_baseline.is_available() { Applied::Applied } else { Applied::NotSupported })
+        Ok(if self.caps.process_baseline.is_available() {
+            Applied::Applied
+        } else {
+            Applied::NotSupported
+        })
     }
     fn apply_current_thread(&self, class: WorkClass) -> Result<Applied, PowerError> {
         self.calls.lock().unwrap().push(class);
-        Ok(if self.caps.thread_class.is_available() { Applied::Applied } else { Applied::NotSupported })
+        Ok(if self.caps.thread_class.is_available() {
+            Applied::Applied
+        } else {
+            Applied::NotSupported
+        })
     }
 }

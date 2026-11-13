@@ -73,17 +73,26 @@ pub struct StatusReport {
 
 impl StatusReport {
     pub fn new(link: String, sessions: u64, turns_completed: u64, boot_mode: String) -> Self {
-        Self { link, sessions, turns_completed, boot_mode }
+        Self {
+            link,
+            sessions,
+            turns_completed,
+            boot_mode,
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum IpcResponse {
-    Hello { version: u32 },
+    Hello {
+        version: u32,
+    },
     Status(StatusReport),
     /// The request was understood but refused (e.g. version mismatch).
-    Refused { reason: &'static str },
+    Refused {
+        reason: &'static str,
+    },
 }
 
 /// IPC protocol version spoken by this build.

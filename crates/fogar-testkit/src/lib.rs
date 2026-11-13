@@ -12,8 +12,8 @@ pub mod fakes;
 pub mod gateway;
 
 pub use fakes::{
-    FakeIpc, FakeIpcClient, FakeMic, FakePowerPolicy, FakeSpeaker, FakeSystemProbe, MemorySecretStore,
-    SeededRandom, TestClock,
+    FakeIpc, FakeIpcClient, FakeMic, FakePowerPolicy, FakeSpeaker, FakeSystemProbe,
+    MemorySecretStore, SeededRandom, TestClock, silence_chunks, tone_chunks,
 };
 pub use gateway::{FakeGatewayLink, GatewayLog, MockConfig, MockGateway};
 

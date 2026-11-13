@@ -3,7 +3,9 @@
 use fogar_proto::{
     ClientMsg, Handshake, OutputMode, decode_client, encode_tts_frame,
     limits::HANDSHAKE_MAX_CHARS,
-    server::{Capabilities, ErrorMsg, Ready, ServerMsg, Status, Token, Transcription, TurnEnd, TurnStart},
+    server::{
+        Capabilities, ErrorMsg, Ready, ServerMsg, Status, Token, Transcription, TurnEnd, TurnStart,
+    },
 };
 use std::{
     future::Future,
@@ -34,6 +36,9 @@ pub struct MockConfig {
     /// Close with 1000 after this much client silence while no turn is streaming (spec: 300 s).
     pub idle_timeout: Option<Duration>,
     pub handshake_timeout: Duration,
+    /// Keep per-message records (`client_msgs`, `sends`, `closes_sent`). Turn it off for soaks:
+    /// the log would otherwise be the only thing growing.
+    pub record: bool,
 }
 
 impl Default for MockConfig {
@@ -48,6 +53,7 @@ impl Default for MockConfig {
             status_before_ready: true,
             idle_timeout: Some(Duration::from_secs(300)),
             handshake_timeout: Duration::from_secs(5),
+            record: true,
         }
     }
 }
@@ -180,7 +186,11 @@ pub(crate) async fn run_conn<T: ServerTransport>(
     // Phase 2: session.
     if ok {
         loop {
-            let idle_at = c.cfg.idle_timeout.filter(|_| c.streaming.is_none()).map(|d| c.last_client + d);
+            let idle_at = c
+                .cfg
+                .idle_timeout
+                .filter(|_| c.streaming.is_none())
+                .map(|d| c.last_client + d);
             let audio_at = c.streaming.as_ref().map(|s| s.next_at);
             let step = tokio::select! {
                 biased;
@@ -212,12 +222,22 @@ async fn sleep_opt(at: Option<Instant>) {
 
 impl Conn {
     async fn close<T: ServerTransport>(&mut self, t: &mut T, code: u16, reason: &str) {
-        self.log.lock().unwrap().closes_sent.push((code, reason.to_owned()));
+        if self.cfg.record {
+            self.log
+                .lock()
+                .unwrap()
+                .closes_sent
+                .push((code, reason.to_owned()));
+        }
         t.close(code, reason).await;
     }
 
     async fn send<T: ServerTransport>(&mut self, t: &mut T, m: &ServerMsg) -> Step {
-        if t.send(json(m)).await { Step::Continue } else { Step::Stop }
+        if t.send(json(m)).await {
+            Step::Continue
+        } else {
+            Step::Stop
+        }
     }
 
     async fn ctl<T: ServerTransport>(&mut self, t: &mut T, cmd: Ctl) -> Step {
@@ -262,17 +282,30 @@ impl Conn {
             let mut l = self.log.lock().unwrap();
             l.handshakes_ok += 1;
             l.handshake_had_type_field |= has_type;
-            l.last_output_mode = hs.output_mode.iter().map(|m| format!("{m:?}").to_lowercase()).collect();
+            l.last_output_mode = hs
+                .output_mode
+                .iter()
+                .map(|m| format!("{m:?}").to_lowercase())
+                .collect();
             l.last_agent = hs.agent.as_deref().map(str::to_owned);
         }
         self.last_client = Instant::now();
         if self.cfg.status_before_ready {
-            let st = ServerMsg::Status(Status { service: "tts".into(), state: "restored".into(), code: None, message: None });
+            let st = ServerMsg::Status(Status {
+                service: "tts".into(),
+                state: "restored".into(),
+                code: None,
+                message: None,
+            });
             if matches!(self.send(t, &st).await, Step::Stop) {
                 return false;
             }
         }
-        let caps = Capabilities { barge_in: true, tts: true, transcriber: true };
+        let caps = Capabilities {
+            barge_in: true,
+            tts: true,
+            transcriber: true,
+        };
         let ready = ServerMsg::Ready(Ready {
             session_id: "c1:1731500000000".into(),
             agent: hs.agent.as_deref().unwrap_or("main").to_owned(),
@@ -313,7 +346,9 @@ impl Conn {
                         .ok()
                         .and_then(|v| v.get("type").and_then(|x| x.as_str()).map(str::to_owned));
                     if let Some(ty) = ty {
-                        self.log.lock().unwrap().client_msgs.push(ty);
+                        if self.cfg.record {
+                            self.log.lock().unwrap().client_msgs.push(ty);
+                        }
                         return Step::Continue;
                     }
                     let err = ServerMsg::Error(ErrorMsg {
@@ -335,20 +370,29 @@ impl Conn {
             ClientMsg::Cancel => "cancel",
             ClientMsg::Keepalive => "keepalive",
         };
-        self.log.lock().unwrap().client_msgs.push(ty.to_owned());
+        if self.cfg.record {
+            self.log.lock().unwrap().client_msgs.push(ty.to_owned());
+        }
         match msg {
             ClientMsg::Keepalive => Step::Continue,
             ClientMsg::End => {
-                let text = if self.utterance_audio > 0 { self.cfg.transcript.clone() } else { String::new() };
+                let text = if self.utterance_audio > 0 {
+                    self.cfg.transcript.clone()
+                } else {
+                    String::new()
+                };
                 self.utterance_audio = 0;
                 let partial = ServerMsg::TranscriptionPartial(Transcription { text: text.clone() });
                 if matches!(self.send(t, &partial).await, Step::Stop) {
                     return Step::Stop;
                 }
-                self.send(t, &ServerMsg::Transcription(Transcription { text })).await
+                self.send(t, &ServerMsg::Transcription(Transcription { text }))
+                    .await
             }
             ClientMsg::Send { text } => {
-                self.log.lock().unwrap().sends.push(text.into_owned());
+                if self.cfg.record {
+                    self.log.lock().unwrap().sends.push(text.into_owned());
+                }
                 // `send` replaces any active turn: its turn_end first.
                 if matches!(self.cancel_turn(t).await, Step::Stop) {
                     return Step::Stop;
@@ -362,7 +406,9 @@ impl Conn {
     async fn cancel_turn<T: ServerTransport>(&mut self, t: &mut T) -> Step {
         if let Some(s) = self.streaming.take() {
             self.log.lock().unwrap().turns_cancelled += 1;
-            return self.send(t, &ServerMsg::TurnEnd(TurnEnd { turn_id: s.turn_id })).await;
+            return self
+                .send(t, &ServerMsg::TurnEnd(TurnEnd { turn_id: s.turn_id }))
+                .await;
         }
         Step::Continue
     }
@@ -375,7 +421,10 @@ impl Conn {
         let turn_id = format!("t-{}", self.turn_n);
         let seq = (self.turn_n & 0xFFFF) as u16;
         self.log.lock().unwrap().turns_started += 1;
-        let start = ServerMsg::TurnStart(TurnStart { turn_id: turn_id.clone(), turn_seq: seq });
+        let start = ServerMsg::TurnStart(TurnStart {
+            turn_id: turn_id.clone(),
+            turn_seq: seq,
+        });
         if matches!(self.send(t, &start).await, Step::Stop) {
             return Step::Stop;
         }
@@ -387,14 +436,26 @@ impl Conn {
             }
             let (a, b) = reply.split_at(mid);
             for part in [a, b] {
-                let tok = ServerMsg::Token(Token { turn_id: turn_id.clone(), text: part.to_owned() });
+                let tok = ServerMsg::Token(Token {
+                    turn_id: turn_id.clone(),
+                    text: part.to_owned(),
+                });
                 if matches!(self.send(t, &tok).await, Step::Stop) {
                     return Step::Stop;
                 }
             }
         }
-        let frames = if self.output_audio { self.cfg.tts_frames } else { 0 };
-        self.streaming = Some(Streaming { turn_id, seq, left: frames, next_at: Instant::now() });
+        let frames = if self.output_audio {
+            self.cfg.tts_frames
+        } else {
+            0
+        };
+        self.streaming = Some(Streaming {
+            turn_id,
+            seq,
+            left: frames,
+            next_at: Instant::now(),
+        });
         Step::Continue
     }
 
@@ -406,15 +467,23 @@ impl Conn {
             let id = s.turn_id.clone();
             self.streaming = None;
             // turn_end is sent after the last audio chunk (spec §7).
-            return self.send(t, &ServerMsg::TurnEnd(TurnEnd { turn_id: id })).await;
+            return self
+                .send(t, &ServerMsg::TurnEnd(TurnEnd { turn_id: id }))
+                .await;
         }
         s.left -= 1;
         s.next_at = Instant::now() + self.cfg.frame_interval;
         let n = self.cfg.tts_samples_per_frame;
-        let pcm: Vec<i16> = (0..n).map(|i| ((i as i32 * 37) % 2000 - 1000) as i16).collect();
+        let pcm: Vec<i16> = (0..n)
+            .map(|i| ((i as i32 * 37) % 2000 - 1000) as i16)
+            .collect();
         let mut buf = Vec::with_capacity(3 + n * 2);
         encode_tts_frame(s.seq, &pcm, &mut buf);
         self.log.lock().unwrap().tts_frames_sent += 1;
-        if t.send(ServerOut::Binary(buf)).await { Step::Continue } else { Step::Stop }
+        if t.send(ServerOut::Binary(buf)).await {
+            Step::Continue
+        } else {
+            Step::Stop
+        }
     }
 }

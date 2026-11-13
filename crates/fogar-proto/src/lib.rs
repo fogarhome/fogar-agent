@@ -32,7 +32,9 @@ pub use audio::{
 };
 pub use client::{ClientMsg, Handshake, InputMode, OutputMode};
 pub use close::{CloseAction, classify_close};
-pub use codec::{DecodeError, EncodeError, decode_client, decode_server, encode_client, encode_handshake};
+pub use codec::{
+    DecodeError, EncodeError, decode_client, decode_server, encode_client, encode_handshake,
+};
 pub use server::ServerMsg;
 
 /// Timing and size constants from the spec (not announced at runtime by the gateway).

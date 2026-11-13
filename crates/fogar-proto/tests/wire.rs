@@ -21,7 +21,10 @@ fn spec_ready_vector_decodes() {
     match decode_server(j).unwrap() {
         ServerMsg::Ready(r) => {
             assert_eq!(r.agent, "main");
-            assert_eq!(r.output_mode, vec![OutputMode::Audio, OutputMode::Text, OutputMode::Status]);
+            assert_eq!(
+                r.output_mode,
+                vec![OutputMode::Audio, OutputMode::Text, OutputMode::Status]
+            );
             assert!(r.live_capabilities.tts);
         }
         other => panic!("{other:?}"),
@@ -43,17 +46,37 @@ fn spec_turn_vectors_decode() {
         r#"{"type":"some_future_message","whatever":true}"#,
     ];
     let decoded: Vec<_> = msgs.iter().map(|m| decode_server(m).unwrap()).collect();
-    assert!(matches!(&decoded[0], ServerMsg::Status(s) if s.state() == fogar_proto::server::ServiceState::Restored));
+    assert!(
+        matches!(&decoded[0], ServerMsg::Status(s) if s.state() == fogar_proto::server::ServiceState::Restored)
+    );
     assert!(matches!(&decoded[2], ServerMsg::TurnStart(t) if t.turn_seq == 1));
-    assert!(matches!(&decoded[5], ServerMsg::Interrupted(Interrupted { turn_id: None })));
-    assert!(matches!(&decoded[6], ServerMsg::Error(e) if e.turn_reason() == Some(TurnErrorReason::TurnTimeout)));
-    assert!(matches!(&decoded[7], ServerMsg::PipelineEvent(p) if p.turn == Some(4) && p.extra.contains_key("x") && !p.extra.contains_key("type")));
+    assert!(matches!(
+        &decoded[5],
+        ServerMsg::Interrupted(Interrupted { turn_id: None })
+    ));
+    assert!(
+        matches!(&decoded[6], ServerMsg::Error(e) if e.turn_reason() == Some(TurnErrorReason::TurnTimeout))
+    );
+    assert!(
+        matches!(&decoded[7], ServerMsg::PipelineEvent(p) if p.turn == Some(4) && p.extra.contains_key("x") && !p.extra.contains_key("type"))
+    );
     assert!(matches!(&decoded[9], ServerMsg::Unknown));
 }
 
 #[test]
 fn malformed_server_frames_are_errors() {
-    for bad in ["", "null", "[]", "42", "\"ready\"", "{}", r#"{"type":5}"#, r#"{"type":"turn_start","turn_id":"t-1","turn_seq":70000}"#, r#"{"type":"token"}"#, "{\"type\":\"ready\""] {
+    for bad in [
+        "",
+        "null",
+        "[]",
+        "42",
+        "\"ready\"",
+        "{}",
+        r#"{"type":5}"#,
+        r#"{"type":"turn_start","turn_id":"t-1","turn_seq":70000}"#,
+        r#"{"type":"token"}"#,
+        "{\"type\":\"ready\"",
+    ] {
         assert!(decode_server(bad).is_err(), "{bad}");
     }
 }
@@ -61,10 +84,19 @@ fn malformed_server_frames_are_errors() {
 #[test]
 fn client_vectors_are_exact() {
     assert_eq!(encode_client(&ClientMsg::End).unwrap(), r#"{"type":"end"}"#);
-    assert_eq!(encode_client(&ClientMsg::Cancel).unwrap(), r#"{"type":"cancel"}"#);
-    assert_eq!(encode_client(&ClientMsg::Keepalive).unwrap(), r#"{"type":"keepalive"}"#);
     assert_eq!(
-        encode_client(&ClientMsg::Send { text: "pon \"la\" serie".into() }).unwrap(),
+        encode_client(&ClientMsg::Cancel).unwrap(),
+        r#"{"type":"cancel"}"#
+    );
+    assert_eq!(
+        encode_client(&ClientMsg::Keepalive).unwrap(),
+        r#"{"type":"keepalive"}"#
+    );
+    assert_eq!(
+        encode_client(&ClientMsg::Send {
+            text: "pon \"la\" serie".into()
+        })
+        .unwrap(),
         r#"{"type":"send","text":"pon \"la\" serie"}"#
     );
     let h = Handshake {
@@ -88,9 +120,15 @@ fn handshake_limit_is_in_chars_and_debug_redacts_key() {
         output_mode: vec![OutputMode::Text],
         agent: None,
     };
-    assert!(encode_handshake(&h).is_ok(), "limit counts characters, not bytes");
+    assert!(
+        encode_handshake(&h).is_ok(),
+        "limit counts characters, not bytes"
+    );
     let key2 = "a".repeat(4100);
-    let h2 = Handshake { client_key: Cow::Borrowed(&key2), ..h.clone() };
+    let h2 = Handshake {
+        client_key: Cow::Borrowed(&key2),
+        ..h.clone()
+    };
     assert!(encode_handshake(&h2).is_err());
     let dbg = format!("{h2:?}");
     assert!(!dbg.contains("aaaa") && dbg.contains("redacted"));
@@ -102,30 +140,70 @@ fn arb_text() -> impl Strategy<Value = String> {
 
 fn arb_server_msg() -> impl Strategy<Value = ServerMsg> {
     prop_oneof![
-        (arb_text(), arb_text(), any::<bool>(), any::<bool>(), any::<bool>()).prop_map(|(s, a, b, t, x)| {
-            ServerMsg::Ready(Ready {
-                session_id: s,
-                agent: a,
-                input_mode: InputMode::Audio,
-                output_mode: vec![OutputMode::Audio, OutputMode::Text],
-                requested_capabilities: Capabilities { barge_in: b, tts: t, transcriber: x },
-                live_capabilities: Capabilities { barge_in: x, tts: b, transcriber: t },
-            })
-        }),
+        (
+            arb_text(),
+            arb_text(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>()
+        )
+            .prop_map(|(s, a, b, t, x)| {
+                ServerMsg::Ready(Ready {
+                    session_id: s,
+                    agent: a,
+                    input_mode: InputMode::Audio,
+                    output_mode: vec![OutputMode::Audio, OutputMode::Text],
+                    requested_capabilities: Capabilities {
+                        barge_in: b,
+                        tts: t,
+                        transcriber: x,
+                    },
+                    live_capabilities: Capabilities {
+                        barge_in: x,
+                        tts: b,
+                        transcriber: t,
+                    },
+                })
+            }),
         arb_text().prop_map(|text| ServerMsg::TranscriptionPartial(Transcription { text })),
         arb_text().prop_map(|text| ServerMsg::Transcription(Transcription { text })),
-        (arb_text(), any::<u16>()).prop_map(|(turn_id, turn_seq)| ServerMsg::TurnStart(TurnStart { turn_id, turn_seq })),
-        (arb_text(), arb_text()).prop_map(|(turn_id, text)| ServerMsg::Token(Token { turn_id, text })),
+        (arb_text(), any::<u16>())
+            .prop_map(|(turn_id, turn_seq)| ServerMsg::TurnStart(TurnStart { turn_id, turn_seq })),
+        (arb_text(), arb_text())
+            .prop_map(|(turn_id, text)| ServerMsg::Token(Token { turn_id, text })),
         arb_text().prop_map(|turn_id| ServerMsg::TurnEnd(TurnEnd { turn_id })),
-        proptest::option::of(arb_text()).prop_map(|turn_id| ServerMsg::Interrupted(Interrupted { turn_id })),
-        (arb_text(), arb_text(), proptest::option::of(arb_text())).prop_map(|(service, state, code)| {
-            ServerMsg::Status(Status { service, state, code, message: None })
-        }),
-        (arb_text(), arb_text(), any::<bool>(), proptest::option::of(arb_text())).prop_map(
-            |(code, message, fatal, turn_id)| ServerMsg::Error(ErrorMsg { code, message, fatal, turn_id })
+        proptest::option::of(arb_text())
+            .prop_map(|turn_id| ServerMsg::Interrupted(Interrupted { turn_id })),
+        (arb_text(), arb_text(), proptest::option::of(arb_text())).prop_map(
+            |(service, state, code)| {
+                ServerMsg::Status(Status {
+                    service,
+                    state,
+                    code,
+                    message: None,
+                })
+            }
         ),
+        (
+            arb_text(),
+            arb_text(),
+            any::<bool>(),
+            proptest::option::of(arb_text())
+        )
+            .prop_map(
+                |(code, message, fatal, turn_id)| ServerMsg::Error(ErrorMsg {
+                    code,
+                    message,
+                    fatal,
+                    turn_id
+                })
+            ),
         (arb_text(), proptest::option::of(any::<u64>())).prop_map(|(stage, turn)| {
-            ServerMsg::PipelineEvent(PipelineEvent { stage, turn, extra: Default::default() })
+            ServerMsg::PipelineEvent(PipelineEvent {
+                stage,
+                turn,
+                extra: Default::default(),
+            })
         }),
     ]
 }

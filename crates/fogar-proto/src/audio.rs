@@ -115,9 +115,15 @@ mod tests {
     fn tts_errors() {
         assert_eq!(parse_tts_frame(&[]), Err(AudioFrameError::TooShort));
         assert_eq!(parse_tts_frame(&[0xA1, 0]), Err(AudioFrameError::TooShort));
-        assert_eq!(parse_tts_frame(&[0xA2, 0, 0]), Err(AudioFrameError::BadMagic(0xA2)));
+        assert_eq!(
+            parse_tts_frame(&[0xA2, 0, 0]),
+            Err(AudioFrameError::BadMagic(0xA2))
+        );
         // Header only is a valid (empty) frame.
-        assert_eq!(parse_tts_frame(&[0xA1, 0xff, 0xff]).unwrap().turn_seq, u16::MAX);
+        assert_eq!(
+            parse_tts_frame(&[0xA1, 0xff, 0xff]).unwrap().turn_seq,
+            u16::MAX
+        );
     }
 
     #[test]
@@ -132,6 +138,9 @@ mod tests {
         let mut out = Vec::new();
         encode_upload_f32le(&[1.0, -0.5], &mut out);
         assert_eq!(out, [0, 0, 0x80, 0x3f, 0, 0, 0, 0xbf]);
-        assert_eq!(decode_upload_f32le(&out).collect::<Vec<_>>(), vec![1.0, -0.5]);
+        assert_eq!(
+            decode_upload_f32le(&out).collect::<Vec<_>>(),
+            vec![1.0, -0.5]
+        );
     }
 }

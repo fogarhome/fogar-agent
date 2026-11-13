@@ -55,7 +55,9 @@ pub mod clock {
                 }
                 #[test]
                 fn sleep_until_past_is_immediate_and_cancel_safe() {
-                    $crate::run_async(async { c::sleep_until_past_is_immediate_and_cancel_safe(&$make).await })
+                    $crate::run_async(async {
+                        c::sleep_until_past_is_immediate_and_cancel_safe(&$make).await
+                    })
                 }
                 #[test]
                 fn suspend_behavior_is_stable() {
@@ -115,15 +117,24 @@ pub mod system_probe {
     pub fn caps_are_stable(p: &dyn SystemProbe) {
         let a = p.capabilities();
         for _ in 0..10 {
-            assert_eq!(a, p.capabilities(), "capabilities() must not change over the adapter's lifetime");
+            assert_eq!(
+                a,
+                p.capabilities(),
+                "capabilities() must not change over the adapter's lifetime"
+            );
         }
     }
 
     pub fn snapshot_matches_caps(p: &dyn SystemProbe) {
         let c = p.capabilities();
-        let s = p.snapshot().expect("snapshot() must succeed on a healthy system");
+        let s = p
+            .snapshot()
+            .expect("snapshot() must succeed on a healthy system");
         if !c.load.is_available() {
-            assert!(s.load_1m.is_none(), "load reported but caps say Unsupported");
+            assert!(
+                s.load_1m.is_none(),
+                "load reported but caps say Unsupported"
+            );
         }
         if !c.memory.is_available() {
             assert!(s.memory.is_none());
@@ -145,7 +156,10 @@ pub mod system_probe {
             assert!(l.is_finite() && l >= 0.0, "load {l}");
         }
         if let Some(m) = s.memory {
-            assert!(m.total_bytes > 0 && m.available_bytes <= m.total_bytes, "{m:?}");
+            assert!(
+                m.total_bytes > 0 && m.available_bytes <= m.total_bytes,
+                "{m:?}"
+            );
         }
         if let Some(b) = s.battery {
             assert!((0.0..=1.0).contains(&b.charge), "{b:?}");
@@ -160,7 +174,10 @@ pub mod system_probe {
             p.snapshot().unwrap();
         }
         let per_call = t.elapsed() / n;
-        assert!(per_call < SNAPSHOT_BUDGET, "snapshot() too slow: {per_call:?}");
+        assert!(
+            per_call < SNAPSHOT_BUDGET,
+            "snapshot() too slow: {per_call:?}"
+        );
     }
 
     pub fn subscribe_matches_caps(p: &dyn SystemProbe) {
@@ -170,7 +187,9 @@ pub mod system_probe {
             (false, Err(ProbeError::Unsupported(_))) => {}
             (true, Err(e)) => panic!("caps claim change_events but subscribe failed: {e}"),
             (false, Ok(_)) => panic!("subscribe succeeded but caps say Unsupported"),
-            (false, Err(e)) => panic!("unsupported subscribe must return ProbeError::Unsupported, got {e}"),
+            (false, Err(e)) => {
+                panic!("unsupported subscribe must return ProbeError::Unsupported, got {e}")
+            }
         }
         p.snapshot().unwrap();
     }
@@ -218,9 +237,16 @@ pub mod secret_store {
             Err(SecretError::Unsupported(_)) => return,
             r => r.unwrap(),
         }
-        assert_eq!(s.get(k).unwrap().unwrap().expose_secret(), "contract-value-1");
-        s.put(k, SecretString::from("contract-value-2".to_owned())).unwrap();
-        assert_eq!(s.get(k).unwrap().unwrap().expose_secret(), "contract-value-2");
+        assert_eq!(
+            s.get(k).unwrap().unwrap().expose_secret(),
+            "contract-value-1"
+        );
+        s.put(k, SecretString::from("contract-value-2".to_owned()))
+            .unwrap();
+        assert_eq!(
+            s.get(k).unwrap().unwrap().expose_secret(),
+            "contract-value-2"
+        );
         s.delete(k).unwrap();
         assert!(s.get(k).unwrap().is_none());
         s.delete(k).unwrap();
@@ -229,7 +255,9 @@ pub mod secret_store {
     /// LOG-1: formatting a secret never reveals it.
     pub fn debug_never_leaks(s: &dyn SecretStore) {
         let k = SecretKey::GatewayClientKey;
-        if s.put(k, SecretString::from("canary-7f3a9".to_owned())).is_err() {
+        if s.put(k, SecretString::from("canary-7f3a9".to_owned()))
+            .is_err()
+        {
             return;
         }
         let v = s.get(k).unwrap().unwrap();
@@ -275,7 +303,10 @@ pub mod audio_source {
         let r = a.open(NonZeroUsize::new(8).unwrap());
         match (a.capabilities().capture.is_available(), r) {
             (false, Err(AudioError::Unsupported(_))) => {}
-            (false, other) => panic!("capture Unsupported but open returned {:?}", other.map(|_| ())),
+            (false, other) => panic!(
+                "capture Unsupported but open returned {:?}",
+                other.map(|_| ())
+            ),
             (true, Ok((cap, stream))) => {
                 assert_eq!(cap.format().channels, 1, "the port delivers mono");
                 assert_eq!(stream.capacity(), 8);
@@ -329,7 +360,10 @@ pub mod audio_sink {
                     }
                 }
                 assert!(total > 0, "a fresh playback must accept some audio");
-                assert!(total < 1000 * chunk.len(), "playback buffer must be bounded");
+                assert!(
+                    total < 1000 * chunk.len(),
+                    "playback buffer must be bounded"
+                );
                 pb.stop();
                 assert_eq!(pb.queued_samples(), 0);
             }
@@ -358,8 +392,17 @@ pub mod power_policy {
     /// Unsupported is data: calls succeed with `NotSupported`; supported calls are idempotent.
     pub fn behaviour_matches_caps(p: &dyn PowerPolicy) {
         let c = p.capabilities();
-        let want = |avail: bool| if avail { Applied::Applied } else { Applied::NotSupported };
-        assert_eq!(p.apply_process_baseline().unwrap(), want(c.process_baseline.is_available()));
+        let want = |avail: bool| {
+            if avail {
+                Applied::Applied
+            } else {
+                Applied::NotSupported
+            }
+        };
+        assert_eq!(
+            p.apply_process_baseline().unwrap(),
+            want(c.process_baseline.is_available())
+        );
         // Run on a scratch thread so the test runner's thread keeps its class.
         let applied = std::thread::scope(|s| {
             s.spawn(|| {
@@ -407,8 +450,13 @@ pub mod gateway_link {
 
     async fn next_msg<S: LinkSession>(s: &mut S) -> ServerMsg {
         loop {
-            match tokio::time::timeout(Duration::from_secs(5), s.recv()).await.expect("recv timed out") {
-                Some(LinkEvent::Frame(Frame::Text(t))) => return decode_server(&t).expect("valid server msg"),
+            match tokio::time::timeout(Duration::from_secs(5), s.recv())
+                .await
+                .expect("recv timed out")
+            {
+                Some(LinkEvent::Frame(Frame::Text(t))) => {
+                    return decode_server(&t).expect("valid server msg");
+                }
                 Some(LinkEvent::Frame(Frame::Binary(_))) => continue,
                 other => panic!("expected a text frame, got {other:?}"),
             }
@@ -454,7 +502,9 @@ pub mod gateway_link {
         for _ in 0..20 {
             let _ = tokio::time::timeout(Duration::from_millis(1), s.recv()).await;
         }
-        s.send(Frame::Text(r#"{"type":"send","text":"hola"}"#.into())).await.unwrap();
+        s.send(Frame::Text(r#"{"type":"send","text":"hola"}"#.into()))
+            .await
+            .unwrap();
         assert!(matches!(next_msg(&mut s).await, ServerMsg::TurnStart(_)));
         s.close(1000, "").await.unwrap();
     }
@@ -468,9 +518,17 @@ pub mod gateway_link {
                 break;
             }
         }
-        assert!(control(Ctl::Close { code: 1008, reason: "revoked".into() }) >= 1);
+        assert!(
+            control(Ctl::Close {
+                code: 1008,
+                reason: "revoked".into()
+            }) >= 1
+        );
         loop {
-            match tokio::time::timeout(Duration::from_secs(5), s.recv()).await.expect("close timed out") {
+            match tokio::time::timeout(Duration::from_secs(5), s.recv())
+                .await
+                .expect("close timed out")
+            {
                 Some(LinkEvent::Closed { code, reason }) => {
                     assert_eq!((code, reason.as_str()), (1008, "revoked"));
                     break;
@@ -484,11 +542,16 @@ pub mod gateway_link {
     /// The gateway's handshake rejection is a close with the documented reason.
     pub async fn bad_key_is_closed_1008<L: GatewayLink>(link: &L) {
         let mut s = link.connect().await.unwrap();
-        s.send(Frame::Text(r#"{"client_key":"wrong","input_mode":"audio","output_mode":["audio"]}"#.into()))
-            .await
-            .unwrap();
+        s.send(Frame::Text(
+            r#"{"client_key":"wrong","input_mode":"audio","output_mode":["audio"]}"#.into(),
+        ))
+        .await
+        .unwrap();
         loop {
-            match tokio::time::timeout(Duration::from_secs(5), s.recv()).await.expect("timed out") {
+            match tokio::time::timeout(Duration::from_secs(5), s.recv())
+                .await
+                .expect("timed out")
+            {
                 Some(LinkEvent::Closed { code, reason }) => {
                     assert_eq!(code, 1008);
                     assert_eq!(reason, crate::gateway::REASON_BAD_KEY);
@@ -577,24 +640,38 @@ pub mod ipc_server {
             while let Ok(Some(req)) = conn.recv().await {
                 let resp = match req {
                     IpcRequest::Hello { version } => IpcResponse::Hello { version },
-                    IpcRequest::Status => {
-                        IpcResponse::Status(StatusReport::new("ready".into(), 1, 2, "normal".into()))
-                    }
-                    _ => IpcResponse::Refused { reason: "unsupported request" },
+                    IpcRequest::Status => IpcResponse::Status(StatusReport::new(
+                        "ready".into(),
+                        1,
+                        2,
+                        "normal".into(),
+                    )),
+                    _ => IpcResponse::Refused {
+                        reason: "unsupported request",
+                    },
                 };
                 conn.send(resp).await.expect("send");
             }
         };
         let client = async {
             let mut c = connect().await;
-            assert_eq!(c.request(IpcRequest::Hello { version: 1 }).await, Some(IpcResponse::Hello { version: 1 }));
+            assert_eq!(
+                c.request(IpcRequest::Hello { version: 1 }).await,
+                Some(IpcResponse::Hello { version: 1 })
+            );
             match c.request(IpcRequest::Status).await {
-                Some(IpcResponse::Status(s)) => assert_eq!((s.link.as_str(), s.sessions, s.turns_completed), ("ready", 1, 2)),
+                Some(IpcResponse::Status(s)) => assert_eq!(
+                    (s.link.as_str(), s.sessions, s.turns_completed),
+                    ("ready", 1, 2)
+                ),
                 other => panic!("{other:?}"),
             }
             drop(c);
         };
-        let r = tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(serve, client) }).await;
+        let r = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(serve, client)
+        })
+        .await;
         assert!(r.is_ok(), "ipc round trip timed out");
     }
 

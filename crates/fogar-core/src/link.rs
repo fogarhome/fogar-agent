@@ -63,7 +63,10 @@ enum Outcome {
     /// Our handshake cannot be encoded (e.g. over 4096 chars): retrying cannot help.
     ClientBug,
     /// The peer closed (or the transport died: 1006).
-    Closed { code: u16, reason: String },
+    Closed {
+        code: u16,
+        reason: String,
+    },
     /// We ended the session: the engine stalled or a write failed / timed out.
     LocalFault,
 }
@@ -104,7 +107,10 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                 Err(_) => {
                     let d = self.cfg.backoff.delay(attempt, &*self.random);
                     attempt = attempt.saturating_add(1);
-                    self.set_state(LinkState::Backoff { attempt, last_close: None });
+                    self.set_state(LinkState::Backoff {
+                        attempt,
+                        last_close: None,
+                    });
                     if self.wait(d, &egress).await {
                         continue;
                     }
@@ -114,7 +120,9 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
             self.set_state(LinkState::Connecting { attempt });
             Stats::inc(&self.stats.connect_attempts);
             let started = self.clock.now();
-            let (outcome, was_ready) = self.attempt(key.expose_secret(), &mut out_rx, &in_tx, &egress).await;
+            let (outcome, was_ready) = self
+                .attempt(key.expose_secret(), &mut out_rx, &in_tx, &egress)
+                .await;
             drop(key);
             if was_ready {
                 Stats::inc(&self.stats.sessions_ended);
@@ -122,8 +130,15 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                 if up_for >= self.cfg.backoff.stable_after {
                     attempt = 0;
                 }
-                if !forward(&*self.clock, &self.stats, &in_tx, Inbound::SessionDown, self.cfg.inbound_deadline, &egress)
-                    .await
+                if !forward(
+                    &*self.clock,
+                    &self.stats,
+                    &in_tx,
+                    Inbound::SessionDown,
+                    self.cfg.inbound_deadline,
+                    &egress,
+                )
+                .await
                 {
                     break;
                 }
@@ -144,12 +159,15 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                 }
                 Outcome::Closed { code, reason } => {
                     let action = classify_close(code, &reason);
-                    self.view.send_modify(|v| v.last_close = Some((code, action)));
+                    self.view
+                        .send_modify(|v| v.last_close = Some((code, action)));
                     if !was_ready {
                         Stats::inc(&self.stats.connect_failures);
                     }
                     match action {
-                        CloseAction::Repair | CloseAction::AgentRefused | CloseAction::FixClient => {
+                        CloseAction::Repair
+                        | CloseAction::AgentRefused
+                        | CloseAction::FixClient => {
                             self.park(action, &egress).await;
                             break;
                         }
@@ -159,7 +177,9 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                             attempt = 0;
                             (self.cfg.backoff.delay(0, &*self.random), Some(action))
                         }
-                        CloseAction::ServerRestart => (self.cfg.backoff.delay(0, &*self.random), Some(action)),
+                        CloseAction::ServerRestart => {
+                            (self.cfg.backoff.delay(0, &*self.random), Some(action))
+                        }
                         CloseAction::RetryBackoff | CloseAction::Unknown => {
                             let d = self.cfg.backoff.delay(attempt, &*self.random);
                             attempt = attempt.saturating_add(1);
@@ -168,7 +188,10 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                     }
                 }
             };
-            self.set_state(LinkState::Backoff { attempt, last_close: close });
+            self.set_state(LinkState::Backoff {
+                attempt,
+                last_close: close,
+            });
             if !self.wait(delay, &egress).await {
                 break;
             }
@@ -209,7 +232,10 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
             return (Outcome::ClientBug, false);
         };
         drop(hs);
-        if !matches!(deadline(clock, self.cfg.write_timeout, sess.send(Frame::Text(text))).await, Some(Ok(()))) {
+        if !matches!(
+            deadline(clock, self.cfg.write_timeout, sess.send(Frame::Text(text))).await,
+            Some(Ok(()))
+        ) {
             self.close_quietly(&mut sess, CLOSE_NORMAL).await;
             return (Outcome::ConnectFailed, false);
         }
@@ -222,9 +248,21 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
             Err(o) => return (o, false),
         }
         Stats::inc(&self.stats.sessions_started);
-        let session = self.stats.sessions_started.load(std::sync::atomic::Ordering::Relaxed);
+        let session = self
+            .stats
+            .sessions_started
+            .load(std::sync::atomic::Ordering::Relaxed);
         self.set_state(LinkState::Ready { session });
-        if !forward(clock, &self.stats, in_tx, Inbound::SessionUp, self.cfg.inbound_deadline, egress).await {
+        if !forward(
+            clock,
+            &self.stats,
+            in_tx,
+            Inbound::SessionUp,
+            self.cfg.inbound_deadline,
+            egress,
+        )
+        .await
+        {
             self.close_quietly(&mut sess, CLOSE_NORMAL).await;
             return (Outcome::Shutdown, true);
         }
@@ -282,7 +320,10 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
         loop {
             // One armed timer at most (energy rule 1): the keepalive deadline, pushed forward by
             // every frame we send.
-            let keepalive_due = self.cfg.keepalive_after.map(|d| last_sent.saturating_add(d));
+            let keepalive_due = self
+                .cfg
+                .keepalive_after
+                .map(|d| last_sent.saturating_add(d));
             tokio::select! {
                 biased;
                 () = egress.cancelled() => {

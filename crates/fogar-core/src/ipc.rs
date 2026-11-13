@@ -50,8 +50,14 @@ async fn serve<C: Clock, K: IpcConn>(
             r = conn.recv() => r,
         };
         let resp = match req {
-            Ok(Some(IpcRequest::Hello { version })) if version == IPC_VERSION => IpcResponse::Hello { version: IPC_VERSION },
-            Ok(Some(IpcRequest::Hello { .. })) => IpcResponse::Refused { reason: "unsupported ipc version" },
+            Ok(Some(IpcRequest::Hello { version })) if version == IPC_VERSION => {
+                IpcResponse::Hello {
+                    version: IPC_VERSION,
+                }
+            }
+            Ok(Some(IpcRequest::Hello { .. })) => IpcResponse::Refused {
+                reason: "unsupported ipc version",
+            },
             Ok(Some(IpcRequest::Status)) => {
                 let h = health.snapshot();
                 IpcResponse::Status(StatusReport::new(
@@ -61,10 +67,15 @@ async fn serve<C: Clock, K: IpcConn>(
                     h.boot_mode.to_owned(),
                 ))
             }
-            Ok(Some(_)) => IpcResponse::Refused { reason: "unsupported request" },
+            Ok(Some(_)) => IpcResponse::Refused {
+                reason: "unsupported request",
+            },
             Ok(None) | Err(_) => return,
         };
-        if !matches!(deadline(&*clock, write_timeout, conn.send(resp)).await, Some(Ok(()))) {
+        if !matches!(
+            deadline(&*clock, write_timeout, conn.send(resp)).await,
+            Some(Ok(()))
+        ) {
             return;
         }
     }

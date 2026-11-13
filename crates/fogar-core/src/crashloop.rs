@@ -43,7 +43,10 @@ impl Default for BreakerPolicy {
 pub enum BootMode {
     Normal,
     /// Wait `delay` (cancellable by SIGTERM), then run with optional slices disabled.
-    SafeMode { recent_crashes: u32, delay: Duration },
+    SafeMode {
+        recent_crashes: u32,
+        delay: Duration,
+    },
 }
 
 impl BootMode {
@@ -60,8 +63,11 @@ impl BootMode {
 pub fn evaluate(entries: &[LedgerEntry], now_ms: u64, p: &BreakerPolicy) -> BootMode {
     let window_ms = u64::try_from(p.window.as_millis()).unwrap_or(u64::MAX);
     let since = now_ms.saturating_sub(window_ms);
-    let mut sorted: Vec<LedgerEntry> =
-        entries.iter().copied().filter(|e| e.unix_ms >= since && e.unix_ms <= now_ms).collect();
+    let mut sorted: Vec<LedgerEntry> = entries
+        .iter()
+        .copied()
+        .filter(|e| e.unix_ms >= since && e.unix_ms <= now_ms)
+        .collect();
     sorted.sort_by_key(|e| e.unix_ms);
     let mut crashes = 0u32;
     let mut open_start = false;
@@ -85,7 +91,10 @@ pub fn evaluate(entries: &[LedgerEntry], now_ms: u64, p: &BreakerPolicy) -> Boot
     }
     let k = crashes - p.threshold;
     let factor = 1u32.checked_shl(k.min(31)).unwrap_or(u32::MAX);
-    BootMode::SafeMode { recent_crashes: crashes, delay: p.first_delay.saturating_mul(factor).min(p.max_delay) }
+    BootMode::SafeMode {
+        recent_crashes: crashes,
+        delay: p.first_delay.saturating_mul(factor).min(p.max_delay),
+    }
 }
 
 #[cfg(test)]
@@ -93,7 +102,12 @@ mod tests {
     use super::*;
 
     fn starts(n: u64) -> Vec<LedgerEntry> {
-        (0..n).map(|i| LedgerEntry { unix_ms: 1_000 + i * 1_000, kind: LedgerKind::Start }).collect()
+        (0..n)
+            .map(|i| LedgerEntry {
+                unix_ms: 1_000 + i * 1_000,
+                kind: LedgerKind::Start,
+            })
+            .collect()
     }
 
     #[test]
@@ -102,13 +116,21 @@ mod tests {
         assert_eq!(evaluate(&starts(3), 10_000, &p), BootMode::Normal);
         assert_eq!(
             evaluate(&starts(4), 10_000, &p),
-            BootMode::SafeMode { recent_crashes: 4, delay: Duration::from_secs(60) }
+            BootMode::SafeMode {
+                recent_crashes: 4,
+                delay: Duration::from_secs(60)
+            }
         );
         assert_eq!(
             evaluate(&starts(5), 10_000, &p),
-            BootMode::SafeMode { recent_crashes: 5, delay: Duration::from_secs(120) }
+            BootMode::SafeMode {
+                recent_crashes: 5,
+                delay: Duration::from_secs(120)
+            }
         );
-        assert!(matches!(evaluate(&starts(60), 100_000, &p), BootMode::SafeMode { delay, .. } if delay == p.max_delay));
+        assert!(
+            matches!(evaluate(&starts(60), 100_000, &p), BootMode::SafeMode { delay, .. } if delay == p.max_delay)
+        );
     }
 
     #[test]
@@ -116,11 +138,20 @@ mod tests {
         let p = BreakerPolicy::default();
         let mut e = Vec::new();
         for i in 0..10 {
-            e.push(LedgerEntry { unix_ms: i * 10, kind: LedgerKind::Start });
-            e.push(LedgerEntry { unix_ms: i * 10 + 5, kind: LedgerKind::Clean });
+            e.push(LedgerEntry {
+                unix_ms: i * 10,
+                kind: LedgerKind::Start,
+            });
+            e.push(LedgerEntry {
+                unix_ms: i * 10 + 5,
+                kind: LedgerKind::Clean,
+            });
         }
         assert_eq!(evaluate(&e, 1_000, &p), BootMode::Normal);
         // 5 crashes, but 20 minutes ago.
-        assert_eq!(evaluate(&starts(5), 1_000 + 20 * 60_000, &p), BootMode::Normal);
+        assert_eq!(
+            evaluate(&starts(5), 1_000 + 20 * 60_000, &p),
+            BootMode::Normal
+        );
     }
 }

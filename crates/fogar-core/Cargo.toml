@@ -17,6 +17,7 @@ tokio-util = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 fogar-testkit = { workspace = true }
+fogar-testalloc = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "test-util"] }
 
 # loom is only built for the loom gate (RUSTFLAGS="--cfg loom"); see src/heartbeat.rs.

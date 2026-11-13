@@ -24,6 +24,6 @@ mod link;
 mod time;
 
 pub use agent::{Agent, AgentPorts, HealthProbe, NoIpc, ShutdownReport};
-pub use link::LinkView;
 pub use config::Config;
+pub use link::LinkView;
 pub use stats::{Health, LinkState, StatsSnapshot};

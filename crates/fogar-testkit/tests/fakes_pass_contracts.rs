@@ -44,10 +44,16 @@ mod mock_gateway_over_ws {
         fogar_testkit::run_async(async {
             let gw = MockGateway::start(MockConfig::default()).await.unwrap();
             let (mut ws, _) = tokio_tungstenite::connect_async(gw.url()).await.unwrap();
-            ws.send(Message::Text(fogar_testkit::contract::gateway_link::handshake().into())).await.unwrap();
+            ws.send(Message::Text(
+                fogar_testkit::contract::gateway_link::handshake().into(),
+            ))
+            .await
+            .unwrap();
             let mut types = Vec::new();
             let mut audio = 0;
-            ws.send(Message::Text(r#"{"type":"send","text":"hola"}"#.into())).await.unwrap();
+            ws.send(Message::Text(r#"{"type":"send","text":"hola"}"#.into()))
+                .await
+                .unwrap();
             while let Some(Ok(m)) = ws.next().await {
                 match m {
                     Message::Text(t) => {
@@ -67,7 +73,17 @@ mod mock_gateway_over_ws {
                     _ => {}
                 }
             }
-            assert_eq!(types, ["status", "ready", "turn_start", "token", "token", "turn_end"]);
+            assert_eq!(
+                types,
+                [
+                    "status",
+                    "ready",
+                    "turn_start",
+                    "token",
+                    "token",
+                    "turn_end"
+                ]
+            );
             assert_eq!(audio, 5);
             gw.shutdown().await;
         });

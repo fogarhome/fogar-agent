@@ -9,16 +9,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkState {
     Starting,
-    Connecting { attempt: u32 },
+    Connecting {
+        attempt: u32,
+    },
     /// Session established (`ready` received).
-    Ready { session: u64 },
+    Ready {
+        session: u64,
+    },
     /// Waiting before the next attempt.
-    Backoff { attempt: u32, last_close: Option<CloseAction> },
+    Backoff {
+        attempt: u32,
+        last_close: Option<CloseAction>,
+    },
     /// No client key stored: the agent is not paired. Re-checked at the backoff cap.
     NotPaired,
     /// Parked: retrying would loop (key revoked/invalid, agent refused, client bug). Stays alive
     /// and reports health; leaves this state only on restart or (S1) re-pairing/config change.
-    Parked { reason: CloseAction },
+    Parked {
+        reason: CloseAction,
+    },
     ShuttingDown,
     Stopped,
 }
@@ -31,8 +40,12 @@ impl LinkState {
             LinkState::Ready { .. } => "ready",
             LinkState::Backoff { .. } => "backoff",
             LinkState::NotPaired => "not_paired",
-            LinkState::Parked { reason: CloseAction::Repair } => "parked_repair",
-            LinkState::Parked { reason: CloseAction::AgentRefused } => "parked_agent_refused",
+            LinkState::Parked {
+                reason: CloseAction::Repair,
+            } => "parked_repair",
+            LinkState::Parked {
+                reason: CloseAction::AgentRefused,
+            } => "parked_agent_refused",
             LinkState::Parked { .. } => "parked_client_error",
             LinkState::ShuttingDown => "shutting_down",
             LinkState::Stopped => "stopped",

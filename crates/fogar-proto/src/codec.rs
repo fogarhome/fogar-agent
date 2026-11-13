@@ -22,7 +22,9 @@ pub enum DecodeError {
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DecodeError::TooLarge { len } => write!(f, "text frame of {len} bytes exceeds the limit"),
+            DecodeError::TooLarge { len } => {
+                write!(f, "text frame of {len} bytes exceeds the limit")
+            }
             DecodeError::Invalid => f.write_str("text frame is not a valid protocol message"),
         }
     }

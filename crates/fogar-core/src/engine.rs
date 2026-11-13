@@ -16,7 +16,9 @@ use fogar_ports::{
     events::EventStream,
     gateway::Frame,
 };
-use fogar_proto::{ClientMsg, audio::TTS_RATE_HZ, encode_client, encode_upload_f32le, parse_tts_frame};
+use fogar_proto::{
+    ClientMsg, audio::TTS_RATE_HZ, encode_client, encode_upload_f32le, parse_tts_frame,
+};
 use std::{borrow::Cow, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -128,7 +130,10 @@ impl<C: Clock> Engine<C> {
                 match st.playback.as_mut() {
                     Some(pb) => {
                         let accepted = pb.write(&st.pcm);
-                        Stats::add(&self.stats.tts_samples_dropped, (st.pcm.len() - accepted.min(st.pcm.len())) as u64);
+                        Stats::add(
+                            &self.stats.tts_samples_dropped,
+                            (st.pcm.len() - accepted.min(st.pcm.len())) as u64,
+                        );
                         Stats::inc(&self.stats.tts_frames_played);
                     }
                     None => Stats::add(&self.stats.tts_samples_dropped, st.pcm.len() as u64),
@@ -190,7 +195,9 @@ impl<C: Clock> Engine<C> {
         let msg = match cmd {
             ClientCmd::End => ClientMsg::End,
             ClientCmd::Cancel => ClientMsg::Cancel,
-            ClientCmd::Send(text) => ClientMsg::Send { text: Cow::Borrowed(text) },
+            ClientCmd::Send(text) => ClientMsg::Send {
+                text: Cow::Borrowed(text),
+            },
         };
         let Ok(text) = encode_client(&msg) else {
             Stats::inc(&self.stats.uplink_control_dropped);
@@ -199,7 +206,10 @@ impl<C: Clock> Engine<C> {
         match deadline(&*self.clock, self.cfg.write_timeout, self.out_tx.reserve()).await {
             Some(Ok(permit)) => {
                 permit.send(Frame::Text(text));
-                Stats::hwm(&self.stats.out_queue_hwm, self.out_tx.max_capacity() - self.out_tx.capacity());
+                Stats::hwm(
+                    &self.stats.out_queue_hwm,
+                    self.out_tx.max_capacity() - self.out_tx.capacity(),
+                );
                 true
             }
             Some(Err(_)) | None => {
@@ -214,7 +224,10 @@ impl<C: Clock> Engine<C> {
         let mut buf = Vec::with_capacity(samples.len() * 4);
         encode_upload_f32le(samples, &mut buf);
         match self.out_tx.try_send(Frame::Binary(buf)) {
-            Ok(()) => Stats::hwm(&self.stats.out_queue_hwm, self.out_tx.max_capacity() - self.out_tx.capacity()),
+            Ok(()) => Stats::hwm(
+                &self.stats.out_queue_hwm,
+                self.out_tx.max_capacity() - self.out_tx.capacity(),
+            ),
             Err(mpsc::error::TrySendError::Full(_)) => Stats::inc(&self.stats.uplink_audio_shed),
             Err(mpsc::error::TrySendError::Closed(_)) => {}
         }

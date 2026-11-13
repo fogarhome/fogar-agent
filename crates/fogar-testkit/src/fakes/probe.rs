@@ -1,7 +1,9 @@
 use fogar_ports::{
     Support,
     events::{EventSink, EventStream, Pushed, event_channel},
-    system_probe::{Battery, Memory, ProbeCaps, ProbeError, ProbeEvent, SystemProbe, SystemSnapshot, Thermal},
+    system_probe::{
+        Battery, Memory, ProbeCaps, ProbeError, ProbeEvent, SystemProbe, SystemSnapshot, Thermal,
+    },
 };
 use std::{
     num::NonZeroUsize,
@@ -36,9 +38,16 @@ impl FakeSystemProbe {
         caps.change_events = Support::Native;
         let snapshot = SystemSnapshot::new()
             .with_load(0.5)
-            .with_memory(Memory { total_bytes: 8 << 30, available_bytes: 4 << 30 })
+            .with_memory(Memory {
+                total_bytes: 8 << 30,
+                available_bytes: 4 << 30,
+            })
             .with_thermal(Thermal::Nominal)
-            .with_battery(Battery { charge: 0.8, on_external_power: true, low_power_mode: Some(false) })
+            .with_battery(Battery {
+                charge: 0.8,
+                on_external_power: true,
+                low_power_mode: Some(false),
+            })
             .with_idle(Duration::from_secs(0));
         Self::with(caps, snapshot)
     }
@@ -51,7 +60,12 @@ impl FakeSystemProbe {
     pub fn with(caps: ProbeCaps, snapshot: SystemSnapshot) -> Self {
         Self {
             caps,
-            state: Arc::new(Mutex::new(ProbeState { snapshot, fail_next: None, sink: None, calls: 0 })),
+            state: Arc::new(Mutex::new(ProbeState {
+                snapshot,
+                fail_next: None,
+                sink: None,
+                calls: 0,
+            })),
         }
     }
 

@@ -29,13 +29,25 @@ pub struct FakeIpcClient {
 impl FakeIpc {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel(4);
-        Self { tx, rx: Arc::new(Mutex::new(rx)) }
+        Self {
+            tx,
+            rx: Arc::new(Mutex::new(rx)),
+        }
     }
     pub async fn client(&self) -> FakeIpcClient {
         let (req_tx, req_rx) = mpsc::channel(8);
         let (resp_tx, resp_rx) = mpsc::channel(8);
-        self.tx.send(FakeConn { rx: req_rx, tx: resp_tx }).await.expect("ipc server gone");
-        FakeIpcClient { tx: req_tx, rx: resp_rx }
+        self.tx
+            .send(FakeConn {
+                rx: req_rx,
+                tx: resp_tx,
+            })
+            .await
+            .expect("ipc server gone");
+        FakeIpcClient {
+            tx: req_tx,
+            rx: resp_rx,
+        }
     }
 }
 
@@ -57,7 +69,10 @@ impl IpcConn for FakeConn {
         Ok(self.rx.recv().await)
     }
     async fn send(&mut self, resp: IpcResponse) -> Result<(), IpcError> {
-        self.tx.send(resp).await.map_err(|_| IpcError::Transport("peer gone".into()))
+        self.tx
+            .send(resp)
+            .await
+            .map_err(|_| IpcError::Transport("peer gone".into()))
     }
 }
 

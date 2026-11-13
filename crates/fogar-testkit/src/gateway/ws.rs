@@ -1,6 +1,8 @@
 //! Protocol-v1 mock gateway over a REAL local WebSocket (127.0.0.1, ephemeral port).
 
-use super::driver::{ClientIn, Ctl, GatewayLog, MockConfig, ServerOut, ServerTransport, SharedLog, run_conn};
+use super::driver::{
+    ClientIn, Ctl, GatewayLog, MockConfig, ServerOut, ServerTransport, SharedLog, run_conn,
+};
 use futures_util::{SinkExt, StreamExt};
 use std::{
     net::SocketAddr,
@@ -42,8 +44,13 @@ impl MockGateway {
             cancel: CancellationToken::new(),
             tasks: TaskTracker::new(),
         };
-        let (log, cfg, ctls, cancel, tasks) =
-            (gw.log.clone(), gw.cfg.clone(), gw.ctls.clone(), gw.cancel.clone(), gw.tasks.clone());
+        let (log, cfg, ctls, cancel, tasks) = (
+            gw.log.clone(),
+            gw.cfg.clone(),
+            gw.ctls.clone(),
+            gw.cancel.clone(),
+            gw.tasks.clone(),
+        );
         gw.tasks.spawn(async move {
             loop {
                 let (sock, _) = tokio::select! {
@@ -55,7 +62,9 @@ impl MockGateway {
                 ctls.lock().unwrap().push(ctl_tx);
                 tasks.spawn(async move {
                     let _ = sock.set_nodelay(true);
-                    let Ok(ws) = tokio_tungstenite::accept_async(sock).await else { return };
+                    let Ok(ws) = tokio_tungstenite::accept_async(sock).await else {
+                        return;
+                    };
                     tokio::select! {
                         () = cancel.cancelled() => {}
                         () = run_conn(WsTransport { ws }, cfg, log, ctl_rx) => {}
@@ -80,10 +89,15 @@ impl MockGateway {
     pub fn control(&self, cmd: Ctl) -> usize {
         let mut ctls = self.ctls.lock().unwrap();
         ctls.retain(|c| !c.is_closed());
-        ctls.iter().filter(|c| c.try_send(cmd.clone()).is_ok()).count()
+        ctls.iter()
+            .filter(|c| c.try_send(cmd.clone()).is_ok())
+            .count()
     }
     pub fn close_all(&self, code: u16, reason: &str) -> usize {
-        self.control(Ctl::Close { code, reason: reason.to_owned() })
+        self.control(Ctl::Close {
+            code,
+            reason: reason.to_owned(),
+        })
     }
     pub async fn shutdown(self) {
         self.cancel.cancel();
@@ -116,10 +130,16 @@ impl ServerTransport for WsTransport {
         self.ws.send(m).await.is_ok()
     }
     async fn close(&mut self, code: u16, reason: &str) {
-        let frame = CloseFrame { code: CloseCode::from(code), reason: reason.into() };
+        let frame = CloseFrame {
+            code: CloseCode::from(code),
+            reason: reason.into(),
+        };
         if self.ws.close(Some(frame)).await.is_ok() {
             // Wait (bounded) for the client's close reply so the close handshake completes.
-            let _ = tokio::time::timeout(Duration::from_secs(1), async { while self.ws.next().await.is_some() {} }).await;
+            let _ = tokio::time::timeout(Duration::from_secs(1), async {
+                while self.ws.next().await.is_some() {}
+            })
+            .await;
         }
     }
 }

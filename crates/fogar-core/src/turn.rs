@@ -25,9 +25,13 @@ pub enum UserPhase {
     /// Streaming an utterance (f32le) to the gateway.
     Listening,
     /// Sent `end`; waiting for the final `transcription`.
-    AwaitTranscription { since: Mono },
+    AwaitTranscription {
+        since: Mono,
+    },
     /// Sent `send`; waiting for its `turn_start`.
-    AwaitTurn { since: Mono },
+    AwaitTurn {
+        since: Mono,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +78,10 @@ pub struct TurnTimeouts {
 
 impl Default for TurnTimeouts {
     fn default() -> Self {
-        Self { transcription: Duration::from_secs(15), turn_start: Duration::from_secs(30) }
+        Self {
+            transcription: Duration::from_secs(15),
+            turn_start: Duration::from_secs(30),
+        }
     }
 }
 
@@ -89,7 +96,12 @@ pub struct TurnMachine {
 
 impl TurnMachine {
     pub fn new(timeouts: TurnTimeouts) -> Self {
-        Self { phase: UserPhase::Offline, turn: None, suppressed_seq: None, timeouts }
+        Self {
+            phase: UserPhase::Offline,
+            turn: None,
+            suppressed_seq: None,
+            timeouts,
+        }
     }
 
     pub fn phase(&self) -> UserPhase {
@@ -113,7 +125,10 @@ impl TurnMachine {
         self.phase = UserPhase::Offline;
         self.turn = None;
         self.suppressed_seq = None;
-        Effects { stop_playback: had_audio, ..Effects::default() }
+        Effects {
+            stop_playback: had_audio,
+            ..Effects::default()
+        }
     }
 
     /// Local VAD detected the start of user speech. `playing` = playback still has queued audio.
@@ -123,7 +138,9 @@ impl TurnMachine {
             UserPhase::Offline => return fx,
             UserPhase::Listening => return fx,
             // A new `send` replaces any pending turn server-side, so no `cancel` is needed.
-            UserPhase::Idle | UserPhase::AwaitTranscription { .. } | UserPhase::AwaitTurn { .. } => {}
+            UserPhase::Idle
+            | UserPhase::AwaitTranscription { .. }
+            | UserPhase::AwaitTurn { .. } => {}
         }
         if let Some(t) = self.turn.take() {
             // Barge-in on a streaming turn: cancel it and drop its late frames.
@@ -150,7 +167,10 @@ impl TurnMachine {
             return Effects::default();
         }
         self.phase = UserPhase::AwaitTranscription { since: now };
-        Effects { send: Some(ClientCmd::End), ..Effects::default() }
+        Effects {
+            send: Some(ClientCmd::End),
+            ..Effects::default()
+        }
     }
 
     /// The uplink could not deliver a control message: give up on the current user action.
@@ -163,7 +183,9 @@ impl TurnMachine {
     /// Next instant at which [`TurnMachine::on_tick`] has something to do.
     pub fn next_deadline(&self) -> Option<Mono> {
         match self.phase {
-            UserPhase::AwaitTranscription { since } => Some(since.saturating_add(self.timeouts.transcription)),
+            UserPhase::AwaitTranscription { since } => {
+                Some(since.saturating_add(self.timeouts.transcription))
+            }
             UserPhase::AwaitTurn { since } => Some(since.saturating_add(self.timeouts.turn_start)),
             _ => None,
         }
@@ -261,7 +283,8 @@ impl TurnMachine {
 
     /// Whether a TTS frame with this `turn_seq` may be played.
     pub fn accept_audio(&self, turn_seq: u16) -> bool {
-        self.suppressed_seq != Some(turn_seq) && self.turn.as_ref().is_some_and(|t| t.turn_seq == turn_seq)
+        self.suppressed_seq != Some(turn_seq)
+            && self.turn.as_ref().is_some_and(|t| t.turn_seq == turn_seq)
     }
 }
 
@@ -271,7 +294,10 @@ mod tests {
     use fogar_proto::server::{Interrupted, Token, Transcription, TurnEnd, TurnStart};
 
     fn ts(id: &str, seq: u16) -> ServerMsg {
-        ServerMsg::TurnStart(TurnStart { turn_id: id.into(), turn_seq: seq })
+        ServerMsg::TurnStart(TurnStart {
+            turn_id: id.into(),
+            turn_seq: seq,
+        })
     }
     fn te(id: &str) -> ServerMsg {
         ServerMsg::TurnEnd(TurnEnd { turn_id: id.into() })
@@ -281,18 +307,33 @@ mod tests {
     #[test]
     fn normal_turn() {
         let mut m = TurnMachine::new(TurnTimeouts::default());
-        assert_eq!(m.speech_start(false), Effects::default(), "offline: ignored");
+        assert_eq!(
+            m.speech_start(false),
+            Effects::default(),
+            "offline: ignored"
+        );
         m.link_up();
         assert_eq!(m.speech_start(false), Effects::default());
         assert!(m.is_listening());
         assert_eq!(m.speech_end(T0).send, Some(ClientCmd::End));
-        let fx = m.on_server(&ServerMsg::Transcription(Transcription { text: " pon la serie ".into() }), T0);
+        let fx = m.on_server(
+            &ServerMsg::Transcription(Transcription {
+                text: " pon la serie ".into(),
+            }),
+            T0,
+        );
         assert_eq!(fx.send, Some(ClientCmd::Send("pon la serie".into())));
         assert!(m.on_server(&ts("t-1", 1), T0).turn_started);
         assert_eq!(m.turn().map(|t| t.origin), Some(Origin::User));
         assert!(m.accept_audio(1));
         assert!(!m.accept_audio(2));
-        m.on_server(&ServerMsg::Token(Token { turn_id: "t-1".into(), text: "Vale".into() }), T0);
+        m.on_server(
+            &ServerMsg::Token(Token {
+                turn_id: "t-1".into(),
+                text: "Vale".into(),
+            }),
+            T0,
+        );
         assert_eq!(m.turn().map(|t| t.text.as_str()), Some("Vale"));
         assert!(m.on_server(&te("t-1"), T0).turn_completed);
         assert!(!m.accept_audio(1));
@@ -311,7 +352,15 @@ mod tests {
         assert!(!m.accept_audio(7));
         // The cancelled turn's turn_end is not a completed turn of ours.
         assert!(!m.on_server(&te("t-1"), T0).turn_completed);
-        assert!(m.on_server(&ServerMsg::Interrupted(Interrupted { turn_id: Some("t-1".into()) }), T0).stop_playback);
+        assert!(
+            m.on_server(
+                &ServerMsg::Interrupted(Interrupted {
+                    turn_id: Some("t-1".into())
+                }),
+                T0
+            )
+            .stop_playback
+        );
         assert!(m.is_listening());
     }
 
@@ -336,7 +385,10 @@ mod tests {
         assert_eq!(m.phase(), UserPhase::Idle);
         m.speech_start(false);
         m.speech_end(T0);
-        m.on_server(&ServerMsg::Transcription(Transcription { text: "x".into() }), T0);
+        m.on_server(
+            &ServerMsg::Transcription(Transcription { text: "x".into() }),
+            T0,
+        );
         let err = ServerMsg::Error(fogar_proto::server::ErrorMsg {
             code: "TURN_ERROR".into(),
             message: "orchestrator_unavailable".into(),
@@ -348,7 +400,14 @@ mod tests {
         // Empty transcription: nothing to send.
         m.speech_start(false);
         m.speech_end(T0);
-        assert_eq!(m.on_server(&ServerMsg::Transcription(Transcription { text: "  ".into() }), T0).send, None);
+        assert_eq!(
+            m.on_server(
+                &ServerMsg::Transcription(Transcription { text: "  ".into() }),
+                T0
+            )
+            .send,
+            None
+        );
     }
 
     #[test]
@@ -367,7 +426,13 @@ mod tests {
         m.link_up();
         m.on_server(&ts("t-1", 1), T0);
         let big = "ñ".repeat(MAX_TURN_TEXT_BYTES);
-        m.on_server(&ServerMsg::Token(Token { turn_id: "t-1".into(), text: big }), T0);
+        m.on_server(
+            &ServerMsg::Token(Token {
+                turn_id: "t-1".into(),
+                text: big,
+            }),
+            T0,
+        );
         let len = m.turn().map(|t| t.text.len()).unwrap();
         assert!(len <= MAX_TURN_TEXT_BYTES && len > MAX_TURN_TEXT_BYTES - 2);
     }

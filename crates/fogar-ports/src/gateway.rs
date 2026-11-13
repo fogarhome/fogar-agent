@@ -50,7 +50,10 @@ impl Frame {
 pub enum LinkEvent {
     Frame(Frame),
     /// The peer closed with a close frame.
-    Closed { code: u16, reason: String },
+    Closed {
+        code: u16,
+        reason: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -77,7 +80,11 @@ pub trait LinkSession: Send + 'static {
     /// **Cancel-safe.**
     fn recv(&mut self) -> impl Future<Output = Option<LinkEvent>> + Send;
     /// Sends a close frame and waits (adapter-bounded) for the peer. Idempotent.
-    fn close(&mut self, code: u16, reason: &str) -> impl Future<Output = Result<(), LinkError>> + Send;
+    fn close(
+        &mut self,
+        code: u16,
+        reason: &str,
+    ) -> impl Future<Output = Result<(), LinkError>> + Send;
 }
 
 pub trait GatewayLink: Send + Sync + 'static {

@@ -7,6 +7,7 @@ members = [
   "crates/fogar-ports",
   "crates/fogar-core",
   "crates/fogar-testkit",
+  "crates/fogar-testalloc",
 ]
 
 [workspace.package]
@@ -23,6 +24,7 @@ fogar-proto = { path = "crates/fogar-proto", default-features = false }
 fogar-ports = { path = "crates/fogar-ports" }
 fogar-core = { path = "crates/fogar-core" }
 fogar-testkit = { path = "crates/fogar-testkit" }
+fogar-testalloc = { path = "crates/fogar-testalloc" }
 fogar-host = { path = "crates/fogar-host" }
 fogar-agent-linux = { path = "crates/fogar-agent-linux" }
 fogar-agent-macos = { path = "crates/fogar-agent-macos" }

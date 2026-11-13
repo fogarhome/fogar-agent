@@ -24,7 +24,9 @@ pub struct SecretCaps {
 }
 
 impl SecretCaps {
-    pub const NONE: Self = Self { persistent: Support::Unsupported };
+    pub const NONE: Self = Self {
+        persistent: Support::Unsupported,
+    };
 }
 
 #[derive(Debug, thiserror::Error)]

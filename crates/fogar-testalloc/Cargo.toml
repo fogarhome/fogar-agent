@@ -1,0 +1,11 @@
+[package]
+name = "fogar-testalloc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Counting global allocator for leak/growth probes in tests. DEV-DEPENDENCY ONLY. Holds the only `unsafe` compiled on Linux, so it is the Miri target."
+
+[lints]
+workspace = true

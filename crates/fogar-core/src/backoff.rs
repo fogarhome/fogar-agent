@@ -32,7 +32,10 @@ impl BackoffPolicy {
     /// overflows, whatever the attempt count.
     pub fn window(&self, attempt: u32) -> Duration {
         let factor = 1u32.checked_shl(attempt.min(31)).unwrap_or(u32::MAX);
-        self.base.saturating_mul(factor).min(self.cap).max(self.floor)
+        self.base
+            .saturating_mul(factor)
+            .min(self.cap)
+            .max(self.floor)
     }
 
     /// Full jitter: uniform in `[floor, window(attempt)]`.
@@ -51,7 +54,9 @@ mod tests {
     struct Seq(std::sync::atomic::AtomicU64);
     impl Random for Seq {
         fn next_u64(&self) -> u64 {
-            let x = self.0.fetch_add(0x9E37_79B9_7F4A_7C15, std::sync::atomic::Ordering::Relaxed);
+            let x = self
+                .0
+                .fetch_add(0x9E37_79B9_7F4A_7C15, std::sync::atomic::Ordering::Relaxed);
             x ^ (x >> 31)
         }
     }
@@ -77,6 +82,9 @@ mod tests {
         let p = BackoffPolicy::default();
         let r = Seq(std::sync::atomic::AtomicU64::new(1));
         let v: std::collections::BTreeSet<_> = (0..50).map(|_| p.delay(6, &r)).collect();
-        assert!(v.len() > 40, "full jitter must not collapse to a few values");
+        assert!(
+            v.len() > 40,
+            "full jitter must not collapse to a few values"
+        );
     }
 }

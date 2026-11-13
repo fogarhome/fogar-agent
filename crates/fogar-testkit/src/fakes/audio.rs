@@ -1,8 +1,8 @@
 use fogar_ports::{
     Support,
     audio::{
-        ActiveCapture, ActivePlayback, AudioChunk, AudioError, AudioFormat, AudioSink, AudioSinkCaps,
-        AudioSource, AudioSourceCaps, MicPermission,
+        ActiveCapture, ActivePlayback, AudioChunk, AudioError, AudioFormat, AudioSink,
+        AudioSinkCaps, AudioSource, AudioSourceCaps, MicPermission,
     },
     events::{EventSink, EventStream, Pushed, event_channel},
 };
@@ -31,7 +31,11 @@ pub fn tone_chunks(n: usize, amp: f32) -> Vec<AudioChunk> {
 }
 
 pub fn silence_chunks(n: usize) -> Vec<AudioChunk> {
-    (0..n).map(|_| AudioChunk { samples: vec![0.0; CHUNK_SAMPLES] }).collect()
+    (0..n)
+        .map(|_| AudioChunk {
+            samples: vec![0.0; CHUNK_SAMPLES],
+        })
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -56,14 +60,27 @@ impl FakeMic {
         let mut caps = AudioSourceCaps::NONE;
         caps.capture = Support::Native;
         caps.permission_query = Support::Native;
-        Self { caps, format: AudioFormat::mono(16_000), permission: MicPermission::Granted, state: Arc::default() }
+        Self {
+            caps,
+            format: AudioFormat::mono(16_000),
+            permission: MicPermission::Granted,
+            state: Arc::default(),
+        }
     }
     /// No capture at all (e.g. a headless Linux box).
     pub fn minimal() -> Self {
-        Self { caps: AudioSourceCaps::NONE, format: AudioFormat::mono(16_000), permission: MicPermission::Unknown, state: Arc::default() }
+        Self {
+            caps: AudioSourceCaps::NONE,
+            format: AudioFormat::mono(16_000),
+            permission: MicPermission::Unknown,
+            state: Arc::default(),
+        }
     }
     pub fn denied() -> Self {
-        Self { permission: MicPermission::Denied, ..Self::healthy() }
+        Self {
+            permission: MicPermission::Denied,
+            ..Self::healthy()
+        }
     }
     pub fn with_format(mut self, f: AudioFormat) -> Self {
         self.format = f;
@@ -77,13 +94,23 @@ impl FakeMic {
         cs.into_iter().map(|c| self.push(c)).collect()
     }
     pub fn is_open(&self) -> bool {
-        self.state.lock().unwrap().sink.as_ref().is_some_and(|s| !s.is_closed())
+        self.state
+            .lock()
+            .unwrap()
+            .sink
+            .as_ref()
+            .is_some_and(|s| !s.is_closed())
     }
     pub fn opens(&self) -> u32 {
         self.state.lock().unwrap().opens
     }
     pub fn dropped(&self) -> u64 {
-        self.state.lock().unwrap().sink.as_ref().map_or(0, |s| s.dropped())
+        self.state
+            .lock()
+            .unwrap()
+            .sink
+            .as_ref()
+            .map_or(0, |s| s.dropped())
     }
 }
 
@@ -114,7 +141,10 @@ impl AudioSource for FakeMic {
     fn mic_permission(&self) -> MicPermission {
         self.permission
     }
-    fn open(&self, capacity: NonZeroUsize) -> Result<(Box<dyn ActiveCapture>, EventStream<AudioChunk>), AudioError> {
+    fn open(
+        &self,
+        capacity: NonZeroUsize,
+    ) -> Result<(Box<dyn ActiveCapture>, EventStream<AudioChunk>), AudioError> {
         if !self.caps.capture.is_available() {
             return Err(AudioError::Unsupported("capture"));
         }
@@ -125,7 +155,13 @@ impl AudioSource for FakeMic {
         let mut st = self.state.lock().unwrap();
         st.sink = Some(tx);
         st.opens += 1;
-        Ok((Box::new(FakeCapture { format: self.format, state: self.state.clone() }), rx))
+        Ok((
+            Box::new(FakeCapture {
+                format: self.format,
+                state: self.state.clone(),
+            }),
+            rx,
+        ))
     }
 }
 
@@ -156,10 +192,20 @@ impl FakeSpeaker {
     pub fn healthy() -> Self {
         let mut caps = AudioSinkCaps::NONE;
         caps.playback = Support::Native;
-        Self { caps, capacity: 240_000, record: true, state: Arc::default() }
+        Self {
+            caps,
+            capacity: 240_000,
+            record: true,
+            state: Arc::default(),
+        }
     }
     pub fn minimal() -> Self {
-        Self { caps: AudioSinkCaps::NONE, capacity: 0, record: false, state: Arc::default() }
+        Self {
+            caps: AudioSinkCaps::NONE,
+            capacity: 0,
+            record: false,
+            state: Arc::default(),
+        }
     }
     pub fn with_capacity(mut self, samples: usize) -> Self {
         self.capacity = samples;
@@ -255,6 +301,11 @@ impl AudioSink for FakeSpeaker {
         let mut st = self.state.lock().unwrap();
         st.opens += 1;
         st.open_now += 1;
-        Ok(Box::new(FakePlayback { format, capacity: self.capacity, record: self.record, state: self.state.clone() }))
+        Ok(Box::new(FakePlayback {
+            format,
+            capacity: self.capacity,
+            record: self.record,
+            state: self.state.clone(),
+        }))
     }
 }

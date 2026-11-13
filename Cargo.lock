@@ -124,6 +124,7 @@ version = "0.0.1"
 dependencies = [
  "fogar-ports",
  "fogar-proto",
+ "fogar-testalloc",
  "fogar-testkit",
  "loom",
  "tokio",
@@ -147,6 +148,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "fogar-testalloc"
+version = "0.0.1"
 
 [[package]]
 name = "fogar-testkit"

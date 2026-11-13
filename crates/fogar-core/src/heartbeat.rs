@@ -19,7 +19,9 @@ pub struct Heartbeat {
 
 impl Heartbeat {
     pub fn new(now_ms: u64) -> Self {
-        Self { last_ms: AtomicU64::new(now_ms) }
+        Self {
+            last_ms: AtomicU64::new(now_ms),
+        }
     }
 
     /// Records liveness at `now_ms` (monotonic milliseconds). Monotone: an older stamp is ignored.
@@ -75,7 +77,10 @@ mod loom_tests {
             let mut seen = 0;
             for _ in 0..3 {
                 let v = h.last();
-                assert!(v >= seen, "watchdog saw the stamp move backwards: {v} < {seen}");
+                assert!(
+                    v >= seen,
+                    "watchdog saw the stamp move backwards: {v} < {seen}"
+                );
                 seen = v;
                 thread::yield_now();
             }

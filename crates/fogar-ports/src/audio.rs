@@ -25,7 +25,10 @@ pub struct AudioFormat {
 
 impl AudioFormat {
     pub const fn mono(sample_rate_hz: u32) -> Self {
-        Self { sample_rate_hz, channels: 1 }
+        Self {
+            sample_rate_hz,
+            channels: 1,
+        }
     }
 }
 
@@ -115,7 +118,9 @@ pub struct AudioSinkCaps {
 }
 
 impl AudioSinkCaps {
-    pub const NONE: Self = Self { playback: Support::Unsupported };
+    pub const NONE: Self = Self {
+        playback: Support::Unsupported,
+    };
 }
 
 /// An open output stream. Dropping it closes the device (release it when idle: energy).

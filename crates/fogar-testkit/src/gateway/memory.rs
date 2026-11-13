@@ -1,6 +1,8 @@
 //! In-memory `GatewayLink` backed by the protocol-v1 driver. For paused-time tests.
 
-use super::driver::{ClientIn, Ctl, GatewayLog, MockConfig, ServerOut, ServerTransport, SharedLog, run_conn};
+use super::driver::{
+    ClientIn, Ctl, GatewayLog, MockConfig, ServerOut, ServerTransport, SharedLog, run_conn,
+};
 use fogar_ports::gateway::{Frame, GatewayLink, LinkError, LinkEvent, LinkSession};
 use std::{
     sync::{
@@ -24,7 +26,7 @@ struct Inner {
     log: SharedLog,
     ctls: Mutex<Vec<mpsc::Sender<Ctl>>>,
     fail_connects: AtomicU32,
-    uplink_delay: Mutex<Option<Duration>>,
+    uplink_delay: Arc<Mutex<Option<Duration>>>,
     tasks: TaskTracker,
 }
 
@@ -36,7 +38,7 @@ impl FakeGatewayLink {
                 log: Arc::default(),
                 ctls: Mutex::default(),
                 fail_connects: AtomicU32::new(0),
-                uplink_delay: Mutex::new(None),
+                uplink_delay: Arc::new(Mutex::new(None)),
                 tasks: TaskTracker::new(),
             }),
         }
@@ -48,7 +50,7 @@ impl FakeGatewayLink {
     pub fn fail_next_connects(&self, n: u32) {
         self.inner.fail_connects.store(n, Ordering::SeqCst);
     }
-    /// Every client `send` takes this long (a slow uplink).
+    /// Every client `send` takes this long (a slow uplink). Applies to live sessions too.
     pub fn set_uplink_delay(&self, d: Option<Duration>) {
         *self.inner.uplink_delay.lock().unwrap() = d;
     }
@@ -59,10 +61,15 @@ impl FakeGatewayLink {
     pub fn control(&self, cmd: Ctl) -> usize {
         let mut ctls = self.inner.ctls.lock().unwrap();
         ctls.retain(|c| !c.is_closed());
-        ctls.iter().filter(|c| c.try_send(cmd.clone()).is_ok()).count()
+        ctls.iter()
+            .filter(|c| c.try_send(cmd.clone()).is_ok())
+            .count()
     }
     pub fn close_all(&self, code: u16, reason: &str) -> usize {
-        self.control(Ctl::Close { code, reason: reason.to_owned() })
+        self.control(Ctl::Close {
+            code,
+            reason: reason.to_owned(),
+        })
     }
     /// Server-side tasks still running (they end when the client side is dropped).
     pub fn live_server_tasks(&self) -> usize {
@@ -87,7 +94,13 @@ impl ServerTransport for MemTransport {
         self.tx.send(LinkEvent::Frame(f)).await.is_ok()
     }
     async fn close(&mut self, code: u16, reason: &str) {
-        let _ = self.tx.send(LinkEvent::Closed { code, reason: reason.to_owned() }).await;
+        let _ = self
+            .tx
+            .send(LinkEvent::Closed {
+                code,
+                reason: reason.to_owned(),
+            })
+            .await;
     }
 }
 
@@ -97,7 +110,7 @@ pub struct FakeSession {
     tx: mpsc::Sender<ClientIn>,
     rx: mpsc::Receiver<LinkEvent>,
     closed: bool,
-    delay: Option<Duration>,
+    delay: Arc<Mutex<Option<Duration>>>,
 }
 
 pub const FAKE_MAX_FRAME: usize = fogar_proto::limits::WS_MAX_FRAME_BYTES;
@@ -111,9 +124,13 @@ impl LinkSession for FakeSession {
             return Err(LinkError::Disconnected);
         }
         if frame.len() > FAKE_MAX_FRAME {
-            return Err(LinkError::TooLarge { len: frame.len(), max: FAKE_MAX_FRAME });
+            return Err(LinkError::TooLarge {
+                len: frame.len(),
+                max: FAKE_MAX_FRAME,
+            });
         }
-        if let Some(d) = self.delay {
+        let delay = *self.delay.lock().unwrap();
+        if let Some(d) = delay {
             tokio::time::sleep(d).await;
         }
         let m = match frame {
@@ -150,8 +167,20 @@ impl GatewayLink for FakeGatewayLink {
         let (ctl_tx, ctl_rx) = mpsc::channel(8);
         self.inner.ctls.lock().unwrap().push(ctl_tx);
         let cfg = self.inner.cfg.lock().unwrap().clone();
-        self.inner.tasks.spawn(run_conn(MemTransport { rx: c2s_rx, tx: s2c_tx }, cfg, self.inner.log.clone(), ctl_rx));
-        let delay = *self.inner.uplink_delay.lock().unwrap();
-        Ok(FakeSession { tx: c2s_tx, rx: s2c_rx, closed: false, delay })
+        self.inner.tasks.spawn(run_conn(
+            MemTransport {
+                rx: c2s_rx,
+                tx: s2c_tx,
+            },
+            cfg,
+            self.inner.log.clone(),
+            ctl_rx,
+        ));
+        Ok(FakeSession {
+            tx: c2s_tx,
+            rx: s2c_rx,
+            closed: false,
+            delay: self.inner.uplink_delay.clone(),
+        })
     }
 }

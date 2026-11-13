@@ -95,7 +95,8 @@ impl HealthProbe {
 }
 
 fn queue_len<T>(w: &mpsc::WeakSender<T>) -> usize {
-    w.upgrade().map_or(0, |tx| tx.max_capacity() - tx.capacity())
+    w.upgrade()
+        .map_or(0, |tx| tx.max_capacity() - tx.capacity())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +134,10 @@ impl<C: Clock> Agent<C> {
     {
         let cfg = Arc::new(cfg);
         let stats = Arc::new(Stats::default());
-        let (view_tx, view_rx) = watch::channel(LinkView { state: LinkState::Starting, last_close: None });
+        let (view_tx, view_rx) = watch::channel(LinkView {
+            state: LinkState::Starting,
+            last_close: None,
+        });
         let (out_tx, out_rx) = mpsc::channel::<Frame>(queues::OUTBOUND);
         let (in_tx, in_rx) = mpsc::channel::<Inbound>(queues::INBOUND);
         let health = HealthProbe {
@@ -148,7 +152,12 @@ impl<C: Clock> Agent<C> {
         let ingress = root.child_token();
         let egress = root.child_token();
         let ops_token = root.child_token();
-        let (data, edge, io, ops) = (TaskTracker::new(), TaskTracker::new(), TaskTracker::new(), TaskTracker::new());
+        let (data, edge, io, ops) = (
+            TaskTracker::new(),
+            TaskTracker::new(),
+            TaskTracker::new(),
+            TaskTracker::new(),
+        );
         let heartbeat = Arc::new(Heartbeat::new(ms(&*ports.clock)));
 
         let engine = Engine {
@@ -174,15 +183,38 @@ impl<C: Clock> Agent<C> {
         io.spawn(link.run(out_rx, in_tx, egress.clone()));
 
         if let Some(server) = ports.ipc {
-            edge.spawn(crate::ipc::run(server, ports.clock.clone(), health.clone(), cfg.write_timeout, ingress.clone()));
+            edge.spawn(crate::ipc::run(
+                server,
+                ports.clock.clone(),
+                health.clone(),
+                cfg.write_timeout,
+                ingress.clone(),
+            ));
         }
 
-        ops.spawn(beat(ports.clock.clone(), heartbeat.clone(), cfg.heartbeat_every, ops_token.clone()));
+        ops.spawn(beat(
+            ports.clock.clone(),
+            heartbeat.clone(),
+            cfg.heartbeat_every,
+            ops_token.clone(),
+        ));
 
         for t in [&data, &edge, &io, &ops] {
             t.close();
         }
-        Self { clock: ports.clock, ingress, egress, ops_token, data, edge, io, ops, health, heartbeat, view_tx }
+        Self {
+            clock: ports.clock,
+            ingress,
+            egress,
+            ops_token,
+            data,
+            edge,
+            io,
+            ops,
+            health,
+            heartbeat,
+            view_tx,
+        }
     }
 
     pub fn health(&self) -> HealthProbe {
@@ -201,21 +233,29 @@ impl<C: Clock> Agent<C> {
 
     /// Ordered shutdown within `budget` (aim < 5 s, below launchd ExitTimeOut).
     pub async fn shutdown(self, budget: Duration) -> ShutdownReport {
-        self.view_tx.send_modify(|v| v.state = LinkState::ShuttingDown);
+        self.view_tx
+            .send_modify(|v| v.state = LinkState::ShuttingDown);
         let phase = budget / 3;
         self.ingress.cancel();
-        let ingress_ok = self.wait(phase, async {
-            self.data.wait().await;
-            self.edge.wait().await;
-        })
-        .await;
+        let ingress_ok = self
+            .wait(phase, async {
+                self.data.wait().await;
+                self.edge.wait().await;
+            })
+            .await;
         self.egress.cancel();
         let egress_ok = self.wait(phase, self.io.wait()).await;
         self.ops_token.cancel();
         let ops_ok = self.wait(phase, self.ops.wait()).await;
         self.view_tx.send_modify(|v| v.state = LinkState::Stopped);
         let tasks_left = self.live_tasks();
-        ShutdownReport { clean: ingress_ok && egress_ok && ops_ok && tasks_left == 0, ingress_ok, egress_ok, ops_ok, tasks_left }
+        ShutdownReport {
+            clean: ingress_ok && egress_ok && ops_ok && tasks_left == 0,
+            ingress_ok,
+            egress_ok,
+            ops_ok,
+            tasks_left,
+        }
     }
 
     async fn wait(&self, d: Duration, f: impl Future<Output = ()>) -> bool {
@@ -227,7 +267,12 @@ fn ms<C: Clock>(clock: &C) -> u64 {
     u64::try_from(clock.now().0.as_millis()).unwrap_or(u64::MAX)
 }
 
-async fn beat<C: Clock>(clock: Arc<C>, hb: Arc<Heartbeat>, every: Duration, cancel: CancellationToken) {
+async fn beat<C: Clock>(
+    clock: Arc<C>,
+    hb: Arc<Heartbeat>,
+    every: Duration,
+    cancel: CancellationToken,
+) {
     loop {
         tokio::select! {
             biased;

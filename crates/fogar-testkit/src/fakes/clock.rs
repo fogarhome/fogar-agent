@@ -12,7 +12,9 @@ pub struct TestClock {
 impl TestClock {
     /// Must be created inside a runtime when time is paused.
     pub fn new() -> Self {
-        Self { epoch: Instant::now() }
+        Self {
+            epoch: Instant::now(),
+        }
     }
 }
 

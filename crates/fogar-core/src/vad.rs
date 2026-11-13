@@ -15,7 +15,11 @@ pub struct VadConfig {
 impl Default for VadConfig {
     fn default() -> Self {
         // 20 ms chunks: 300 ms hangover, 30 s max utterance.
-        Self { threshold_rms: 0.02, hangover_chunks: 15, max_utterance_chunks: 1500 }
+        Self {
+            threshold_rms: 0.02,
+            hangover_chunks: 15,
+            max_utterance_chunks: 1500,
+        }
     }
 }
 
@@ -40,7 +44,12 @@ pub struct EnergyVad {
 
 impl EnergyVad {
     pub fn new(cfg: VadConfig) -> Self {
-        Self { cfg, in_speech: false, quiet_run: 0, length: 0 }
+        Self {
+            cfg,
+            in_speech: false,
+            quiet_run: 0,
+            length: 0,
+        }
     }
 
     pub fn reset(&mut self) {
@@ -65,8 +74,13 @@ impl EnergyVad {
             return VadEvent::Silence;
         }
         self.length = self.length.saturating_add(1);
-        self.quiet_run = if voiced { 0 } else { self.quiet_run.saturating_add(1) };
-        if self.quiet_run >= self.cfg.hangover_chunks || self.length > self.cfg.max_utterance_chunks {
+        self.quiet_run = if voiced {
+            0
+        } else {
+            self.quiet_run.saturating_add(1)
+        };
+        if self.quiet_run >= self.cfg.hangover_chunks || self.length > self.cfg.max_utterance_chunks
+        {
             self.reset();
             return VadEvent::SpeechEnd;
         }
@@ -90,7 +104,11 @@ mod tests {
 
     #[test]
     fn utterance_with_hangover() {
-        let mut v = EnergyVad::new(VadConfig { threshold_rms: 0.1, hangover_chunks: 2, max_utterance_chunks: 100 });
+        let mut v = EnergyVad::new(VadConfig {
+            threshold_rms: 0.1,
+            hangover_chunks: 2,
+            max_utterance_chunks: 100,
+        });
         let loud = [0.5f32; 320];
         let quiet = [0.0f32; 320];
         assert_eq!(v.process(&quiet), VadEvent::Silence);
@@ -103,7 +121,11 @@ mod tests {
 
     #[test]
     fn long_speech_is_cut_and_nan_is_silence() {
-        let mut v = EnergyVad::new(VadConfig { threshold_rms: 0.1, hangover_chunks: 2, max_utterance_chunks: 3 });
+        let mut v = EnergyVad::new(VadConfig {
+            threshold_rms: 0.1,
+            hangover_chunks: 2,
+            max_utterance_chunks: 3,
+        });
         let loud = [0.5f32; 4];
         assert_eq!(v.process(&loud), VadEvent::SpeechStart);
         assert_eq!(v.process(&loud), VadEvent::Speech);
