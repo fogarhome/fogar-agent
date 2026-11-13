@@ -10,6 +10,7 @@ members = [
   "crates/fogar-testalloc",
   "crates/fogar-host",
   "crates/fogar-agent-linux",
+  "crates/fogar-agent-macos",
 ]
 
 [workspace.package]

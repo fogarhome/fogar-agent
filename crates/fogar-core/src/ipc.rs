@@ -18,6 +18,8 @@ pub(crate) async fn run<C: Clock, S: IpcServer>(
     ingress: CancellationToken,
 ) {
     let mut conns = JoinSet::new();
+    // Accept failures back off exponentially (250 ms .. 30 s) so a broken listener cannot spin.
+    let mut fail_delay = Duration::from_millis(250);
     loop {
         tokio::select! {
             biased;
@@ -25,11 +27,18 @@ pub(crate) async fn run<C: Clock, S: IpcServer>(
             Some(_) = conns.join_next(), if !conns.is_empty() => {}
             r = server.accept(), if conns.len() < IPC_MAX_CONNS => match r {
                 Ok((_peer, conn)) => {
+                    fail_delay = Duration::from_millis(250);
                     Stats::inc(&health.stats.ipc_connections);
                     conns.spawn(serve(conn, clock.clone(), health.clone(), write_timeout, ingress.child_token()));
                 }
-                // Transient accept failure: brief pause so a broken listener cannot hot-loop.
-                Err(_) => clock.sleep(Duration::from_millis(250)).await,
+                Err(_) => {
+                    tokio::select! {
+                        biased;
+                        () = ingress.cancelled() => break,
+                        () = clock.sleep(fail_delay) => {}
+                    }
+                    fail_delay = (fail_delay * 2).min(Duration::from_secs(30));
+                }
             },
         }
     }

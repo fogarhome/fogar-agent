@@ -130,6 +130,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fogar-agent-macos"
+version = "0.0.1"
+dependencies = [
+ "fogar-ports",
+ "fogar-testkit",
+]
+
+[[package]]
 name = "fogar-core"
 version = "0.0.1"
 dependencies = [
