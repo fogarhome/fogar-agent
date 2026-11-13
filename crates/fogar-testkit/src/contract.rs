@@ -490,7 +490,9 @@ pub mod gateway_link {
         s.close(1000, "").await.unwrap();
     }
 
-    /// Dropping an in-flight `recv` (a lost select! race) must not lose the next frame.
+    /// Dropping an in-flight `recv` (a lost select! race) must not lose a frame: neither while
+    /// idle nor while frames are streaming in (review code#8: the first version only cancelled
+    /// while nothing was in flight, so a `recv` that loses a frame it already took passed).
     pub async fn recv_is_cancel_safe<L: GatewayLink>(link: &L) {
         let mut s = link.connect().await.unwrap();
         s.send(Frame::Text(handshake())).await.unwrap();
@@ -502,11 +504,61 @@ pub mod gateway_link {
         for _ in 0..20 {
             let _ = tokio::time::timeout(Duration::from_millis(1), s.recv()).await;
         }
+        // A turn streams turn_start, tokens, TTS frames and turn_end; every other receive is
+        // polled exactly once and dropped if it is not ready, i.e. cancelled at whatever point
+        // the adapter is at (possibly with a frame already taken from the transport).
         s.send(Frame::Text(r#"{"type":"send","text":"hola"}"#.into()))
             .await
             .unwrap();
-        assert!(matches!(next_msg(&mut s).await, ServerMsg::TurnStart(_)));
+        let cfg = MockConfig::default();
+        let (mut starts, mut tokens, mut audio) = (0u32, 0u32, 0u32);
+        let t0 = tokio::time::Instant::now();
+        let mut i = 0u64;
+        loop {
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "cancel-safety: turn_end never arrived (starts {starts}, tokens {tokens}, audio {audio})"
+            );
+            i += 1;
+            let ev = if i.is_multiple_of(2) {
+                poll_once_then_drop(s.recv()).await
+            } else {
+                tokio::time::timeout(Duration::from_millis(50), s.recv())
+                    .await
+                    .ok()
+            };
+            match ev {
+                None => continue,
+                Some(Some(LinkEvent::Frame(Frame::Binary(_)))) => audio += 1,
+                Some(Some(LinkEvent::Frame(Frame::Text(t)))) => {
+                    match decode_server(&t).expect("valid server msg") {
+                        ServerMsg::TurnStart(_) => starts += 1,
+                        ServerMsg::Token(_) => tokens += 1,
+                        ServerMsg::TurnEnd(_) => break,
+                        _ => {}
+                    }
+                }
+                Some(other) => panic!("cancel-safety: unexpected {other:?}"),
+            }
+        }
+        assert_eq!(
+            (starts, tokens, audio),
+            (1, 2, cfg.tts_frames),
+            "cancel-safety: frames lost when recv was dropped in flight"
+        );
         s.close(1000, "").await.unwrap();
+    }
+
+    /// Polls `f` once; `Some(output)` if it was ready, otherwise drops it (a cancellation).
+    async fn poll_once_then_drop<F: std::future::Future>(f: F) -> Option<F::Output> {
+        let mut f = std::pin::pin!(f);
+        std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(match f.as_mut().poll(cx) {
+                std::task::Poll::Ready(v) => Some(v),
+                std::task::Poll::Pending => None,
+            })
+        })
+        .await
     }
 
     /// A peer close surfaces as `Closed { code, reason }` with the exact reason text.

@@ -71,8 +71,19 @@ else
 fi
 
 # --- loom: the custom primitive (fogar-core heartbeat). Separate target dir: --cfg changes hashes.
-run_gate "loom (heartbeat)" env RUSTFLAGS="--cfg fogar_loom" CARGO_TARGET_DIR=target/loom \
-  cargo test -p fogar-core --release --lib --locked heartbeat
+# Review code#8: a filter that matches zero tests must FAIL the gate, not pass it silently.
+LOOM_FILTER="${LOOM_FILTER:-heartbeat}"
+loom_gate() {
+  local out rc n
+  out="$(env RUSTFLAGS="--cfg fogar_loom" CARGO_TARGET_DIR=target/loom \
+    cargo test -p fogar-core --release --lib --locked "$LOOM_FILTER" 2>&1)"; rc=$?
+  echo "$out"
+  [ "$rc" -eq 0 ] || return 1
+  n="$(echo "$out" | sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' | awk '{s+=$1} END {print s+0}')"
+  if [ "$n" -eq 0 ]; then echo "loom gate: filter '$LOOM_FILTER' matched zero tests"; return 1; fi
+  echo "loom gate: $n loom test(s) ran"
+}
+run_gate "loom (heartbeat)" loom_gate
 
 # --- benchmark harness placeholder: must build and run (numbers are informational, not a gate).
 run_gate "bench harness (placeholder)" cargo bench -p fogar-bench --locked

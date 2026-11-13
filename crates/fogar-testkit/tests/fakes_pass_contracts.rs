@@ -89,3 +89,49 @@ mod mock_gateway_over_ws {
         });
     }
 }
+
+/// Review code#8: the cancel-safety contract must catch an adapter whose `recv` loses a frame
+/// when it is dropped while a frame is in flight (here: the frame is taken from the transport,
+/// then the future yields once before returning it).
+mod contract_catches_lossy_recv {
+    use fogar_ports::gateway::{Frame, GatewayLink, LinkError, LinkEvent, LinkSession};
+    use fogar_testkit::{FakeGatewayLink, MockConfig};
+
+    #[derive(Clone)]
+    struct Lossy(FakeGatewayLink);
+    struct LossySess(<FakeGatewayLink as GatewayLink>::Session);
+
+    impl LinkSession for LossySess {
+        fn max_frame(&self) -> usize {
+            self.0.max_frame()
+        }
+        async fn send(&mut self, f: Frame) -> Result<(), LinkError> {
+            self.0.send(f).await
+        }
+        async fn recv(&mut self) -> Option<LinkEvent> {
+            let ev = self.0.recv().await;
+            // NOT cancel-safe: dropping the future here loses `ev`.
+            tokio::task::yield_now().await;
+            ev
+        }
+        async fn close(&mut self, c: u16, r: &str) -> Result<(), LinkError> {
+            self.0.close(c, r).await
+        }
+    }
+
+    impl GatewayLink for Lossy {
+        type Session = LossySess;
+        async fn connect(&self) -> Result<LossySess, LinkError> {
+            Ok(LossySess(self.0.connect().await?))
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "cancel-safety")]
+    fn lossy_recv_fails_the_contract() {
+        fogar_testkit::run_async(async {
+            let link = Lossy(FakeGatewayLink::new(MockConfig::default()));
+            fogar_testkit::contract::gateway_link::recv_is_cancel_safe(&link).await
+        })
+    }
+}
