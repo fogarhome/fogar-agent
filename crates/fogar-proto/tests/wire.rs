@@ -289,3 +289,32 @@ fn ready_decoding_is_tolerant() {
     assert!(r.live_capabilities.tts);
     assert_eq!(r.input_mode, None);
 }
+
+/// Review sec#7 (LOG-1): `{:?}` of server messages never prints transcripts, reply tokens or
+/// tool results (they are user content and end up in logs/panic messages otherwise).
+#[test]
+fn debug_output_redacts_user_content() {
+    for (frame, secret) in [
+        (
+            r#"{"type":"transcription","text":"my bank PIN is 4321"}"#,
+            "4321",
+        ),
+        (
+            r#"{"type":"transcription_partial","text":"my bank PIN is 4321"}"#,
+            "4321",
+        ),
+        (
+            r#"{"type":"token","turn_id":"t-1","text":"your PIN is 4321"}"#,
+            "4321",
+        ),
+        (
+            r#"{"type":"tool_call","turn_id":"t-1","phase":"result","name":"n","tool_call_id":"i","result":"PIN 4321"}"#,
+            "4321",
+        ),
+    ] {
+        let m = decode_server(frame).unwrap();
+        let dbg = format!("{m:?} {m:#?}");
+        assert!(!dbg.contains(secret), "{dbg}");
+        assert!(dbg.contains("redacted"), "{dbg}");
+    }
+}

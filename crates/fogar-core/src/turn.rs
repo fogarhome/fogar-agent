@@ -42,7 +42,7 @@ pub enum Origin {
     Push,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ActiveTurn {
     pub turn_id: String,
     pub turn_seq: u16,
@@ -50,12 +50,38 @@ pub struct ActiveTurn {
     pub text: String,
 }
 
+/// Redacting `Debug`: `text` is the agent's reply (user content; review sec#7, LOG-1).
+impl std::fmt::Debug for ActiveTurn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActiveTurn")
+            .field("turn_id", &self.turn_id)
+            .field("turn_seq", &self.turn_seq)
+            .field("origin", &self.origin)
+            .field(
+                "text",
+                &format_args!("<redacted {} bytes>", self.text.len()),
+            )
+            .finish()
+    }
+}
+
 /// Client messages the engine must send.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ClientCmd {
     End,
     Send(String),
     Cancel,
+}
+
+/// Redacting `Debug`: `Send` carries the user's transcript (review sec#7, LOG-1).
+impl std::fmt::Debug for ClientCmd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientCmd::End => f.write_str("End"),
+            ClientCmd::Send(t) => write!(f, "Send(<redacted {} bytes>)", t.len()),
+            ClientCmd::Cancel => f.write_str("Cancel"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -285,6 +311,25 @@ impl TurnMachine {
     pub fn accept_audio(&self, turn_seq: u16) -> bool {
         self.suppressed_seq != Some(turn_seq)
             && self.turn.as_ref().is_some_and(|t| t.turn_seq == turn_seq)
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::ClientCmd;
+
+    #[test]
+    fn client_cmd_debug_redacts_the_transcript() {
+        let d = format!("{:?}", ClientCmd::Send("my PIN is 4321".into()));
+        assert!(!d.contains("4321") && d.contains("redacted"), "{d}");
+        let t = super::ActiveTurn {
+            turn_id: "t-1".into(),
+            turn_seq: 1,
+            origin: super::Origin::User,
+            text: "your PIN is 4321".into(),
+        };
+        let d = format!("{t:?}");
+        assert!(!d.contains("4321") && d.contains("redacted"), "{d}");
     }
 }
 

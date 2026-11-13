@@ -97,7 +97,8 @@ fn private_state_dir(explicit: Option<std::path::PathBuf>) -> Result<std::path::
 }
 
 fn store_key(state_dir: &std::path::Path) -> ExitCode {
-    let mut key = String::new();
+    // Zeroized on drop (review sec#7, SEC-2); the SecretString below zeroizes its own copy.
+    let mut key = zeroize::Zeroizing::new(String::new());
     if std::io::stdin().read_to_string(&mut key).is_err() || key.trim().is_empty() {
         eprintln!("fogar-agentd: expected the client key on stdin");
         return ExitCode::from(64);

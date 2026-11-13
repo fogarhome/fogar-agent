@@ -57,7 +57,8 @@ impl SecretStore for FileSecretStore {
                 "secret file must be a regular 0600 file owned by the agent user".into(),
             ));
         }
-        let s = std::fs::read_to_string(&p).map_err(platform)?;
+        // Zeroized on drop (review sec#7, SEC-2): only the SecretString copy outlives this call.
+        let s = zeroize::Zeroizing::new(std::fs::read_to_string(&p).map_err(platform)?);
         let v = s.trim();
         Ok((!v.is_empty()).then(|| SecretString::from(v.to_owned())))
     }

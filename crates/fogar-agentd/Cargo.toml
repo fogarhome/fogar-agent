@@ -16,6 +16,7 @@ fogar-core = { workspace = true }
 fogar-ports = { workspace = true }
 fogar-host = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "time", "signal", "sync"] }
+zeroize = { workspace = true, features = ["alloc"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["std", "fs", "process"] }

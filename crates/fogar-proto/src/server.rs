@@ -5,6 +5,7 @@
 //! done by the agent itself.
 
 use alloc::{string::String, vec::Vec};
+use core::fmt;
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned, de::IgnoredAny};
 use serde_json::Value;
 
@@ -108,9 +109,26 @@ pub struct Capabilities {
 }
 
 /// CERTAIN. A partial is the accumulated text of the current utterance; it replaces the previous one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transcription {
     pub text: String,
+}
+
+/// `<redacted N bytes>`: user content never reaches `{:?}` (review sec#7, LOG-1).
+struct Redacted(usize);
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<redacted {} bytes>", self.0)
+    }
+}
+
+impl fmt::Debug for Transcription {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Transcription")
+            .field("text", &Redacted(self.text.len()))
+            .finish()
+    }
 }
 
 /// CERTAIN names. `turn_seq` = N & 0xFFFF (wraps; compare by equality). `turn_id` is "t-N" and
@@ -122,10 +140,19 @@ pub struct TurnStart {
 }
 
 /// CERTAIN
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Token {
     pub turn_id: String,
     pub text: String,
+}
+
+impl fmt::Debug for Token {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Token")
+            .field("turn_id", &self.turn_id)
+            .field("text", &Redacted(self.text.len()))
+            .finish()
+    }
 }
 
 /// CERTAIN: exactly one per TurnStart (known exception JGW-286: silent push).
@@ -142,7 +169,7 @@ pub struct Interrupted {
 }
 
 /// Field names CERTAIN (JAP §1.6). `args` shape UNKNOWN and unused: skipped, not kept (sec#4).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub turn_id: String,
     /// "start" | "result" (String-backed on purpose; see [`ToolCall::phase`]).
@@ -156,6 +183,20 @@ pub struct ToolCall {
     pub result: Option<String>,
     #[serde(default)]
     pub is_error: Option<bool>,
+}
+
+impl fmt::Debug for ToolCall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ToolCall")
+            .field("turn_id", &self.turn_id)
+            .field("phase", &self.phase)
+            .field("name", &self.name)
+            .field("tool_call_id", &self.tool_call_id)
+            .field("args", &self.args)
+            .field("result", &self.result.as_ref().map(|r| Redacted(r.len())))
+            .field("is_error", &self.is_error)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

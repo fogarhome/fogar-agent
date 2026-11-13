@@ -12,6 +12,7 @@ fogar-ports = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util"] }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
+zeroize = { workspace = true, features = ["alloc"] }
 
 [dev-dependencies]
 fogar-testkit = { workspace = true }
