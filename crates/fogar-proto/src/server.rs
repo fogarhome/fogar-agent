@@ -6,8 +6,11 @@
 
 use alloc::{string::String, vec::Vec};
 use core::fmt;
-use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned, de::IgnoredAny};
-use serde_json::Value;
+use core::marker::PhantomData;
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor, value::StrDeserializer},
+};
 
 use crate::client::{InputMode, OutputMode};
 
@@ -51,38 +54,279 @@ pub enum ServerMsg {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ready {
     /// `"<client_id>:<timestamp_ms>"`: identifies the connection, not the conversation.
-    #[serde(default, deserialize_with = "lenient")]
+    #[serde(default, deserialize_with = "lenient_string")]
     pub session_id: String,
     /// Effective agent: trust it over the requested one. `None` if absent or `null`.
-    #[serde(default, deserialize_with = "lenient")]
+    #[serde(default, deserialize_with = "lenient_opt_string")]
     pub agent: Option<String>,
     /// `None` if absent or a value this client does not know.
-    #[serde(default, deserialize_with = "lenient")]
+    #[serde(default, deserialize_with = "lenient_input_mode")]
     pub input_mode: Option<InputMode>,
     /// Known modes only (unknown values are skipped).
     #[serde(default, deserialize_with = "lenient_modes")]
     pub output_mode: Vec<OutputMode>,
-    #[serde(default, deserialize_with = "lenient")]
+    #[serde(default, deserialize_with = "lenient_capabilities")]
     pub requested_capabilities: Capabilities,
-    #[serde(default, deserialize_with = "lenient")]
+    #[serde(default, deserialize_with = "lenient_capabilities")]
     pub live_capabilities: Capabilities,
 }
 
-/// `T` if the value has `T`'s shape, otherwise `T::default()`. The intermediate `Value` lives only
-/// while one `ready` frame is decoded (once per connection).
-fn lenient<'de, D: Deserializer<'de>, T: DeserializeOwned + Default>(d: D) -> Result<T, D::Error> {
-    let v = Value::deserialize(d)?;
-    Ok(T::deserialize(v).unwrap_or_default())
+// --- tolerant `ready` fields without an intermediate tree (round-2 review F5) ----------------
+// The first version decoded each field into a `serde_json::Value` and then tried `T`: a 1 MiB
+// `ready` frame of `[[],[],...]` peaked at 16 MiB. These visitors take what they understand
+// straight from the input and skip everything else with `IgnoredAny` (no allocation); a value of
+// the wrong shape becomes the default. Only the strings that are actually kept are allocated.
+
+/// Visits one JSON value: `Some(T)` if it is a string `T` accepts, `None` for anything else.
+struct Lenient<T>(PhantomData<T>);
+
+/// How a string becomes the field's type.
+trait FromJsonStr: Sized {
+    fn from_json_str<E: de::Error>(s: &str) -> Option<Self>;
+}
+
+impl FromJsonStr for String {
+    fn from_json_str<E: de::Error>(s: &str) -> Option<Self> {
+        Some(String::from(s))
+    }
+}
+
+impl FromJsonStr for InputMode {
+    fn from_json_str<E: de::Error>(s: &str) -> Option<Self> {
+        InputMode::deserialize(StrDeserializer::<E>::new(s)).ok()
+    }
+}
+
+impl FromJsonStr for OutputMode {
+    fn from_json_str<E: de::Error>(s: &str) -> Option<Self> {
+        OutputMode::deserialize(StrDeserializer::<E>::new(s)).ok()
+    }
+}
+
+fn drain_seq<'de, A: SeqAccess<'de>>(mut a: A) -> Result<(), A::Error> {
+    while a.next_element::<IgnoredAny>()?.is_some() {}
+    Ok(())
+}
+
+fn drain_map<'de, A: MapAccess<'de>>(mut a: A) -> Result<(), A::Error> {
+    while a.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+    Ok(())
+}
+
+/// Scalars and containers that are not what the field wants: skipped, `default` returned.
+macro_rules! lenient_other {
+    ($default:expr) => {
+        fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+            Ok($default)
+        }
+        fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+            Ok($default)
+        }
+        fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+            Ok($default)
+        }
+        fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+            Ok($default)
+        }
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok($default)
+        }
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok($default)
+        }
+    };
+}
+
+impl<'de, T: FromJsonStr> Visitor<'de> for Lenient<T> {
+    type Value = Option<T>;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(T::from_json_str::<E>(v))
+    }
+    fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_any(self)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, a: A) -> Result<Self::Value, A::Error> {
+        drain_seq(a)?;
+        Ok(None)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, a: A) -> Result<Self::Value, A::Error> {
+        drain_map(a)?;
+        Ok(None)
+    }
+    lenient_other!(None);
+}
+
+impl<'de, T: FromJsonStr> de::DeserializeSeed<'de> for Lenient<T> {
+    type Value = Option<T>;
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+fn lenient_string<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(d.deserialize_any(Lenient::<String>(PhantomData))?
+        .unwrap_or_default())
+}
+
+fn lenient_opt_string<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    d.deserialize_any(Lenient::<String>(PhantomData))
+}
+
+fn lenient_input_mode<'de, D: Deserializer<'de>>(d: D) -> Result<Option<InputMode>, D::Error> {
+    d.deserialize_any(Lenient::<InputMode>(PhantomData))
+}
+
+/// Known output modes of an array; anything else (unknown strings, other values, a non-array)
+/// is skipped.
+struct LenientModes;
+
+impl<'de> Visitor<'de> for LenientModes {
+    type Value = Vec<OutputMode>;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+        let mut out = Vec::new();
+        while let Some(m) = a.next_element_seed(Lenient::<OutputMode>(PhantomData))? {
+            // At most one entry per known mode: a frame of `"audio","audio",...` stays tiny.
+            if let Some(m) = m.filter(|m| !out.contains(m)) {
+                out.push(m);
+            }
+        }
+        Ok(out)
+    }
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(Vec::new())
+    }
+    fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_any(self)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, a: A) -> Result<Self::Value, A::Error> {
+        drain_map(a)?;
+        Ok(Vec::new())
+    }
+    lenient_other!(Vec::new());
 }
 
 fn lenient_modes<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<OutputMode>, D::Error> {
-    Ok(match Value::deserialize(d)? {
-        Value::Array(items) => items
-            .into_iter()
-            .filter_map(|v| OutputMode::deserialize(v).ok())
-            .collect(),
-        _ => Vec::new(),
-    })
+    d.deserialize_any(LenientModes)
+}
+
+/// A capabilities object: known keys with boolean values are taken; a known key with another
+/// value counts as `false`; unknown keys are skipped; a non-object gives the default.
+struct LenientCaps;
+
+/// Which capability a key names (`None`: unknown key).
+struct CapKey;
+
+impl<'de> Visitor<'de> for CapKey {
+    type Value = Option<u8>;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a key")
+    }
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(match v {
+            "barge_in" => Some(0),
+            "tts" => Some(1),
+            "transcriber" => Some(2),
+            _ => None,
+        })
+    }
+}
+
+impl<'de> de::DeserializeSeed<'de> for CapKey {
+    type Value = Option<u8>;
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_str(self)
+    }
+}
+
+/// A boolean, or `false` for any other value (skipped).
+struct LenientBool;
+
+impl<'de> Visitor<'de> for LenientBool {
+    type Value = bool;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+        Ok(v)
+    }
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(false)
+    }
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(false)
+    }
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(false)
+    }
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(false)
+    }
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(false)
+    }
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(false)
+    }
+    fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_any(self)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, a: A) -> Result<Self::Value, A::Error> {
+        drain_seq(a)?;
+        Ok(false)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, a: A) -> Result<Self::Value, A::Error> {
+        drain_map(a)?;
+        Ok(false)
+    }
+}
+
+impl<'de> de::DeserializeSeed<'de> for LenientBool {
+    type Value = bool;
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for LenientCaps {
+    type Value = Capabilities;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+        let mut c = Capabilities::default();
+        while let Some(k) = a.next_key_seed(CapKey)? {
+            match k {
+                Some(0) => c.barge_in = a.next_value_seed(LenientBool)?,
+                Some(1) => c.tts = a.next_value_seed(LenientBool)?,
+                Some(2) => c.transcriber = a.next_value_seed(LenientBool)?,
+                _ => {
+                    a.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(c)
+    }
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(Capabilities::default())
+    }
+    fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_any(self)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, a: A) -> Result<Self::Value, A::Error> {
+        drain_seq(a)?;
+        Ok(Capabilities::default())
+    }
+    lenient_other!(Capabilities::default());
+}
+
+fn lenient_capabilities<'de, D: Deserializer<'de>>(d: D) -> Result<Capabilities, D::Error> {
+    d.deserialize_any(LenientCaps)
 }
 
 /// A field whose value the agent never reads: skipped while parsing (no allocation, no
