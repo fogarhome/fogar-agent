@@ -15,8 +15,8 @@
 
 use fogar_ports::{
     audio::{
-        ActiveCapture, ActivePlayback, AudioChunk, AudioError, AudioFormat, AudioSink, AudioSinkCaps, AudioSource,
-        AudioSourceCaps, MicPermission,
+        ActiveCapture, ActivePlayback, AudioChunk, AudioError, AudioFormat, AudioSink,
+        AudioSinkCaps, AudioSource, AudioSourceCaps, MicPermission,
     },
     events::EventStream,
 };
@@ -32,7 +32,10 @@ impl AudioSource for MacAudioSource {
     fn mic_permission(&self) -> MicPermission {
         MicPermission::Unknown
     }
-    fn open(&self, _capacity: NonZeroUsize) -> Result<(Box<dyn ActiveCapture>, EventStream<AudioChunk>), AudioError> {
+    fn open(
+        &self,
+        _capacity: NonZeroUsize,
+    ) -> Result<(Box<dyn ActiveCapture>, EventStream<AudioChunk>), AudioError> {
         Err(AudioError::Unsupported("macOS capture arrives in S2"))
     }
 }

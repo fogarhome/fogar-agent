@@ -47,7 +47,9 @@ impl PowerPolicy for MacPowerPolicy {
         if rc == 0 {
             Ok(Applied::Applied)
         } else {
-            Err(PowerError::Platform(Box::new(std::io::Error::from_raw_os_error(rc))))
+            Err(PowerError::Platform(Box::new(
+                std::io::Error::from_raw_os_error(rc),
+            )))
         }
     }
 }

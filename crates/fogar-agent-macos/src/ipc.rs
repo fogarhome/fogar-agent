@@ -8,7 +8,9 @@
 //! the Team-ID designated requirement of the Swift app; uid via `getpeereid` as a first gate.
 //! Never authorize by PID (`LOCAL_PEERPID`). Same framing as fogar-agent-linux `UdsConn`.
 
-use fogar_ports::ipc::{IpcCaps, IpcConn, IpcError, IpcRequest, IpcResponse, IpcServer, PeerIdentity};
+use fogar_ports::ipc::{
+    IpcCaps, IpcConn, IpcError, IpcRequest, IpcResponse, IpcServer, PeerIdentity,
+};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MacIpcServer;

@@ -35,7 +35,9 @@ impl SystemProbe for MacSystemProbe {
         // getloadavg writes at most nelem values and does not retain the pointer.
         let n = unsafe { getloadavg(avg.as_mut_ptr(), 3) };
         if n < 1 {
-            return Err(ProbeError::Platform(Box::new(std::io::Error::last_os_error())));
+            return Err(ProbeError::Platform(Box::new(
+                std::io::Error::last_os_error(),
+            )));
         }
         Ok(SystemSnapshot::new().with_load(avg[0].max(0.0) as f32))
     }

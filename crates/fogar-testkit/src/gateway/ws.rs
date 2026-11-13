@@ -34,7 +34,11 @@ pub struct MockGateway {
 
 impl MockGateway {
     pub async fn start(cfg: MockConfig) -> std::io::Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        Self::from_listener(TcpListener::bind("127.0.0.1:0").await?, cfg)
+    }
+
+    /// Serves on an already-bound listener (e.g. a fixed port that was down a moment ago).
+    pub fn from_listener(listener: TcpListener, cfg: MockConfig) -> std::io::Result<Self> {
         let addr = listener.local_addr()?;
         let gw = Self {
             addr,
