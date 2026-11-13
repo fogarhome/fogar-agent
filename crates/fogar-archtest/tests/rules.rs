@@ -340,10 +340,10 @@ fn adapters_reaching_core(dir: &Path) -> Vec<String> {
     let mut bad = Vec::new();
     for p in md["packages"].as_array().unwrap() {
         let name = p["name"].as_str().unwrap();
-        if name == "fogar-host" || name.starts_with(ADAPTER_PREFIX) {
-            if closure_in(dir, name).contains("fogar-core") {
-                bad.push(name.to_owned());
-            }
+        if (name == "fogar-host" || name.starts_with(ADAPTER_PREFIX))
+            && closure_in(dir, name).contains("fogar-core")
+        {
+            bad.push(name.to_owned());
         }
     }
     bad
