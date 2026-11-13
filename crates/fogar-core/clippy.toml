@@ -21,10 +21,22 @@ disallowed-methods = [
   { path = "tokio::time::sleep", reason = "use the Clock port" },
   { path = "tokio::time::timeout", reason = "use crate::time::deadline over the Clock port" },
   { path = "tokio::time::interval", reason = "use the Clock port" },
+  # Review code#4: the whole tokio::time module is off-limits (archtest R10 also scans sources).
+  { path = "tokio::time::sleep_until", reason = "use the Clock port" },
+  { path = "tokio::time::timeout_at", reason = "use crate::time::deadline over the Clock port" },
+  { path = "tokio::time::interval_at", reason = "use the Clock port" },
+  { path = "tokio::time::Instant::now", reason = "use the Clock port" },
+  { path = "tokio::time::pause", reason = "paused time is for tests only" },
+  { path = "tokio::time::advance", reason = "paused time is for tests only" },
+  { path = "tokio::time::resume", reason = "paused time is for tests only" },
 ]
 disallowed-types = [
   { path = "std::fs::File", reason = "storage is a port" },
   { path = "std::net::TcpStream", reason = "network is the GatewayLink port" },
   { path = "std::time::Instant", reason = "use fogar_ports::clock::Mono" },
+  { path = "tokio::time::Instant", reason = "use fogar_ports::clock::Mono" },
+  { path = "tokio::time::Sleep", reason = "use the Clock port" },
+  { path = "tokio::time::Interval", reason = "use the Clock port" },
+  { path = "tokio::time::Timeout", reason = "use crate::time::deadline over the Clock port" },
   { path = "tokio::sync::mpsc::UnboundedSender", reason = "every queue is bounded" },
 ]
