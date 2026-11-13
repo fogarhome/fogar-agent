@@ -131,7 +131,7 @@ mod busy_downlink {
         type Session = FloodSess;
         async fn connect(&self) -> Result<FloodSess, LinkError> {
             let inner = self.inner.connect().await?;
-            let rx = self.rx.lock().unwrap().take();
+            let rx = self.rx.lock().ok().and_then(|mut g| g.take());
             Ok(FloodSess { inner, rx })
         }
     }
