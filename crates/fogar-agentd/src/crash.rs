@@ -20,12 +20,22 @@ fn record_path(state_dir: &Path) -> PathBuf {
 pub(crate) fn write_record(state_dir: &Path, what: &str) {
     let path = record_path(state_dir);
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        use std::os::unix::fs::DirBuilderExt;
+        let _ = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir);
+        // Never write through a symlinked crash dir (review sec#1).
+        if std::fs::symlink_metadata(dir).map_or(true, |m| !m.is_dir()) {
+            return;
+        }
     }
-    let too_big = std::fs::metadata(&path)
+    let too_big = std::fs::symlink_metadata(&path)
         .map(|m| m.len() > MAX_RECORD_BYTES)
         .unwrap_or(false);
-    let mut opts = std::fs::OpenOptions::new();
+    // O_NOFOLLOW + 0600: a planted `last.txt` symlink makes the open fail instead of clobbering
+    // its target.
+    let mut opts = crate::state_dir::private_file();
     opts.create(true);
     if too_big {
         opts.write(true).truncate(true);
@@ -51,4 +61,25 @@ pub(crate) fn install_hook(state_dir: &Path) {
         let bt = std::backtrace::Backtrace::force_capture();
         write_record(&dir, &format!("{info}\n{bt}"));
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review sec#1: a symlink planted at `crash/last.txt` is never followed.
+    #[cfg(unix)]
+    #[test]
+    fn planted_crash_record_symlink_is_not_followed() {
+        let base = std::env::temp_dir().join(format!("fogar-crash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("state");
+        std::fs::create_dir_all(dir.join("crash")).unwrap();
+        let victim = base.join("victim.txt");
+        std::fs::write(&victim, "keep\n").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("crash/last.txt")).unwrap();
+        write_record(&dir, "boom");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep\n");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

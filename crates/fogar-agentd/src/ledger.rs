@@ -1,6 +1,7 @@
 //! Boot ledger for the crash-loop breaker (ADR-0003). Policy lives in `fogar_core::crashloop`;
 //! this file only persists lines `<unix_ms> start|clean|stable`, bounded to the policy window.
 
+use crate::state_dir;
 use fogar_core::crashloop::{BootMode, BreakerPolicy, LedgerEntry, LedgerKind, evaluate};
 use std::{
     io::Write,
@@ -54,7 +55,8 @@ impl Ledger {
     pub(crate) fn begin_boot(&self) -> BootMode {
         let policy = BreakerPolicy::default();
         let now = now_ms();
-        let entries: Vec<LedgerEntry> = std::fs::read_to_string(&self.path)
+        // A symlinked ledger is ignored (and replaced below), never followed (review sec#1).
+        let entries: Vec<LedgerEntry> = state_dir::read_private(&self.path)
             .map(|s| s.lines().filter_map(parse).collect())
             .unwrap_or_default();
         let mode = evaluate(&entries, now, &policy);
@@ -69,24 +71,15 @@ impl Ledger {
             unix_ms: now,
             kind: LedgerKind::Start,
         }));
-        if let Some(dir) = self.path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let tmp = self.path.with_extension("tmp");
-        let ok = std::fs::File::create(&tmp)
-            .and_then(|mut f| {
-                f.write_all(out.as_bytes())?;
-                f.sync_all()
-            })
-            .and_then(|()| std::fs::rename(&tmp, &self.path));
-        if let Err(e) = ok {
+        // The state dir itself was validated by the caller (state_dir::ensure_private_dir).
+        if let Err(e) = state_dir::replace_private(&self.path, out.as_bytes()) {
             eprintln!("fogar-agentd: boot ledger not writable ({e}); crash-loop breaker degraded");
         }
         mode
     }
 
     fn append(&self, kind: LedgerKind) {
-        let r = std::fs::OpenOptions::new()
+        let r = state_dir::private_file()
             .append(true)
             .create(true)
             .open(&self.path)
@@ -117,6 +110,58 @@ impl Ledger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("fogar-ledger-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Review sec#1: symlinks planted at `boot.tmp` / `boot.ledger` are never followed.
+    #[cfg(unix)]
+    #[test]
+    fn planted_symlinks_are_not_followed() {
+        let dir = tmpdir("sym");
+        let victim_dir = tmpdir("victim");
+        let v1 = victim_dir.join("important.conf");
+        let v2 = victim_dir.join("other.ledger");
+        std::fs::write(&v1, "DO NOT TOUCH\n").unwrap();
+        let now = now_ms();
+        let planted: String = (0..12)
+            .map(|i| format!("{} start\n", now - 1000 - i))
+            .collect();
+        std::fs::write(&v2, &planted).unwrap();
+        std::os::unix::fs::symlink(&v1, dir.join("boot.tmp")).unwrap();
+        std::os::unix::fs::symlink(&v2, dir.join("boot.ledger")).unwrap();
+        let l = Ledger::new(&dir);
+        // A symlinked ledger is not trusted: it cannot trip SafeMode.
+        assert_eq!(l.begin_boot(), BootMode::Normal);
+        l.mark_clean();
+        assert_eq!(std::fs::read_to_string(&v1).unwrap(), "DO NOT TOUCH\n");
+        assert_eq!(std::fs::read_to_string(&v2).unwrap(), planted);
+        let md = std::fs::symlink_metadata(dir.join("boot.ledger")).unwrap();
+        assert!(
+            md.file_type().is_file(),
+            "ledger replaced by a regular file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&victim_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_never_follows_a_symlinked_ledger() {
+        let dir = tmpdir("app");
+        let victim_dir = tmpdir("appvictim");
+        let v = victim_dir.join("authorized_keys");
+        std::fs::write(&v, "ssh-ed25519 AAAA\n").unwrap();
+        std::os::unix::fs::symlink(&v, dir.join("boot.ledger")).unwrap();
+        Ledger::new(&dir).mark_clean();
+        assert_eq!(std::fs::read_to_string(&v).unwrap(), "ssh-ed25519 AAAA\n");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&victim_dir);
+    }
 
     #[test]
     fn parse_render_roundtrip_and_garbage() {

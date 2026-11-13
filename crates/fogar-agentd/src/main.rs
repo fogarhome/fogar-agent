@@ -6,10 +6,12 @@
 //!   fogar-agentd run --gateway ws://127.0.0.1:8004/ws/stream [--agent NAME] [--state-dir DIR]
 //!                    [--keepalive-secs N] [--no-ipc]
 //!   fogar-agentd store-key [--state-dir DIR]      (reads the gateway client key from stdin)
+#![forbid(unsafe_code)] // OS calls go through adapters or rustix's safe wrappers (review sec#7)
 
 mod cli;
 mod crash;
 mod ledger;
+mod state_dir;
 mod status_log;
 
 std::cfg_select! {
@@ -53,6 +55,10 @@ const STATUS_LOG_BURST: u32 = 20;
 const WATCHDOG_STALE: Duration = Duration::from_secs(60);
 
 fn main() -> ExitCode {
+    // Before anything holds the client key (review sec#7).
+    if let Err(e) = state_dir::disable_core_dumps() {
+        eprintln!("fogar-agentd: could not disable core dumps: {e}");
+    }
     let cmd = match cli::parse(std::env::args().skip(1)) {
         Ok(c) => c,
         Err(msg) => {
@@ -61,11 +67,33 @@ fn main() -> ExitCode {
         }
     };
     match cmd {
-        cli::Command::StoreKey { state_dir } => {
-            store_key(&state_dir.unwrap_or_else(platform::default_state_dir))
-        }
+        cli::Command::StoreKey { state_dir } => match private_state_dir(state_dir) {
+            Ok(dir) => store_key(&dir),
+            Err(code) => code,
+        },
         cli::Command::Run(opts) => run(opts),
     }
+}
+
+/// Resolves and validates the state directory before anything touches it (review sec#1). A bad
+/// state dir is a configuration error (EX_CONFIG), reported before the boot ledger exists, so it
+/// is never counted as a crash.
+fn private_state_dir(explicit: Option<std::path::PathBuf>) -> Result<std::path::PathBuf, ExitCode> {
+    let Some(dir) = explicit.or_else(platform::default_state_dir) else {
+        eprintln!(
+            "fogar-agentd: no state directory: HOME (or XDG_STATE_HOME) is unset or relative; \
+             pass --state-dir DIR (there is no shared /tmp fallback)"
+        );
+        return Err(ExitCode::from(78));
+    };
+    if let Err(e) = state_dir::ensure_private_dir(&dir) {
+        eprintln!(
+            "fogar-agentd: state directory {} is not a private directory owned by this user: {e}",
+            dir.display()
+        );
+        return Err(ExitCode::from(78));
+    }
+    Ok(dir)
 }
 
 fn store_key(state_dir: &std::path::Path) -> ExitCode {
@@ -102,10 +130,10 @@ fn run(opts: cli::RunOpts) -> ExitCode {
             return ExitCode::from(64);
         }
     };
-    let state_dir = opts
-        .state_dir
-        .clone()
-        .unwrap_or_else(platform::default_state_dir);
+    let state_dir = match private_state_dir(opts.state_dir.clone()) {
+        Ok(d) => d,
+        Err(code) => return code,
+    };
     crash::install_hook(&state_dir);
     let ledger = ledger::Ledger::new(&state_dir);
 

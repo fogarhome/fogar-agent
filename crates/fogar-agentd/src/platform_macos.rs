@@ -22,11 +22,12 @@ pub(crate) struct Platform {
 }
 
 /// Frozen identity (fogar-macos-daemon hard rule 2): never change across versions.
-pub(crate) fn default_state_dir() -> PathBuf {
-    std::env::var_os("HOME").map_or_else(
-        || PathBuf::from("/tmp/com.fogar.agent"),
-        |h| PathBuf::from(h).join("Library/Application Support/com.fogar.agent"),
-    )
+/// `None` when `HOME` is unset or relative: no predictable `/tmp` fallback (review sec#1).
+pub(crate) fn default_state_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|h| h.is_absolute())
+        .map(|h| h.join("Library/Application Support/com.fogar.agent"))
 }
 
 pub(crate) fn secret_store(_state_dir: &Path) -> std::io::Result<Arc<dyn SecretStore>> {

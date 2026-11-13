@@ -17,6 +17,9 @@ fogar-ports = { workspace = true }
 fogar-host = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "time", "signal", "sync"] }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["std", "fs", "process"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 fogar-agent-linux = { workspace = true }
 

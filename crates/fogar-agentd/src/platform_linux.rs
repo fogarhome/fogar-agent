@@ -20,11 +20,14 @@ pub(crate) struct Platform {
     pub(crate) ipc: Option<UdsIpcServer>,
 }
 
-pub(crate) fn default_state_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("XDG_STATE_HOME") {
-        return PathBuf::from(d).join("fogar-agent");
+/// `$XDG_STATE_HOME/fogar-agent` or `$HOME/.local/state/fogar-agent` (absolute values only).
+/// `None` when neither is set: there is NO predictable shared fallback (review sec#1).
+pub(crate) fn default_state_dir() -> Option<PathBuf> {
+    let abs = |v: std::ffi::OsString| Some(PathBuf::from(v)).filter(|p| p.is_absolute());
+    if let Some(d) = std::env::var_os("XDG_STATE_HOME").and_then(abs) {
+        return Some(d.join("fogar-agent"));
     }
-    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp/fogar-agent"), |h| PathBuf::from(h).join(".local/state/fogar-agent"))
+    std::env::var_os("HOME").and_then(abs).map(|h| h.join(".local/state/fogar-agent"))
 }
 
 pub(crate) fn secret_store(state_dir: &Path) -> std::io::Result<Arc<dyn SecretStore>> {
