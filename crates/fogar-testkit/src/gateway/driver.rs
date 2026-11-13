@@ -308,8 +308,8 @@ impl Conn {
         };
         let ready = ServerMsg::Ready(Ready {
             session_id: "c1:1731500000000".into(),
-            agent: hs.agent.as_deref().unwrap_or("main").to_owned(),
-            input_mode: hs.input_mode,
+            agent: Some(hs.agent.as_deref().unwrap_or("main").to_owned()),
+            input_mode: Some(hs.input_mode),
             output_mode: hs.output_mode.clone(),
             requested_capabilities: caps,
             live_capabilities: caps,

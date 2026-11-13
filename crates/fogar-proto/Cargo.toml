@@ -19,6 +19,7 @@ serde_json = { workspace = true, features = ["alloc"] }
 
 [dev-dependencies]
 proptest = { workspace = true }
+fogar-testalloc = { workspace = true }
 
 [lints]
 workspace = true

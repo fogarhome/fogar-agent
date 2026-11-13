@@ -106,14 +106,14 @@ impl<C: Clock> Engine<C> {
                 // Release the output device while offline (energy).
                 st.playback = None;
             }
-            Inbound::Server(msg) => {
+            Inbound::Server(msg, _charge) => {
                 let fx = st.turns.on_server(&msg, now);
                 if fx.turn_started {
                     Stats::inc(&self.stats.turns_started);
                 }
                 self.apply(st, fx, now).await;
             }
-            Inbound::Audio(buf) => {
+            Inbound::Audio(buf, _charge) => {
                 let Ok(frame) = parse_tts_frame(&buf) else {
                     Stats::inc(&self.stats.tts_frames_invalid);
                     return;

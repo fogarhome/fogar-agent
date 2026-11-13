@@ -20,7 +20,7 @@ fn spec_ready_vector_decodes() {
  "live_capabilities": {"barge_in": true, "tts": true, "transcriber": true}, "future_field": 1}"#;
     match decode_server(j).unwrap() {
         ServerMsg::Ready(r) => {
-            assert_eq!(r.agent, "main");
+            assert_eq!(r.agent.as_deref(), Some("main"));
             assert_eq!(
                 r.output_mode,
                 vec![OutputMode::Audio, OutputMode::Text, OutputMode::Status]
@@ -58,7 +58,7 @@ fn spec_turn_vectors_decode() {
         matches!(&decoded[6], ServerMsg::Error(e) if e.turn_reason() == Some(TurnErrorReason::TurnTimeout))
     );
     assert!(
-        matches!(&decoded[7], ServerMsg::PipelineEvent(p) if p.turn == Some(4) && p.extra.contains_key("x") && !p.extra.contains_key("type"))
+        matches!(&decoded[7], ServerMsg::PipelineEvent(p) if p.turn == Some(4) && p.stage == "llm_start")
     );
     assert!(matches!(&decoded[9], ServerMsg::Unknown));
 }
@@ -150,8 +150,8 @@ fn arb_server_msg() -> impl Strategy<Value = ServerMsg> {
             .prop_map(|(s, a, b, t, x)| {
                 ServerMsg::Ready(Ready {
                     session_id: s,
-                    agent: a,
-                    input_mode: InputMode::Audio,
+                    agent: Some(a),
+                    input_mode: Some(InputMode::Audio),
                     output_mode: vec![OutputMode::Audio, OutputMode::Text],
                     requested_capabilities: Capabilities {
                         barge_in: b,
@@ -198,13 +198,8 @@ fn arb_server_msg() -> impl Strategy<Value = ServerMsg> {
                     turn_id
                 })
             ),
-        (arb_text(), proptest::option::of(any::<u64>())).prop_map(|(stage, turn)| {
-            ServerMsg::PipelineEvent(PipelineEvent {
-                stage,
-                turn,
-                extra: Default::default(),
-            })
-        }),
+        (arb_text(), proptest::option::of(any::<u64>()))
+            .prop_map(|(stage, turn)| { ServerMsg::PipelineEvent(PipelineEvent { stage, turn }) }),
     ]
 }
 
@@ -262,4 +257,35 @@ proptest! {
     fn classify_close_is_total(code in any::<u16>(), reason in "\\PC{0,40}") {
         let _ = fogar_proto::classify_close(code, &reason);
     }
+}
+
+/// Review code#5: any frame with `"type":"ready"` is a `ready`, whatever its other fields look
+/// like (older gateways, future fields, nulls, new enum values). Missing/odd fields get defaults.
+#[test]
+fn ready_decoding_is_tolerant() {
+    let cases = [
+        r#"{"type":"ready"}"#,
+        r#"{"type":"ready","session_id":"c:1","agent":null}"#,
+        r#"{"type":"ready","capabilities":{"barge_in":true,"tts":true}}"#,
+        r#"{"type":"ready","capabilities":["tts"],"agent":"main"}"#,
+        r#"{"type":"ready","output_mode":["audio","video","text"],"input_mode":"video"}"#,
+        r#"{"type":"ready","output_mode":"audio","input_mode":null,"session_id":42}"#,
+        r#"{"type":"ready","requested_capabilities":[],"live_capabilities":{"tts":"yes"}}"#,
+        r#"{"type":"ready","live_capabilities":{"tts":true,"new_cap":true}}"#,
+    ];
+    for c in cases {
+        match decode_server(c) {
+            Ok(ServerMsg::Ready(_)) => {}
+            other => panic!("{c} -> {other:?}"),
+        }
+    }
+    let Ok(ServerMsg::Ready(r)) = decode_server(
+        r#"{"type":"ready","agent":null,"output_mode":["audio","video","text"],"live_capabilities":{"tts":true,"new_cap":true}}"#,
+    ) else {
+        panic!()
+    };
+    assert_eq!(r.agent, None);
+    assert_eq!(r.output_mode, vec![OutputMode::Audio, OutputMode::Text]);
+    assert!(r.live_capabilities.tts);
+    assert_eq!(r.input_mode, None);
 }

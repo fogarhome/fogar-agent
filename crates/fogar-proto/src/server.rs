@@ -4,8 +4,8 @@
 //! produces them, and the round-trip proptests use it. Serialising a server message is never
 //! done by the agent itself.
 
-use alloc::{collections::BTreeMap, string::String, vec::Vec};
-use serde::{Deserialize, Serialize};
+use alloc::{string::String, vec::Vec};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned, de::IgnoredAny};
 use serde_json::Value;
 
 use crate::client::{InputMode, OutputMode};
@@ -42,16 +42,58 @@ pub enum ServerMsg {
 }
 
 /// CERTAIN (JAP §1.4). May arrive AFTER one or more `Status`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Tolerant by design (review code#5): ANY frame with `"type":"ready"` decodes as `Ready`. Every
+/// field is optional; a missing, `null` or unexpectedly shaped value takes its default; unknown
+/// `output_mode` values are dropped; unknown fields (e.g. an older gateway's `capabilities`) are
+/// ignored. The agent only needs the fact that the session is ready.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ready {
     /// `"<client_id>:<timestamp_ms>"`: identifies the connection, not the conversation.
+    #[serde(default, deserialize_with = "lenient")]
     pub session_id: String,
-    /// Effective agent: trust it over the requested one.
-    pub agent: String,
-    pub input_mode: InputMode,
+    /// Effective agent: trust it over the requested one. `None` if absent or `null`.
+    #[serde(default, deserialize_with = "lenient")]
+    pub agent: Option<String>,
+    /// `None` if absent or a value this client does not know.
+    #[serde(default, deserialize_with = "lenient")]
+    pub input_mode: Option<InputMode>,
+    /// Known modes only (unknown values are skipped).
+    #[serde(default, deserialize_with = "lenient_modes")]
     pub output_mode: Vec<OutputMode>,
+    #[serde(default, deserialize_with = "lenient")]
     pub requested_capabilities: Capabilities,
+    #[serde(default, deserialize_with = "lenient")]
     pub live_capabilities: Capabilities,
+}
+
+/// `T` if the value has `T`'s shape, otherwise `T::default()`. The intermediate `Value` lives only
+/// while one `ready` frame is decoded (once per connection).
+fn lenient<'de, D: Deserializer<'de>, T: DeserializeOwned + Default>(d: D) -> Result<T, D::Error> {
+    let v = Value::deserialize(d)?;
+    Ok(T::deserialize(v).unwrap_or_default())
+}
+
+fn lenient_modes<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<OutputMode>, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::Array(items) => items
+            .into_iter()
+            .filter_map(|v| OutputMode::deserialize(v).ok())
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// A field whose value the agent never reads: skipped while parsing (no allocation, no
+/// `serde_json::Value` tree; review sec#4). Only its presence is recorded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Skipped;
+
+impl<'de> Deserialize<'de> for Skipped {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        IgnoredAny::deserialize(d)?;
+        Ok(Skipped)
+    }
 }
 
 /// CERTAIN keys. `false` is ambiguous ("not requested" or "down").
@@ -99,7 +141,7 @@ pub struct Interrupted {
     pub turn_id: Option<String>,
 }
 
-/// Field names CERTAIN (JAP §1.6). `args` shape UNKNOWN (kept as `Value`).
+/// Field names CERTAIN (JAP §1.6). `args` shape UNKNOWN and unused: skipped, not kept (sec#4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub turn_id: String,
@@ -107,8 +149,9 @@ pub struct ToolCall {
     pub phase: String,
     pub name: String,
     pub tool_call_id: String,
-    #[serde(default)]
-    pub args: Option<Value>,
+    /// `Some` if the frame carried `args` (the value itself is not kept).
+    #[serde(default, skip_serializing)]
+    pub args: Option<Skipped>,
     #[serde(default)]
     pub result: Option<String>,
     #[serde(default)]
@@ -234,12 +277,11 @@ impl ErrorMsg {
 }
 
 /// GUESSED beyond `stage` and `turn`. Only sent if `OutputMode::Status` was requested (we don't).
-/// `turn` is a different counter from `turn_id`.
+/// `turn` is a different counter from `turn_id`. Other fields are ignored, not kept (review sec#4:
+/// a flattened map of `Value`s cost ~30x the frame size).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PipelineEvent {
     pub stage: String,
     #[serde(default)]
     pub turn: Option<u64>,
-    #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
 }

@@ -1,8 +1,9 @@
 //! JSON text-frame codecs. Errors are small `Copy` enums (no allocation, no source chains that
 //! could echo untrusted input into logs).
 
-use alloc::string::String;
+use alloc::{borrow::Cow, string::String};
 use core::fmt;
+use serde::Deserialize;
 
 use crate::{
     client::{ClientMsg, Handshake},
@@ -55,12 +56,42 @@ impl fmt::Display for EncodeError {
 }
 impl core::error::Error for EncodeError {}
 
+/// Only the `type` tag; every other field is skipped without allocating.
+#[derive(Deserialize)]
+struct Tag<'a> {
+    #[serde(borrow, rename = "type")]
+    ty: Cow<'a, str>,
+}
+
 /// Decodes one server text frame. Never panics on any input (proptest-checked).
+///
+/// Two passes over the text instead of serde's internally-tagged enum (review sec#4): the derived
+/// `ServerMsg` deserializer buffers the WHOLE object as a `Content` tree before it can look at
+/// `type` (~32x the frame size for nested arrays). Pass 1 reads only `type`; pass 2 parses the
+/// frame straight into the variant's struct, skipping unknown fields. Unknown types never parse
+/// further than the tag.
 pub fn decode_server(text: &str) -> Result<ServerMsg, DecodeError> {
     if text.len() > WS_MAX_FRAME_BYTES {
         return Err(DecodeError::TooLarge { len: text.len() });
     }
-    serde_json::from_str(text).map_err(|_| DecodeError::Invalid)
+    fn body<'a, T: Deserialize<'a>>(text: &'a str) -> Result<T, DecodeError> {
+        serde_json::from_str(text).map_err(|_| DecodeError::Invalid)
+    }
+    let tag: Tag<'_> = body(text)?;
+    Ok(match tag.ty.as_ref() {
+        "ready" => ServerMsg::Ready(body(text)?),
+        "transcription_partial" => ServerMsg::TranscriptionPartial(body(text)?),
+        "transcription" => ServerMsg::Transcription(body(text)?),
+        "turn_start" => ServerMsg::TurnStart(body(text)?),
+        "token" => ServerMsg::Token(body(text)?),
+        "tool_call" => ServerMsg::ToolCall(body(text)?),
+        "turn_end" => ServerMsg::TurnEnd(body(text)?),
+        "interrupted" => ServerMsg::Interrupted(body(text)?),
+        "status" => ServerMsg::Status(body(text)?),
+        "error" => ServerMsg::Error(body(text)?),
+        "pipeline_event" => ServerMsg::PipelineEvent(body(text)?),
+        _ => ServerMsg::Unknown,
+    })
 }
 
 /// Decodes one client text frame (used by the fake gateway; the agent never needs it).

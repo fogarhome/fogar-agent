@@ -217,6 +217,7 @@ dependencies = [
 name = "fogar-proto"
 version = "0.0.1"
 dependencies = [
+ "fogar-testalloc",
  "proptest",
  "serde",
  "serde_json",

@@ -181,6 +181,7 @@ impl<C: Clock> Agent<C> {
             cfg: cfg.clone(),
             stats: stats.clone(),
             view: view_tx.clone(),
+            budget: queues::ByteBudget::new(queues::INBOUND_BYTES),
         };
         io.spawn(link.run(out_rx, in_tx, egress.clone()));
 

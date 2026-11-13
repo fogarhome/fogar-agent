@@ -14,6 +14,7 @@ use std::{
 };
 
 static LIVE: AtomicIsize = AtomicIsize::new(0);
+static PEAK: AtomicIsize = AtomicIsize::new(0);
 
 /// Forwards to [`System`] and tracks live bytes (relaxed: a statistic, publishes nothing).
 #[derive(Debug, Clone, Copy, Default)]
@@ -22,6 +23,22 @@ pub struct Counting;
 /// Live heap bytes allocated through [`Counting`] (process-global).
 pub fn live_bytes() -> isize {
     LIVE.load(Ordering::Relaxed)
+}
+
+/// Highest [`live_bytes`] seen since the last [`reset_peak`] (process-global; tests that use it
+/// must not run other allocating tests concurrently, e.g. one test per binary).
+pub fn peak_bytes() -> isize {
+    PEAK.load(Ordering::Relaxed)
+}
+
+/// Starts a new peak measurement at the current live size.
+pub fn reset_peak() {
+    PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
+fn grew(delta: isize) {
+    let now = LIVE.fetch_add(delta, Ordering::Relaxed) + delta;
+    PEAK.fetch_max(now, Ordering::Relaxed);
 }
 
 fn size(l: Layout) -> isize {
@@ -35,7 +52,7 @@ unsafe impl GlobalAlloc for Counting {
         // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract (non-zero size layout).
         let p = unsafe { System.alloc(l) };
         if !p.is_null() {
-            LIVE.fetch_add(size(l), Ordering::Relaxed);
+            grew(size(l));
         }
         p
     }
@@ -43,7 +60,7 @@ unsafe impl GlobalAlloc for Counting {
         // SAFETY: as for `alloc`.
         let p = unsafe { System.alloc_zeroed(l) };
         if !p.is_null() {
-            LIVE.fetch_add(size(l), Ordering::Relaxed);
+            grew(size(l));
         }
         p
     }
@@ -57,10 +74,7 @@ unsafe impl GlobalAlloc for Counting {
         // SAFETY: same provenance argument as `dealloc`; `new_size` constraints are the caller's.
         let q = unsafe { System.realloc(p, l, new_size) };
         if !q.is_null() {
-            LIVE.fetch_add(
-                isize::try_from(new_size).unwrap_or(isize::MAX) - size(l),
-                Ordering::Relaxed,
-            );
+            grew(isize::try_from(new_size).unwrap_or(isize::MAX) - size(l));
         }
         q
     }

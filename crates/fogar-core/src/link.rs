@@ -9,6 +9,7 @@
 
 use crate::{
     config::Config,
+    queues::{ByteBudget, Charge},
     stats::{LinkState, Stats},
     time::deadline,
 };
@@ -26,14 +27,26 @@ use std::{borrow::Cow, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-/// Session -> engine events.
-#[derive(Debug)]
+/// Session -> engine events. Frames carry the [`Charge`] of their bytes against
+/// `queues::INBOUND_BYTES`; it is released when the engine drops the message.
 pub(crate) enum Inbound {
     SessionUp,
     SessionDown,
-    Server(ServerMsg),
+    Server(ServerMsg, Charge),
     /// Raw binary frame (0xA1 + turn_seq + PCM16); the engine parses it zero-copy.
-    Audio(Vec<u8>),
+    Audio(Vec<u8>, Charge),
+}
+
+/// Redacting `Debug` (review sec#7, LOG-1): transcripts, tokens and audio never reach a log line.
+impl std::fmt::Debug for Inbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Inbound::SessionUp => f.write_str("SessionUp"),
+            Inbound::SessionDown => f.write_str("SessionDown"),
+            Inbound::Server(m, _) => f.debug_tuple("Server").field(m).finish(),
+            Inbound::Audio(b, _) => write!(f, "Audio(<{} bytes>)", b.len()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +63,8 @@ pub(crate) struct LinkCtx<C, L> {
     pub(crate) cfg: Arc<Config>,
     pub(crate) stats: Arc<Stats>,
     pub(crate) view: watch::Sender<LinkView>,
+    /// Byte budget of the inbound queue (`queues::INBOUND_BYTES`).
+    pub(crate) budget: ByteBudget,
 }
 
 /// Why a connection attempt / session ended.
@@ -130,16 +145,7 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                 if up_for >= self.cfg.backoff.stable_after {
                     attempt = 0;
                 }
-                if !forward(
-                    &*self.clock,
-                    &self.stats,
-                    &in_tx,
-                    Inbound::SessionDown,
-                    self.cfg.inbound_deadline,
-                    &egress,
-                )
-                .await
-                {
+                if !self.forward(&in_tx, Inbound::SessionDown, &egress).await {
                     break;
                 }
             }
@@ -253,16 +259,7 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
             .sessions_started
             .load(std::sync::atomic::Ordering::Relaxed);
         self.set_state(LinkState::Ready { session });
-        if !forward(
-            clock,
-            &self.stats,
-            in_tx,
-            Inbound::SessionUp,
-            self.cfg.inbound_deadline,
-            egress,
-        )
-        .await
-        {
+        if !self.forward(in_tx, Inbound::SessionUp, egress).await {
             self.close_quietly(&mut sess, CLOSE_NORMAL).await;
             return (Outcome::Shutdown, true);
         }
@@ -291,7 +288,10 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                     Some(LinkEvent::Frame(Frame::Text(t))) => match decode_server(&t) {
                         Ok(ServerMsg::Ready(_)) => return Ok(()),
                         Ok(msg @ ServerMsg::Status(_)) => {
-                            if !forward(clock, &self.stats, in_tx, Inbound::Server(msg), self.cfg.inbound_deadline, egress).await {
+                            let Some(charge) = self.charge(t.len(), egress).await else {
+                                return Err(Outcome::EngineGone);
+                            };
+                            if !self.forward(in_tx, Inbound::Server(msg, charge), egress).await {
                                 return Err(Outcome::EngineGone);
                             }
                         }
@@ -336,7 +336,11 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                     Some(LinkEvent::Frame(Frame::Text(t))) => match decode_server(&t) {
                         Ok(ServerMsg::Unknown) => {}
                         Ok(msg) => {
-                            if !forward(clock, &self.stats, in_tx, Inbound::Server(msg), self.cfg.inbound_deadline, egress).await {
+                            let delivered = match self.charge(t.len(), egress).await {
+                                Some(charge) => self.forward(in_tx, Inbound::Server(msg, charge), egress).await,
+                                None => false,
+                            };
+                            if !delivered {
                                 if egress.is_cancelled() {
                                     self.close_quietly(sess, CLOSE_NORMAL).await;
                                     return Outcome::Shutdown;
@@ -351,13 +355,16 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                         }
                         Err(_) => Stats::inc(&self.stats.inbound_invalid),
                     },
-                    Some(LinkEvent::Frame(Frame::Binary(b))) => match in_tx.try_send(Inbound::Audio(b)) {
+                    Some(LinkEvent::Frame(Frame::Binary(b))) => match self.budget.try_charge(b.len()) {
+                        None => Stats::inc(&self.stats.inbound_audio_shed),
+                        Some(charge) => match in_tx.try_send(Inbound::Audio(b, charge)) {
                         Ok(()) => Stats::hwm(&self.stats.in_queue_hwm, in_tx.max_capacity() - in_tx.capacity()),
                         Err(mpsc::error::TrySendError::Full(_)) => Stats::inc(&self.stats.inbound_audio_shed),
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             self.close_quietly(sess, CLOSE_NORMAL).await;
                             return Outcome::EngineGone;
                         }
+                        },
                     },
                 },
                 out = out_rx.recv() => match out {
@@ -401,27 +408,40 @@ async fn sleep_until_opt<C: Clock>(clock: &C, at: Option<Mono>) {
     }
 }
 
-/// Must-deliver enqueue with a deadline (see `queues`). `false` = shutdown, engine gone, or the
-/// engine stalled past the deadline.
-async fn forward<C: Clock>(
-    clock: &C,
-    stats: &Stats,
-    in_tx: &mpsc::Sender<Inbound>,
-    ev: Inbound,
-    limit: Duration,
-    egress: &CancellationToken,
-) -> bool {
-    let permit = tokio::select! {
-        biased;
-        () = egress.cancelled() => return false,
-        p = deadline(clock, limit, in_tx.reserve()) => p,
-    };
-    match permit {
-        Some(Ok(p)) => {
-            p.send(ev);
-            Stats::hwm(&stats.in_queue_hwm, in_tx.max_capacity() - in_tx.capacity());
-            true
+impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
+    /// Charges a must-deliver JSON frame's bytes against `INBOUND_BYTES`, waiting up to
+    /// `inbound_deadline`. `None` = shutdown or the engine stalled past the deadline.
+    async fn charge(&self, bytes: usize, egress: &CancellationToken) -> Option<Charge> {
+        tokio::select! {
+            biased;
+            () = egress.cancelled() => None,
+            c = deadline(&*self.clock, self.cfg.inbound_deadline, self.budget.charge(bytes)) => c.flatten(),
         }
-        Some(Err(_)) | None => false,
+    }
+
+    /// Must-deliver enqueue with a deadline (see `queues`). `false` = shutdown, engine gone, or
+    /// the engine stalled past the deadline.
+    async fn forward(
+        &self,
+        in_tx: &mpsc::Sender<Inbound>,
+        ev: Inbound,
+        egress: &CancellationToken,
+    ) -> bool {
+        let permit = tokio::select! {
+            biased;
+            () = egress.cancelled() => return false,
+            p = deadline(&*self.clock, self.cfg.inbound_deadline, in_tx.reserve()) => p,
+        };
+        match permit {
+            Some(Ok(p)) => {
+                p.send(ev);
+                Stats::hwm(
+                    &self.stats.in_queue_hwm,
+                    in_tx.max_capacity() - in_tx.capacity(),
+                );
+                true
+            }
+            Some(Err(_)) | None => false,
+        }
     }
 }
