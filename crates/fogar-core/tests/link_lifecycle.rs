@@ -266,3 +266,80 @@ async fn locked_secret_store_backs_off_and_recovers() {
     assert_eq!(rig.health.snapshot().stats.connect_attempts, 1);
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
+
+/// Review code#1 / sec#2: a gateway that answers every session with a "normal" (1000) or
+/// "restart" (1012) close right after `ready` must not drive a reconnect storm. Unstable sessions
+/// (shorter than `stable_after`) escalate the backoff like any other failure.
+#[tokio::test(start_paused = true)]
+async fn flapping_normal_or_restart_close_escalates_backoff() {
+    for code in [1000u16, 1012] {
+        let mut rig = RigBuilder::fake(MockConfig::default()).start();
+        let t0 = tokio::time::Instant::now();
+        let mut last_attempt = 0;
+        for n in 1..=10u64 {
+            wait_state(
+                &mut rig.health,
+                |v| matches!(v.state, LinkState::Ready { session } if session == n),
+            )
+            .await;
+            assert_eq!(rig.link.close_all(code, ""), 1);
+            let v = wait_state(&mut rig.health, |v| {
+                matches!(v.state, LinkState::Backoff { .. })
+            })
+            .await;
+            let LinkState::Backoff { attempt, .. } = v.state else {
+                unreachable!()
+            };
+            last_attempt = attempt;
+        }
+        assert_eq!(last_attempt, 10, "close {code}: attempt must escalate");
+        // 9 waits with windows 0.5, 1, 2, 4, ... 60 s: full jitter averages far above the old
+        // storm (10 x U[0.1, 0.5] s = a few seconds).
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed > Duration::from_secs(20),
+            "close {code}: 10 flapping sessions in only {elapsed:?}"
+        );
+        assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
+    }
+}
+
+/// A session that stayed up >= `stable_after` and then got the idle close reconnects promptly
+/// (attempt counter reset, first window).
+#[tokio::test(start_paused = true)]
+async fn stable_session_normal_close_reconnects_promptly() {
+    let b = RigBuilder::fake(MockConfig::default());
+    let stable = b.cfg.backoff.stable_after;
+    let first = b.cfg.backoff.window(0);
+    let mut rig = b.start();
+    // Escalate first with a few flapping sessions.
+    for n in 1..=4u64 {
+        wait_state(
+            &mut rig.health,
+            |v| matches!(v.state, LinkState::Ready { session } if session == n),
+        )
+        .await;
+        rig.link.close_all(1000, "");
+    }
+    wait_state(&mut rig.health, |v| {
+        matches!(v.state, LinkState::Ready { session: 5 })
+    })
+    .await;
+    tokio::time::sleep(stable + Duration::from_secs(1)).await;
+    rig.link.close_all(1000, "");
+    let v = wait_state(&mut rig.health, |v| {
+        matches!(v.state, LinkState::Backoff { .. })
+    })
+    .await;
+    assert!(
+        matches!(v.state, LinkState::Backoff { attempt: 1, .. }),
+        "{v:?}"
+    );
+    let t = tokio::time::Instant::now();
+    wait_state(&mut rig.health, |v| {
+        matches!(v.state, LinkState::Ready { session: 6 })
+    })
+    .await;
+    assert!(t.elapsed() <= first + Duration::from_millis(50));
+    assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
+}

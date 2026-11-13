@@ -171,16 +171,16 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                             self.park(action, &egress).await;
                             break;
                         }
-                        // Idle close (300 s without client messages) or a normal close: not an
-                        // error; reconnect promptly (jittered) because pushes need a live socket.
-                        CloseAction::IdleOrNormal => {
-                            attempt = 0;
-                            (self.cfg.backoff.delay(0, &*self.random), Some(action))
-                        }
-                        CloseAction::ServerRestart => {
-                            (self.cfg.backoff.delay(0, &*self.random), Some(action))
-                        }
-                        CloseAction::RetryBackoff | CloseAction::Unknown => {
+                        // Idle close (300 s without client messages), a normal close or a
+                        // server restart: not an error, but only a session that stayed up for
+                        // `stable_after` has reset `attempt` above, so a gateway that closes
+                        // every session at once escalates the backoff like any other failure
+                        // (review code#1/sec#2: no reconnect storm, NET-4). After a stable
+                        // session this is `delay(0)`: prompt, jittered reconnect.
+                        CloseAction::IdleOrNormal
+                        | CloseAction::ServerRestart
+                        | CloseAction::RetryBackoff
+                        | CloseAction::Unknown => {
                             let d = self.cfg.backoff.delay(attempt, &*self.random);
                             attempt = attempt.saturating_add(1);
                             (d, Some(action))

@@ -10,6 +10,7 @@
 mod cli;
 mod crash;
 mod ledger;
+mod status_log;
 
 std::cfg_select! {
     target_os = "linux" => {
@@ -45,6 +46,9 @@ use std::{
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(4);
 /// Uptime after which this boot counts as stable for the crash-loop breaker.
 const STABLE_AFTER: Duration = Duration::from_secs(600);
+/// At most `STATUS_LOG_BURST` link status lines per `STATUS_LOG_WINDOW` on stderr.
+const STATUS_LOG_WINDOW: Duration = Duration::from_secs(60);
+const STATUS_LOG_BURST: u32 = 20;
 /// The OS-thread watchdog aborts if the runtime heartbeat is older than this.
 const WATCHDOG_STALE: Duration = Duration::from_secs(60);
 
@@ -196,6 +200,7 @@ async fn serve(
     let watchdog = Watchdog::spawn(agent.heartbeat(), clock.epoch_std(), state_dir.clone());
     let mut health = agent.health();
     let mut last = String::new();
+    let mut limiter = status_log::LogLimiter::new(STATUS_LOG_WINDOW, STATUS_LOG_BURST);
     let stable = tokio::time::sleep(STABLE_AFTER);
     tokio::pin!(stable);
     let mut stable_done = false;
@@ -205,6 +210,13 @@ async fn serve(
             () = &mut stop => break,
             v = health.wait_link(|v| v.state.label() != last) => {
                 last = v.state.label().to_owned();
+                match limiter.check(std::time::Instant::now()) {
+                    status_log::Verdict::Suppress => continue,
+                    status_log::Verdict::Print(Some(n)) => {
+                        eprintln!("fogar-agentd: ({n} link status lines suppressed)");
+                    }
+                    status_log::Verdict::Print(None) => {}
+                }
                 match v.last_close {
                     Some((code, action)) if matches!(v.state, LinkState::Backoff { .. } | LinkState::Parked { .. }) => {
                         eprintln!("fogar-agentd: link {last} (last close {code} -> {action:?})");
