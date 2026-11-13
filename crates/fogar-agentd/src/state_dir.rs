@@ -89,18 +89,26 @@ pub(crate) fn replace_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Review sec#7: no core dumps of the daemon (they would contain the client key and, from S2,
-/// captured audio). Linux: RLIMIT_CORE = 0 (soft and hard). macOS: the same call is POSIX and
-/// is made too; TODO(macos, S2): verify on the M2 that launchd-started processes honour it and
-/// that the release build is not `get-task-allow` (fogar-secure-rust MAC-1).
+/// captured audio). RLIMIT_CORE = 0 (soft and hard), POSIX, on every OS. Linux additionally
+/// (round-2 review F8): PR_SET_DUMPABLE = 0 through rustix's safe wrapper, which also covers a
+/// `core_pattern` pipe helper and refuses same-user ptrace / `/proc/<pid>/mem`. macOS: TODO(macos,
+/// S2): verify on the M2 that launchd-started processes honour the rlimit and that the release
+/// build is not `get-task-allow` (fogar-secure-rust MAC-1); PT_DENY_ATTACH is a separate decision.
+/// Both steps are attempted; the first error is returned.
 pub(crate) fn disable_core_dumps() -> io::Result<()> {
-    rustix::process::setrlimit(
+    let rlimit = rustix::process::setrlimit(
         rustix::process::Resource::Core,
         rustix::process::Rlimit {
             current: Some(0),
             maximum: Some(0),
         },
-    )
-    .map_err(io::Error::from)
+    );
+    #[cfg(target_os = "linux")]
+    let dumpable =
+        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable);
+    #[cfg(not(target_os = "linux"))]
+    let dumpable: rustix::io::Result<()> = Ok(());
+    rlimit.and(dumpable).map_err(io::Error::from)
 }
 
 #[cfg(test)]
@@ -123,5 +131,20 @@ mod tests {
         std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
         assert!(ensure_private_dir(&base.join("link")).is_err());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Round-2 review F8: on Linux the process is also marked non-dumpable (PR_SET_DUMPABLE=0):
+    /// no core dump even if RLIMIT_CORE is raised again or a core pattern pipes to a helper, and
+    /// same-user ptrace / /proc/<pid>/mem access is refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core_dumps_disabled_and_process_not_dumpable() {
+        disable_core_dumps().unwrap();
+        let r = rustix::process::getrlimit(rustix::process::Resource::Core);
+        assert_eq!((r.current, r.maximum), (Some(0), Some(0)));
+        assert_eq!(
+            rustix::process::dumpable_behavior().unwrap(),
+            rustix::process::DumpableBehavior::NotDumpable
+        );
     }
 }
