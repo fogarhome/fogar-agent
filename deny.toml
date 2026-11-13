@@ -1,0 +1,51 @@
+# cargo-deny configuration — written for cargo-deny 0.20.2 (deprecated keys avoided:
+# [advisories] vulnerability/notice, [licenses] unlicensed/copyleft/allow-osi-fsf-free/default/deny).
+# Complements crates/fogar-archtest: archtest = layering between OUR crates; cargo-deny =
+# third-party OS crates only via adapter crates, licenses, advisories, sources.
+# Owned by the architecture owner; agents never edit it to get green (CLAUDE.md).
+
+[graph]
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+]
+all-features = true
+
+[advisories]
+# Vulnerabilities are always errors in 0.20; also fail on unmaintained / unsound / yanked.
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Only what `cargo deny check licenses` actually reported; every addition needs a reason in the PR.
+allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
+confidence-threshold = 0.9
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies inside the workspace are not wildcards.
+allow-wildcard-paths = true
+deny = [
+  # Apple bindings only through the macOS adapter crate (and the binding crates' own families).
+  { crate = "objc2", wrappers = ["fogar-agent-macos", "objc2-foundation", "objc2-core-foundation", "objc2-io-kit", "objc2-security", "block2", "dispatch2"], reason = "macOS APIs only via fogar-agent-macos" },
+  { crate = "windows", wrappers = ["fogar-agent-windows"], reason = "Win32 only via fogar-agent-windows (S8)" },
+  { crate = "openssl", reason = "TLS is rustls (S1)" },
+  { crate = "openssl-sys", reason = "TLS is rustls (S1)" },
+  { crate = "native-tls", reason = "TLS is rustls (S1)" },
+  { crate = "bincode", reason = "unmaintained; fogar-proto is serde_json for protocol v1" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

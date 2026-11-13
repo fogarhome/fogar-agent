@@ -51,8 +51,8 @@ loom = { version = "0.7.3" }
 unreachable_pub = "warn"
 missing_debug_implementations = "warn"
 unsafe_op_in_unsafe_fn = "deny"
-# `--cfg loom` is used by the loom gate (scripts/gates.sh) for fogar-core's custom primitive.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+# `--cfg fogar_loom` is used by the loom gate (scripts/gates.sh) for fogar-core's custom primitive.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fogar_loom)"] }
 
 [workspace.lints.clippy]
 # clippy.toml next to each inner crate holds the disallowed-* lists; these make them errors.

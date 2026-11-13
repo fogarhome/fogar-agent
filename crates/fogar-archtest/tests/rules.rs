@@ -5,7 +5,7 @@
 //!  R1 inner crates never reach adapter / host / composition-root crates (normal+build, all targets)
 //!  R2 test-support crates (testkit, testalloc) are only ever dev-dependencies
 //!  R3 only adapter crates and the composition root declare target-specific deps
-//!     (exception: `cfg(loom)` dev-dependencies, used by the loom gate)
+//!     (exception: `cfg(fogar_loom)` dev-dependencies, used by the loom gate)
 //!  R4 inner crates never reach OS-binding or I/O-driver crates, even transitively
 //!  R5 no platform cfg (`target_os`, `cfg(unix)`, `cfg_select!`...) in inner crates' sources
 //!  R6 fogar-proto: dependency allowlist, every dep with default-features = false
@@ -115,7 +115,7 @@ fn r3_only_adapters_and_root_have_target_specific_deps() {
             if target.is_null() {
                 continue;
             }
-            let loom_dev = target.as_str() == Some("cfg(loom)") && d["kind"].as_str() == Some("dev");
+            let loom_dev = target.as_str() == Some("cfg(fogar_loom)") && d["kind"].as_str() == Some("dev");
             assert!(loom_dev, "{name}: target-specific dep {} ({target})", d["name"]);
         }
     }

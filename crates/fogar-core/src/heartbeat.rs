@@ -2,14 +2,14 @@
 //! thread OUTSIDE the runtime reads its age and aborts the process if the runtime is starved.
 //!
 //! This is the only hand-written concurrency primitive in the workspace, so it is the loom target
-//! (`RUSTFLAGS="--cfg loom" cargo test -p fogar-core --lib heartbeat`). Invariants:
+//! (`RUSTFLAGS="--cfg fogar_loom" cargo test -p fogar-core --lib heartbeat`). Invariants:
 //! - the stamp never moves backwards, even with concurrent `beat`s carrying out-of-order times
 //!   (`fetch_max`);
 //! - `age()` never underflows when the reader's clock lags a writer's.
 
-#[cfg(loom)]
+#[cfg(fogar_loom)]
 use loom::sync::atomic::{AtomicU64, Ordering};
-#[cfg(not(loom))]
+#[cfg(not(fogar_loom))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Default)]
@@ -39,7 +39,7 @@ impl Heartbeat {
     }
 }
 
-#[cfg(all(test, not(loom)))]
+#[cfg(all(test, not(fogar_loom)))]
 mod tests {
     use super::*;
 
@@ -54,7 +54,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, loom))]
+#[cfg(all(test, fogar_loom))]
 mod loom_tests {
     use super::*;
     use loom::{sync::Arc, thread};

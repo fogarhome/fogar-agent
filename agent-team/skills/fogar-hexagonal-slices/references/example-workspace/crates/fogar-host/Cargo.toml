@@ -1,0 +1,19 @@
+[package]
+name = "fogar-host"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Portable adapters shared by every agent crate (tokio clock, TCP uplink...). No cfg(target_os)."
+
+[dependencies]
+fogar-ports = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+fogar-testkit = { workspace = true }
+tokio = { workspace = true, features = ["time", "rt", "macros", "test-util"] }
+
+[lints]
+workspace = true

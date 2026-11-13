@@ -1,0 +1,16 @@
+[package]
+name = "fogar-ports"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Port traits + the plain data types that cross them. No OS APIs, no runtime."
+
+[dependencies]
+thiserror = { workspace = true, features = ["std"] }
+# Only the runtime-agnostic channel types; no executor, no timers, no I/O.
+tokio = { workspace = true, features = ["sync"] }
+
+[lints]
+workspace = true
