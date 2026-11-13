@@ -8,9 +8,22 @@ Status: **PROVISIONAL**
 - `fogar-agentd` installs a panic hook first thing in `run`; it writes a content-free record
   (message, location, thread, uptime, backtrace) to `<state>/crash/last.txt` and fsyncs it
   (capped at 1 MiB).
-- Boot ledger `<state>/boot.ledger` (`start|clean|stable`, bounded to a 10-minute window).
-  4+ unclean starts in 10 min => SafeMode: delayed start 60 s doubling to 32 min, cancellable by
-  SIGTERM. Policy is pure (`fogar_core::crashloop`), I/O in the composition root.
+- Boot ledger `<state>/boot.ledger` (`start|clean|stable`, kept for 3 h). A *run* is the sequence
+  of crashes (unclean starts) since the last `clean`/`stable`. 4 crashes of a run inside 10 min
+  => SafeMode: delayed start 60 s, doubling with every further crash of the run up to 32 min,
+  cancellable by SIGTERM; a `clean` or `stable` boot ends the run. Policy is pure
+  (`fogar_core::crashloop`), I/O in the composition root. (Review code#7a: the first version
+  counted crashes only inside the 10-min window, so the escalating delays pushed old crashes out
+  of the window and the delay plateaued at 4-8 min; the 3 h retention covers a full escalation,
+  60+120+...+1920 s = 62 min. Test: `a_sustained_crash_loop_reaches_the_maximum_delay`.)
+- What counts as clean (review code#2/code#7b): SIGTERM/SIGINT handlers are installed before the
+  ledger records `start`; any stop asked for by a signal writes `clean`, even if a shutdown phase
+  overran its deadline (the overrun is logged separately, not counted as a crash). Shutdown
+  budget 4 s: ingress 1/4, egress (WebSocket close, `close_timeout` 1 s) the rest minus 1/4, ops
+  1/4.
+- The state dir is validated before the ledger is touched (ADR-0006 item 10): owner, 0700, not a
+  symlink, no `/tmp` fallback; ledger/crash files are opened `O_NOFOLLOW`, temp files
+  `create_new`. RLIMIT_CORE = 0 at daemon start (the core would contain the client key).
 - Config/auth problems never exit (exiting makes launchd loop): the link parks and reports health.
 - An OS-thread watchdog aborts (with a crash record) if the runtime heartbeat is > 60 s stale.
 - Exit code after SIGTERM is always 0 (a non-zero exit would make the supervisor restart a

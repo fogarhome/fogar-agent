@@ -1,5 +1,5 @@
 //! Boot ledger for the crash-loop breaker (ADR-0003). Policy lives in `fogar_core::crashloop`;
-//! this file only persists lines `<unix_ms> start|clean|stable`, bounded to the policy window.
+//! this file only persists lines `<unix_ms> start|clean|stable`, bounded to the policy retention.
 
 use crate::state_dir;
 use fogar_core::crashloop::{BootMode, BreakerPolicy, LedgerEntry, LedgerKind, evaluate};
@@ -61,7 +61,7 @@ impl Ledger {
             .unwrap_or_default();
         let mode = evaluate(&entries, now, &policy);
         let since =
-            now.saturating_sub(u64::try_from(policy.window.as_millis()).unwrap_or(u64::MAX));
+            now.saturating_sub(u64::try_from(policy.retention.as_millis()).unwrap_or(u64::MAX));
         let mut out: String = entries
             .iter()
             .filter(|e| e.unix_ms >= since)
