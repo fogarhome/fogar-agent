@@ -7,8 +7,15 @@
 //! Policy (ADR-0003, aligned in review code#7a): a *run* is the sequence of crashes since the last
 //! `Clean`/`Stable`. SafeMode trips when `threshold` crashes of the run fall inside `window`
 //! (10 min), and then stays tripped for the rest of the run: every further crash doubles the delay
-//! up to `max_delay`. The ledger keeps `retention` (3 h) so the run is still visible while the
-//! delays themselves stretch it far beyond 10 min (60+120+...+1920 s = 62 min).
+//! up to `max_delay`.
+//!
+//! Round-2 review F4: the trip is PERSISTED. A boot that starts in SafeMode records a `Safe`
+//! marker next to its `Start`, and a `Safe` marker inside the run keeps it tripped, so the delay
+//! never falls back to 0 when the run's first (fast) crashes age out of the ledger. The run ends
+//! only with `Clean`/`Stable`, or with a quiet gap longer than `retention` (3 h) between two
+//! entries or since the last one (machine off: the next boot starts afresh). A crash loop at the
+//! 32-min ceiling never leaves such a gap. `retain` keeps the run (bounded to
+//! `MAX_LEDGER_ENTRIES`, recent ones first; the run's newest `Safe` marker is always among them).
 
 use std::time::Duration;
 
@@ -17,6 +24,8 @@ pub enum LedgerKind {
     Start,
     Clean,
     Stable,
+    /// This boot started in SafeMode (persisted trip; written right after its `Start`).
+    Safe,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,16 +81,9 @@ impl BootMode {
 /// `Start`). Entries may be unsorted; future entries and entries older than `retention` are
 /// ignored.
 pub fn evaluate(entries: &[LedgerEntry], now_ms: u64, p: &BreakerPolicy) -> BootMode {
-    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-    let since = now_ms.saturating_sub(ms(p.retention));
     let window_ms = ms(p.window);
     let threshold = usize::try_from(p.threshold.max(1)).unwrap_or(usize::MAX);
-    let mut sorted: Vec<LedgerEntry> = entries
-        .iter()
-        .copied()
-        .filter(|e| e.unix_ms >= since && e.unix_ms <= now_ms)
-        .collect();
-    sorted.sort_by_key(|e| e.unix_ms);
+    let sorted = current_run(entries, now_ms, p);
     // Start times of the crashed boots of the current run.
     let mut run: Vec<u64> = Vec::new();
     let mut tripped = false;
@@ -103,11 +105,9 @@ pub fn evaluate(entries: &[LedgerEntry], now_ms: u64, p: &BreakerPolicy) -> Boot
                 }
                 open_start = Some(e.unix_ms);
             }
-            LedgerKind::Clean | LedgerKind::Stable => {
-                open_start = None;
-                run.clear();
-                tripped = false;
-            }
+            LedgerKind::Safe => tripped = true,
+            // `current_run` starts after the last Clean/Stable.
+            LedgerKind::Clean | LedgerKind::Stable => {}
         }
     }
     // The last boot never wrote Clean/Stable: it crashed too (we are booting again).
@@ -124,6 +124,67 @@ pub fn evaluate(entries: &[LedgerEntry], now_ms: u64, p: &BreakerPolicy) -> Boot
         recent_crashes: crashes,
         delay: p.first_delay.saturating_mul(factor).min(p.max_delay),
     }
+}
+
+fn ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The current run, sorted: entries after the last `Clean`/`Stable` and after the last quiet gap
+/// longer than `retention` (future entries ignored; empty if the newest entry is older than
+/// `retention`).
+fn current_run(entries: &[LedgerEntry], now_ms: u64, p: &BreakerPolicy) -> Vec<LedgerEntry> {
+    let gap = ms(p.retention);
+    let mut sorted: Vec<LedgerEntry> = entries
+        .iter()
+        .copied()
+        .filter(|e| e.unix_ms <= now_ms)
+        .collect();
+    sorted.sort_by_key(|e| e.unix_ms); // stable: Start before its Safe marker
+    if sorted
+        .last()
+        .is_none_or(|e| now_ms.saturating_sub(e.unix_ms) > gap)
+    {
+        return Vec::new();
+    }
+    let mut from = 0;
+    for (i, e) in sorted.iter().enumerate() {
+        if matches!(e.kind, LedgerKind::Clean | LedgerKind::Stable) {
+            from = i + 1;
+        } else if i > 0 && e.unix_ms.saturating_sub(sorted[i - 1].unix_ms) > gap {
+            from = i;
+        }
+    }
+    sorted.split_off(from)
+}
+
+/// Upper bound on the entries kept in the ledger.
+pub const MAX_LEDGER_ENTRIES: usize = 64;
+
+/// Appends this boot's entries (call after `evaluate` with its result): `Start`, plus the
+/// persisted-trip marker `Safe` when this boot runs in SafeMode.
+pub fn record_boot(entries: &mut Vec<LedgerEntry>, now_ms: u64, mode: BootMode) {
+    entries.push(LedgerEntry {
+        unix_ms: now_ms,
+        kind: LedgerKind::Start,
+    });
+    if matches!(mode, BootMode::SafeMode { .. }) {
+        entries.push(LedgerEntry {
+            unix_ms: now_ms,
+            kind: LedgerKind::Safe,
+        });
+    }
+}
+
+/// The entries the ledger keeps after this boot (the composition root rewrites the file with
+/// them): the current run only, at most `MAX_LEDGER_ENTRIES`, newest kept. Dropping the run's
+/// oldest entries is safe: once tripped, every boot wrote a `Safe` marker, and the newest ones are
+/// kept; and the delay is already at `max_delay` long before 64 entries.
+pub fn retain(entries: &[LedgerEntry], now_ms: u64, p: &BreakerPolicy) -> Vec<LedgerEntry> {
+    let mut run = current_run(entries, now_ms, p);
+    let excess = run.len().saturating_sub(MAX_LEDGER_ENTRIES);
+    run.drain(..excess);
+    run
 }
 
 #[cfg(test)]
@@ -229,5 +290,70 @@ mod tests {
             })
             .collect();
         assert_eq!(evaluate(&spread, 1_000 + 40 * 60_000, &p), BootMode::Normal);
+    }
+
+    /// Round-2 review F4: one boot of a crash-looping daemon, exactly as the composition root does
+    /// it (evaluate, record, prune), then a run of `run_ms` before the next crash + 10 s restart.
+    fn boot(
+        entries: &mut Vec<LedgerEntry>,
+        now: &mut u64,
+        p: &BreakerPolicy,
+        run_ms: u64,
+    ) -> Duration {
+        let mode = evaluate(entries, *now, p);
+        record_boot(entries, *now, mode);
+        *entries = retain(entries, *now, p);
+        let delay = match mode {
+            BootMode::Normal => Duration::ZERO,
+            BootMode::SafeMode { delay, .. } => delay,
+        };
+        *now += u64::try_from(delay.as_millis()).unwrap() + run_ms + 10_000;
+        delay
+    }
+
+    /// Round-2 review F4: over 40 boots of a sustained crash loop the SafeMode delay never drops
+    /// back once tripped (before the fix: 60 s -> 1920 s, then 0 s again after the first entries
+    /// aged past `retention`, a sawtooth).
+    #[test]
+    fn forty_boot_crash_loop_never_drops_back_to_zero() {
+        let p = BreakerPolicy::default();
+        let (mut entries, mut now) = (Vec::new(), 1_000_000_000u64);
+        let delays: Vec<Duration> = (0..40)
+            .map(|_| boot(&mut entries, &mut now, &p, 5_000))
+            .collect();
+        let first_trip = delays.iter().position(|d| !d.is_zero()).unwrap();
+        assert_eq!(first_trip, 4, "{delays:?}");
+        for w in delays[first_trip..].windows(2) {
+            assert!(w[1] >= w[0], "delay dropped: {delays:?}");
+        }
+        assert_eq!(*delays.last().unwrap(), p.max_delay, "{delays:?}");
+        assert!(
+            entries.len() <= MAX_LEDGER_ENTRIES,
+            "ledger bounded: {}",
+            entries.len()
+        );
+    }
+
+    /// A stable run still resets a tripped breaker, and a long quiet gap (machine off for longer
+    /// than `retention`) ends the run too.
+    #[test]
+    fn tripped_breaker_resets_only_on_stable_or_a_long_gap() {
+        let p = BreakerPolicy::default();
+        let (mut entries, mut now) = (Vec::new(), 1_000_000_000u64);
+        for _ in 0..20 {
+            boot(&mut entries, &mut now, &p, 5_000);
+        }
+        assert!(matches!(
+            evaluate(&entries, now, &p),
+            BootMode::SafeMode { .. }
+        ));
+        let mut stable = entries.clone();
+        stable.push(LedgerEntry {
+            unix_ms: now - 5_000,
+            kind: LedgerKind::Stable,
+        });
+        assert_eq!(evaluate(&stable, now, &p), BootMode::Normal);
+        let later = now + u64::try_from(p.retention.as_millis()).unwrap() + 1;
+        assert_eq!(evaluate(&entries, later, &p), BootMode::Normal);
     }
 }

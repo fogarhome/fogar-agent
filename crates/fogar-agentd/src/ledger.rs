@@ -2,7 +2,9 @@
 //! this file only persists lines `<unix_ms> start|clean|stable`, bounded to the policy retention.
 
 use crate::state_dir;
-use fogar_core::crashloop::{BootMode, BreakerPolicy, LedgerEntry, LedgerKind, evaluate};
+use fogar_core::crashloop::{
+    BootMode, BreakerPolicy, LedgerEntry, LedgerKind, evaluate, record_boot, retain,
+};
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -27,6 +29,7 @@ fn parse(line: &str) -> Option<LedgerEntry> {
         "start" => LedgerKind::Start,
         "clean" => LedgerKind::Clean,
         "stable" => LedgerKind::Stable,
+        "safe" => LedgerKind::Safe,
         _ => return None,
     };
     Some(LedgerEntry {
@@ -40,6 +43,7 @@ fn render(e: &LedgerEntry) -> String {
         LedgerKind::Start => "start",
         LedgerKind::Clean => "clean",
         LedgerKind::Stable => "stable",
+        LedgerKind::Safe => "safe",
     };
     format!("{} {k}\n", e.unix_ms)
 }
@@ -51,7 +55,8 @@ impl Ledger {
         }
     }
 
-    /// Decides this boot's mode, then records `start` (rewriting the file bounded to the window).
+    /// Decides this boot's mode, then records `start` (+ `safe` in SafeMode: the persisted trip,
+    /// round-2 review F4), rewriting the file with the current run only (`crashloop::retain`).
     pub(crate) fn begin_boot(&self) -> BootMode {
         let policy = BreakerPolicy::default();
         let now = now_ms();
@@ -60,17 +65,9 @@ impl Ledger {
             .map(|s| s.lines().filter_map(parse).collect())
             .unwrap_or_default();
         let mode = evaluate(&entries, now, &policy);
-        let since =
-            now.saturating_sub(u64::try_from(policy.retention.as_millis()).unwrap_or(u64::MAX));
-        let mut out: String = entries
-            .iter()
-            .filter(|e| e.unix_ms >= since)
-            .map(render)
-            .collect();
-        out.push_str(&render(&LedgerEntry {
-            unix_ms: now,
-            kind: LedgerKind::Start,
-        }));
+        let mut entries = entries;
+        record_boot(&mut entries, now, mode);
+        let out: String = retain(&entries, now, &policy).iter().map(render).collect();
         // The state dir itself was validated by the caller (state_dir::ensure_private_dir).
         if let Err(e) = state_dir::replace_private(&self.path, out.as_bytes()) {
             eprintln!("fogar-agentd: boot ledger not writable ({e}); crash-loop breaker degraded");
@@ -170,6 +167,11 @@ mod tests {
             kind: LedgerKind::Clean,
         };
         assert_eq!(parse(render(&e).trim_end()), Some(e));
+        let safe = LedgerEntry {
+            unix_ms: 7,
+            kind: LedgerKind::Safe,
+        };
+        assert_eq!(parse(render(&safe).trim_end()), Some(safe));
         assert_eq!(parse("x start"), None);
         assert_eq!(parse("1 crash"), None);
         assert_eq!(parse(""), None);

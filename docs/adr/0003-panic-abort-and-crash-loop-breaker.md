@@ -8,7 +8,7 @@ Status: **PROVISIONAL**
 - `fogar-agentd` installs a panic hook first thing in `run`; it writes a content-free record
   (message, location, thread, uptime, backtrace) to `<state>/crash/last.txt` and fsyncs it
   (capped at 1 MiB).
-- Boot ledger `<state>/boot.ledger` (`start|clean|stable`, kept for 3 h). A *run* is the sequence
+- Boot ledger `<state>/boot.ledger` (`start|clean|stable|safe`; current run only, <= 64 lines). A *run* is the sequence
   of crashes (unclean starts) since the last `clean`/`stable`. 4 crashes of a run inside 10 min
   => SafeMode: delayed start 60 s, doubling with every further crash of the run up to 32 min,
   cancellable by SIGTERM; a `clean` or `stable` boot ends the run. Policy is pure
@@ -16,6 +16,12 @@ Status: **PROVISIONAL**
   counted crashes only inside the 10-min window, so the escalating delays pushed old crashes out
   of the window and the delay plateaued at 4-8 min; the 3 h retention covers a full escalation,
   60+120+...+1920 s = 62 min. Test: `a_sustained_crash_loop_reaches_the_maximum_delay`.)
+  Round-2 review F4: that still made a sawtooth (60 s -> 1920 s, then 0 s for 4 boots once the
+  fast first crashes aged past 3 h). The trip is now persisted: a SafeMode boot writes a `safe`
+  line after its `start`, and a `safe` line in the run keeps it tripped. The run ends only on
+  `clean`/`stable` or a quiet gap > 3 h (between entries or since the last one: machine off).
+  The file holds the current run only, at most 64 lines (`crashloop::retain`). Test:
+  `forty_boot_crash_loop_never_drops_back_to_zero` (40-boot simulation incl. pruning).
 - What counts as clean (review code#2/code#7b): SIGTERM/SIGINT handlers are installed before the
   ledger records `start`; any stop asked for by a signal writes `clean`, even if a shutdown phase
   overran its deadline (the overrun is logged separately, not counted as a crash). Shutdown
