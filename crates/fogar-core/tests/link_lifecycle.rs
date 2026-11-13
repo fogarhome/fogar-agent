@@ -1,6 +1,6 @@
 //! Gateway close classification, reconnect with exponential backoff + full jitter, keepalive and
 //! the idle close, credentials missing/unavailable. Paused time, in-memory gateway.
-#![allow(clippy::disallowed_methods)] // the harness drives tokio's paused clock directly
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)] // the harness drives tokio's paused clock directly
 
 mod common;
 use common::*;

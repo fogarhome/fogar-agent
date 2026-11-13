@@ -1,6 +1,6 @@
 //! Ordered graceful shutdown: no leaked tasks (runtime live-task count returns to baseline), the
 //! gateway gets a close frame, the mic and speaker are released, IPC served until ingress closes.
-#![allow(clippy::disallowed_methods)] // the harness drives tokio's paused clock directly
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)] // the harness drives tokio's paused clock directly
 
 mod common;
 use common::*;
