@@ -150,3 +150,20 @@ fn sigterm_right_after_boot_records_a_clean_stop() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Review sec#3: plain `ws://` (loopback only in slice 0) is allowed but announced loudly.
+#[test]
+fn plain_ws_gateway_prints_a_loud_warning() {
+    let dir = state_dir("wswarn");
+    store_key(&dir);
+    let (mut child, rx) = spawn(&dir, "ws://127.0.0.1:9/ws/stream");
+    let mut all = Vec::new();
+    wait_line(&rx, "boot mode", &mut all);
+    term_and_wait(&mut child);
+    assert!(
+        all.iter()
+            .any(|l| l.contains("WARNING") && l.to_lowercase().contains("unencrypted")),
+        "{all:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
