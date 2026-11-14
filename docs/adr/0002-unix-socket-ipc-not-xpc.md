@@ -62,10 +62,18 @@ the signature, not the name in parentheses of the certificate):
   **And the bigger hole on today's setup:** on the M2 `codesign` used the owner's Apple
   Development key from a plain shell without any prompt (all probe signings in this ADR), so any
   same-user process can sign its own `com.fogar.desktop` with the hardened runtime and get
-  `SameSigner` directly. Against same-user malware `SameSigner` is therefore not a boundary while
-  that key sits unprotected in the login keychain (mitigation: restrict the key's ACL so
-  `codesign` prompts, or keep the signing key off the machine). It still stops other users and
-  unsigned/ad-hoc tools that do not try.
+  `SameSigner` directly.
+- **Threat model as of S1 (decided 2026-11-14):** `SameSigner` stops other users, unsigned or
+  ad-hoc same-user code, and the fd-share/exec attacks above. It does NOT stop same-user code
+  that can use the owner's signing key, nor the blocked-write variant. Both residuals are
+  accepted for S1; the core's `Pair`/`Unpair` gate is as strong as this, no stronger.
+- **Follow-ups (with trigger):**
+  1. Signing key: restrict the Apple Development key's ACL so `codesign` prompts on use, or keep
+     the key off the dev Mac; Developer ID in S7. Trigger: before anyone relies on `SameSigner`
+     against same-user malware; at the latest S7.
+  2. Per-connection nonce sent after verification and echoed in `Pair`/`Unpair` (`fogar-ports` +
+     `fogar-host::ipc_wire` + core + Swift app). Trigger: only once follow-up 1 is done; until
+     then it closes a hard path and leaves the easy one open.
 - A signed agent whose own signature cannot be read or no longer validates refuses to bind (fails
   closed) instead of downgrading to uid-only. Not exercised: a tampered bare executable is killed
   by the kernel before it runs; a tampered `.app` bundle resource is the case this covers.
