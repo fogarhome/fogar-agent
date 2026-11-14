@@ -130,11 +130,14 @@ impl<R: Resolver> GatewayHttp for HttpGateway<R> {
 pub(crate) async fn read_response<S: AsyncRead + Unpin>(s: &mut S) -> Result<HttpReply, HttpError> {
     // The head buffer may also hold the first body bytes: wiped on drop.
     let mut head = Zeroizing::new(vec![0u8; MAX_HEAD_BYTES]);
-    let mut filled = 0;
+    let (mut filled, mut scanned) = (0usize, 0usize);
     let head_end = loop {
-        if let Some(i) = head[..filled].windows(4).position(|w| w == b"\r\n\r\n") {
-            break i;
+        // Only the newly read bytes (plus 3 of overlap) can complete the terminator.
+        let from = scanned.saturating_sub(3);
+        if let Some(i) = head[from..filled].windows(4).position(|w| w == b"\r\n\r\n") {
+            break from + i;
         }
+        scanned = filled;
         if filled == head.len() {
             return Err(malformed("response head too large"));
         }
@@ -196,6 +199,8 @@ fn parse_head(head: &[u8]) -> Result<(u16, Option<usize>), HttpError> {
     let status = status_line
         .strip_prefix("HTTP/1.1 ")
         .or_else(|| status_line.strip_prefix("HTTP/1.0 "))
+        // Exactly three digits, then a space or the end of the line (`2000`, `200OK` are bad).
+        .filter(|r| r.len() == 3 || r.as_bytes().get(3) == Some(&b' '))
         .and_then(|r| r.get(..3))
         .filter(|c| c.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|c| c.parse::<u16>().ok())
@@ -206,6 +211,14 @@ fn parse_head(head: &[u8]) -> Result<(u16, Option<usize>), HttpError> {
         let (name, value) = line
             .split_once(':')
             .ok_or_else(|| malformed("bad header line"))?;
+        // RFC 9112 §5.1: no whitespace before the colon (`Content-Length : 5` must not slip past).
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+        {
+            return Err(malformed("bad header name"));
+        }
         let value = value.trim();
         if name.eq_ignore_ascii_case("content-length") {
             if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
@@ -240,7 +253,30 @@ mod tests {
         fogar_testkit::run_async(parses_and_bounds());
     }
 
+    /// Hands out one byte per `read`: the head terminator and the body cross read boundaries.
+    struct Trickle<'a>(&'a [u8]);
+    impl tokio::io::AsyncRead for Trickle<'_> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if let Some((b, rest)) = self.0.split_first() {
+                buf.put_slice(&[*b]);
+                self.0 = rest;
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
     async fn parses_and_bounds() {
+        for raw in [
+            &b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\n{}"[..],
+            b"HTTP/1.1 201 Created\r\n\r\n{}",
+        ] {
+            let r = read_response(&mut Trickle(raw)).await.unwrap();
+            assert_eq!((r.status, &r.body[..]), (201, &b"{}"[..]));
+        }
         let r = parse(b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\n{}")
             .await
             .unwrap();
@@ -273,8 +309,12 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
             b"HTTP/1.1 100 Continue\r\n\r\n",
             b"HTTP/2 200\r\n\r\n",
+            b"HTTP/1.1 2000 OK\r\n\r\n",
+            b"HTTP/1.1 200OK\r\n\r\n",
             b"SSH-2.0-OpenSSH\r\n\r\n",
             b"HTTP/1.1 200 OK\r\nno-colon\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding : chunked\r\n\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\n Content-Length: 2\r\n\r\n{}",
             b"HTTP/1.1 200 OK\r\n",
         ] {
             assert!(

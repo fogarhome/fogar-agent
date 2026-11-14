@@ -19,6 +19,10 @@ pub trait Resolver: Send + Sync + 'static {
 }
 
 /// The OS resolver (`getaddrinfo` on tokio's blocking pool).
+///
+/// shortcut: a timed-out lookup keeps its blocking thread until `getaddrinfo` returns, so a
+/// stalled DNS plus repeated probes can pile up blocking threads (bounded by the runtime's
+/// `max_blocking_threads`); upgrade to a single-flight lookup if S1 measurements show it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemResolver;
 
