@@ -185,6 +185,8 @@ struct Campo<Field: View>: View {
                         .opacity(enfocado ? 1 : 0)
                 }
                 .focused($enfocado)
+                // An error that appears while focus stays put (5 digits + Return) is still heard.
+                .onChange(of: error) { _, e in if let e { AccessibilityNotification.Announcement(e).post() } }
                 .accessibilityLabel(etiqueta)
                 .accessibilityHint(error ?? pista ?? "")
             if let error {

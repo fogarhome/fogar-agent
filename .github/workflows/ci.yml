@@ -53,3 +53,15 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests (incl. macOS adapter contract suites)
         run: cargo test --workspace --locked
+      # Fogar Desktop (apps/macos): the Swift tests and the generated wire types. The package needs
+      # Swift 6.2 / the macOS 26 SDK, so the newest installed Xcode 26 is selected explicitly.
+      - name: Select Xcode 26
+        run: |
+          xcode=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          test -n "$xcode" || { echo "no Xcode 26 on this runner"; ls -d /Applications/Xcode*.app; exit 1; }
+          sudo xcode-select -s "$xcode"
+          swift --version
+      - name: typeshare-cli (pinned)
+        run: cargo install --locked typeshare-cli --version 1.13.4
+      - name: Fogar Desktop tests and Wire.swift check
+        run: cd apps/macos && swift test && scripts/gen-wire.sh --check

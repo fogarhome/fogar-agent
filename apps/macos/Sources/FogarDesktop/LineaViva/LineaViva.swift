@@ -93,8 +93,10 @@ private struct LineaCapa: NSViewRepresentable {
             if let window {
                 NotificationCenter.default.addObserver(self, selector: #selector(reprogramar),
                                                        name: NSWindow.didChangeOcclusionStateNotification, object: window)
+            } else {
+                calma?.invalidate()
             }
-            reprogramar()
+            reprogramar() // out of a window: stops the display link and the wake-up timer
         }
 
         override func layout() {
@@ -168,12 +170,6 @@ private struct LineaCapa: NSViewRepresentable {
 
         override var isFlipped: Bool { true } // the engine's y grows downwards
 
-        override func removeFromSuperview() {
-            parar()
-            despertar?.invalidate()
-            calma?.invalidate()
-            super.removeFromSuperview()
-        }
     }
 }
 

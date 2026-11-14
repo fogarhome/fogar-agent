@@ -13,7 +13,9 @@ nonisolated final class FakeAgent: @unchecked Sendable {
     let path = NSTemporaryDirectory() + "fogar-t-\(UUID().uuidString.prefix(8)).sock"
     private var listener: NWListener?
 
-    init(_ respond: @escaping @Sendable (WireRequest) -> [WireResponse]) throws {
+    /// `dropAfterSubscribe`: close each subscribed connection this long after its first event
+    /// (an agent restart, as the app sees it).
+    init(dropAfterSubscribe: Duration? = nil, _ respond: @escaping @Sendable (WireRequest) -> [WireResponse]) throws {
         unlink(path)
         let params = NWParameters.tcp
         params.requiredLocalEndpoint = .unix(path: path)
@@ -28,6 +30,11 @@ nonisolated final class FakeAgent: @unchecked Sendable {
                         let req = try WireCodec.decodeRequest(try await c.receive())
                         for r in respond(req) { try await c.send(WireCodec.encode(r)) }
                         if case .subscribe = req, let raw = Self.rawAfterSubscribe { try await c.send(Data(raw.utf8)) }
+                        if case .subscribe = req, let d = dropAfterSubscribe {
+                            try await Task.sleep(for: d)
+                            c.cancel()
+                            return
+                        }
                     }
                 } catch {}
             }
@@ -130,6 +137,19 @@ extension AgentLinkOverASocket {
         #expect(await waitFor(link) { $0 == .noLiveStatus })
         try await Task.sleep(for: .seconds(2))
         #expect(agent.accepted == 1)
+    }
+
+    /// The agent drops the subscription (restart): the app says so, then comes back on its own.
+    @Test func reconnectsAfterTheAgentDropsTheLink() async throws {
+        let agent = try FakeAgent(dropAfterSubscribe: .milliseconds(300), answers())
+        try await Task.sleep(for: .milliseconds(200))
+        let link = AgentLink(socketPath: agent.path)
+        link.start()
+        defer { link.stop() }
+        #expect(await waitFor(link) { $0 == .live(ready) })
+        #expect(await waitFor(link) { $0 == .notRunning })
+        #expect(await waitFor(link) { $0 == .live(ready) })
+        #expect(agent.accepted >= 2)
     }
 
     @Test func undecodableEventIsSaidNotAgentDown() async throws {

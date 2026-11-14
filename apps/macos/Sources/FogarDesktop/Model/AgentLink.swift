@@ -36,8 +36,9 @@ enum CommandError: Error, Equatable {
 
 /// The app's single link to the agent: one long subscription for live status, plus a short
 /// connection per command (an unsubscribed connection is closed after 30 s idle by the agent, and
-/// there are no request ids, so commands never share the event stream). At most 2 of the agent's
-/// 4 IPC slots.
+/// there are no request ids, so commands never share the event stream). The subscription plus at
+/// most one connection per command in flight: 3 of the agent's 4 IPC slots when a search and a
+/// pairing overlap.
 @Observable
 final class AgentLink {
     private(set) var state: AgentState = .looking
@@ -106,7 +107,7 @@ final class AgentLink {
                 set(.refused); permanent = true
             } catch CommandError.unexpected {
                 set(.noLiveStatus); permanent = true
-            } catch is DecodingError {
+            } catch is DecodingError, LinkError.frame {
                 set(.unintelligible); permanent = true
             } catch {
                 // Socket gone, agent restarted or wedged: honestly «not running» until it answers.

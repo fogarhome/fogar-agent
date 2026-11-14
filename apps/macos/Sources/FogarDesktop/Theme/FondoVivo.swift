@@ -8,7 +8,6 @@ import SwiftUI
 struct FondoVivo: View {
     var calor = 0.38
     var humo = 0.75
-    var velocidad = 0.4
     /// A still frame, never animated (the menu bar extra).
     var quieto = false
 
@@ -20,7 +19,7 @@ struct FondoVivo: View {
     var body: some View {
         // Moves only while you look at it: window on screen and the app in front. The smoke is slow
         // (velocity 0.4), so 12 frames a second read as continuous.
-        CapaFondo(calor: calor, humo: humo, velocidad: velocidad, oscuro: scheme == .dark,
+        CapaFondo(calor: calor, humo: humo, velocidad: 0.4, oscuro: scheme == .dark,
                   animado: !(quieto || reduce || !visible || activa == .inactive))
             // The grain is a static layer of its own (never redrawn per frame), faded like the smoke.
             .overlay(Grano().opacity(0.03).mask(FondoVivo.mascara))
@@ -85,10 +84,6 @@ private struct CapaFondo: NSViewRepresentable {
             layer?.contents = FondoPintor.pinta(t: t, calor: c, humo: h, velocidad: v, oscuro: o)
         }
 
-        override func removeFromSuperview() {
-            reloj?.invalidate()
-            super.removeFromSuperview()
-        }
     }
 }
 

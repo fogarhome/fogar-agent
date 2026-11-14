@@ -24,8 +24,11 @@ public enum LinkError: Error, Equatable {
     case closed
     case timedOut
     case frame(FrameError)
-    case malformed
 }
+
+/// `sockaddr_un.sun_path` holds 104 bytes including the NUL: a longer path cannot be connected
+/// to, and Network.framework traps on it instead of failing.
+public let maxSocketPathBytes = 103
 
 /// One framed stream over a Unix socket (Network.framework). Used by the app (client) and by the
 /// stand-in agent (server side of an accepted connection). Every call that waits is cancellable:
@@ -41,6 +44,7 @@ public actor FramedConnection {
 
     /// Connects to `path`. Fails fast with `.unavailable` when nothing listens there.
     public static func connect(path: String, timeout: Duration = .seconds(2)) async throws -> FramedConnection {
+        guard path.utf8.count <= maxSocketPathBytes else { throw LinkError.unavailable }
         let c = FramedConnection(accepted: NWConnection(to: .unix(path: path), using: .tcp))
         try await withDeadline(timeout) { try await c.start() }
         return c

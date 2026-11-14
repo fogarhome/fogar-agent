@@ -91,6 +91,14 @@ import Testing
 
 /// End to end over a real Unix socket against an in-test listener: framing + connection.
 @Suite struct OverASocket {
+    /// sun_path holds 104 bytes: a longer path must fail cleanly (Network.framework would trap).
+    @Test func overlongSocketPathIsUnavailableNotACrash() async {
+        let path = "/tmp/" + String(repeating: "a", count: 120) + ".sock"
+        await #expect(throws: LinkError.unavailable) {
+            _ = try await FramedConnection.connect(path: path)
+        }
+    }
+
     @Test func connectToNothingIsUnavailable() async {
         let path = NSTemporaryDirectory() + "fogar-none-\(UUID().uuidString.prefix(8)).sock"
         await #expect(throws: LinkError.unavailable) {

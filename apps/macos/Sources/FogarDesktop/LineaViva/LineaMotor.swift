@@ -28,8 +28,6 @@ final class LineaMotor {
     private var clock: Double?, acc = 0.0
 
     static let stroke = 4.4, tip = 0.8
-    var tin: Int { Int((Double(n) * 0.02).rounded()) }
-    var tout: Int { Int((Double(n) * 0.05).rounded()) }
 
     init() {
         word = geo.word.map { V2($0.x, $0.y) }
@@ -125,11 +123,11 @@ final class LineaMotor {
 
     private static func g55(_ d: Double) -> Double { exp(-d * d / (2 * 55 * 55)) }
 
-    /// 0 nothing, 1 the F's bar plucked, 2 the wave across the letters. Fills `wdy` and `wmul`.
-    @discardableResult
-    private func waveFill(_ tw: Double) -> Int {
+    /// The rest wave at time `tw` since it started: the F's bar plucked (first second), then the
+    /// wave across the letters. Fills `wdy` and `wmul`.
+    private func waveFill(_ tw: Double) {
         for i in 0..<n { wdy[i] = 0; wmul[i] = 1 }
-        guard tw >= 0 && tw <= 2.8 else { return 0 }
+        guard tw >= 0 && tw <= 2.8 else { return }
         let c: Double, amp: Double
         if tw < 1 { // a plucked string: the F's arm bends 10 px and is let go; the ember runs along it
             let e = Self.smooth(Self.clamp(tw / 0.18)) * Self.smooth(Self.clamp((1 - tw) / 0.55))
@@ -152,7 +150,6 @@ final class LineaMotor {
         for i in max(0, Int((c - 3 * sg).rounded(.down)))...min(n - 1, Int((c + 3 * sg).rounded(.up))) {
             wmul[i] = 1 + 0.3 * amp * exp(-pow((Double(i) - c) / sg, 2) / 2)
         }
-        return tw < 1 ? 1 : 2
     }
 
     private func target(_ t: Double, _ out: inout [V2]) {
