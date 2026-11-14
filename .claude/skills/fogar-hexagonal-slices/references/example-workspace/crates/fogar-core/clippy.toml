@@ -1,0 +1,17 @@
+# Core must reach the outside world ONLY through ports.
+# Clippy reads clippy.toml from the crate's own directory first (CARGO_MANIFEST_DIR),
+# so this list applies to fogar-core only. Lints are set to `deny` in [workspace.lints.clippy].
+disallowed-methods = [
+  { path = "std::time::Instant::now", reason = "use fogar_ports::clock::Clock::now (testable, virtual time)" },
+  { path = "std::time::SystemTime::now", reason = "use a Clock port" },
+  { path = "std::thread::sleep", reason = "blocks the executor; use Clock::sleep" },
+  { path = "std::thread::spawn", reason = "the composition root owns threads/runtime" },
+  { path = "std::env::var", reason = "configuration is injected by the composition root" },
+  { path = "std::process::Command::new", reason = "process control is a port (ProcessLifecycle)" },
+  { path = "std::fs::read", reason = "storage is a port" },
+  { path = "std::fs::write", reason = "storage is a port" },
+]
+disallowed-types = [
+  { path = "std::fs::File", reason = "storage is a port" },
+  { path = "std::net::TcpStream", reason = "network is the Uplink port" },
+]
