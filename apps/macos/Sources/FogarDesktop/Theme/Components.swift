@@ -9,6 +9,8 @@ struct Pildora: ButtonStyle {
     var variante: Variante = .discreto
     var pequena = false
     var ocupado = false
+    /// Fills the available width (the label and spinner stay centred together).
+    var ancho = false
 
     @Environment(\.isEnabled) private var isEnabled
     @State private var hover = false
@@ -21,7 +23,7 @@ struct Pildora: ButtonStyle {
         .font(Tipo.texto(pequena ? 14 : 15, peso: 550))
         .lineLimit(1)
         .padding(.horizontal, pequena ? 14 : 20)
-        .frame(minHeight: pequena ? 32 : 40)
+        .frame(maxWidth: ancho ? .infinity : nil, minHeight: pequena ? 32 : 40)
         .foregroundStyle(variante == .principal ? Color.sobreAccion : Color.hueso)
         .background(Capsule().fill(fondo(configuration)))
         .contentShape(Capsule())
@@ -172,7 +174,15 @@ struct Campo<Field: View>: View {
                 .background(RoundedRectangle(cornerRadius: Medida.radioNodo).fill(Color.noche))
                 .overlay {
                     RoundedRectangle(cornerRadius: Medida.radioNodo)
-                        .strokeBorder(enfocado ? Color.hueso : (error != nil ? Color.error : Color.veta), lineWidth: enfocado ? 2 : 1)
+                        .strokeBorder(error != nil ? Color.error : Color.veta, lineWidth: 1)
+                }
+                // FgCampo: the focus ring is a 2 pt bone outline outside the field, so an error
+                // border stays visible while the field is focused.
+                .overlay {
+                    RoundedRectangle(cornerRadius: Medida.radioNodo + 3)
+                        .strokeBorder(Color.hueso, lineWidth: 2)
+                        .padding(-3)
+                        .opacity(enfocado ? 1 : 0)
                 }
                 .focused($enfocado)
                 .accessibilityLabel(etiqueta)

@@ -26,12 +26,14 @@ struct EmparejarView: View {
                 }
                 .frame(maxWidth: 420, alignment: .leading)
                 .padding(.horizontal, 48)
-                .padding(.vertical, 56)
+                .padding(.top, 108) // clears the title bar, then the dashboard's 56
+                .padding(.bottom, 56)
                 .frame(maxWidth: .infinity, minHeight: 560, alignment: .leading)
             }
             .frame(minWidth: 420, maxWidth: .infinity)
+            .modifier(SinBordeDeScroll())
         }
-        .clipped()
+        .ignoresSafeArea(edges: .top)
         .navigationTitle("Emparejar")
     }
 }
@@ -49,7 +51,8 @@ private struct Marca: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.horizontal, 56)
-        .padding(.vertical, 56)
+        .padding(.top, 108)
+        .padding(.bottom, 56)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background {
             // Bleeds past the panel like the dashboard's (inset -10% -20% -30% -30%); the mask fades it.
@@ -98,7 +101,8 @@ private struct Formulario: View {
                     .textContentType(.oneTimeCode)
                     .autocorrectionDisabled()
                     .font(Tipo.texto(22, peso: 500)).monospacedDigit().tracking(2)
-                    .onChange(of: codigo) { errorCodigo = nil; errorGeneral = nil }
+                    // Typing clears the error; the app emptying a spent code must not.
+                    .onChange(of: codigo) { _, nuevo in if !nuevo.isEmpty { errorCodigo = nil; errorGeneral = nil } }
                     .onSubmit(emparejar)
             }, enfocado: $focoCodigo)
 
@@ -111,14 +115,15 @@ private struct Formulario: View {
                 .accessibilityElement(children: .combine)
             }
 
+            // Busy, not disabled: the label keeps full contrast; `emparejar()` ignores repeats.
             Button(action: emparejar) {
-                Text(emparejando ? "Emparejando…" : "Emparejar").frame(maxWidth: .infinity)
+                Text(emparejando ? "Emparejando…" : "Emparejar")
             }
-            .buttonStyle(Pildora(variante: .principal, ocupado: emparejando))
+            .buttonStyle(Pildora(variante: .principal, ocupado: emparejando, ancho: true))
             .keyboardShortcut(.defaultAction)
-            .disabled(emparejando)
         }
         .task { await buscar() }
+        .onDisappear { codigo = "" }
     }
 
     @ViewBuilder private var encontrados: some View {
@@ -128,7 +133,6 @@ private struct Formulario: View {
                 Spacer()
                 Button(buscando ? "Buscando…" : "Buscar otra vez") { Task { await buscar() } }
                     .buttonStyle(Pildora(pequena: true, ocupado: buscando))
-                    .disabled(buscando)
             }
             if candidatos.isEmpty {
                 Text(buscando ? "Mirando en la dirección guardada, en este Mac y en tu tailnet…"
@@ -138,8 +142,8 @@ private struct Formulario: View {
             } else {
                 VStack(spacing: 8) {
                     ForEach(candidatos, id: \.address) { c in
-                        Candidato(c: c, elegido: direccion == c.address) {
-                            direccion = c.address
+                        Candidato(c: c, elegido: direccion == sinEsquema(c.address)) {
+                            direccion = sinEsquema(c.address)
                             focoCodigo = true
                         }
                     }
@@ -149,18 +153,19 @@ private struct Formulario: View {
     }
 
     private func buscar() async {
+        guard !buscando else { return }
         buscando = true
         defer { buscando = false }
         do {
             candidatos = try await link.discover()
-            if candidatos.count == 1, direccion.isEmpty { direccion = candidatos[0].address }
+            if candidatos.count == 1, direccion.isEmpty { direccion = sinEsquema(candidatos[0].address) }
             // Keyboard first: straight to what is still missing.
             if !focoDireccion && !focoCodigo {
                 if direccion.isEmpty { focoDireccion = true } else { focoCodigo = true }
             }
         } catch {
             candidatos = []
-            errorGeneral = Textos.fallo(error)
+            errorGeneral = Textos.falloBusqueda(error)
         }
     }
 
@@ -182,17 +187,22 @@ private struct Formulario: View {
         emparejando = true
         Task {
             defer { emparejando = false }
+            var sigueValiendo = false // the gateway did not consume it: keep it for the retry
+            defer { if !sigueValiendo { codigo = "" } }
             do {
                 switch try await link.pair(address: dir, code: digits) {
                 case .paired:
-                    codigo = ""
                     nav.seccion = .estado
                 case .failed(let f):
                     switch f {
                     case .badAddress, .unreachable, .notAGateway:
+                        sigueValiendo = true
                         errorDireccion = Textos.fallo(f); focoDireccion = true
                     case .badCode, .invalidCode:
                         errorCodigo = Textos.fallo(f); focoCodigo = true
+                    case .gatewayError, .busy:
+                        sigueValiendo = true
+                        errorGeneral = Textos.fallo(f)
                     default:
                         errorGeneral = Textos.fallo(f)
                     }
@@ -240,7 +250,7 @@ private struct Candidato: View {
     /// listen on 127.0.0.1:8004).
     private var detalle: String {
         let local = c.address.contains("127.0.0.1") || c.address.contains("localhost")
-        return local ? "en este Mac · versión \(c.version)" : "\(c.address.replacingOccurrences(of: "http://", with: "")) · versión \(c.version)"
+        return local ? "en este Mac · versión \(c.version)" : "\(sinEsquema(c.address)) · versión \(c.version)"
     }
 }
 
@@ -285,5 +295,18 @@ private struct SinAgente: View {
             Button("Volver a llamar") { link.retryNow() }
                 .buttonStyle(Pildora())
         }
+    }
+}
+
+/// Addresses as the person writes them (the hint says «sin http://»).
+func sinEsquema(_ address: String) -> String {
+    address.replacingOccurrences(of: "http://", with: "")
+}
+
+/// macOS 26 draws a soft scroll-edge band under the title bar; on this full-bleed screen it reads
+/// as a seam across the living background.
+private struct SinBordeDeScroll: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 26, *) { content.scrollEdgeEffectHidden(true, for: .top) } else { content }
     }
 }

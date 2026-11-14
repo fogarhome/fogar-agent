@@ -23,7 +23,7 @@ struct FogarDesktopApp: App {
                 .environment(nav)
         }
         .defaultSize(width: 1100, height: 740)
-        .windowToolbarStyle(.unified(showsTitle: false))
+        .windowStyle(.hiddenTitleBar)
         .commands { FogarCommands(link: link, nav: nav) }
 
         Settings {
@@ -31,6 +31,7 @@ struct FogarDesktopApp: App {
                 .environment(link)
                 .environment(nav)
         }
+        .windowResizability(.contentSize)
 
         MenuBarExtra {
             MenuBarView()
@@ -100,7 +101,7 @@ enum Apariencia: String, CaseIterable, Identifiable {
 
     var titulo: String {
         switch self {
-        case .sistema: "Como el sistema"
+        case .sistema: "Automática"
         case .oscura: "Oscura"
         case .clara: "Clara"
         }

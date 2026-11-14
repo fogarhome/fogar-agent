@@ -20,7 +20,7 @@ struct RootView: View {
                 case .ajustes: AjustesView(enVentana: true)
                 }
             }
-            .toolbarBackground(.hidden, for: .windowToolbar)
+            .modifier(BarraSinFondo())
         }
         .frame(minWidth: 940, minHeight: 620)
         .background(Color.noche)
@@ -30,13 +30,12 @@ struct RootView: View {
             // Revoked or unpaired elsewhere: go where the person can fix it.
             if new == .notPaired, let old, old != .notPaired { nav.seccion = .emparejar }
         }
-        .onChange(of: link.state) { _, new in anunciar(new) }
+        // Announce a new headline, not every counter tick.
+        .onChange(of: Textos.titular(link.state).titulo) { _, titulo in
+            AccessibilityNotification.Announcement(titulo).post()
+        }
     }
 
-    /// VoiceOver hears a change of state without having to look for it (aria-live polite).
-    private func anunciar(_ state: AgentState) {
-        AccessibilityNotification.Announcement(Textos.titular(state).titulo).post()
-    }
 }
 
 /// BarraLateral: the word, the sections, and at the foot what the app knows of the agent.
@@ -117,7 +116,6 @@ private struct Pie: View {
             Estado(tono: tono, texto: texto)
                 .font(Tipo.texto(12, peso: 550))
                 .foregroundStyle(Color.huesoSuave)
-            Text("Protocolo con el agente: v\(ipcVersion)").font(Tipo.texto(12)).foregroundStyle(Color.huesoTenue)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -137,6 +135,19 @@ private struct Pie: View {
         case .notRunning: "Agente parado"
         case .versionMismatch: "Agente de otra versión"
         case .refused: "Agente rechaza la app"
+        case .noLiveStatus, .unintelligible: "Agente desactualizado"
+        }
+    }
+}
+
+/// The title bar keeps no band of its own: the night (and the living background) runs under it,
+/// like the dashboard, which has no top bar at all.
+private struct BarraSinFondo: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 15, *) {
+            content.toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+        } else {
+            content.toolbarBackground(.hidden, for: .windowToolbar)
         }
     }
 }

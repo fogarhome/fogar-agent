@@ -29,15 +29,15 @@ struct MenuBarView: View {
             }
 
             VStack(alignment: .leading, spacing: 8) {
-                Button { abrir(.estado) } label: { Text("Abrir Fogar Desktop").frame(maxWidth: .infinity) }
-                    .buttonStyle(Pildora(variante: .principal, pequena: true))
+                Button { abrir(.estado) } label: { Text("Abrir Fogar Desktop") }
+                    .buttonStyle(Pildora(variante: .principal, pequena: true, ancho: true))
                 switch link.state {
                 case .live(let s) where s.phase == .notPaired:
-                    Button { abrir(.emparejar) } label: { Text("Emparejar este Mac…").frame(maxWidth: .infinity) }
-                        .buttonStyle(Pildora(pequena: true))
-                case .notRunning, .refused:
-                    Button { link.retryNow() } label: { Text("Volver a llamar al agente").frame(maxWidth: .infinity) }
-                        .buttonStyle(Pildora(pequena: true))
+                    Button { abrir(.emparejar) } label: { Text("Emparejar este Mac…") }
+                        .buttonStyle(Pildora(pequena: true, ancho: true))
+                case .notRunning, .refused, .noLiveStatus, .unintelligible:
+                    Button { link.retryNow() } label: { Text("Volver a llamar al agente") }
+                        .buttonStyle(Pildora(pequena: true, ancho: true))
                 default:
                     EmptyView()
                 }

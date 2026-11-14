@@ -24,7 +24,8 @@ struct AjustesView: View {
             .frame(maxWidth: enVentana ? 720 : .infinity, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(minWidth: enVentana ? nil : 520, minHeight: enVentana ? nil : 520)
+        // Settings window: the usual macOS width, never stretched across the screen.
+        .frame(width: enVentana ? nil : 580, height: enVentana ? nil : 640)
         .background(Color.noche)
         .tint(.hueso)
         .navigationTitle("Ajustes")
@@ -108,13 +109,14 @@ private struct AparienciaBloque: View {
     @AppStorage("apariencia") private var apariencia = Apariencia.sistema
     var body: some View {
         Bloque(titulo: "Apariencia") {
-            Picker("Apariencia", selection: $apariencia) {
+            Picker(selection: $apariencia) {
                 ForEach(Apariencia.allCases) { Text($0.titulo).tag($0) }
-            }
+            } label: { EmptyView() }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(maxWidth: 360)
-            Text("Fogar nace oscuro. La variante clara es una propuesta que aún no forma parte de la marca.")
+            .accessibilityLabel("Apariencia")
+            .fixedSize()
+            Text("«Automática» sigue el modo claro u oscuro de tu Mac.")
                 .meta().fixedSize(horizontal: false, vertical: true)
         }
     }

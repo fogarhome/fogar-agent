@@ -30,7 +30,7 @@ Only debug builds honour `FOGAR_AGENT_SOCKET`. Phases: `not_paired`, `connecting
 `reconnecting`, `parked_repair`, `parked_agent_refused`, `parked_client_error`, `stopping` (also typed
 on the stand-in's stdin to change the live state). `--version 3` plays a newer agent, `--refuse-pair`
 an agent that refuses this app, `--boot safe` the crash-loop safe mode, `--peer uid_only` an unverified
-app. Pairing codes decide the outcome: `482913` pairs; `111111` invalid_code, `222222` unreachable,
+app (pair/unpair refused, like the core), `--old` today's pre-S1 core (no live status). Pairing codes decide the outcome: `482913` pairs; `111111` invalid_code, `222222` unreachable,
 `333333` not_a_gateway, `444444` gateway_error, `555555` storage_failed, `666666` busy, `777777`
 bad_address. Launch arguments `-seccion emparejar` and `-apariencia clara|oscura|sistema` pick the
 screen and appearance.

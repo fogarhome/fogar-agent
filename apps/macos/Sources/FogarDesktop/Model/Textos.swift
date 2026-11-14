@@ -26,6 +26,14 @@ enum Textos {
             return Titular(titulo: "Actualiza el agente de Fogar",
                            sub: "Esta app habla la versión \(ipcVersion) y el agente, la \(agente). Instala el agente que va con esta app.",
                            tono: .bad)
+        case .noLiveStatus:
+            return Titular(titulo: "Actualiza el agente de Fogar",
+                           sub: "Este agente aún no cuenta su estado en vivo a la app. Instala el agente que va con esta versión de Fogar Desktop.",
+                           tono: .bad)
+        case .unintelligible:
+            return Titular(titulo: "La app no entiende al agente",
+                           sub: "El agente ha contado algo que esta app no sabe leer. Seguramente uno de los dos está desactualizado: actualiza los dos.",
+                           tono: .bad)
         case .refused:
             return Titular(titulo: "El agente no deja entrar a esta app",
                            sub: "El agente ha rechazado la conexión. Comprueba que la app y el agente son de la misma instalación.",
@@ -108,6 +116,7 @@ enum Textos {
         case .notRunning: "Agente · sin respuesta"
         case .versionMismatch: "Agente · otra versión"
         case .refused: "Agente · rechaza la app"
+        case .noLiveStatus, .unintelligible: "Agente · desactualizado"
         }
     }
 
@@ -141,6 +150,14 @@ enum Textos {
         case .refused: "El agente no deja hacer esto desde esta app: no está firmada por el mismo firmante que el agente."
         case .noAnswer: "El agente no ha contestado a tiempo. Prueba otra vez."
         case .unexpected: "El agente ha contestado algo que esta app no esperaba. Prueba otra vez."
+        }
+    }
+
+    /// The search for gateways is open to any app: a refusal there is not about signing.
+    static func falloBusqueda(_ e: CommandError) -> String {
+        switch e {
+        case .refused: "Este agente todavía no sabe buscar gateways. Escribe la dirección aquí abajo."
+        default: fallo(e)
         }
     }
 

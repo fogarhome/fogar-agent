@@ -34,7 +34,10 @@ iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
 rm -rf "$(dirname "$iconset")"
 
 identity=${FOGAR_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Apple Development/ {print $2; exit}')}
-[ -n "$identity" ] || identity=-
+if [ -z "$identity" ]; then
+  identity=-
+  echo "warning: no Apple Development identity: signing ad hoc; the agent will refuse pair/unpair (uid_only)" >&2
+fi
 codesign --force --options runtime --timestamp=none --sign "$identity" "$app"
 codesign --verify --strict "$app"
 echo "built $app ($config, signed: $identity)"

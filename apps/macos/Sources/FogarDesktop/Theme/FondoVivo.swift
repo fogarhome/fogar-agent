@@ -143,8 +143,8 @@ enum FondoPintor {
         let W = Double(lw), H = Double(lh), s = t * velocidad
         // Materia y humo: dark = the brand; light = the same smoke, as pale mist over bone.
         let noche: RGB = oscuro ? (11, 16, 18) : (241, 236, 227)
-        let humoC: RGB = oscuro ? (19, 32, 27) : (214, 226, 214)
-        let niebla: RGB = oscuro ? (32, 51, 42) : (200, 217, 204)
+        let humoC: RGB = oscuro ? (19, 32, 27) : (226, 230, 216)
+        let niebla: RGB = oscuro ? (32, 51, 42) : (216, 226, 210)
         x.setFillColor(color(noche, 1))
         x.fill(CGRect(x: 0, y: 0, width: W, height: H))
         for k in 0..<3 {
@@ -152,11 +152,12 @@ enum FondoPintor {
             let X = W * (0.2 + 0.6 * (0.5 + 0.5 * sin(s * 0.21 + kd * 2.1)))
             let Y = H * (0.15 + 0.55 * (0.5 + 0.5 * sin(s * 0.17 + kd * 1.3)))
             let r = W * (0.42 + 0.08 * sin(s * 0.3 + kd))
-            radial(x, X, Y, r, [(k == 1 ? niebla : humoC, 0.75 * humo, 0), (k == 1 ? niebla : humoC, 0, 1)])
+            radial(x, X, Y, r, [(k == 1 ? niebla : humoC, 0.75 * humo * (oscuro ? 1 : 0.7), 0), (k == 1 ? niebla : humoC, 0, 1)])
         }
-        // Light adds on the night; on bone it can only darken, so it multiplies (and stays fainter).
-        x.setBlendMode(oscuro ? .plusLighter : .multiply)
-        let luz = oscuro ? 1.0 : 0.55
+        // Light adds on the night. On bone, adding light would vanish and multiplying reads as
+        // dirt, so the ember is laid over thinly: a faint warmth, never a grey stain.
+        x.setBlendMode(oscuro ? .plusLighter : .normal)
+        let luz = oscuro ? 1.0 : 0.3
         let X0 = W * (0.5 + 0.45 * sin(s * 0.09 + 1)), Y0 = H * (0.25 + 0.2 * sin(s * 0.13))
         radial(x, X0, Y0, W * 0.5, [(contra, 0.07 * humo * luz, 0), (contra, 0, 1)])
         for k in 0..<3 {

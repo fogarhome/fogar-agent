@@ -5,7 +5,11 @@ import Testing
 @testable import FogarDesktop
 
 /// A scripted agent on a real Unix socket: answers each request with `respond`.
-final class FakeAgent: @unchecked Sendable {
+nonisolated final class FakeAgent: @unchecked Sendable {
+    /// Connections accepted so far (to catch reconnect loops).
+    private let lock = NSLock()
+    private var _accepted = 0
+    var accepted: Int { lock.withLock { _accepted } }
     let path = NSTemporaryDirectory() + "fogar-t-\(UUID().uuidString.prefix(8)).sock"
     private var listener: NWListener?
 
@@ -14,7 +18,8 @@ final class FakeAgent: @unchecked Sendable {
         let params = NWParameters.tcp
         params.requiredLocalEndpoint = .unix(path: path)
         let l = try NWListener(using: params)
-        l.newConnectionHandler = { conn in
+        l.newConnectionHandler = { [weak self] conn in
+            self?.lock.withLock { self?._accepted += 1 }
             Task {
                 let c = FramedConnection(accepted: conn)
                 do {
@@ -22,6 +27,7 @@ final class FakeAgent: @unchecked Sendable {
                     while true {
                         let req = try WireCodec.decodeRequest(try await c.receive())
                         for r in respond(req) { try await c.send(WireCodec.encode(r)) }
+                        if case .subscribe = req, let raw = Self.rawAfterSubscribe { try await c.send(Data(raw.utf8)) }
                     }
                 } catch {}
             }
@@ -29,6 +35,9 @@ final class FakeAgent: @unchecked Sendable {
         l.start(queue: .global())
         listener = l
     }
+
+    /// A raw frame body pushed after `subscribed` (to feed garbage).
+    nonisolated(unsafe) static var rawAfterSubscribe: String?
 
     deinit {
         listener?.cancel()
@@ -103,6 +112,38 @@ func waitFor(_ link: AgentLink, _ ok: (AgentState) -> Bool) async -> Bool {
         try await Task.sleep(for: .milliseconds(200))
         let link = AgentLink(socketPath: agent.path)
         await #expect(throws: CommandError.refused) { _ = try await link.pair(address: "x", code: "482913") }
+    }
+}
+
+extension AgentLinkOverASocket {
+    /// Today's core refuses `subscribe` («not implemented yet»): an honest state, and no 2 Hz
+    /// reconnect loop (review finding).
+    @Test func refusedSubscribeIsAnOlderAgentNotALoop() async throws {
+        let agent = try FakeAgent { req in
+            if case .hello = req { return [.hello(WireHello(version: 2))] }
+            return [.refused(WireRefused(reason: "not implemented yet"))]
+        }
+        try await Task.sleep(for: .milliseconds(200))
+        let link = AgentLink(socketPath: agent.path)
+        link.start()
+        defer { link.stop() }
+        #expect(await waitFor(link) { $0 == .noLiveStatus })
+        try await Task.sleep(for: .seconds(2))
+        #expect(agent.accepted == 1)
+    }
+
+    @Test func undecodableEventIsSaidNotAgentDown() async throws {
+        FakeAgent.rawAfterSubscribe = #"{"type":"event","data":{"phase":"dancing"}}"#
+        defer { FakeAgent.rawAfterSubscribe = nil }
+        let agent = try FakeAgent { req in
+            if case .hello = req { return [.hello(WireHello(version: 2))] }
+            return [.subscribed]
+        }
+        try await Task.sleep(for: .milliseconds(200))
+        let link = AgentLink(socketPath: agent.path)
+        link.start()
+        defer { link.stop() }
+        #expect(await waitFor(link) { $0 == .unintelligible })
     }
 }
 

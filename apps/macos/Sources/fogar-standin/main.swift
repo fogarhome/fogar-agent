@@ -3,7 +3,7 @@
 //
 //   swift run fogar-standin [--socket PATH] [--phase not_paired|connecting|ready|reconnecting|
 //       parked_repair|parked_agent_refused|parked_client_error|stopping] [--version N]
-//       [--gateways 0|1|2] [--refuse-pair] [--peer uid_only|same_signer] [--boot safe]
+//       [--gateways 0|1|2] [--refuse-pair] [--peer uid_only|same_signer] [--boot safe] [--old]
 //
 // Pairing codes decide the outcome: 482913 pairs; 111111 invalid_code, 222222 unreachable,
 // 333333 not_a_gateway, 444444 gateway_error, 555555 storage_failed, 666666 busy,
@@ -21,6 +21,8 @@ struct Options {
     var refusePair = false
     var peer = WirePeerCheck.sameSigner
     var boot = "normal"
+    /// Plays today's pre-S1 core: `subscribe`, `discover`, `pair`, `unpair` answered `refused`.
+    var old = false
 
     init(_ args: [String]) {
         var it = args.dropFirst().makeIterator()
@@ -33,6 +35,7 @@ struct Options {
             case "--refuse-pair": refusePair = true
             case "--peer": peer = WirePeerCheck(rawValue: it.next() ?? "") ?? peer
             case "--boot": boot = it.next() ?? boot
+            case "--old": old = true
             default: fail("unknown argument \(a)")
             }
         }
@@ -93,6 +96,12 @@ actor StandIn {
     }
 
     func answer(_ request: WireRequest) async -> WireResponse {
+        if options.old {
+            switch request {
+            case .hello, .status: break
+            default: return .refused(WireRefused(reason: "not implemented yet"))
+            }
+        }
         switch request {
         case .hello: return .hello(WireHello(version: options.version))
         case .status: return .status(status)
@@ -105,7 +114,8 @@ actor StandIn {
             ]
             return .discovered(WireDiscovered(gateways: Array(all.prefix(max(0, options.gateways)))))
         case .pair(let p):
-            if options.refusePair { return .refused(WireRefused(reason: "peer not allowed to pair")) }
+            // Like the core: pair/unpair only for a verified same-signer peer.
+            if options.refusePair || options.peer == .uidOnly { return .refused(WireRefused(reason: "peer not allowed to pair")) }
             if pairing { return .pairFailed(WirePairFailed(reason: .busy)) }
             if link != "not_paired" { return .pairFailed(WirePairFailed(reason: .alreadyPaired)) }
             guard let code = parsePairCode(p.code) else { return .pairFailed(WirePairFailed(reason: .badCode)) }
@@ -133,7 +143,7 @@ actor StandIn {
             }
             return .paired(paired)
         case .unpair:
-            if options.refusePair { return .refused(WireRefused(reason: "peer not allowed to unpair")) }
+            if options.refusePair || options.peer == .uidOnly { return .refused(WireRefused(reason: "peer not allowed to unpair")) }
             await set(link: "not_paired")
             return .unpaired
         }
@@ -141,14 +151,17 @@ actor StandIn {
 }
 
 func serve(_ c: FramedConnection, _ agent: StandIn) async {
-    defer { Task { await agent.drop(c); await c.cancel() } }
+    defer { c.cancel(); Task { await agent.drop(c) } }
     do {
         try await c.start()
+        var saludado = false
         while true {
             let request = try WireCodec.decodeRequest(try await c.receive())
+            // Like the real agent: `hello` first, or the connection is dropped.
+            if case .hello = request { saludado = true } else if !saludado { return }
             let response = await agent.answer(request)
             try await c.send(WireCodec.encode(response))
-            if case .subscribe = request {
+            if case .subscribe = request, case .subscribed = response {
                 await agent.subscribe(c)
                 try await c.send(WireCodec.encode(WireResponse.event(await agent.status)))
             }
@@ -181,7 +194,8 @@ listener.stateUpdateHandler = { state in
     }
 }
 listener.start(queue: .main)
-signal(SIGINT) { _ in unlink(AgentSocket.path(allowOverride: true)); exit(0) }
+// Ctrl-C: the socket file is left behind; the next start unlinks it before listening.
+signal(SIGINT, SIG_DFL)
 
 Task.detached {
     while let line = readLine() {

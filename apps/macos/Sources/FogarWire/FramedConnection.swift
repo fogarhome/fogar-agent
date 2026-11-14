@@ -63,6 +63,12 @@ public actor FramedConnection {
                     default: break
                     }
                 }
+                // Cancelled before the handler above existed: `onCancel` already ran, and a
+                // cancelled NWConnection may never report `.cancelled` to a late handler.
+                if Task.isCancelled {
+                    once.run { k.resume(throwing: LinkError.closed) }
+                    return
+                }
                 connection.start(queue: queue)
             }
         } onCancel: {
@@ -98,7 +104,8 @@ public actor FramedConnection {
         }
     }
 
-    public func cancel() { connection.cancel() }
+    /// Thread-safe (NWConnection.cancel is), so callers can tear down synchronously.
+    public nonisolated func cancel() { connection.cancel() }
 
     private func readChunk() async throws -> Data {
         let connection = self.connection

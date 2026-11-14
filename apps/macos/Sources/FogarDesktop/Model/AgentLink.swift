@@ -10,8 +10,12 @@ enum AgentState: Equatable {
     case notRunning
     /// The agent speaks another IPC version: one side needs updating.
     case versionMismatch(agent: UInt32)
-    /// The agent answered `refused` to `hello` or `subscribe`.
+    /// The agent answered `refused` to `hello`.
     case refused
+    /// The agent answers but refuses `subscribe`: an agent older than S1 (no live status).
+    case noLiveStatus
+    /// The agent sent something this app cannot decode (e.g. a new phase without a version bump).
+    case unintelligible
     /// Subscribed: the latest status the agent pushed.
     case live(WireStatus)
 
@@ -76,30 +80,42 @@ final class AgentLink {
     private func run() async {
         var backoff = Duration.milliseconds(500)
         while !Task.isCancelled {
+            var permanent = false // retrying soon would not change the answer
             do {
                 let c = try await FramedConnection.connect(path: socketPath)
-                defer { Task { await c.cancel() } }
-                try await handshake(c)
-                try await c.send(WireCodec.encode(WireRequest.subscribe))
-                backoff = .milliseconds(500)
+                defer { c.cancel() }
+                // Every outside await has a deadline; only the event stream itself is open-ended.
+                try await withDeadline(.seconds(5)) {
+                    try await self.handshake(c)
+                    try await c.send(WireCodec.encode(WireRequest.subscribe))
+                }
                 while !Task.isCancelled {
                     switch try WireCodec.decodeResponse(await c.receive()) {
-                    case .event(let s), .status(let s): set(.live(s))
-                    case .refused: set(.refused); throw LinkError.closed
-                    default: break // `subscribed` and anything else carry nothing to show
+                    case .event(let s), .status(let s):
+                        set(.live(s))
+                        backoff = .milliseconds(500) // only a real event proves the link
+                    case .refused:
+                        throw CommandError.unexpected // subscribe refused: see the catch below
+                    default:
+                        break // `subscribed` carries nothing to show
                     }
                 }
             } catch let CommandError.versionMismatch(agent) {
-                set(.versionMismatch(agent: agent))
+                set(.versionMismatch(agent: agent)); permanent = true
             } catch CommandError.refused {
-                set(.refused)
+                set(.refused); permanent = true
+            } catch CommandError.unexpected {
+                set(.noLiveStatus); permanent = true
+            } catch is DecodingError {
+                set(.unintelligible); permanent = true
             } catch {
-                // Socket gone, agent restarted, garbage frame: honestly «not running» until it answers.
+                // Socket gone, agent restarted or wedged: honestly «not running» until it answers.
                 set(.notRunning)
             }
-            // shortcut: retries on a timer (0.5 s doubling to 8 s); a vnode watch on the run
-            // directory would wake exactly when the agent starts. Upgrade if idle cost shows up.
-            await sleep(backoff)
+            // shortcut: retries on a timer (0.5 s doubling to 8 s; 60 s when the agent answered
+            // but retrying cannot help); a vnode watch on the run directory would wake exactly
+            // when the agent starts. Upgrade if idle cost shows up.
+            await sleep(permanent ? .seconds(60) : backoff)
             backoff = min(backoff * 2, .seconds(8))
         }
     }
@@ -149,7 +165,7 @@ final class AgentLink {
         do {
             return try await withDeadline(timeout) {
                 let c = try await FramedConnection.connect(path: path)
-                defer { Task { await c.cancel() } }
+                defer { c.cancel() }
                 try await self.handshake(c)
                 try await c.send(WireCodec.encode(request))
                 while true {
@@ -189,6 +205,8 @@ private extension AgentState {
         case .notRunning: "notRunning"
         case .versionMismatch: "version"
         case .refused: "refused"
+        case .noLiveStatus: "noLiveStatus"
+        case .unintelligible: "unintelligible"
         case .live(let s): "live.\(s.link)"
         }
     }

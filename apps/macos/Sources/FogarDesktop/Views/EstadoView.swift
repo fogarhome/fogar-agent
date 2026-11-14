@@ -60,7 +60,7 @@ private struct Cabecera: View {
         case .live(let s) where s.link == "parked_repair":
             Button("Ir a Ajustes") { nav.seccion = .ajustes }
                 .buttonStyle(Pildora(variante: .principal))
-        case .notRunning, .refused:
+        case .notRunning, .refused, .noLiveStatus, .unintelligible:
             Button("Volver a llamar") { link.retryNow() }
                 .buttonStyle(Pildora())
         default:
@@ -73,7 +73,7 @@ private struct Cabecera: View {
         case .live: "En vivo desde el agente · \(Textos.desde(since, ahora: ahora))"
         case .looking: "Llamando al agente…"
         case .notRunning: "Sin respuesta del agente \(Textos.desde(since, ahora: ahora)) · la app vuelve a llamar sola"
-        case .versionMismatch, .refused: "El agente contesta, pero no se entienden"
+        case .versionMismatch, .refused, .noLiveStatus, .unintelligible: "El agente contesta, pero no se entienden"
         }
     }
 }
