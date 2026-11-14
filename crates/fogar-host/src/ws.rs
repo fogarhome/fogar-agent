@@ -4,8 +4,8 @@
 //! message/frame <= 1 MiB (the gateway's own limit), write buffer capped (tungstenite's default
 //! `max_write_buffer_size` is `usize::MAX`), small eager read buffer (energy skill pitfall).
 //! Deadlines: the name lookup, each TCP attempt and the TLS handshake under `attempt_timeout`,
-//! the close handshake under `close_timeout`; the whole connect, send and recv are bounded by
-//! the core.
+//! the whole connect, send, recv and the close handshake are bounded by the core
+//! (`fogar_core::Config`).
 //!
 //! Transport policy (NET-1, ADR-0006 item 4): the name is resolved ONCE by [`Resolver`],
 //! `cleartext_allowed` is applied to every resolved address, and the upgrade runs over the
@@ -34,7 +34,6 @@ const CLOSE_NO_STATUS: u16 = 1005;
 /// Adapter tuning. The gateway address is per call (`GatewayLink::connect`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WsConfig {
-    pub close_timeout: Duration,
     pub max_frame: usize,
     /// Per resolved address (and for the name lookup).
     pub attempt_timeout: Duration,
@@ -43,7 +42,6 @@ pub struct WsConfig {
 impl Default for WsConfig {
     fn default() -> Self {
         Self {
-            close_timeout: Duration::from_secs(2),
             max_frame: WS_MAX_FRAME_BYTES,
             attempt_timeout: Duration::from_secs(3),
         }
@@ -199,15 +197,11 @@ impl LinkSession for WsSession {
             code: CloseCode::from(code),
             reason: reason.into(),
         };
-        let t = self.cfg.close_timeout;
-        let ws = &mut self.ws;
-        // RFC 6455 §7.1.1: send our close, then wait (bounded) for the server to finish.
-        let _ = tokio::time::timeout(t, async {
-            if ws.close(Some(frame)).await.is_ok() {
-                while ws.next().await.is_some() {}
-            }
-        })
-        .await;
+        // RFC 6455 §7.1.1: send our close, then wait for the server to finish. Unbounded here:
+        // the core's `close_timeout` deadline drops this future.
+        if self.ws.close(Some(frame)).await.is_ok() {
+            while self.ws.next().await.is_some() {}
+        }
         Ok(())
     }
 }
