@@ -3,6 +3,11 @@
 # temporary copy of the repo's agent config and asserts the checker rejects it; the pristine copy
 # must pass. Run by scripts/gates.sh.
 set -uo pipefail
+# The planted mutations use GNU sed (-i without suffix, \n in replacements). On macOS use gsed.
+if ! sed --version >/dev/null 2>&1; then
+  command -v gsed >/dev/null 2>&1 || { echo "test_check_vendored: GNU sed required (brew install gnu-sed)" >&2; exit 1; }
+  sed() { gsed "$@"; }
+fi
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fogar-vendored-test.XXXXXX")"
@@ -14,7 +19,7 @@ fresh() { # -> path of a pristine copy
   rm -rf "$d"; mkdir -p "$d/docs"
   cp -R "$ROOT/scripts" "$ROOT/agent-team" "$d/"
   cp -R "$ROOT/docs/adr" "$d/docs/"
-  [ -d "$ROOT/.claude" ] && cp -R "$ROOT/.claude" "$d/"
+  mkdir -p "$d/.claude"  # pristine = nothing installed; cases that need the installed copy call installed()
   echo "$d"
 }
 
