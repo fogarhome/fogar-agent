@@ -9,6 +9,7 @@
 
 use crate::{
     config::Config,
+    pairing::{PairingRecord, is_revocation, load_record},
     queues::{ByteBudget, Charge},
     stats::{LinkState, Stats},
     time::deadline,
@@ -16,6 +17,7 @@ use crate::{
 use fogar_ports::{
     clock::{Clock, Mono},
     gateway::{Frame, GatewayLink, LinkEvent, LinkSession},
+    ipc::GatewayInfo,
     random::Random,
     secrets::{ExposeSecret, SecretKey, SecretStore},
 };
@@ -53,6 +55,8 @@ impl std::fmt::Debug for Inbound {
 pub struct LinkView {
     pub state: LinkState,
     pub last_close: Option<(u16, CloseAction)>,
+    /// The gateway of the pairing record the link is using; `None` = not paired.
+    pub gateway: Option<GatewayInfo>,
 }
 
 pub(crate) struct LinkCtx<C, L> {
@@ -65,6 +69,12 @@ pub(crate) struct LinkCtx<C, L> {
     pub(crate) view: watch::Sender<LinkView>,
     /// Byte budget of the inbound queue (`queues::INBOUND_BYTES`).
     pub(crate) budget: ByteBudget,
+    /// Bumped whenever the pairing record is written or deleted: the link drops what it is
+    /// doing (session, backoff, park) and starts over from the stored record.
+    pub(crate) pairing: watch::Receiver<()>,
+    /// Keeps the pairing channel open while the link runs: a closed `watch` would make every
+    /// `changed()` branch above resolve at once (a hot loop).
+    pub(crate) _pairing_keep: watch::Sender<()>,
 }
 
 /// Why a connection attempt / session ended.
@@ -84,6 +94,8 @@ enum Outcome {
     },
     /// We ended the session: the engine stalled or a write failed / timed out.
     LocalFault,
+    /// The pairing record changed (paired, unpaired): start over without backoff.
+    PairingChanged,
 }
 
 impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
@@ -91,16 +103,19 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
         self.view.send_modify(|v| v.state = state);
     }
 
+    /// `false` = shutdown. Returns early (`true`) when the pairing record changes.
     async fn wait(&self, d: Duration, egress: &CancellationToken) -> bool {
+        let mut pairing = self.pairing.clone();
         tokio::select! {
             biased;
             () = egress.cancelled() => false,
+            _ = pairing.changed() => true,
             () = self.clock.sleep(d) => true,
         }
     }
 
     pub(crate) async fn run(
-        self,
+        mut self,
         mut out_rx: mpsc::Receiver<Frame>,
         in_tx: mpsc::Sender<Inbound>,
         egress: CancellationToken,
@@ -110,19 +125,23 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
             if egress.is_cancelled() || in_tx.is_closed() {
                 break;
             }
-            let key = match (
-                &self.cfg.gateway,
-                self.secrets.get(SecretKey::GatewayClientKey),
-            ) {
-                (Some(_), Ok(Some(k))) => k,
-                (None, _) | (_, Ok(None)) => {
-                    self.set_state(LinkState::NotPaired);
+            // Changes from here on interrupt whatever the link does with this record.
+            self.pairing.borrow_and_update();
+            let record = match load_record(&*self.secrets) {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    self.view.send_modify(|v| {
+                        v.state = LinkState::NotPaired;
+                        v.gateway = None;
+                    });
+                    // Re-read at the backoff cap too: a record written outside the agent (the
+                    // CLI) is picked up without a restart.
                     if self.wait(self.cfg.backoff.cap, &egress).await {
                         continue;
                     }
                     break;
                 }
-                (_, Err(_)) => {
+                Err(_) => {
                     let d = self.cfg.backoff.delay(attempt, &*self.random);
                     attempt = attempt.saturating_add(1);
                     self.set_state(LinkState::Backoff {
@@ -135,13 +154,16 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                     break;
                 }
             };
-            self.set_state(LinkState::Connecting { attempt });
+            let info = record.info();
+            self.view.send_modify(|v| {
+                v.state = LinkState::Connecting { attempt };
+                if v.gateway.as_ref() != Some(&info) {
+                    v.gateway = Some(info);
+                }
+            });
             Stats::inc(&self.stats.connect_attempts);
             let started = self.clock.now();
-            let (outcome, was_ready) = self
-                .attempt(key.expose_secret(), &mut out_rx, &in_tx, &egress)
-                .await;
-            drop(key);
+            let (outcome, was_ready) = self.attempt(&record, &mut out_rx, &in_tx, &egress).await;
             if was_ready {
                 Stats::inc(&self.stats.sessions_ended);
                 let up_for = self.clock.now().saturating_since(started);
@@ -154,8 +176,14 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
             }
             let (delay, close) = match outcome {
                 Outcome::Shutdown | Outcome::EngineGone => break,
+                Outcome::PairingChanged => {
+                    attempt = 0;
+                    continue;
+                }
                 Outcome::ClientBug => {
-                    self.park(CloseAction::FixClient, &egress).await;
+                    if self.park(CloseAction::FixClient, &egress).await {
+                        continue;
+                    }
                     break;
                 }
                 Outcome::ConnectFailed | Outcome::LocalFault => {
@@ -173,11 +201,20 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                     if !was_ready {
                         Stats::inc(&self.stats.connect_failures);
                     }
+                    if is_revocation(code, &reason) && self.revoke(&record) {
+                        // Back to "not paired" (the loop finds no record); never retry this key.
+                        attempt = 0;
+                        continue;
+                    }
                     match action {
+                        // Repair without one of the two exact texts keeps the key (spec §0).
                         CloseAction::Repair
                         | CloseAction::AgentRefused
                         | CloseAction::FixClient => {
-                            self.park(action, &egress).await;
+                            if self.park(action, &egress).await {
+                                attempt = 0;
+                                continue;
+                            }
                             break;
                         }
                         // Idle close (300 s without client messages), a normal close or a
@@ -208,34 +245,53 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
     }
 
     /// Stays alive but stops retrying (retrying would loop: fogar-longrun "config/auth errors do
-    /// not exit"). Leaves only on shutdown in slice 0; S1 adds re-pairing / config reload.
-    async fn park(&self, reason: CloseAction, egress: &CancellationToken) {
+    /// not exit"). `true` = the pairing record changed (re-paired/unpaired): start over;
+    /// `false` = shutdown.
+    async fn park(&self, reason: CloseAction, egress: &CancellationToken) -> bool {
         self.set_state(LinkState::Parked { reason });
-        egress.cancelled().await;
+        let mut pairing = self.pairing.clone();
+        tokio::select! {
+            biased;
+            () = egress.cancelled() => false,
+            r = pairing.changed() => r.is_ok(),
+        }
+    }
+
+    /// The gateway revoked `record`'s key: delete it, unless the record was replaced meanwhile
+    /// (an Unpair + Pair raced the close). `false` = the delete failed: the caller parks rather
+    /// than retry a dead key.
+    fn revoke(&self, record: &PairingRecord) -> bool {
+        let still_ours = matches!(
+            load_record(&*self.secrets),
+            Ok(Some(r)) if r.client_id() == record.client_id() && r.address() == record.address()
+        );
+        if still_ours && self.secrets.delete(SecretKey::GatewayPairing).is_err() {
+            return false;
+        }
+        true
     }
 
     /// One connect + handshake + session. Returns the outcome and whether `ready` was reached.
     async fn attempt(
         &self,
-        key: &str,
+        record: &PairingRecord,
         out_rx: &mut mpsc::Receiver<Frame>,
         in_tx: &mpsc::Sender<Inbound>,
         egress: &CancellationToken,
     ) -> (Outcome, bool) {
         let clock = &*self.clock;
-        let Some(addr) = &self.cfg.gateway else {
-            return (Outcome::ConnectFailed, false);
-        };
+        let mut pairing = self.pairing.clone();
         let connect = tokio::select! {
             biased;
             () = egress.cancelled() => return (Outcome::Shutdown, false),
-            r = deadline(clock, self.cfg.connect_timeout, self.link.connect(addr)) => r,
+            _ = pairing.changed() => return (Outcome::PairingChanged, false),
+            r = deadline(clock, self.cfg.connect_timeout, self.link.connect(record.address())) => r,
         };
         let Some(Ok(mut sess)) = connect else {
             return (Outcome::ConnectFailed, false);
         };
         let hs = Handshake {
-            client_key: Cow::Borrowed(key),
+            client_key: Cow::Borrowed(record.client_key().expose_secret()),
             input_mode: self.cfg.input_mode,
             output_mode: self.cfg.output_mode.clone(),
             agent: self.cfg.agent.as_deref().map(Cow::Borrowed),
@@ -281,12 +337,17 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
     ) -> Result<(), Outcome> {
         let clock = &*self.clock;
         let ready_by = clock.now().saturating_add(self.cfg.ready_timeout);
+        let mut pairing = self.pairing.clone();
         loop {
             tokio::select! {
                 biased;
                 () = egress.cancelled() => {
                     self.close_quietly(sess, CLOSE_NORMAL).await;
                     return Err(Outcome::Shutdown);
+                }
+                _ = pairing.changed() => {
+                    self.close_quietly(sess, CLOSE_NORMAL).await;
+                    return Err(Outcome::PairingChanged);
                 }
                 ev = sess.recv() => match ev {
                     None => return Err(Outcome::Closed { code: CLOSE_ABNORMAL, reason: String::new() }),
@@ -323,6 +384,7 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
     ) -> Outcome {
         let clock = &*self.clock;
         let mut last_sent: Mono = clock.now();
+        let mut pairing = self.pairing.clone();
         loop {
             // One armed timer at most (energy rule 1): the keepalive deadline, pushed forward by
             // every frame we send.
@@ -335,6 +397,10 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                 () = egress.cancelled() => {
                     self.close_quietly(sess, CLOSE_NORMAL).await;
                     return Outcome::Shutdown;
+                }
+                _ = pairing.changed() => {
+                    self.close_quietly(sess, CLOSE_NORMAL).await;
+                    return Outcome::PairingChanged;
                 }
                 ev = sess.recv() => match ev {
                     None => return Outcome::Closed { code: CLOSE_ABNORMAL, reason: String::new() },
@@ -506,6 +572,20 @@ mod budget_tests {
     use crate::queues::{INBOUND, INBOUND_BYTES};
     use fogar_ports::gateway::LinkError;
     use fogar_testkit::{MemorySecretStore, SeededRandom, TestClock};
+
+    fn paired_store(addr: &str, key: &str) -> MemorySecretStore {
+        let s = MemorySecretStore::default();
+        let rec = PairingRecord::new(
+            fogar_ports::gateway::GatewayAddr::parse(addr).unwrap(),
+            "c-1".into(),
+            key.to_owned().into(),
+            "gw".into(),
+            "1".into(),
+            "Mac".into(),
+        );
+        s.put(SecretKey::GatewayPairing, rec.encode()).unwrap();
+        s
+    }
     use std::{collections::VecDeque, sync::Mutex};
 
     const READY: &str = r#"{"type":"ready","session_id":"c:1"}"#;
@@ -565,19 +645,20 @@ mod budget_tests {
         let (view, _) = watch::channel(LinkView {
             state: LinkState::Starting,
             last_close: None,
+            gateway: None,
         });
+        let (pairing_keep, pairing) = watch::channel(());
         let ctx = LinkCtx {
             clock: clock.clone(),
             link: Scripted(Arc::new(Mutex::new(Some(script)))),
-            secrets: Arc::new(MemorySecretStore::with_client_key("k")),
+            secrets: Arc::new(paired_store("127.0.0.1", "k")),
             random: Arc::new(SeededRandom::new(7)),
-            cfg: Arc::new(Config {
-                gateway: fogar_ports::gateway::GatewayAddr::parse("127.0.0.1").ok(),
-                ..Config::default()
-            }),
+            cfg: Arc::new(Config::default()),
             stats: stats.clone(),
             view,
             budget: budget.clone(),
+            pairing,
+            _pairing_keep: pairing_keep,
         };
         let (out_tx, out_rx) = mpsc::channel(8);
         let (in_tx, in_rx) = mpsc::channel(INBOUND);

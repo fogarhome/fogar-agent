@@ -13,6 +13,7 @@ pub mod backoff;
 pub mod config;
 pub mod crashloop;
 pub mod heartbeat;
+pub mod pairing;
 pub mod queues;
 pub mod stats;
 pub mod turn;
@@ -23,7 +24,8 @@ mod ipc;
 mod link;
 mod time;
 
-pub use agent::{Agent, AgentPorts, HealthProbe, NoIpc, ShutdownReport};
+pub use agent::{Agent, AgentPorts, HealthProbe, NoHttp, NoIpc, ShutdownReport};
 pub use config::Config;
 pub use link::LinkView;
+pub use pairing::PairingRecord;
 pub use stats::{Health, LinkState, StatsSnapshot};

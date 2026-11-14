@@ -11,7 +11,10 @@
 //! | inbound TTS audio | link session -> engine | shares `INBOUND` and `INBOUND_BYTES` | shed NEWEST, count `inbound_audio_shed` (`try_send` / `try_charge`); the session never waits on audio |
 //! | playback buffer | engine -> audio sink adapter | adapter-owned, bounded | `ActivePlayback::write` accepts what fits; engine counts the rest in `tts_samples_dropped` |
 //! | link state / health | many -> readers | `watch` (1) | coalesce: latest value wins |
-//! | IPC connections | IPC adapter -> service | `IPC_MAX_CONNS` concurrent | further accepts wait (the accept branch is disabled while full); a connection idle for `Config::ipc_idle_timeout` (30 s) is closed, so silent clients cannot hold the slots |
+//! | IPC connections | IPC adapter -> service | `IPC_MAX_CONNS` concurrent (subscribers included) | further accepts wait (the accept branch is disabled while full); a connection idle for `Config::ipc_idle_timeout` (30 s) is closed, so silent clients cannot hold the slots; a SUBSCRIBED connection is exempt from the idle close but each push runs under `write_timeout` and a miss closes it |
+//! | status subscription | link view -> each subscribed connection | `watch` (1) | coalesce: latest value wins, a push is skipped when the status did not change; never a backlog |
+//! | pairing generation | IPC pair/unpair -> link | `watch` (1) | coalesce: the link only needs "the record changed", then re-reads it |
+//! | pairing operations | IPC connections -> gateway `/pair` | `PAIRING` in flight | admission control: a second `Pair` gets `PairFailure::Busy` at once (`try_acquire`); `Unpair` waits for the running one, which is bounded by its HTTP deadlines |
 //!
 //! Stale uplink frames left in the `out` channel when a session dies are discarded (and counted)
 //! before the next session starts: they belonged to a turn that no longer exists.
@@ -34,6 +37,8 @@ pub const OUTBOUND: usize = 64;
 pub const INBOUND: usize = 128;
 /// Concurrent local UI connections.
 pub const IPC_MAX_CONNS: usize = 4;
+/// Pairing operations in flight (one: the gateway's code is one-use).
+pub const PAIRING: usize = 1;
 /// Bytes of inbound frames (JSON text length / binary length) queued link -> engine at once
 /// (review sec#4): with 1 MiB frames, `INBOUND` messages alone would allow 128 MiB.
 pub const INBOUND_BYTES: usize = 4 << 20;

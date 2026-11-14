@@ -1,31 +1,45 @@
-//! Local UI service over the IpcServer port (ADR-0002). Read-only in slice 0: version handshake
-//! and status. Connections live in a JoinSet drained in the same loop and aborted on shutdown.
+//! Local UI service over the IpcServer port (ADR-0002): version handshake, status, status
+//! subscription, discovery and pairing. Connections live in a JoinSet drained in the same loop
+//! and aborted on shutdown.
+//!
+//! Authorization (IPC-4): `Pair`/`Unpair` change where the user's voice goes, so they are
+//! answered only for a `PeerCheck::SameSigner` peer, unless the composition root opted in to
+//! `UidOnly` peers at compile time (`Config::pair_from_uid_only_peers`). The rest is read-only.
 
-use crate::{agent::HealthProbe, queues::IPC_MAX_CONNS, stats::Stats, time::deadline};
+use crate::{
+    agent::HealthProbe, link::LinkView, pairing::Pairing, queues::IPC_MAX_CONNS, stats::Stats,
+    time::deadline,
+};
 use fogar_ports::{
     clock::Clock,
-    ipc::{IPC_VERSION, IpcConn, IpcRequest, IpcResponse, IpcServer, PeerCheck, StatusReport},
+    gateway_http::GatewayHttp,
+    ipc::{
+        IPC_VERSION, IpcConn, IpcError, IpcRequest, IpcResponse, IpcServer, PeerCheck, StatusReport,
+    },
 };
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-/// Per-connection deadlines.
+/// Per-connection limits.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Limits {
-    /// Each response write.
+    /// Each response write, including pushed `Event`s (a miss closes the connection).
     pub(crate) write_timeout: Duration,
-    /// Waiting for the next complete request; on expiry the connection is closed and its slot
-    /// freed (review code#3/sec#5: `IPC_MAX_CONNS` silent clients would otherwise lock the
-    /// service out forever).
+    /// Waiting for the next complete request on an UNSUBSCRIBED connection; on expiry the
+    /// connection is closed and its slot freed (review code#3/sec#5: `IPC_MAX_CONNS` silent
+    /// clients would otherwise lock the service out forever).
     pub(crate) idle_timeout: Duration,
+    /// IPC-4 development opt-in (compile-time at the composition root).
+    pub(crate) pair_from_uid_only_peers: bool,
 }
 
-pub(crate) async fn run<C: Clock, S: IpcServer>(
+pub(crate) async fn run<C: Clock, S: IpcServer, H: GatewayHttp>(
     server: S,
     clock: Arc<C>,
     health: HealthProbe,
     limits: Limits,
+    pairing: Pairing<C, H>,
     ingress: CancellationToken,
 ) {
     let mut conns = JoinSet::new();
@@ -42,7 +56,15 @@ pub(crate) async fn run<C: Clock, S: IpcServer>(
                     let peer_check = peer.check();
                     fail_delay = Duration::from_millis(250);
                     Stats::inc(&health.stats.ipc_connections);
-                    conns.spawn(serve(conn, clock.clone(), health.clone(), limits, peer_check, ingress.child_token()));
+                    conns.spawn(serve(Conn {
+                        conn,
+                        clock: clock.clone(),
+                        health: health.clone(),
+                        limits,
+                        pairing: pairing.clone(),
+                        peer_check,
+                        cancel: ingress.child_token(),
+                    }));
                 }
                 Err(_) => {
                     tokio::select! {
@@ -58,69 +80,148 @@ pub(crate) async fn run<C: Clock, S: IpcServer>(
     conns.shutdown().await;
 }
 
-async fn serve<C: Clock, K: IpcConn>(
-    mut conn: K,
+struct Conn<K, C, H> {
+    conn: K,
     clock: Arc<C>,
     health: HealthProbe,
     limits: Limits,
+    pairing: Pairing<C, H>,
     peer_check: PeerCheck,
     cancel: CancellationToken,
-) {
+}
+
+fn report(health: &HealthProbe, v: &LinkView, peer_check: PeerCheck) -> StatusReport {
+    let s = health.stats.snapshot();
+    StatusReport::new(
+        v.state.label().to_owned(),
+        v.state.phase(),
+        v.gateway.clone(),
+        s.sessions_started,
+        s.turns_completed,
+        health.boot_mode.to_owned(),
+        peer_check,
+    )
+}
+
+impl<K: IpcConn, C: Clock, H: GatewayHttp> Conn<K, C, H> {
+    /// `false` = the write failed or missed `write_timeout`: close the connection.
+    async fn send(&mut self, resp: IpcResponse) -> bool {
+        matches!(
+            deadline(
+                &*self.clock,
+                self.limits.write_timeout,
+                self.conn.send(resp)
+            )
+            .await,
+            Some(Ok(()))
+        )
+    }
+
+    fn may_pair(&self) -> bool {
+        self.peer_check == PeerCheck::SameSigner || self.limits.pair_from_uid_only_peers
+    }
+}
+
+/// Runs a (bounded) operation unless shutdown starts first; `None` = shutdown.
+async fn op<T>(cancel: &CancellationToken, f: impl Future<Output = T>) -> Option<T> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => None,
+        v = f => Some(v),
+    }
+}
+
+/// Next request; with `idle = None` (subscribed) it waits as long as the peer stays.
+/// `None` = idle deadline passed.
+async fn recv_within<C: Clock, K: IpcConn>(
+    clock: &C,
+    conn: &mut K,
+    idle: Option<Duration>,
+) -> Option<Result<Option<IpcRequest>, IpcError>> {
+    match idle {
+        Some(d) => deadline(clock, d, conn.recv()).await,
+        None => Some(conn.recv().await),
+    }
+}
+
+async fn serve<K: IpcConn, C: Clock, H: GatewayHttp>(mut c: Conn<K, C, H>) {
+    let mut view = c.health.view.clone();
+    let mut subscribed = false;
+    // A peer that said another version is told ours, then refused (it must not guess).
+    let mut version_ok = true;
+    let mut last_pushed: Option<StatusReport> = None;
     loop {
         let req = tokio::select! {
             biased;
-            () = cancel.cancelled() => return,
-            r = deadline(&*clock, limits.idle_timeout, conn.recv()) => match r {
-                Some(r) => r,
-                // Idle: close the connection (dropping it) and free the slot.
-                None => return,
+            () = c.cancel.cancelled() => return,
+            r = view.changed(), if subscribed => {
+                if r.is_err() {
+                    return;
+                }
+                let rep = report(&c.health, &view.borrow_and_update(), c.peer_check);
+                if last_pushed.as_ref() == Some(&rep) {
+                    continue;
+                }
+                if !c.send(IpcResponse::Event(rep.clone())).await {
+                    return;
+                }
+                last_pushed = Some(rep);
+                continue;
+            }
+            r = recv_within(&*c.clock, &mut c.conn, (!subscribed).then_some(c.limits.idle_timeout)) => match r {
+                Some(Ok(Some(req))) => req,
+                // Idle, peer gone or a bad frame: close the connection (dropping it).
+                None | Some(Ok(None) | Err(_)) => return,
             },
         };
         let resp = match req {
-            Ok(Some(IpcRequest::Hello { version })) if version == IPC_VERSION => {
+            IpcRequest::Hello { version } => {
+                version_ok &= version == IPC_VERSION;
                 IpcResponse::Hello {
                     version: IPC_VERSION,
                 }
             }
-            // Version mismatch: answer with ours so the client can tell the person which side
-            // to update (it compares and stops).
-            Ok(Some(IpcRequest::Hello { .. })) => IpcResponse::Hello {
-                version: IPC_VERSION,
+            _ if !version_ok => IpcResponse::Refused {
+                reason: "ipc version mismatch",
             },
-            Ok(Some(IpcRequest::Status)) => {
-                let h = health.snapshot();
-                IpcResponse::Status(StatusReport::new(
-                    h.link.label().to_owned(),
-                    h.link.phase(),
-                    // TODO(S1 core PR): gateway info from the pairing record.
-                    None,
-                    h.stats.sessions_started,
-                    h.stats.turns_completed,
-                    h.boot_mode.to_owned(),
-                    peer_check,
-                ))
+            IpcRequest::Status => {
+                IpcResponse::Status(report(&c.health, &view.borrow(), c.peer_check))
             }
-            // TODO(S1 core PR): subscribe (watch, exempt from idle_timeout, push deadline closes),
-            // discover, pair, unpair (Pair/Unpair only for PeerCheck::SameSigner unless the
-            // composition root opts in). Listed explicitly so a new variant is a conscious
-            // decision.
-            Ok(Some(
-                IpcRequest::Subscribe
-                | IpcRequest::Discover
-                | IpcRequest::Pair { .. }
-                | IpcRequest::Unpair,
-            )) => IpcResponse::Refused {
-                reason: "not implemented yet",
+            IpcRequest::Subscribe => {
+                if !c.send(IpcResponse::Subscribed).await {
+                    return;
+                }
+                let rep = report(&c.health, &view.borrow_and_update(), c.peer_check);
+                subscribed = true;
+                last_pushed = Some(rep.clone());
+                IpcResponse::Event(rep)
+            }
+            IpcRequest::Discover => match op(&c.cancel, c.pairing.discover()).await {
+                Some(found) => IpcResponse::Discovered(found),
+                None => return,
             },
-            Ok(Some(_)) => IpcResponse::Refused {
+            IpcRequest::Pair { .. } | IpcRequest::Unpair if !c.may_pair() => IpcResponse::Refused {
+                reason: "pairing needs the signed Fogar app",
+            },
+            IpcRequest::Pair { address, code } => {
+                match op(&c.cancel, c.pairing.pair(&address, code.as_ref())).await {
+                    Some(Ok(info)) => IpcResponse::Paired(info),
+                    Some(Err(f)) => IpcResponse::PairFailed(f),
+                    None => return,
+                }
+            }
+            IpcRequest::Unpair => match op(&c.cancel, c.pairing.unpair()).await {
+                Some(Ok(())) => IpcResponse::Unpaired,
+                Some(Err(_)) => IpcResponse::Refused {
+                    reason: "could not delete the pairing",
+                },
+                None => return,
+            },
+            _ => IpcResponse::Refused {
                 reason: "unsupported request",
             },
-            Ok(None) | Err(_) => return,
         };
-        if !matches!(
-            deadline(&*clock, limits.write_timeout, conn.send(resp)).await,
-            Some(Ok(()))
-        ) {
+        if !c.send(resp).await {
             return;
         }
     }
