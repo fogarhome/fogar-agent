@@ -112,7 +112,7 @@ async fn pairing_happy_path_persists_then_connects() {
     assert_eq!(body["output_mode"], serde_json::json!(["audio", "text"]));
 
     // The link restarts on the new record and the subscriber sees it.
-    wait_ready(&mut rig.health).await;
+    ready_promptly(&mut rig.health).await;
     event_until(&mut c, |r| {
         r.phase == LinkPhase::Ready && r.gateway.as_ref() == Some(&info)
     })
@@ -123,6 +123,16 @@ async fn pairing_happy_path_persists_then_connects() {
         "{s:?}"
     );
     assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
+}
+
+/// Ready well before the NotPaired re-read (`backoff.cap`, 60 s): only the pairing-change
+/// signal can get it there this fast.
+async fn ready_promptly(h: &mut fogar_core::HealthProbe) {
+    within(
+        Duration::from_secs(5),
+        h.wait_link(|v| matches!(v.state, LinkState::Ready { .. })),
+    )
+    .await;
 }
 
 fn rig_cfg_name() -> String {
@@ -271,6 +281,9 @@ async fn every_pair_failure_is_reported_and_stores_nothing() {
             "{address} {code} {status:?}"
         );
         assert_eq!(posts(&rig.routes), n_posts, "{address} {code} {status:?}");
+        if matches!(expected, PairFailure::BadCode) || address.contains('@') {
+            assert!(rig.routes.seen().is_empty(), "no network for {expected:?}");
+        }
         assert!(!rig.secrets.contains(SecretKey::GatewayPairing));
         assert_eq!(rig.health.snapshot().stats.connect_attempts, 0);
         assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
@@ -415,9 +428,12 @@ async fn unpair_deletes_the_record_and_stops_the_link_then_repairing_works() {
     let mut c = client(&rig).await; // the first one was closed for being idle
     let r = c.request(pair_req("127.0.0.1", "482913")).await;
     assert!(matches!(r, Some(IpcResponse::Paired(_))), "{r:?}");
-    wait_state(&mut rig.health, |v| {
-        matches!(v.state, LinkState::Ready { session: 2 })
-    })
+    // Promptly, not at the next 60 s re-read: the pairing change restarts the link.
+    within(
+        Duration::from_secs(5),
+        rig.health
+            .wait_link(|v| matches!(v.state, LinkState::Ready { session: 2 })),
+    )
     .await;
     assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
 }
@@ -436,9 +452,12 @@ async fn revoked_then_repaired() {
     let mut c = client(&rig).await;
     let r = c.request(pair_req("127.0.0.1", "482913")).await;
     assert!(matches!(r, Some(IpcResponse::Paired(_))), "{r:?}");
-    wait_state(&mut rig.health, |v| {
-        matches!(v.state, LinkState::Ready { session: 2 })
-    })
+    // Promptly, not at the next 60 s re-read: the pairing change restarts the link.
+    within(
+        Duration::from_secs(5),
+        rig.health
+            .wait_link(|v| matches!(v.state, LinkState::Ready { session: 2 })),
+    )
     .await;
     assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
 }

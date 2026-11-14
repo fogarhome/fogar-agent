@@ -271,8 +271,9 @@ async fn serve(
     let mut cfg = fogar_core::Config {
         agent: opts.agent.clone(),
         // IPC-4: pairing from a peer checked by uid only (no code signature: Linux, ad-hoc
-        // builds) is a development convenience, fixed at compile time; release builds never.
-        pair_from_uid_only_peers: cfg!(debug_assertions),
+        // builds) is a development convenience behind an explicit Cargo feature, fixed at
+        // compile time (not tied to debug-assertions, which a release profile could enable).
+        pair_from_uid_only_peers: cfg!(feature = "dev-uid-pairing"),
         ..fogar_core::Config::default()
     };
     if let Some(k) = opts.keepalive_secs {
@@ -371,8 +372,13 @@ fn adopt_stored_key(secrets: &dyn SecretStore, addr: GatewayAddr) {
         String::new(),
         String::new(),
     );
-    if let Err(e) = secrets.put(SecretKey::GatewayPairing, record.encode()) {
-        eprintln!("fogar-agentd: could not store the pairing record: {e}");
+    match secrets.put(SecretKey::GatewayPairing, record.encode()) {
+        // One-time migration: once adopted, the old key must not come back after an Unpair or
+        // a revocation (which delete only the record).
+        Ok(()) => {
+            let _ = secrets.delete(SecretKey::GatewayClientKey);
+        }
+        Err(e) => eprintln!("fogar-agentd: could not store the pairing record: {e}"),
     }
 }
 

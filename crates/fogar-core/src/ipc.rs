@@ -177,6 +177,8 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp>(mut c: Conn<K, C, H>) {
         let resp = match req {
             IpcRequest::Hello { version } => {
                 version_ok &= version == IPC_VERSION;
+                // A peer speaking another version gets no more pushes either.
+                subscribed &= version_ok;
                 IpcResponse::Hello {
                     version: IPC_VERSION,
                 }

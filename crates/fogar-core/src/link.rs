@@ -202,9 +202,19 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                         Stats::inc(&self.stats.connect_failures);
                     }
                     if is_revocation(code, &reason) && self.revoke(&record) {
-                        // Back to "not paired" (the loop finds no record); never retry this key.
-                        attempt = 0;
-                        continue;
+                        // Back to "not paired"; never retry this key. Still through the backoff:
+                        // a store whose delete silently fails must not turn a gateway that
+                        // revokes every connect into back-to-back reconnects (NET-4).
+                        self.view.send_modify(|v| {
+                            v.state = LinkState::NotPaired;
+                            v.gateway = None;
+                        });
+                        let d = self.cfg.backoff.delay(attempt, &*self.random);
+                        attempt = attempt.saturating_add(1);
+                        if self.wait(d, &egress).await {
+                            continue;
+                        }
+                        break;
                     }
                     match action {
                         // Repair without one of the two exact texts keeps the key (spec §0).
@@ -259,11 +269,20 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
 
     /// The gateway revoked `record`'s key: delete it, unless the record was replaced meanwhile
     /// (an Unpair + Pair raced the close). `false` = the delete failed: the caller parks rather
-    /// than retry a dead key.
+    /// than retry a dead key (also when the store cannot be read).
+    /// Check-then-delete without the pairing lock: safe because nothing awaits in between and
+    /// `Pair`/`Unpair` write the store synchronously too (one runtime thread in fogar-agentd).
     fn revoke(&self, record: &PairingRecord) -> bool {
+        let Ok(stored) = load_record(&*self.secrets) else {
+            return false;
+        };
         let still_ours = matches!(
-            load_record(&*self.secrets),
-            Ok(Some(r)) if r.client_id() == record.client_id() && r.address() == record.address()
+            stored,
+            Some(r) if r.client_id() == record.client_id()
+                && r.address() == record.address()
+                // Both keys are our own copies (no remote timing oracle, SEC-4 n/a): a key
+                // rotated under the same client_id must not be deleted by the old key's close.
+                && r.client_key().expose_secret() == record.client_key().expose_secret()
         );
         if still_ours && self.secrets.delete(SecretKey::GatewayPairing).is_err() {
             return false;

@@ -32,6 +32,21 @@ const REVOKED_REASONS: [&str; 2] = ["Clave de cliente invalida o inactiva.", "re
 /// Longest `client_key` we accept from `/pair` (it travels in the 4096-char handshake).
 const MAX_KEY_LEN: usize = 1024;
 const RECORD_VERSION: u8 = 1;
+/// Longest gateway-supplied label we keep (names, versions, ids).
+const MAX_LABEL_CHARS: usize = 128;
+
+/// Gateway-supplied text shown in the UI and stored in the record: no control or bidi
+/// characters (UI spoofing), at most `MAX_LABEL_CHARS`.
+fn label(s: String) -> String {
+    let bidi = |c: char| matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    if s.chars().count() <= MAX_LABEL_CHARS && !s.chars().any(|c| c.is_control() || bidi(c)) {
+        return s;
+    }
+    s.chars()
+        .filter(|&c| !c.is_control() && !bidi(c))
+        .take(MAX_LABEL_CHARS)
+        .collect()
+}
 
 /// The key is dead: delete the record and show the pairing screen. Any other 1008 keeps it.
 pub(crate) fn is_revocation(code: u16, reason: &str) -> bool {
@@ -248,7 +263,11 @@ impl<C: Clock, H: GatewayHttp> Pairing<C, H> {
                 continue;
             }
             if let Probe::Fogar(wk) = self.probe(&addr).await {
-                return vec![GatewayCandidate::new(addr.to_string(), wk.name, wk.version)];
+                return vec![GatewayCandidate::new(
+                    addr.to_string(),
+                    label(wk.name),
+                    label(wk.version),
+                )];
             }
             tried.push(addr);
         }
@@ -323,11 +342,11 @@ impl<C: Clock, H: GatewayHttp> Pairing<C, H> {
         }
         let record = PairingRecord::new(
             addr,
-            client_id,
+            label(client_id),
             client_key,
-            gateway.name,
-            gateway.version,
-            name,
+            label(gateway.name),
+            label(gateway.version),
+            label(name),
         );
         self.persist(&record)?;
         self.changed.send_replace(());
@@ -344,8 +363,11 @@ impl<C: Clock, H: GatewayHttp> Pairing<C, H> {
         match stored {
             Some(r) if r.client_id == record.client_id && r.address == record.address => Ok(()),
             _ => {
-                // Best effort: never leave a half-stored record behind.
-                let _ = self.secrets.delete(SecretKey::GatewayPairing);
+                // Never leave a half-stored record behind; if even that fails, let the link
+                // look at whatever the store holds now instead of a stale idea of it.
+                if self.secrets.delete(SecretKey::GatewayPairing).is_err() {
+                    self.changed.send_replace(());
+                }
                 Err(PairFailure::StorageFailed)
             }
         }
@@ -403,6 +425,13 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn gateway_labels_are_cleaned_and_capped() {
+        assert_eq!(label("green-house".into()), "green-house");
+        assert_eq!(label("a\u{202E}b\nc\u{0}".into()), "abc");
+        assert_eq!(label("ñ".repeat(500)).chars().count(), MAX_LABEL_CHARS);
     }
 
     #[test]
