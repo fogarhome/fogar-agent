@@ -20,6 +20,7 @@ use crate::{
     engine::Engine,
     heartbeat::Heartbeat,
     link::{Inbound, LinkCtx, LinkView},
+    pairing::Pairing,
     queues,
     stats::{Health, LinkState, Stats},
     time::deadline,
@@ -27,23 +28,26 @@ use crate::{
 use fogar_ports::{
     audio::{AudioSink, AudioSource},
     clock::Clock,
-    gateway::{Frame, GatewayLink},
+    gateway::{Frame, GatewayAddr, GatewayLink},
+    gateway_http::{GatewayHttp, HttpCall, HttpError, HttpReply},
     ipc::{IpcCaps, IpcConn, IpcError, IpcRequest, IpcResponse, IpcServer, PeerIdentity},
     random::Random,
     secrets::SecretStore,
     system_probe::{ProbeCaps, SystemProbe},
 };
 use std::{future::Future, sync::Arc, time::Duration};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 /// Everything the engine needs from the outside world, built by the composition root.
 #[allow(missing_debug_implementations)] // holds trait objects without Debug
-pub struct AgentPorts<C, L, I> {
+pub struct AgentPorts<C, L, I, H = NoHttp> {
     pub clock: Arc<C>,
     pub link: L,
     /// `None` = no local UI socket on this platform/build.
     pub ipc: Option<I>,
+    /// Discovery and pairing (`/.well-known`, `POST /pair`); used by the IPC service only.
+    pub http: H,
     pub secrets: Arc<dyn SecretStore>,
     pub random: Arc<dyn Random>,
     pub audio_in: Arc<dyn AudioSource>,
@@ -55,8 +59,8 @@ pub struct AgentPorts<C, L, I> {
 #[derive(Debug, Clone)]
 pub struct HealthProbe {
     pub(crate) stats: Arc<Stats>,
-    view: watch::Receiver<LinkView>,
-    boot_mode: &'static str,
+    pub(crate) view: watch::Receiver<LinkView>,
+    pub(crate) boot_mode: &'static str,
     probe_caps: Option<ProbeCaps>,
     out_tx: mpsc::WeakSender<Frame>,
     in_tx: mpsc::WeakSender<Inbound>,
@@ -129,17 +133,21 @@ pub struct Agent<C> {
 
 impl<C: Clock> Agent<C> {
     /// Spawns the services on the current tokio runtime. Must be called inside a runtime.
-    pub fn start<L, I>(ports: AgentPorts<C, L, I>, cfg: Config, boot: BootMode) -> Self
+    pub fn start<L, I, H>(ports: AgentPorts<C, L, I, H>, cfg: Config, boot: BootMode) -> Self
     where
         L: GatewayLink,
         I: IpcServer,
+        H: GatewayHttp,
     {
         let cfg = Arc::new(cfg);
         let stats = Arc::new(Stats::default());
         let (view_tx, view_rx) = watch::channel(LinkView {
             state: LinkState::Starting,
             last_close: None,
+            gateway: None,
         });
+        // Pairing generation (`queues`: watch, coalescing): IPC pair/unpair -> link.
+        let (pairing_tx, pairing_rx) = watch::channel(());
         let (out_tx, out_rx) = mpsc::channel::<Frame>(queues::OUTBOUND);
         let (in_tx, in_rx) = mpsc::channel::<Inbound>(queues::INBOUND);
         let health = HealthProbe {
@@ -176,16 +184,26 @@ impl<C: Clock> Agent<C> {
         let link = LinkCtx {
             clock: ports.clock.clone(),
             link: ports.link,
-            secrets: ports.secrets,
+            secrets: ports.secrets.clone(),
             random: ports.random,
             cfg: cfg.clone(),
             stats: stats.clone(),
             view: view_tx.clone(),
             budget: queues::ByteBudget::new(queues::INBOUND_BYTES),
+            pairing: pairing_rx,
+            _pairing_keep: pairing_tx.clone(),
         };
         io.spawn(link.run(out_rx, in_tx, egress.clone()));
 
         if let Some(server) = ports.ipc {
+            let pairing = Pairing {
+                clock: ports.clock.clone(),
+                http: Arc::new(ports.http),
+                secrets: ports.secrets,
+                cfg: cfg.clone(),
+                changed: pairing_tx,
+                lock: Arc::new(Semaphore::new(queues::PAIRING)),
+            };
             edge.spawn(crate::ipc::run(
                 server,
                 ports.clock.clone(),
@@ -193,7 +211,9 @@ impl<C: Clock> Agent<C> {
                 crate::ipc::Limits {
                     write_timeout: cfg.write_timeout,
                     idle_timeout: cfg.ipc_idle_timeout,
+                    pair_from_uid_only_peers: cfg.pair_from_uid_only_peers,
                 },
+                pairing,
                 ingress.clone(),
             ));
         }
@@ -318,5 +338,24 @@ impl IpcServer for NoIpc {
     }
     async fn accept(&self) -> Result<(PeerIdentity, NoConn), IpcError> {
         std::future::pending().await
+    }
+}
+
+/// For builds without the HTTP adapter yet: nothing ever answers (discovery finds nothing,
+/// pairing fails with `Unreachable`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoHttp;
+
+impl GatewayHttp for NoHttp {
+    async fn get(&self, _addr: &GatewayAddr, _call: HttpCall) -> Result<HttpReply, HttpError> {
+        Err(HttpError::Unreachable)
+    }
+    async fn post_json(
+        &self,
+        _addr: &GatewayAddr,
+        _call: HttpCall,
+        _body: secrecy::zeroize::Zeroizing<Vec<u8>>,
+    ) -> Result<HttpReply, HttpError> {
+        Err(HttpError::Unreachable)
     }
 }

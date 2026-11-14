@@ -1,15 +1,22 @@
 //! Engine configuration, injected by the composition root (core never reads env or files).
 
 use crate::{backoff::BackoffPolicy, turn::TurnTimeouts, vad::VadConfig};
-use fogar_ports::gateway::GatewayAddr;
 use fogar_proto::{InputMode, OutputMode, limits};
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
-    /// Gateway to connect to. `None` = not paired (S1 core PR replaces this with the pairing
-    /// record from the SecretStore).
-    pub gateway: Option<GatewayAddr>,
+    /// Name proposed to the gateway at pairing (`POST /pair` `name`); the admin may override it.
+    /// The composition root sets it (e.g. the Mac's name).
+    pub client_name: String,
+    /// Deadline for probing one address (`/.well-known`, both paths; spec §0: 1–2 s).
+    pub probe_timeout: Duration,
+    /// Deadline for `POST /pair` (a 5xx or no answer leaves the code open: retry it).
+    pub pair_timeout: Duration,
+    /// Answer `Pair`/`Unpair` from a peer the IPC adapter only checked by OS user (IPC-4).
+    /// `false` = only `PeerCheck::SameSigner`. The composition root may set it ONLY from a
+    /// compile-time switch of development builds, never from a runtime flag.
+    pub pair_from_uid_only_peers: bool,
     /// Requested agent; `None` = gateway fallback cascade (spec §2).
     pub agent: Option<String>,
     pub input_mode: InputMode,
@@ -45,7 +52,11 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            gateway: None,
+            // GUESSED: the composition root should pass the device name.
+            client_name: "Fogar Desktop".into(),
+            probe_timeout: Duration::from_millis(1500),
+            pair_timeout: Duration::from_secs(10),
+            pair_from_uid_only_peers: false,
             agent: None,
             input_mode: InputMode::Audio,
             output_mode: vec![OutputMode::Audio, OutputMode::Text],

@@ -3,8 +3,15 @@
 //! TTS frames 0xA1 + turn_seq + PCM16 -> fake player. Real time, loopback, a few seconds total.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use fogar_core::{Agent, AgentPorts, Config, HealthProbe, LinkState, NoIpc, crashloop::BootMode};
+use fogar_core::{
+    Agent, AgentPorts, Config, HealthProbe, LinkState, NoHttp, NoIpc, PairingRecord,
+    crashloop::BootMode,
+};
 use fogar_host::{TokioClock, WsConfig, WsGatewayLink};
+use fogar_ports::{
+    gateway::GatewayAddr,
+    secrets::{SecretKey, SecretStore as _},
+};
 use fogar_proto::CloseAction;
 use fogar_testkit::{
     FakeMic, FakeSpeaker, MemorySecretStore, MockConfig, MockGateway, SeededRandom, gateway::Ctl,
@@ -22,6 +29,21 @@ struct E2e {
     speaker: FakeSpeaker,
 }
 
+/// A store paired with the gateway at `addr`.
+fn paired(addr: GatewayAddr, key: &str) -> MemorySecretStore {
+    let s = MemorySecretStore::default();
+    let rec = PairingRecord::new(
+        addr,
+        "c-1".into(),
+        key.to_owned().into(),
+        "mock".into(),
+        "1".into(),
+        "e2e".into(),
+    );
+    s.put(SecretKey::GatewayPairing, rec.encode()).unwrap();
+    s
+}
+
 fn fast_config() -> Config {
     let mut c = Config::default();
     c.vad.hangover_chunks = 10;
@@ -31,9 +53,8 @@ fn fast_config() -> Config {
     c
 }
 
-async fn start(mock: MockConfig, mut cfg: Config, key: &str) -> E2e {
+async fn start(mock: MockConfig, cfg: Config, key: &str) -> E2e {
     let gw = MockGateway::start(mock).await.unwrap();
-    cfg.gateway = Some(gw.addr());
     let baseline = alive_tasks();
     let mic = FakeMic::healthy();
     let speaker = FakeSpeaker::healthy();
@@ -41,7 +62,8 @@ async fn start(mock: MockConfig, mut cfg: Config, key: &str) -> E2e {
         clock: Arc::new(TokioClock::new()),
         link: WsGatewayLink::new(WsConfig::default()),
         ipc: None,
-        secrets: Arc::new(MemorySecretStore::with_client_key(key)),
+        http: NoHttp,
+        secrets: Arc::new(paired(gw.addr(), key)),
         random: Arc::new(SeededRandom::new(3)),
         audio_in: Arc::new(mic.clone()),
         audio_out: Arc::new(speaker.clone()),
@@ -253,10 +275,15 @@ async fn gateway_closes_are_classified_over_websocket() {
         if reconnects {
             ready(&mut e.health, 2).await;
         } else {
+            // Revocation deletes the pairing (spec §0); other refusals park and keep it.
+            let expect = if action == CloseAction::Repair {
+                LinkState::NotPaired
+            } else {
+                LinkState::Parked { reason: action }
+            };
             within(
                 Duration::from_secs(10),
-                e.health
-                    .wait_link(|v| v.state == LinkState::Parked { reason: action }),
+                e.health.wait_link(|v| v.state == expect),
             )
             .await;
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -271,12 +298,11 @@ async fn gateway_closes_are_classified_over_websocket() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wrong_key_is_rejected_at_handshake_and_parks() {
+async fn wrong_key_is_rejected_at_handshake_and_unpairs() {
     let mut e = start(MockConfig::default(), fast_config(), "not-the-key").await;
     let v = within(
         Duration::from_secs(10),
-        e.health
-            .wait_link(|v| matches!(v.state, LinkState::Parked { .. })),
+        e.health.wait_link(|v| v.state == LinkState::NotPaired),
     )
     .await;
     assert_eq!(v.last_close, Some((1008, CloseAction::Repair)));
@@ -324,23 +350,19 @@ async fn gateway_down_then_up_reconnects() {
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = probe.local_addr().unwrap().port();
     drop(probe);
-    let addr = fogar_ports::gateway::GatewayAddr::parse(&format!("127.0.0.1:{port}")).unwrap();
+    let addr = GatewayAddr::parse(&format!("127.0.0.1:{port}")).unwrap();
     let ports: AgentPorts<TokioClock, WsGatewayLink, NoIpc> = AgentPorts {
         clock: Arc::new(TokioClock::new()),
         link: WsGatewayLink::new(WsConfig::default()),
         ipc: None,
-        secrets: Arc::new(MemorySecretStore::with_client_key(
-            &MockConfig::default().client_key,
-        )),
+        http: NoHttp,
+        secrets: Arc::new(paired(addr, &MockConfig::default().client_key)),
         random: Arc::new(SeededRandom::new(5)),
         audio_in: Arc::new(FakeMic::minimal()),
         audio_out: Arc::new(FakeSpeaker::minimal()),
         probe: None,
     };
-    let cfg = Config {
-        gateway: Some(addr),
-        ..fast_config()
-    };
+    let cfg = fast_config();
     let agent = Agent::start(ports, cfg, BootMode::Normal);
     let mut h = agent.health();
     within(

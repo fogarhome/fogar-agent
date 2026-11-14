@@ -169,8 +169,14 @@ dependencies = [
 name = "fogar-agent-macos"
 version = "0.0.1"
 dependencies = [
+ "core-foundation",
+ "fogar-host",
  "fogar-ports",
  "fogar-testkit",
+ "libc",
+ "security-framework",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -215,6 +221,9 @@ dependencies = [
  "fogar-testalloc",
  "fogar-testkit",
  "loom",
+ "secrecy",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-util",
 ]

@@ -14,9 +14,6 @@ use fogar_ports::clock::Mono;
 use fogar_proto::server::{ErrorMsg, ServerMsg};
 use std::time::Duration;
 
-/// Cap on accumulated response text per turn (bounded memory; text is display-only here).
-pub const MAX_TURN_TEXT_BYTES: usize = 64 * 1024;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserPhase {
     /// No gateway session: utterances are discarded.
@@ -42,27 +39,13 @@ pub enum Origin {
     Push,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+/// The turn being played. The reply text is not kept: nothing shows it yet (re-add, bounded and
+/// with a redacting `Debug`, when a UI does).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveTurn {
     pub turn_id: String,
     pub turn_seq: u16,
     pub origin: Origin,
-    pub text: String,
-}
-
-/// Redacting `Debug`: `text` is the agent's reply (user content; review sec#7, LOG-1).
-impl std::fmt::Debug for ActiveTurn {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ActiveTurn")
-            .field("turn_id", &self.turn_id)
-            .field("turn_seq", &self.turn_seq)
-            .field("origin", &self.origin)
-            .field(
-                "text",
-                &format_args!("<redacted {} bytes>", self.text.len()),
-            )
-            .finish()
-    }
 }
 
 /// Client messages the engine must send.
@@ -258,21 +241,8 @@ impl TurnMachine {
                     turn_id: ts.turn_id.clone(),
                     turn_seq: ts.turn_seq,
                     origin,
-                    text: String::new(),
                 });
                 fx.turn_started = true;
-            }
-            ServerMsg::Token(tok) => {
-                if let Some(t) = self.turn.as_mut().filter(|t| t.turn_id == tok.turn_id) {
-                    let room = MAX_TURN_TEXT_BYTES.saturating_sub(t.text.len());
-                    if room > 0 {
-                        let mut cut = tok.text.len().min(room);
-                        while !tok.text.is_char_boundary(cut) {
-                            cut -= 1;
-                        }
-                        t.text.push_str(&tok.text[..cut]);
-                    }
-                }
             }
             ServerMsg::TurnEnd(te) => {
                 if self.turn.as_ref().is_some_and(|t| t.turn_id == te.turn_id) {
@@ -290,6 +260,7 @@ impl TurnMachine {
             | ServerMsg::TranscriptionPartial(_)
             | ServerMsg::ToolCall(_)
             | ServerMsg::Status(_)
+            | ServerMsg::Token(_)
             | ServerMsg::PipelineEvent(_)
             | ServerMsg::Unknown => {}
         }
@@ -322,21 +293,13 @@ mod redaction_tests {
     fn client_cmd_debug_redacts_the_transcript() {
         let d = format!("{:?}", ClientCmd::Send("my PIN is 4321".into()));
         assert!(!d.contains("4321") && d.contains("redacted"), "{d}");
-        let t = super::ActiveTurn {
-            turn_id: "t-1".into(),
-            turn_seq: 1,
-            origin: super::Origin::User,
-            text: "your PIN is 4321".into(),
-        };
-        let d = format!("{t:?}");
-        assert!(!d.contains("4321") && d.contains("redacted"), "{d}");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fogar_proto::server::{Interrupted, Token, Transcription, TurnEnd, TurnStart};
+    use fogar_proto::server::{Interrupted, Transcription, TurnEnd, TurnStart};
 
     fn ts(id: &str, seq: u16) -> ServerMsg {
         ServerMsg::TurnStart(TurnStart {
@@ -372,14 +335,6 @@ mod tests {
         assert_eq!(m.turn().map(|t| t.origin), Some(Origin::User));
         assert!(m.accept_audio(1));
         assert!(!m.accept_audio(2));
-        m.on_server(
-            &ServerMsg::Token(Token {
-                turn_id: "t-1".into(),
-                text: "Vale".into(),
-            }),
-            T0,
-        );
-        assert_eq!(m.turn().map(|t| t.text.as_str()), Some("Vale"));
         assert!(m.on_server(&te("t-1"), T0).turn_completed);
         assert!(!m.accept_audio(1));
         assert_eq!(m.phase(), UserPhase::Idle);
@@ -463,22 +418,5 @@ mod tests {
         assert!(m.link_down().stop_playback);
         assert_eq!(m.phase(), UserPhase::Offline);
         assert!(!m.accept_audio(1));
-    }
-
-    #[test]
-    fn token_text_is_bounded_on_char_boundary() {
-        let mut m = TurnMachine::new(TurnTimeouts::default());
-        m.link_up();
-        m.on_server(&ts("t-1", 1), T0);
-        let big = "ñ".repeat(MAX_TURN_TEXT_BYTES);
-        m.on_server(
-            &ServerMsg::Token(Token {
-                turn_id: "t-1".into(),
-                text: big,
-            }),
-            T0,
-        );
-        let len = m.turn().map(|t| t.text.len()).unwrap();
-        assert!(len <= MAX_TURN_TEXT_BYTES && len > MAX_TURN_TEXT_BYTES - 2);
     }
 }

@@ -1,5 +1,16 @@
 fogar-agent — progress log (honest status; update at the end of every agent session)
 ================================================================================
+2026-11-14  S1 core PR (fogar-core + minimal fogar-agentd wiring), branch claude/fervent-franklin-b5139c
+-----------------------------------------------------------------------------------------------
+Done: pairing record in the SecretStore (Config.gateway removed), discover/pair/unpair over the
+GatewayHttp port, revocation by the two exact 1008 texts, IPC v2 (subscribe via watch, version
+mismatch, IPC-4 SameSigner gate), queues.rs rows. Acceptance tests in paused time (pairing.rs) +
+lossy-IPC canary. scripts/gates.sh: PASS on macOS (cargo audit, miri NOT RUN locally).
+Open: fogar-agentd passes NoHttp (host HTTP adapter not merged yet) and the default client_name
+("Fogar Desktop", GUESSED) instead of the Mac's name; tailnet discovery (spec §0 step 3) left to
+the integration PR; 422 / malformed 201 map to GatewayError (contract has no client-bug variant);
+store-key + run --gateway kept as a dev path (turns the old key into a pairing record).
+
 2026-11-13  slice-0 review ROUND 2 fixes (independent reviewer F1-F8), branch slice-0, not pushed
 -----------------------------------------------------------------------------------------------
 Each fix: regression test / self-test seen FAILING on the old code first, then the fix.
@@ -128,3 +139,13 @@ ACTION FOR A HUMAN:
 
 NEXT: S1 (docs/ROADMAP.md, reordered 2026-11-14) — Mac connected + companion app: pairing + Keychain,
 ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app in apps/macos/. SQLite and WS pings move to S2.
+
+## S1 step 4 — macOS adapters (2026-11-14, on the M2)
+- MacKeychainStore: generic password, service com.fogar.agent, account per SecretKey; keychain UI
+  disabled process-wide; locked → Unavailable; ACL denial → Platform; delete falls back to a
+  tombstone when a same-signer rebuild may not delete (measured). Contract suite green on the M2.
+- MacIpcServer: UDS in ~/Library/Application Support/com.fogar.agent/run (0700/0600, <104 bytes,
+  stale-socket handling as Linux), getpeereid gate, LOCAL_PEERTOKEN → SecCode same-signer check
+  (Team ID from the agent's own signature + id com.fogar.desktop, GUESSED). Contract suite green.
+- Signed matrix verified manually with examples/signer_probe.rs (ADR-0002). UNVERIFIED: Developer
+  ID, real .app bundle peers, UI-side check of the agent, flock single instance (not done).
