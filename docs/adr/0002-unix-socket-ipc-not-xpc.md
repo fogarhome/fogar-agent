@@ -58,22 +58,25 @@ the signature, not the name in parentheses of the certificate):
   per-connection nonce sent only after verification and echoed in `Pair`/`Unpair` (a blocked
   write cannot contain it; reading it moves the token to the reader): a wire change in
   `fogar-ports` + `fogar-host::ipc_wire` + core + the Swift app, outside this adapter. (2) stays
-  an assumption: the app must not use inherited stdio as a socket.
+  an assumption, and a rule for the Swift app: it never polls, reads or makes zero-length writes
+  on stdin, stdout or stderr (it cannot choose which fds it inherits).
   **And the bigger hole on today's setup:** on the M2 `codesign` used the owner's Apple
   Development key from a plain shell without any prompt (all probe signings in this ADR), so any
   same-user process can sign its own `com.fogar.desktop` with the hardened runtime and get
   `SameSigner` directly.
 - **Threat model as of S1 (decided 2026-11-14):** `SameSigner` stops other users, unsigned or
-  ad-hoc same-user code, and the fd-share/exec attacks above. It does NOT stop same-user code
+  ad-hoc same-user code, and the two fd-share/exec attacks measured above. It does NOT stop same-user code
   that can use the owner's signing key, nor the blocked-write variant. Both residuals are
-  accepted for S1; the core's `Pair`/`Unpair` gate is as strong as this, no stronger.
+  accepted for S1; the core's `Pair`/`Unpair` gate is as strong as this, no stronger. Same-user
+  code can also always SIGSTOP, kill or DoS the agent (which is how it wins these timings).
 - **Follow-ups (with trigger):**
   1. Signing key: restrict the Apple Development key's ACL so `codesign` prompts on use, or keep
      the key off the dev Mac; Developer ID in S7. Trigger: before anyone relies on `SameSigner`
      against same-user malware; at the latest S7.
   2. Per-connection nonce sent after verification and echoed in `Pair`/`Unpair` (`fogar-ports` +
      `fogar-host::ipc_wire` + core + Swift app). Trigger: only once follow-up 1 is done; until
-     then it closes a hard path and leaves the easy one open.
+     then it closes a hard path and leaves the easy one open. Developer ID (S7) does not close the
+     blocked write, so this stays needed after S7.
 - A signed agent whose own signature cannot be read or no longer validates refuses to bind (fails
   closed) instead of downgrading to uid-only. Not exercised: a tampered bare executable is killed
   by the kernel before it runs; a tampered `.app` bundle resource is the case this covers.
