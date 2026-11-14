@@ -1,5 +1,16 @@
 fogar-agent — progress log (honest status; update at the end of every agent session)
 ================================================================================
+2026-11-14  S1 core PR (fogar-core + minimal fogar-agentd wiring), branch claude/fervent-franklin-b5139c
+-----------------------------------------------------------------------------------------------
+Done: pairing record in the SecretStore (Config.gateway removed), discover/pair/unpair over the
+GatewayHttp port, revocation by the two exact 1008 texts, IPC v2 (subscribe via watch, version
+mismatch, IPC-4 SameSigner gate), queues.rs rows. Acceptance tests in paused time (pairing.rs) +
+lossy-IPC canary. scripts/gates.sh: PASS on macOS (cargo audit, miri NOT RUN locally).
+Open: fogar-agentd passes NoHttp (host HTTP adapter not merged yet) and the default client_name
+("Fogar Desktop", GUESSED) instead of the Mac's name; tailnet discovery (spec §0 step 3) left to
+the integration PR; 422 / malformed 201 map to GatewayError (contract has no client-bug variant);
+store-key + run --gateway kept as a dev path (turns the old key into a pairing record).
+
 2026-11-13  slice-0 review ROUND 2 fixes (independent reviewer F1-F8), branch slice-0, not pushed
 -----------------------------------------------------------------------------------------------
 Each fix: regression test / self-test seen FAILING on the old code first, then the fix.

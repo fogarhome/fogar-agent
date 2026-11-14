@@ -3,10 +3,18 @@
 //! runs the engine on a dedicated runtime thread, and performs the ordered SIGTERM shutdown.
 //!
 //! Usage:
-//!   fogar-agentd run --gateway ws://127.0.0.1:8004/ws/stream [--agent NAME] [--state-dir DIR]
+//!   fogar-agentd run [--gateway ws://127.0.0.1:8004/ws/stream] [--agent NAME] [--state-dir DIR]
 //!                    [--keepalive-secs N] [--no-ipc]
 //!   fogar-agentd store-key [--state-dir DIR]      (reads the gateway client key from stdin)
+//!
+//! Pairing normally happens from the app over the IPC (the pairing record lives in the secret
+//! store). `store-key` + `run --gateway` is the slice-0 development path: at start the stored key
+//! becomes a pairing record for that address, unless one exists already.
 #![forbid(unsafe_code)] // OS calls go through adapters or rustix's safe wrappers (review sec#7)
+
+// IPC-4: the uid-only pairing opt-in must never reach an optimized (release) build.
+#[cfg(all(feature = "dev-uid-pairing", not(debug_assertions)))]
+compile_error!("the dev-uid-pairing feature is for development builds only");
 
 mod cli;
 mod crash;
@@ -28,12 +36,12 @@ std::cfg_select! {
     }
 }
 
-use fogar_core::{Agent, AgentPorts, LinkState, crashloop};
+use fogar_core::{Agent, AgentPorts, LinkState, NoHttp, PairingRecord, crashloop};
 use fogar_host::{PrngRandom, TokioClock, WsConfig, WsGatewayLink};
 use fogar_ports::{
     gateway::GatewayAddr,
     power::WorkClass,
-    secrets::{SecretKey, SecretString},
+    secrets::{ExposeSecret, SecretKey, SecretStore, SecretString},
 };
 use std::{
     io::Read,
@@ -125,24 +133,26 @@ fn store_key(state_dir: &std::path::Path) -> ExitCode {
 
 fn run(opts: cli::RunOpts) -> ExitCode {
     // Validate configuration before the boot ledger records a start: a usage error is not a crash.
-    let gateway = match GatewayAddr::parse(&opts.gateway) {
+    let gateway = match opts.gateway.as_deref().map(GatewayAddr::parse).transpose() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("fogar-agentd: {e}");
             return ExitCode::from(64);
         }
     };
-    if let Err(e) = WsConfig::check(&gateway) {
-        eprintln!("fogar-agentd: {e}");
-        return ExitCode::from(64);
+    if let Some(gateway) = &gateway {
+        if let Err(e) = WsConfig::check(gateway) {
+            eprintln!("fogar-agentd: {e}");
+            return ExitCode::from(64);
+        }
+        // Review sec#3: slice 0 has no TLS; WsConfig accepts only loopback ws:// (wss:// is
+        // refused until the S1 host PR). Allowed, but never silent.
+        eprintln!(
+            "fogar-agentd: WARNING: the gateway link is UNENCRYPTED ws:// (loopback only). Local \
+             processes that can reach or proxy that port see the client key in the handshake. \
+             TLS (wss://) arrives with S1 (ADR-0006 item 4)."
+        );
     }
-    // Review sec#3: slice 0 has no TLS; WsConfig accepts only loopback ws:// (wss:// is refused
-    // until S1). Allowed, but never silent.
-    eprintln!(
-        "fogar-agentd: WARNING: the gateway link is UNENCRYPTED ws:// (loopback only). Local \
-         processes that can reach or proxy that port see the client key in the handshake. TLS \
-         (wss://) arrives with S1 (ADR-0006 item 4)."
-    );
     let state_dir = match private_state_dir(opts.state_dir.clone()) {
         Ok(d) => d,
         Err(code) => return code,
@@ -231,7 +241,7 @@ struct Stopped {
 async fn serve(
     opts: cli::RunOpts,
     state_dir: std::path::PathBuf,
-    gateway: GatewayAddr,
+    gateway: Option<GatewayAddr>,
     boot: crashloop::BootMode,
     mut stop: StopSignal,
 ) -> Stopped {
@@ -258,10 +268,16 @@ async fn serve(
             return stopped;
         }
     };
+    if let Some(addr) = gateway {
+        adopt_stored_key(&*p.secrets, addr);
+    }
     let clock = TokioClock::new();
     let mut cfg = fogar_core::Config {
-        gateway: Some(gateway),
         agent: opts.agent.clone(),
+        // IPC-4: pairing from a peer checked by uid only (no code signature: Linux, ad-hoc
+        // builds) is a development convenience behind an explicit Cargo feature, fixed at
+        // compile time (not tied to debug-assertions, which a release profile could enable).
+        pair_from_uid_only_peers: cfg!(feature = "dev-uid-pairing"),
         ..fogar_core::Config::default()
     };
     if let Some(k) = opts.keepalive_secs {
@@ -271,6 +287,8 @@ async fn serve(
         clock: Arc::new(clock),
         link: WsGatewayLink::new(WsConfig::default()),
         ipc: p.ipc,
+        // TODO(S1 integration PR): the fogar-host HTTP adapter.
+        http: NoHttp,
         secrets: p.secrets,
         random: Arc::new(PrngRandom::new()),
         audio_in: p.audio_in,
@@ -338,6 +356,44 @@ async fn serve(
     eprintln!("fogar-agentd: shutdown {report:?}");
     Stopped {
         report: Some(report),
+    }
+}
+
+/// Dev path: a key stored by `store-key` (slice 0) becomes the pairing record for `addr` when
+/// there is none yet. Gateway name/version are unknown on this path.
+fn adopt_stored_key(secrets: &dyn SecretStore, addr: GatewayAddr) {
+    if !matches!(secrets.get(SecretKey::GatewayPairing), Ok(None)) {
+        return;
+    }
+    let Ok(Some(key)) = secrets.get(SecretKey::GatewayClientKey) else {
+        return;
+    };
+    let record = PairingRecord::new(
+        addr,
+        String::new(),
+        SecretString::from(key.expose_secret().to_owned()),
+        String::new(),
+        String::new(),
+        String::new(),
+    );
+    match secrets.put(SecretKey::GatewayPairing, record.encode()) {
+        // One-time migration: once adopted, the old key must not come back after an Unpair or
+        // a revocation (which delete only the record).
+        // Only once the record reads back intact (as `Pairing::persist` does).
+        Ok(()) => {
+            let stored = secrets
+                .get(SecretKey::GatewayPairing)
+                .ok()
+                .flatten()
+                .and_then(|s| PairingRecord::decode(&s));
+            if stored.is_some_and(|r| {
+                r.address() == record.address()
+                    && r.client_key().expose_secret() == record.client_key().expose_secret()
+            }) {
+                let _ = secrets.delete(SecretKey::GatewayClientKey);
+            }
+        }
+        Err(e) => eprintln!("fogar-agentd: could not store the pairing record: {e}"),
     }
 }
 

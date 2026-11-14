@@ -1,13 +1,19 @@
 //! Test rig: the agent wired to in-memory fakes (paused-time friendly).
+#![allow(clippy::unwrap_used)]
 #![allow(dead_code)]
 
 use fogar_core::{
-    Agent, AgentPorts, Config, HealthProbe, LinkState, LinkView, NoIpc, crashloop::BootMode,
+    Agent, AgentPorts, Config, HealthProbe, LinkState, LinkView, NoHttp, NoIpc, PairingRecord,
+    crashloop::BootMode,
 };
-use fogar_ports::gateway::GatewayLink;
+use fogar_ports::{
+    gateway::{GatewayAddr, GatewayLink},
+    ipc::{IpcCaps, IpcError, IpcServer, PeerIdentity},
+    secrets::{SecretKey, SecretStore},
+};
 use fogar_testkit::{
-    FakeGatewayLink, FakeIpc, FakeMic, FakeSpeaker, FakeSystemProbe, MemorySecretStore, MockConfig,
-    SeededRandom, TestClock, silence_chunks, tone_chunks,
+    FakeGatewayHttp, FakeGatewayLink, FakeIpc, FakeMic, FakeSpeaker, FakeSystemProbe, HttpRoutes,
+    MemorySecretStore, MockConfig, SeededRandom, TestClock, silence_chunks, tone_chunks,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -20,15 +26,60 @@ pub(crate) struct Rig<L: GatewayLink = FakeGatewayLink> {
     pub(crate) clock: TestClock,
     pub(crate) secrets: Arc<MemorySecretStore>,
     pub(crate) ipc: Option<FakeIpc>,
+    pub(crate) routes: HttpRoutes,
 }
 
+/// Address of the paired test gateway (the in-memory link ignores it; `FakeGatewayHttp`
+/// answers on it).
+pub(crate) const GW_ADDR: &str = "127.0.0.1:8004";
+
 pub(crate) fn test_config() -> Config {
-    let mut c = Config {
-        gateway: fogar_ports::gateway::GatewayAddr::parse("127.0.0.1").ok(),
-        ..Config::default()
-    };
+    let mut c = Config::default();
     c.vad.hangover_chunks = 10;
     c
+}
+
+/// A pairing record for `GW_ADDR` with `key`.
+pub(crate) fn record(key: &str) -> PairingRecord {
+    PairingRecord::new(
+        GatewayAddr::parse(GW_ADDR).unwrap(),
+        "client-1".into(),
+        key.to_owned().into(),
+        "green-house".into(),
+        "1.29.0".into(),
+        "Mac".into(),
+    )
+}
+
+/// A store holding a pairing record with `key`.
+pub(crate) fn paired_store(key: &str) -> MemorySecretStore {
+    let s = MemorySecretStore::default();
+    s.put(SecretKey::GatewayPairing, record(key).encode())
+        .unwrap();
+    s
+}
+
+/// `FakeIpc` whose peers the "adapter" verified as the same signer (`signed`) or by uid only.
+#[derive(Debug, Clone)]
+pub(crate) struct TestIpc {
+    pub(crate) inner: FakeIpc,
+    pub(crate) signed: bool,
+}
+
+impl IpcServer for TestIpc {
+    type Conn = <FakeIpc as IpcServer>::Conn;
+    fn capabilities(&self) -> IpcCaps {
+        self.inner.capabilities()
+    }
+    async fn accept(&self) -> Result<(PeerIdentity, Self::Conn), IpcError> {
+        let (peer, conn) = self.inner.accept().await?;
+        let peer = if self.signed {
+            PeerIdentity::verified_signer(peer.uid, "com.fogar.desktop".into())
+        } else {
+            peer
+        };
+        Ok((peer, conn))
+    }
 }
 
 pub(crate) struct RigBuilder<L: GatewayLink> {
@@ -38,6 +89,9 @@ pub(crate) struct RigBuilder<L: GatewayLink> {
     pub(crate) speaker: FakeSpeaker,
     pub(crate) secrets: Arc<MemorySecretStore>,
     pub(crate) with_ipc: bool,
+    /// IPC peers are verified as the same signer (else uid only).
+    pub(crate) signed_peer: bool,
+    pub(crate) routes: HttpRoutes,
 }
 
 impl RigBuilder<FakeGatewayLink> {
@@ -54,8 +108,10 @@ impl<L: GatewayLink + Clone> RigBuilder<L> {
             link,
             mic: FakeMic::healthy(),
             speaker: FakeSpeaker::healthy(),
-            secrets: Arc::new(MemorySecretStore::with_client_key(key)),
+            secrets: Arc::new(paired_store(key)),
             with_ipc: false,
+            signed_peer: true,
+            routes: HttpRoutes::fogar("green-house"),
         }
     }
 
@@ -65,7 +121,11 @@ impl<L: GatewayLink + Clone> RigBuilder<L> {
         let ports = AgentPorts {
             clock: Arc::new(clock),
             link: self.link.clone(),
-            ipc: ipc.clone(),
+            ipc: ipc.clone().map(|inner| TestIpc {
+                inner,
+                signed: self.signed_peer,
+            }),
+            http: FakeGatewayHttp::at(self.routes.clone(), GatewayAddr::parse(GW_ADDR).unwrap()),
             secrets: self.secrets.clone(),
             random: Arc::new(SeededRandom::new(7)),
             audio_in: Arc::new(self.mic.clone()),
@@ -82,6 +142,7 @@ impl<L: GatewayLink + Clone> RigBuilder<L> {
             clock,
             secrets: self.secrets,
             ipc,
+            routes: self.routes,
         }
     }
 }
@@ -91,10 +152,11 @@ pub(crate) fn start_no_ipc<L: GatewayLink + Clone>(
     b: RigBuilder<L>,
 ) -> (Agent<TestClock>, HealthProbe) {
     let clock = TestClock::new();
-    let ports: AgentPorts<TestClock, L, NoIpc> = AgentPorts {
+    let ports: AgentPorts<TestClock, L, NoIpc, NoHttp> = AgentPorts {
         clock: Arc::new(clock),
         link: b.link.clone(),
         ipc: None,
+        http: NoHttp,
         secrets: b.secrets.clone(),
         random: Arc::new(SeededRandom::new(7)),
         audio_in: Arc::new(b.mic.clone()),

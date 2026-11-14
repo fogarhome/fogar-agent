@@ -3,12 +3,14 @@
 use std::path::PathBuf;
 
 pub(crate) const USAGE: &str = "usage:
-  fogar-agentd run --gateway ws://127.0.0.1:8004/ws/stream [--agent NAME] [--state-dir DIR] [--keepalive-secs N] [--no-ipc]
-  fogar-agentd store-key [--state-dir DIR]   (client key on stdin)";
+  fogar-agentd run [--gateway ws://127.0.0.1:8004/ws/stream] [--agent NAME] [--state-dir DIR] [--keepalive-secs N] [--no-ipc]
+  fogar-agentd store-key [--state-dir DIR]   (client key on stdin; dev only: `run --gateway` turns it into a pairing)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunOpts {
-    pub(crate) gateway: String,
+    /// Dev path (Linux): pairs a key stored with `store-key` to this address. The app pairs
+    /// through the IPC instead.
+    pub(crate) gateway: Option<String>,
     pub(crate) agent: Option<String>,
     pub(crate) state_dir: Option<PathBuf>,
     pub(crate) keepalive_secs: Option<u64>,
@@ -47,7 +49,7 @@ pub(crate) fn parse(mut args: impl Iterator<Item = String>) -> Result<Command, S
     }
     match sub.as_str() {
         "run" => Ok(Command::Run(RunOpts {
-            gateway: gateway.ok_or("--gateway is required")?,
+            gateway,
             agent,
             state_dir,
             keepalive_secs,
@@ -72,14 +74,17 @@ mod tests {
             p("run --gateway ws://127.0.0.1:1/ws/stream --agent main --keepalive-secs 0 --no-ipc")
                 .unwrap(),
             Command::Run(RunOpts {
-                gateway: "ws://127.0.0.1:1/ws/stream".into(),
+                gateway: Some("ws://127.0.0.1:1/ws/stream".into()),
                 agent: Some("main".into()),
                 state_dir: None,
                 keepalive_secs: Some(0),
                 no_ipc: true
             })
         );
-        assert!(p("run").is_err());
+        assert!(matches!(
+            p("run"),
+            Ok(Command::Run(RunOpts { gateway: None, .. }))
+        ));
         assert!(p("run --gateway").is_err());
         assert!(p("run --gateway x --bogus").is_err());
         assert!(p("").is_err());

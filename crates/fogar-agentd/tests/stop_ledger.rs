@@ -170,7 +170,8 @@ fn plain_ws_gateway_prints_a_loud_warning() {
 
 /// Round-2 review F3: the stderr rate limit must never swallow a terminal state. The gateway
 /// flaps (`ready`, then a normal 1000 close) until the burst is used up, then revokes the key
-/// (1008 `revoked` -> Parked/Repair). The `link parked` line must still appear, and the count of
+/// (1008 `revoked` -> the pairing is deleted, NotPaired; S1 spec §0). The `link not_paired` line
+/// must still appear, and the count of
 /// suppressed lines must be reported (here: at the latest when the daemon stops).
 #[test]
 fn rate_limit_never_swallows_parked_and_reports_suppressed_lines() {
@@ -218,9 +219,9 @@ fn rate_limit_never_swallows_parked_and_reports_suppressed_lines() {
         let left = Duration::from_secs(150).saturating_sub(t0.elapsed());
         let Ok(l) = rx.recv_timeout(left) else {
             let _ = child.kill();
-            panic!("no `link parked` line: {all:#?}");
+            panic!("no `link not_paired` line: {all:#?}");
         };
-        let parked = l.contains("link parked");
+        let parked = l.contains("link not_paired");
         all.push((Instant::now(), l));
         // Before the fix this line never came once the flaps had used up the burst.
         if parked {

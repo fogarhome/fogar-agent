@@ -5,6 +5,7 @@
 mod common;
 use common::*;
 use fogar_core::LinkState;
+use fogar_ports::secrets::{SecretKey, SecretStore as _};
 use fogar_proto::CloseAction;
 use fogar_testkit::{MockConfig, gateway::Ctl};
 use std::time::Duration;
@@ -16,6 +17,8 @@ type Case = (Option<(u16, &'static str)>, CloseAction, Expect);
 enum Expect {
     Reconnects,
     Parks(CloseAction),
+    /// Revoked (spec §0): the pairing record is deleted and the link shows "not paired".
+    Unpairs,
 }
 
 /// Every row of spec §11, plus an unknown code and an abrupt drop (1006).
@@ -48,7 +51,7 @@ async fn every_close_code_is_classified_and_acted_on() {
         (
             Some((1008, "Clave de cliente invalida o inactiva.")),
             CloseAction::Repair,
-            Expect::Parks(CloseAction::Repair),
+            Expect::Unpairs,
         ),
         (
             Some((1008, "Agent 'x' not permitted for this client.")),
@@ -63,7 +66,7 @@ async fn every_close_code_is_classified_and_acted_on() {
         (
             Some((1008, "revoked")),
             CloseAction::Repair,
-            Expect::Parks(CloseAction::Repair),
+            Expect::Unpairs,
         ),
         (
             Some((1011, "Servicio crítico no disponible.")),
@@ -124,6 +127,24 @@ async fn every_close_code_is_classified_and_acted_on() {
                 let s = rig.health.snapshot().stats;
                 assert_eq!(s.connect_attempts, 1, "{close:?} must not retry");
                 assert_eq!(rig.link.log().connections, 1);
+                assert!(
+                    rig.secrets.contains(SecretKey::GatewayPairing),
+                    "{close:?} keeps the key"
+                );
+            }
+            Expect::Unpairs => {
+                let v = wait_state(&mut rig.health, |v| v.state == LinkState::NotPaired).await;
+                assert_eq!(v.gateway, None);
+                assert!(
+                    !rig.secrets.contains(SecretKey::GatewayPairing),
+                    "{close:?}"
+                );
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                assert_eq!(
+                    rig.health.snapshot().stats.connect_attempts,
+                    1,
+                    "{close:?} must not retry"
+                );
             }
         }
         let r = rig.agent.shutdown(Duration::from_secs(5)).await;
@@ -132,21 +153,16 @@ async fn every_close_code_is_classified_and_acted_on() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn handshake_rejection_parks_with_repair() {
-    // Wrong key stored locally: the gateway closes 1008 before `ready`.
+async fn handshake_rejection_of_the_key_unpairs() {
+    // Wrong key stored locally: the gateway closes 1008 "Clave de cliente invalida o inactiva."
+    // before `ready`: the record is deleted and the link waits for a new pairing.
     let mut b = RigBuilder::fake(MockConfig::default());
-    b.secrets = std::sync::Arc::new(fogar_testkit::MemorySecretStore::with_client_key("wrong"));
+    b.secrets = std::sync::Arc::new(paired_store("wrong"));
     let mut rig = b.start();
-    let v = wait_state(&mut rig.health, |v| {
-        matches!(v.state, LinkState::Parked { .. })
-    })
-    .await;
-    assert_eq!(
-        v.state,
-        LinkState::Parked {
-            reason: CloseAction::Repair
-        }
-    );
+    let v = wait_state(&mut rig.health, |v| v.last_close.is_some()).await;
+    assert_eq!(v.last_close, Some((1008, CloseAction::Repair)));
+    wait_state(&mut rig.health, |v| v.state == LinkState::NotPaired).await;
+    assert!(!rig.secrets.contains(SecretKey::GatewayPairing));
     assert_eq!(rig.health.snapshot().stats.sessions_started, 0);
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
@@ -233,27 +249,42 @@ async fn without_keepalive_the_idle_close_is_classified_and_recovered() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn not_paired_waits_quietly_then_connects_when_a_key_appears() {
+async fn not_paired_waits_quietly() {
     let b = RigBuilder::fake(MockConfig::default());
-    b.secrets
-        .delete(fogar_ports::secrets::SecretKey::GatewayClientKey)
-        .ok();
-    use fogar_ports::secrets::SecretStore as _;
+    b.secrets.delete(SecretKey::GatewayPairing).ok();
     let mut rig = b.start();
     wait_state(&mut rig.health, |v| v.state == LinkState::NotPaired).await;
-    tokio::time::sleep(Duration::from_secs(3600)).await;
-    assert_eq!(
-        rig.health.snapshot().stats.connect_attempts,
-        0,
-        "no connects without a key"
-    );
-    rig.secrets
-        .put(
-            fogar_ports::secrets::SecretKey::GatewayClientKey,
-            MockConfig::default().client_key.into(),
-        )
-        .unwrap();
+    // A store read while idle would consume this injected failure and show up as Backoff.
+    rig.secrets.fail_next(1);
+    let mut view = rig.health.clone();
+    let changed = tokio::time::timeout(
+        Duration::from_secs(24 * 3600),
+        view.wait_link(|v| v.state != LinkState::NotPaired),
+    )
+    .await;
+    assert!(changed.is_err(), "unpaired link woke up: {changed:?}");
+    assert_eq!(rig.health.snapshot().stats.connect_attempts, 0);
+    assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
+}
+
+/// Spec §0 "no reintentes en bucle": a revocation whose record cannot be read (locked
+/// keychain) parks with Repair instead of retrying the dead key.
+#[tokio::test(start_paused = true)]
+async fn revocation_with_an_unreadable_store_parks() {
+    let mut rig = RigBuilder::fake(MockConfig::default()).start();
     wait_ready(&mut rig.health).await;
+    rig.secrets.fail_next(1);
+    assert_eq!(rig.link.close_all(1008, "revoked"), 1);
+    wait_state(&mut rig.health, |v| {
+        v.state
+            == LinkState::Parked {
+                reason: CloseAction::Repair,
+            }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3600)).await;
+    assert_eq!(rig.health.snapshot().stats.connect_attempts, 1);
+    assert_eq!(rig.link.log().connections, 1);
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
 
