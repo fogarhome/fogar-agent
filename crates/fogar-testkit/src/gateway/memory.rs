@@ -43,6 +43,10 @@ impl FakeGatewayLink {
             }),
         }
     }
+    /// Any address: the in-memory gateway ignores it .
+    pub fn addr(&self) -> fogar_ports::gateway::GatewayAddr {
+        fogar_ports::gateway::GatewayAddr::parse("127.0.0.1").expect("addr")
+    }
     pub fn log(&self) -> GatewayLog {
         self.inner.log.lock().unwrap().clone()
     }
@@ -153,7 +157,10 @@ impl LinkSession for FakeSession {
 
 impl GatewayLink for FakeGatewayLink {
     type Session = FakeSession;
-    async fn connect(&self) -> Result<FakeSession, LinkError> {
+    async fn connect(
+        &self,
+        _addr: &fogar_ports::gateway::GatewayAddr,
+    ) -> Result<FakeSession, LinkError> {
         let fail = self
             .inner
             .fail_connects

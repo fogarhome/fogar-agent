@@ -232,7 +232,29 @@ pub mod secret_store {
     /// Round trip, overwrite, delete-missing is Ok. Adapters backed by a real user store must be
     /// constructed on a TEST location (temp dir / test keychain service name).
     pub fn put_get_delete(s: &dyn SecretStore) {
-        let k = SecretKey::GatewayClientKey;
+        for k in [SecretKey::GatewayClientKey, SecretKey::GatewayPairing] {
+            put_get_delete_one(s, k);
+        }
+    }
+
+    /// Keys are independent items: writing or deleting one never touches another.
+    pub fn keys_are_independent(s: &dyn SecretStore) {
+        let (a, b) = (SecretKey::GatewayClientKey, SecretKey::GatewayPairing);
+        if s.put(a, SecretString::from("a".to_owned())).is_err() {
+            return;
+        }
+        s.put(b, SecretString::from(r#"{"json":"record"}"#.to_owned()))
+            .unwrap();
+        s.delete(a).unwrap();
+        assert_eq!(
+            s.get(b).unwrap().unwrap().expose_secret(),
+            r#"{"json":"record"}"#
+        );
+        assert!(s.get(a).unwrap().is_none());
+        s.delete(b).unwrap();
+    }
+
+    fn put_get_delete_one(s: &dyn SecretStore, k: SecretKey) {
         match s.put(k, SecretString::from("contract-value-1".to_owned())) {
             Err(SecretError::Unsupported(_)) => return,
             r => r.unwrap(),
@@ -279,6 +301,10 @@ pub mod secret_store {
                 #[test]
                 fn debug_never_leaks() {
                     c::debug_never_leaks(&$make)
+                }
+                #[test]
+                fn keys_are_independent() {
+                    c::keys_are_independent(&$make)
                 }
             }
         };
@@ -434,10 +460,13 @@ pub mod power_policy {
 }
 
 pub mod gateway_link {
-    //! Clauses run against a link pointed at a running mock gateway expecting
-    //! `MockConfig::default().client_key`. `$make` builds `(link, mock_handle)` inside the runtime.
+    //! Clauses run against a link and the address of a running mock gateway expecting
+    //! `MockConfig::default().client_key`. `$make` builds `(link, mock_handle)` inside the
+    //! runtime; the handle has `.addr() -> GatewayAddr` and `.control(Ctl) -> usize`.
     use crate::gateway::{Ctl, MockConfig};
-    use fogar_ports::gateway::{Frame, GatewayLink, LinkError, LinkEvent, LinkSession};
+    use fogar_ports::gateway::{
+        Frame, GatewayAddr, GatewayLink, LinkError, LinkEvent, LinkSession,
+    };
     use fogar_proto::{ServerMsg, decode_server};
     use std::time::Duration;
 
@@ -463,8 +492,8 @@ pub mod gateway_link {
         }
     }
 
-    pub async fn connects_and_gets_ready<L: GatewayLink>(link: &L) {
-        let mut s = link.connect().await.expect("connect");
+    pub async fn connects_and_gets_ready<L: GatewayLink>(link: &L, addr: &GatewayAddr) {
+        let mut s = link.connect(addr).await.expect("connect");
         s.send(Frame::Text(handshake())).await.unwrap();
         loop {
             match next_msg(&mut s).await {
@@ -477,8 +506,11 @@ pub mod gateway_link {
         s.close(1000, "").await.unwrap(); // idempotent
     }
 
-    pub async fn oversized_frame_is_rejected_and_session_survives<L: GatewayLink>(link: &L) {
-        let mut s = link.connect().await.unwrap();
+    pub async fn oversized_frame_is_rejected_and_session_survives<L: GatewayLink>(
+        link: &L,
+        addr: &GatewayAddr,
+    ) {
+        let mut s = link.connect(addr).await.unwrap();
         let big = Frame::Binary(vec![0; s.max_frame() + 1]);
         assert!(matches!(s.send(big).await, Err(LinkError::TooLarge { .. })));
         s.send(Frame::Text(handshake())).await.unwrap();
@@ -493,8 +525,8 @@ pub mod gateway_link {
     /// Dropping an in-flight `recv` (a lost select! race) must not lose a frame: neither while
     /// idle nor while frames are streaming in (review code#8: the first version only cancelled
     /// while nothing was in flight, so a `recv` that loses a frame it already took passed).
-    pub async fn recv_is_cancel_safe<L: GatewayLink>(link: &L) {
-        let mut s = link.connect().await.unwrap();
+    pub async fn recv_is_cancel_safe<L: GatewayLink>(link: &L, addr: &GatewayAddr) {
+        let mut s = link.connect(addr).await.unwrap();
         s.send(Frame::Text(handshake())).await.unwrap();
         loop {
             if let ServerMsg::Ready(_) = next_msg(&mut s).await {
@@ -562,8 +594,12 @@ pub mod gateway_link {
     }
 
     /// A peer close surfaces as `Closed { code, reason }` with the exact reason text.
-    pub async fn peer_close_is_reported<L: GatewayLink>(link: &L, control: impl Fn(Ctl) -> usize) {
-        let mut s = link.connect().await.unwrap();
+    pub async fn peer_close_is_reported<L: GatewayLink>(
+        link: &L,
+        addr: &GatewayAddr,
+        control: impl Fn(Ctl) -> usize,
+    ) {
+        let mut s = link.connect(addr).await.unwrap();
         s.send(Frame::Text(handshake())).await.unwrap();
         loop {
             if let ServerMsg::Ready(_) = next_msg(&mut s).await {
@@ -592,8 +628,8 @@ pub mod gateway_link {
     }
 
     /// The gateway's handshake rejection is a close with the documented reason.
-    pub async fn bad_key_is_closed_1008<L: GatewayLink>(link: &L) {
-        let mut s = link.connect().await.unwrap();
+    pub async fn bad_key_is_closed_1008<L: GatewayLink>(link: &L, addr: &GatewayAddr) {
+        let mut s = link.connect(addr).await.unwrap();
         s.send(Frame::Text(
             r#"{"client_key":"wrong","input_mode":"audio","output_mode":["audio"]}"#.into(),
         ))
@@ -627,36 +663,36 @@ pub mod gateway_link {
                 #[test]
                 fn connects_and_gets_ready() {
                     $crate::run_async(async {
-                        let (link, _gw) = $make;
-                        c::connects_and_gets_ready(&link).await
+                        let (link, gw) = $make;
+                        c::connects_and_gets_ready(&link, &gw.addr()).await
                     })
                 }
                 #[test]
                 fn oversized_frame_is_rejected_and_session_survives() {
                     $crate::run_async(async {
-                        let (link, _gw) = $make;
-                        c::oversized_frame_is_rejected_and_session_survives(&link).await
+                        let (link, gw) = $make;
+                        c::oversized_frame_is_rejected_and_session_survives(&link, &gw.addr()).await
                     })
                 }
                 #[test]
                 fn recv_is_cancel_safe() {
                     $crate::run_async(async {
-                        let (link, _gw) = $make;
-                        c::recv_is_cancel_safe(&link).await
+                        let (link, gw) = $make;
+                        c::recv_is_cancel_safe(&link, &gw.addr()).await
                     })
                 }
                 #[test]
                 fn peer_close_is_reported() {
                     $crate::run_async(async {
                         let (link, gw) = $make;
-                        c::peer_close_is_reported(&link, |cmd| gw.control(cmd)).await
+                        c::peer_close_is_reported(&link, &gw.addr(), |cmd| gw.control(cmd)).await
                     })
                 }
                 #[test]
                 fn bad_key_is_closed_1008() {
                     $crate::run_async(async {
-                        let (link, _gw) = $make;
-                        c::bad_key_is_closed_1008(&link).await
+                        let (link, gw) = $make;
+                        c::bad_key_is_closed_1008(&link, &gw.addr()).await
                     })
                 }
             }
@@ -667,17 +703,89 @@ pub mod gateway_link {
 pub mod ipc_server {
     //! `$make` evaluates (inside the runtime) to `(server, connect)` where `connect().await`
     //! yields a client speaking the adapter's wire format through [`IpcTestClient`].
-    use fogar_ports::ipc::{IpcConn, IpcRequest, IpcResponse, IpcServer, StatusReport};
+    use fogar_ports::ipc::{
+        GatewayInfo, IpcConn, IpcRequest, IpcResponse, IpcServer, LinkPhase, PairCode, PairFailure,
+        PeerCheck, StatusReport,
+    };
     use std::{future::Future, time::Duration};
 
     pub trait IpcTestClient {
+        /// Sends `r` and waits for the next message.
         fn request(&mut self, r: IpcRequest) -> impl Future<Output = Option<IpcResponse>>;
+        /// Waits for the next message without sending (pushed events). `None` = closed.
+        fn next(&mut self) -> impl Future<Output = Option<IpcResponse>>;
     }
 
     impl IpcTestClient for crate::FakeIpcClient {
         async fn request(&mut self, r: IpcRequest) -> Option<IpcResponse> {
             crate::FakeIpcClient::request(self, r).await
         }
+        async fn next(&mut self) -> Option<IpcResponse> {
+            crate::FakeIpcClient::next(self).await
+        }
+    }
+
+    fn report(n: u64) -> StatusReport {
+        StatusReport::new(
+            "ready".into(),
+            LinkPhase::Ready,
+            Some(GatewayInfo::new(
+                "http://127.0.0.1:8004".into(),
+                "green-house".into(),
+                "1.29.0".into(),
+                "Mac".into(),
+            )),
+            n,
+            2,
+            "normal".into(),
+            PeerCheck::UidOnly,
+        )
+    }
+
+    /// Echo server used by the clauses: answers each request deterministically.
+    async fn serve_one<S: IpcServer>(server: &S, push_after_subscribe: u64) {
+        let (_peer, mut conn) = server.accept().await.expect("accept");
+        while let Ok(Some(req)) = conn.recv().await {
+            let resp = match req {
+                IpcRequest::Hello { version } => IpcResponse::Hello { version },
+                IpcRequest::Status => IpcResponse::Status(report(1)),
+                IpcRequest::Subscribe => {
+                    conn.send(IpcResponse::Subscribed).await.expect("send");
+                    // Unsolicited pushes: no request precedes them.
+                    for n in 0..push_after_subscribe {
+                        conn.send(IpcResponse::Event(report(n)))
+                            .await
+                            .expect("push");
+                    }
+                    continue;
+                }
+                IpcRequest::Pair { code: None, .. } => {
+                    IpcResponse::PairFailed(PairFailure::BadCode)
+                }
+                IpcRequest::Pair {
+                    address,
+                    code: Some(c),
+                } => {
+                    assert_eq!(c.digits(), "482913", "code must cross the wire intact");
+                    IpcResponse::Paired(GatewayInfo::new(
+                        address,
+                        "gw".into(),
+                        "1".into(),
+                        "Mac".into(),
+                    ))
+                }
+                IpcRequest::Unpair => IpcResponse::Unpaired,
+                _ => IpcResponse::Refused {
+                    reason: "unsupported request",
+                },
+            };
+            conn.send(resp).await.expect("send");
+        }
+    }
+
+    async fn bounded<F: Future>(f: F) {
+        let r = tokio::time::timeout(Duration::from_secs(5), f).await;
+        assert!(r.is_ok(), "ipc clause timed out");
     }
 
     pub async fn request_response_roundtrip<S, F, Fut, K>(server: S, connect: F)
@@ -687,44 +795,84 @@ pub mod ipc_server {
         Fut: Future<Output = K>,
         K: IpcTestClient,
     {
-        let serve = async {
-            let (_peer, mut conn) = server.accept().await.expect("accept");
-            while let Ok(Some(req)) = conn.recv().await {
-                let resp = match req {
-                    IpcRequest::Hello { version } => IpcResponse::Hello { version },
-                    IpcRequest::Status => IpcResponse::Status(StatusReport::new(
-                        "ready".into(),
-                        1,
-                        2,
-                        "normal".into(),
-                    )),
-                    _ => IpcResponse::Refused {
-                        reason: "unsupported request",
-                    },
-                };
-                conn.send(resp).await.expect("send");
-            }
-        };
         let client = async {
             let mut c = connect().await;
             assert_eq!(
-                c.request(IpcRequest::Hello { version: 1 }).await,
-                Some(IpcResponse::Hello { version: 1 })
+                c.request(IpcRequest::Hello { version: 2 }).await,
+                Some(IpcResponse::Hello { version: 2 })
             );
-            match c.request(IpcRequest::Status).await {
-                Some(IpcResponse::Status(s)) => assert_eq!(
-                    (s.link.as_str(), s.sessions, s.turns_completed),
-                    ("ready", 1, 2)
-                ),
-                other => panic!("{other:?}"),
-            }
+            assert_eq!(
+                c.request(IpcRequest::Status).await,
+                Some(IpcResponse::Status(report(1)))
+            );
+            assert_eq!(
+                c.request(IpcRequest::Unpair).await,
+                Some(IpcResponse::Unpaired)
+            );
             drop(c);
         };
-        let r = tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(serve, client)
-        })
-        .await;
-        assert!(r.is_ok(), "ipc round trip timed out");
+        bounded(async { tokio::join!(serve_one(&server, 0), client) }).await;
+    }
+
+    /// `send` without a preceding request reaches the client, in order, and the connection
+    /// keeps answering requests afterwards.
+    pub async fn unsolicited_send_reaches_client<S, F, Fut, K>(server: S, connect: F)
+    where
+        S: IpcServer,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = K>,
+        K: IpcTestClient,
+    {
+        let client = async {
+            let mut c = connect().await;
+            assert_eq!(
+                c.request(IpcRequest::Subscribe).await,
+                Some(IpcResponse::Subscribed)
+            );
+            for n in 0..3 {
+                assert_eq!(c.next().await, Some(IpcResponse::Event(report(n))));
+            }
+            assert_eq!(
+                c.request(IpcRequest::Status).await,
+                Some(IpcResponse::Status(report(1)))
+            );
+            drop(c);
+        };
+        bounded(async { tokio::join!(serve_one(&server, 3), client) }).await;
+    }
+
+    /// The pairing code crosses the adapter intact; a typo arrives as `code: None` (decoded, not
+    /// dropped), so the core can answer `BadCode`.
+    pub async fn pair_request_crosses_intact<S, F, Fut, K>(server: S, connect: F)
+    where
+        S: IpcServer,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = K>,
+        K: IpcTestClient,
+    {
+        let client = async {
+            let mut c = connect().await;
+            match c
+                .request(IpcRequest::Pair {
+                    address: "green-house:8004".into(),
+                    code: PairCode::parse("482 913"),
+                })
+                .await
+            {
+                Some(IpcResponse::Paired(g)) => assert_eq!(g.address, "green-house:8004"),
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(
+                c.request(IpcRequest::Pair {
+                    address: "x".into(),
+                    code: None
+                })
+                .await,
+                Some(IpcResponse::PairFailed(PairFailure::BadCode))
+            );
+            drop(c);
+        };
+        bounded(async { tokio::join!(serve_one(&server, 0), client) }).await;
     }
 
     /// Dropping a pending `accept` must not lose the next connection.
@@ -760,6 +908,228 @@ pub mod ipc_server {
                     $crate::run_async(async {
                         let (server, connect) = $make;
                         c::accept_is_cancel_safe(server, connect).await
+                    })
+                }
+                #[test]
+                fn unsolicited_send_reaches_client() {
+                    $crate::run_async(async {
+                        let (server, connect) = $make;
+                        c::unsolicited_send_reaches_client(server, connect).await
+                    })
+                }
+                #[test]
+                fn pair_request_crosses_intact() {
+                    $crate::run_async(async {
+                        let (server, connect) = $make;
+                        c::pair_request_crosses_intact(server, connect).await
+                    })
+                }
+            }
+        };
+    }
+}
+
+pub mod gateway_http {
+    //! `$make` evaluates (inside the runtime) to `(http, server)` where `server` has
+    //! `.addr()`, `.dead_addr()` and `.routes() -> HttpRoutes` (a `MockHttpServer` for real
+    //! adapters, the `FakeGatewayHttp` itself for the fake).
+    use crate::gateway::HttpRoutes;
+    use fogar_ports::{
+        gateway::GatewayAddr,
+        gateway_http::{GatewayHttp, HttpCall, HttpError, MAX_BODY_BYTES},
+    };
+    use secrecy::zeroize::Zeroizing;
+    use std::time::Duration;
+
+    const WK: HttpCall = HttpCall::WellKnown("/.well-known/fogar-gateway");
+
+    async fn bounded<F: std::future::Future>(f: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(5), f)
+            .await
+            .expect("http clause timed out")
+    }
+
+    pub async fn get_returns_status_and_body<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        routes.set("GET", WK.path(), 200, r#"{"service":"fogar-gateway"}"#);
+        let r = bounded(h.get(addr, WK)).await.expect("get");
+        assert_eq!(r.status, 200);
+        assert_eq!(&r.body[..], br#"{"service":"fogar-gateway"}"#);
+        assert!(
+            !format!("{r:?}").contains("service"),
+            "Debug must not print the body"
+        );
+        let seen = routes.seen();
+        assert_eq!(
+            (seen[0].method.as_str(), seen[0].path.as_str()),
+            ("GET", WK.path())
+        );
+    }
+
+    pub async fn post_sends_the_json_body<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        routes.set("POST", "/pair", 201, r#"{"client_key":"k"}"#);
+        let body = br#"{"code":"482913"}"#.to_vec();
+        let r = bounded(h.post_json(addr, HttpCall::Pair, Zeroizing::new(body.clone())))
+            .await
+            .expect("post");
+        assert_eq!(
+            (r.status, &r.body[..]),
+            (201, &br#"{"client_key":"k"}"#[..])
+        );
+        let seen = routes.seen();
+        let last = seen.last().expect("request seen");
+        assert_eq!(
+            (last.method.as_str(), last.path.as_str()),
+            ("POST", "/pair")
+        );
+        assert_eq!(last.body, body);
+        assert!(
+            last.content_type
+                .as_deref()
+                .is_some_and(|c| c.starts_with("application/json"))
+        );
+    }
+
+    /// 4xx/5xx are replies (the core reads `detail`), not transport errors; a GET of `/pair`
+    /// is refused locally.
+    pub async fn error_statuses_are_replies<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        routes.set(
+            "POST",
+            "/pair",
+            400,
+            r#"{"detail":"invalid or expired code"}"#,
+        );
+        let r = bounded(h.post_json(addr, HttpCall::Pair, Zeroizing::new(b"{}".to_vec())))
+            .await
+            .expect("400 is a reply");
+        assert_eq!(r.status, 400);
+        let r = bounded(h.get(addr, HttpCall::WellKnown("/nope")))
+            .await
+            .expect("404 reply");
+        assert_eq!(r.status, 404);
+        assert!(matches!(
+            bounded(h.get(addr, HttpCall::Pair)).await,
+            Err(HttpError::Refused)
+        ));
+    }
+
+    pub async fn oversized_body_is_refused<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        routes.set("GET", WK.path(), 200, vec![b' '; MAX_BODY_BYTES + 1]);
+        assert!(matches!(
+            bounded(h.get(addr, WK)).await,
+            Err(HttpError::TooLarge { .. })
+        ));
+    }
+
+    /// A redirect could move the key exchange elsewhere: it is returned, never followed.
+    pub async fn redirects_are_not_followed<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        routes.set_redirect("POST", "/pair", "http://evil.example/pair");
+        let r = bounded(h.post_json(addr, HttpCall::Pair, Zeroizing::new(b"{}".to_vec())))
+            .await
+            .expect("redirect reply");
+        assert_eq!(r.status, 302);
+        assert_eq!(routes.seen().len(), 1);
+    }
+
+    pub async fn unreachable_is_reported<H: GatewayHttp>(h: &H, dead: &GatewayAddr) {
+        assert!(matches!(
+            bounded(h.get(dead, WK)).await,
+            Err(HttpError::Unreachable)
+        ));
+    }
+
+    /// Dropping an in-flight call leaves the adapter usable.
+    pub async fn cancelled_call_leaves_adapter_usable<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        routes.set("GET", WK.path(), 200, "{}");
+        for _ in 0..5 {
+            let mut f = std::pin::pin!(h.get(addr, WK));
+            std::future::poll_fn(|cx| {
+                let _ = f.as_mut().poll(cx);
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        let r = bounded(h.get(addr, WK)).await.expect("get after cancels");
+        assert_eq!(r.status, 200);
+    }
+
+    #[macro_export]
+    macro_rules! gateway_http_contract {
+        ($make:expr) => {
+            mod gateway_http_contract {
+                #[allow(unused_imports)]
+                use super::*;
+                use $crate::contract::gateway_http as c;
+                #[test]
+                fn get_returns_status_and_body() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::get_returns_status_and_body(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn post_sends_the_json_body() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::post_sends_the_json_body(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn error_statuses_are_replies() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::error_statuses_are_replies(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn oversized_body_is_refused() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::oversized_body_is_refused(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn redirects_are_not_followed() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::redirects_are_not_followed(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn unreachable_is_reported() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::unreachable_is_reported(&h, &s.dead_addr()).await
+                    })
+                }
+                #[test]
+                fn cancelled_call_leaves_adapter_usable() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::cancelled_call_leaves_adapter_usable(&h, &s.addr(), &s.routes()).await
                     })
                 }
             }

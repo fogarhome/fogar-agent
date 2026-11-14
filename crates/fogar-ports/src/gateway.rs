@@ -89,7 +89,188 @@ pub trait LinkSession: Send + 'static {
 
 pub trait GatewayLink: Send + Sync + 'static {
     type Session: LinkSession;
-    /// Opens a new transport session (TCP+TLS+WS upgrade for the real adapter). The core wraps
-    /// this in its own deadline; dropping the future must not leak a half-open socket.
-    fn connect(&self) -> impl Future<Output = Result<Self::Session, LinkError>> + Send;
+    /// Opens a new transport session to `addr` (TCP [+TLS] + WS upgrade on `/ws/stream` for the
+    /// real adapter). The address comes from the pairing record, so it can change between calls.
+    /// The adapter refuses addresses its transport policy forbids (e.g. clear text to a public
+    /// host) with `NotConfigured`. The core wraps this in its own deadline; dropping the future
+    /// must not leak a half-open socket.
+    fn connect(
+        &self,
+        addr: &GatewayAddr,
+    ) -> impl Future<Output = Result<Self::Session, LinkError>> + Send;
+}
+
+/// Default gateway port (client-protocol §0).
+pub const DEFAULT_GATEWAY_PORT: u16 = 8004;
+
+/// Transport security of a gateway address. LAN and tailnet gateways speak clear text
+/// (`http`/`ws`); behind a TLS proxy, `https`/`wss` (client-protocol §0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Scheme {
+    Plain,
+    Tls,
+}
+
+/// Where a gateway lives: `host[:port]` plus transport security. Validated user input (the
+/// person may type it): no credentials, no path, no whitespace, port 1..=65535.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GatewayAddr {
+    scheme: Scheme,
+    host: String,
+    port: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("not a gateway address (expected host[:port], optionally with http:// or https://)")]
+pub struct AddrError;
+
+impl GatewayAddr {
+    /// Accepts `host`, `host:port`, `[v6]:port` and the same with `http://`, `https://`, `ws://`
+    /// or `wss://` in front (an optional trailing `/` or `/ws/stream` is ignored). Without a
+    /// scheme the address is plain text: GUESSED from client-protocol §0, which gives bare
+    /// `host:port` for LAN/tailnet and says nothing about how a client picks TLS.
+    pub fn parse(input: &str) -> Result<Self, AddrError> {
+        let s = input.trim();
+        let (scheme, rest) = match s.split_once("://") {
+            Some(("http" | "ws", r)) => (Scheme::Plain, r),
+            Some(("https" | "wss", r)) => (Scheme::Tls, r),
+            Some(_) => return Err(AddrError),
+            None => (Scheme::Plain, s),
+        };
+        let rest = rest
+            .strip_suffix("/ws/stream")
+            .or_else(|| rest.strip_suffix('/'))
+            .unwrap_or(rest);
+        if rest.is_empty()
+            || rest.len() > 255
+            || rest
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '@' | '?' | '#'))
+        {
+            return Err(AddrError);
+        }
+        let (host, port) = if let Some(v6) = rest.strip_prefix('[') {
+            let (h, after) = v6.split_once(']').ok_or(AddrError)?;
+            let port = match after {
+                "" => None,
+                p => Some(p.strip_prefix(':').ok_or(AddrError)?),
+            };
+            if h.is_empty()
+                || !h
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+            {
+                return Err(AddrError);
+            }
+            (h, port)
+        } else {
+            match rest.split_once(':') {
+                Some((h, p)) => (h, Some(p)),
+                None => (rest, None),
+            }
+        };
+        if host.is_empty()
+            || !host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | ':' | '_'))
+        {
+            return Err(AddrError);
+        }
+        let port = match port {
+            None => DEFAULT_GATEWAY_PORT,
+            Some(p) => match p.parse::<u16>() {
+                Ok(0) | Err(_) => return Err(AddrError),
+                Ok(n) => n,
+            },
+        };
+        Ok(Self {
+            scheme,
+            host: host.to_ascii_lowercase(),
+            port,
+        })
+    }
+
+    pub fn scheme(&self) -> Scheme {
+        self.scheme
+    }
+    /// Host without brackets (IPv6 literals are bare).
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+    /// `host:port` with IPv6 literals bracketed (for URLs and `Host:` headers).
+    pub fn authority(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+}
+
+/// `http(s)://host:port` form, round-trips through [`GatewayAddr::parse`].
+impl fmt::Display for GatewayAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self.scheme {
+            Scheme::Plain => "http",
+            Scheme::Tls => "https",
+        };
+        write!(f, "{s}://{}", self.authority())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_the_forms_people_type() {
+        let a = GatewayAddr::parse("green-house").unwrap();
+        assert_eq!(
+            (a.scheme(), a.host(), a.port()),
+            (Scheme::Plain, "green-house", 8004)
+        );
+        let a = GatewayAddr::parse(" 192.168.1.19:9000 ").unwrap();
+        assert_eq!((a.host(), a.port()), ("192.168.1.19", 9000));
+        let a = GatewayAddr::parse("https://Fogar.Example.com/").unwrap();
+        assert_eq!(
+            (a.scheme(), a.host(), a.port()),
+            (Scheme::Tls, "fogar.example.com", 8004)
+        );
+        let a = GatewayAddr::parse("ws://127.0.0.1:8004/ws/stream").unwrap();
+        assert_eq!(a.authority(), "127.0.0.1:8004");
+        let a = GatewayAddr::parse("[fd7a:115c::1]:8004").unwrap();
+        assert_eq!(
+            (a.host(), a.authority().as_str()),
+            ("fd7a:115c::1", "[fd7a:115c::1]:8004")
+        );
+        let a = GatewayAddr::parse("gw.tail1234.ts.net").unwrap();
+        assert_eq!(GatewayAddr::parse(&a.to_string()), Ok(a));
+    }
+
+    #[test]
+    fn rejects_everything_else() {
+        for bad in [
+            "",
+            " ",
+            "ftp://x",
+            "u:p@host",
+            "host/path",
+            "host:0",
+            "host:70000",
+            "host:",
+            "ho st",
+            "host?x",
+            "[::1",
+            "[]:80",
+            "http://",
+            "host#f",
+            "h\u{0}x",
+        ] {
+            assert_eq!(GatewayAddr::parse(bad), Err(AddrError), "{bad:?}");
+        }
+        assert!(GatewayAddr::parse(&"a".repeat(300)).is_err());
+    }
 }

@@ -13,6 +13,7 @@
 //! NOT modelled: STT/barge-in from audio partials, push queueing, tool calls, pipeline events.
 
 mod driver;
+mod http;
 mod memory;
 mod ws;
 
@@ -20,5 +21,6 @@ pub use driver::{
     Ctl, GatewayLog, MockConfig, REASON_BAD_JSON, REASON_BAD_KEY, REASON_NOT_TEXT, REASON_TIMEOUT,
     REASON_TOO_LARGE,
 };
+pub use http::{FakeGatewayHttp, HttpRoutes, MockHttpServer, SeenRequest};
 pub use memory::{FAKE_MAX_FRAME, FakeGatewayLink, FakeSession};
 pub use ws::MockGateway;

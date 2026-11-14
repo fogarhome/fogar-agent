@@ -4,7 +4,8 @@
 use crate::{agent::HealthProbe, queues::IPC_MAX_CONNS, stats::Stats, time::deadline};
 use fogar_ports::{
     clock::Clock,
-    ipc::{IPC_VERSION, IpcConn, IpcRequest, IpcResponse, IpcServer, StatusReport},
+    ipc::{IPC_VERSION, IpcConn, IpcRequest, IpcResponse, IpcServer, PeerCheck, StatusReport},
+    support::Support,
 };
 use std::{sync::Arc, time::Duration};
 use tokio::task::JoinSet;
@@ -28,6 +29,11 @@ pub(crate) async fn run<C: Clock, S: IpcServer>(
     limits: Limits,
     ingress: CancellationToken,
 ) {
+    let peer_check = if server.capabilities().peer_code_identity == Support::Native {
+        PeerCheck::SameSigner
+    } else {
+        PeerCheck::UidOnly
+    };
     let mut conns = JoinSet::new();
     // Accept failures back off exponentially (250 ms .. 30 s) so a broken listener cannot spin.
     let mut fail_delay = Duration::from_millis(250);
@@ -40,7 +46,7 @@ pub(crate) async fn run<C: Clock, S: IpcServer>(
                 Ok((_peer, conn)) => {
                     fail_delay = Duration::from_millis(250);
                     Stats::inc(&health.stats.ipc_connections);
-                    conns.spawn(serve(conn, clock.clone(), health.clone(), limits, ingress.child_token()));
+                    conns.spawn(serve(conn, clock.clone(), health.clone(), limits, peer_check, ingress.child_token()));
                 }
                 Err(_) => {
                     tokio::select! {
@@ -61,6 +67,7 @@ async fn serve<C: Clock, K: IpcConn>(
     clock: Arc<C>,
     health: HealthProbe,
     limits: Limits,
+    peer_check: PeerCheck,
     cancel: CancellationToken,
 ) {
     loop {
@@ -86,11 +93,25 @@ async fn serve<C: Clock, K: IpcConn>(
                 let h = health.snapshot();
                 IpcResponse::Status(StatusReport::new(
                     h.link.label().to_owned(),
+                    h.link.phase(),
+                    // TODO(S1 core PR): gateway info from the pairing record.
+                    None,
                     h.stats.sessions_started,
                     h.stats.turns_completed,
                     h.boot_mode.to_owned(),
+                    peer_check,
                 ))
             }
+            // TODO(S1 core PR): subscribe (watch, exempt from idle_timeout), discover, pair,
+            // unpair. Listed explicitly so a new variant is a conscious decision.
+            Ok(Some(
+                IpcRequest::Subscribe
+                | IpcRequest::Discover
+                | IpcRequest::Pair { .. }
+                | IpcRequest::Unpair,
+            )) => IpcResponse::Refused {
+                reason: "not implemented yet",
+            },
             Ok(Some(_)) => IpcResponse::Refused {
                 reason: "unsupported request",
             },

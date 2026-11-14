@@ -118,8 +118,11 @@ mod hung_close {
 
     impl GatewayLink for HungClose {
         type Session = HungSess;
-        async fn connect(&self) -> Result<HungSess, LinkError> {
-            Ok(HungSess(self.0.connect().await?))
+        async fn connect(
+            &self,
+            addr: &fogar_ports::gateway::GatewayAddr,
+        ) -> Result<HungSess, LinkError> {
+            Ok(HungSess(self.0.connect(addr).await?))
         }
     }
 }

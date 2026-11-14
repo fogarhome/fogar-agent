@@ -14,6 +14,11 @@ pub use secrecy::{ExposeSecret, SecretString};
 pub enum SecretKey {
     /// The gateway's per-device bearer key (spec §2). Shown once at pairing; never logged.
     GatewayClientKey,
+    /// The pairing record: gateway address + `client_id` + `client_key` + gateway name, stored
+    /// as ONE item so the key can never be paired with the wrong address (the key is only valid
+    /// on the gateway that issued it). Encoded by fogar-core; opaque to adapters. Supersedes
+    /// `GatewayClientKey` from S1 on.
+    GatewayPairing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

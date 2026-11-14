@@ -110,16 +110,19 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
             if egress.is_cancelled() || in_tx.is_closed() {
                 break;
             }
-            let key = match self.secrets.get(SecretKey::GatewayClientKey) {
-                Ok(Some(k)) => k,
-                Ok(None) => {
+            let key = match (
+                &self.cfg.gateway,
+                self.secrets.get(SecretKey::GatewayClientKey),
+            ) {
+                (Some(_), Ok(Some(k))) => k,
+                (None, _) | (_, Ok(None)) => {
                     self.set_state(LinkState::NotPaired);
                     if self.wait(self.cfg.backoff.cap, &egress).await {
                         continue;
                     }
                     break;
                 }
-                Err(_) => {
+                (_, Err(_)) => {
                     let d = self.cfg.backoff.delay(attempt, &*self.random);
                     attempt = attempt.saturating_add(1);
                     self.set_state(LinkState::Backoff {
@@ -220,10 +223,13 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
         egress: &CancellationToken,
     ) -> (Outcome, bool) {
         let clock = &*self.clock;
+        let Some(addr) = &self.cfg.gateway else {
+            return (Outcome::ConnectFailed, false);
+        };
         let connect = tokio::select! {
             biased;
             () = egress.cancelled() => return (Outcome::Shutdown, false),
-            r = deadline(clock, self.cfg.connect_timeout, self.link.connect()) => r,
+            r = deadline(clock, self.cfg.connect_timeout, self.link.connect(addr)) => r,
         };
         let Some(Ok(mut sess)) = connect else {
             return (Outcome::ConnectFailed, false);
@@ -529,7 +535,7 @@ mod budget_tests {
 
     impl GatewayLink for Scripted {
         type Session = Sess;
-        async fn connect(&self) -> Result<Sess, LinkError> {
+        async fn connect(&self, _: &fogar_ports::gateway::GatewayAddr) -> Result<Sess, LinkError> {
             let taken = self.0.lock().unwrap().take();
             match taken {
                 Some(frames) => Ok(Sess(frames)),
@@ -565,7 +571,10 @@ mod budget_tests {
             link: Scripted(Arc::new(Mutex::new(Some(script)))),
             secrets: Arc::new(MemorySecretStore::with_client_key("k")),
             random: Arc::new(SeededRandom::new(7)),
-            cfg: Arc::new(Config::default()),
+            cfg: Arc::new(Config {
+                gateway: fogar_ports::gateway::GatewayAddr::parse("127.0.0.1").ok(),
+                ..Config::default()
+            }),
             stats: stats.clone(),
             view,
             budget: budget.clone(),

@@ -15,7 +15,10 @@ pub use fakes::{
     FakeIpc, FakeIpcClient, FakeMic, FakePowerPolicy, FakeSpeaker, FakeSystemProbe,
     MemorySecretStore, SeededRandom, TestClock, silence_chunks, tone_chunks,
 };
-pub use gateway::{FakeGatewayLink, GatewayLog, MockConfig, MockGateway};
+pub use gateway::{
+    FakeGatewayHttp, FakeGatewayLink, GatewayLog, HttpRoutes, MockConfig, MockGateway,
+    MockHttpServer,
+};
 
 /// Runs an async contract clause on a fresh current-thread runtime with time and I/O enabled.
 pub fn run_async<F: std::future::Future>(f: F) -> F::Output {

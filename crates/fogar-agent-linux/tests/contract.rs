@@ -25,6 +25,9 @@ impl fogar_testkit::contract::ipc_server::IpcTestClient for Client {
     ) -> Option<fogar_ports::ipc::IpcResponse> {
         self.0.request(r).await
     }
+    async fn next(&mut self) -> Option<fogar_ports::ipc::IpcResponse> {
+        self.0.next().await
+    }
 }
 
 fogar_testkit::system_probe_contract!(ProcSystemProbe);

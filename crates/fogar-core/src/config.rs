@@ -1,11 +1,15 @@
 //! Engine configuration, injected by the composition root (core never reads env or files).
 
 use crate::{backoff::BackoffPolicy, turn::TurnTimeouts, vad::VadConfig};
+use fogar_ports::gateway::GatewayAddr;
 use fogar_proto::{InputMode, OutputMode, limits};
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
+    /// Gateway to connect to. `None` = not paired (S1 core PR replaces this with the pairing
+    /// record from the SecretStore).
+    pub gateway: Option<GatewayAddr>,
     /// Requested agent; `None` = gateway fallback cascade (spec §2).
     pub agent: Option<String>,
     pub input_mode: InputMode,
@@ -41,6 +45,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            gateway: None,
             agent: None,
             input_mode: InputMode::Audio,
             output_mode: vec![OutputMode::Audio, OutputMode::Text],

@@ -129,8 +129,11 @@ mod busy_downlink {
 
     impl GatewayLink for FloodLink {
         type Session = FloodSess;
-        async fn connect(&self) -> Result<FloodSess, LinkError> {
-            let inner = self.inner.connect().await?;
+        async fn connect(
+            &self,
+            addr: &fogar_ports::gateway::GatewayAddr,
+        ) -> Result<FloodSess, LinkError> {
+            let inner = self.inner.connect(addr).await?;
             let rx = self.rx.lock().ok().and_then(|mut g| g.take());
             Ok(FloodSess { inner, rx })
         }

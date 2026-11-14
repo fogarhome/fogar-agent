@@ -9,6 +9,6 @@ fogar_testkit::gateway_link_contract!({
     let gw = MockGateway::start(MockConfig::default())
         .await
         .expect("mock gateway");
-    let link = WsGatewayLink::new(WsConfig::new(gw.url()).expect("loopback url"));
+    let link = WsGatewayLink::new(WsConfig::default());
     (link, gw)
 });

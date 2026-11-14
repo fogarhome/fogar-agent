@@ -31,6 +31,7 @@ impl FileSecretStore {
     fn path(&self, key: SecretKey) -> PathBuf {
         let name = match key {
             SecretKey::GatewayClientKey => "gateway_client_key",
+            SecretKey::GatewayPairing => "gateway_pairing",
             _ => "unknown_key",
         };
         self.dir.join(name)

@@ -62,6 +62,10 @@ impl FakeIpcClient {
         self.tx.send(r).await.ok()?;
         self.rx.recv().await
     }
+    /// Next pushed message (after `Subscribe`). `None` = the server closed.
+    pub async fn next(&mut self) -> Option<IpcResponse> {
+        self.rx.recv().await
+    }
 }
 
 impl IpcConn for FakeConn {

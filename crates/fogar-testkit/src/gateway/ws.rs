@@ -83,6 +83,10 @@ impl MockGateway {
     pub fn url(&self) -> String {
         format!("ws://{}/ws/stream", self.addr)
     }
+    /// The mock's address as the core and the link adapters see it.
+    pub fn addr(&self) -> fogar_ports::gateway::GatewayAddr {
+        fogar_ports::gateway::GatewayAddr::parse(&self.addr.to_string()).expect("mock addr")
+    }
     pub fn log(&self) -> GatewayLog {
         self.log.lock().unwrap().clone()
     }
