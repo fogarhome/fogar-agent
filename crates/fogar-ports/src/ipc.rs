@@ -41,14 +41,26 @@ impl IpcCaps {
 #[non_exhaustive]
 pub struct PeerIdentity {
     pub uid: Option<u32>,
-    /// Code-signing identifier, set ONLY when the adapter verified that the peer is signed by
-    /// the same signer as the agent and carries the expected identifier (ADR-0002 amendment).
-    pub code_id: Option<String>,
+    /// Private: only [`PeerIdentity::verified_signer`] sets it, so elevating a peer is always an
+    /// explicit, greppable act in an adapter.
+    code_id: Option<String>,
 }
 
 impl PeerIdentity {
-    pub fn new(uid: Option<u32>, code_id: Option<String>) -> Self {
-        Self { uid, code_id }
+    /// A peer authenticated by OS user only.
+    pub fn uid_only(uid: Option<u32>) -> Self {
+        Self { uid, code_id: None }
+    }
+    /// A peer the adapter VERIFIED is signed by the same signer as the agent and carries the
+    /// expected identifier (ADR-0002 amendment). Grants `PeerCheck::SameSigner`.
+    pub fn verified_signer(uid: Option<u32>, code_id: String) -> Self {
+        Self {
+            uid,
+            code_id: Some(code_id),
+        }
+    }
+    pub fn code_id(&self) -> Option<&str> {
+        self.code_id.as_deref()
     }
     pub fn check(&self) -> PeerCheck {
         if self.code_id.is_some() {

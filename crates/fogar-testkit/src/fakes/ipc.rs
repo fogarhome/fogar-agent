@@ -102,7 +102,7 @@ impl IpcServer for FakeIpc {
         // accept loses no connection.
         let mut rx = self.rx.lock().await;
         match rx.recv().await {
-            Some(c) => Ok((PeerIdentity::new(Some(0), None), c)),
+            Some(c) => Ok((PeerIdentity::uid_only(Some(0)), c)),
             None => std::future::pending().await,
         }
     }

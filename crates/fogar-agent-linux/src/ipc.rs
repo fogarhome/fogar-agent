@@ -102,7 +102,7 @@ impl IpcServer for UdsIpcServer {
             let (stream, _) = self.listener.accept().await.map_err(io_err)?;
             match stream.peer_cred() {
                 Ok(c) if c.uid() == self.uid => {
-                    return Ok((PeerIdentity::new(Some(c.uid()), None), UdsConn::new(stream)));
+                    return Ok((PeerIdentity::uid_only(Some(c.uid())), UdsConn::new(stream)));
                 }
                 // Another user (or unknown): drop the connection before reading a byte.
                 _ => continue,
