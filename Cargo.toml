@@ -48,6 +48,12 @@ tokio = { version = "1.54.1", default-features = false }
 tokio-util = { version = "0.7.20", default-features = false }
 tokio-tungstenite = { version = "0.30.0", default-features = false }
 futures-util = { version = "0.3.34", default-features = false }
+# TLS for https:// and wss:// gateways (S1, NET-1): rustls on the ring provider (no aws-lc, no
+# OpenSSL), certificates checked by the OS trust store. Verified on crates.io 2026-11-14 (cargo info):
+# rustls 0.23.46 (latest stable; 0.24 is -dev), tokio-rustls 0.26.6, rustls-platform-verifier 0.7.1.
+rustls = { version = "0.23.46", default-features = false }
+tokio-rustls = { version = "0.26.6", default-features = false }
+rustls-platform-verifier = { version = "0.7.1", default-features = false }
 # macOS adapter only (fogar-agent-macos target table): Keychain, SecCode peer check, getsockopt
 # LOCAL_PEERTOKEN. Verified on crates.io 2026-11-14: security-framework 3.7.0 (2026-02-20),
 # core-foundation 0.10.1 (2025-05-26), libc 0.2.191 (2026-10-16, already in Cargo.lock).

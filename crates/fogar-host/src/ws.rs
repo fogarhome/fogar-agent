@@ -3,20 +3,25 @@
 //! Bounded everything (fogar-longrun-reliability rule 2, fogar-secure-rust NET-3): inbound
 //! message/frame <= 1 MiB (the gateway's own limit), write buffer capped (tungstenite's default
 //! `max_write_buffer_size` is `usize::MAX`), small eager read buffer (energy skill pitfall).
-//! Deadlines: connect/write are applied by the core (`Config`); the close handshake here.
+//! Deadlines: the name lookup, each TCP attempt and the TLS handshake under `attempt_timeout`,
+//! the whole connect, send, recv and the close handshake are bounded by the core
+//! (`fogar_core::Config`).
 //!
-//! TLS: not yet. `wss://` is refused with an explicit error and plain `ws://` is accepted
-//! only for loopback hosts (ADR-0006, NET-1). The S1 host PR adds rustls and explicit LAN/tailnet.
+//! Transport policy (NET-1, ADR-0006 item 4): the name is resolved ONCE by [`Resolver`],
+//! `cleartext_allowed` is applied to every resolved address, and the upgrade runs over the
+//! socket already connected to one of them (tungstenite never resolves again). `wss://` runs
+//! over rustls with the OS trust store (`net::platform_tls`); no clear-text fallback.
 
+use crate::net::{Conn, DialError, Resolver, SystemResolver, dial, platform_tls};
 use fogar_ports::gateway::{
-    Frame, GatewayAddr, GatewayLink, LinkError, LinkEvent, LinkSession, Scheme,
+    Frame, GatewayAddr, GatewayLink, LinkError, LinkEvent, LinkSession, Scheme, cleartext_allowed,
 };
 use fogar_proto::limits::WS_MAX_FRAME_BYTES;
 use futures_util::{SinkExt, StreamExt};
+use rustls::ClientConfig;
 use std::{fmt, sync::Arc, time::Duration};
-use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream,
+    WebSocketStream,
     tungstenite::{
         Message,
         protocol::{CloseFrame, WebSocketConfig, frame::coding::CloseCode},
@@ -29,32 +34,33 @@ const CLOSE_NO_STATUS: u16 = 1005;
 /// Adapter tuning. The gateway address is per call (`GatewayLink::connect`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WsConfig {
-    pub close_timeout: Duration,
     pub max_frame: usize,
+    /// Per resolved address (and for the name lookup).
+    pub attempt_timeout: Duration,
 }
 
 impl Default for WsConfig {
     fn default() -> Self {
         Self {
-            close_timeout: Duration::from_secs(2),
             max_frame: WS_MAX_FRAME_BYTES,
+            attempt_timeout: Duration::from_secs(3),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WsConfigError {
-    /// `https`/`wss` needs the TLS adapter (S1, fogar-host PR).
-    TlsNotYetSupported,
-    /// Plain `ws://` to a non-loopback host would send the client key in clear text.
+    /// Plain `ws://` to an IP outside loopback/LAN/tailnet would send the client key in clear
+    /// text.
     InsecureRemote,
 }
 
 impl fmt::Display for WsConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            WsConfigError::TlsNotYetSupported => "wss:// is not supported yet",
-            WsConfigError::InsecureRemote => "plain ws:// is only allowed to a loopback address",
+            WsConfigError::InsecureRemote => {
+                "plain ws:// is only allowed to loopback, LAN or tailnet addresses"
+            }
         })
     }
 }
@@ -62,32 +68,53 @@ impl fmt::Display for WsConfigError {
 impl std::error::Error for WsConfigError {}
 
 impl WsConfig {
-    /// Transport policy for `addr` (NET-1, ADR-0006 item 4). Checked on every `connect`;
-    /// callers may check early to report a usage error.
+    /// Early usage check of the transport policy (NET-1): IP literals only. A name passes here;
+    /// `connect` checks every address it resolves to.
     pub fn check(addr: &GatewayAddr) -> Result<(), WsConfigError> {
         match addr.scheme() {
-            Scheme::Tls => Err(WsConfigError::TlsNotYetSupported),
-            Scheme::Plain if !is_loopback(addr.host()) => Err(WsConfigError::InsecureRemote),
+            Scheme::Tls => Ok(()),
+            Scheme::Plain
+                if addr
+                    .host()
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| !cleartext_allowed(ip)) =>
+            {
+                Err(WsConfigError::InsecureRemote)
+            }
             Scheme::Plain => Ok(()),
         }
     }
 }
 
-fn is_loopback(host: &str) -> bool {
-    host == "localhost"
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|a| a.is_loopback())
-}
-
 #[derive(Debug, Clone)]
-pub struct WsGatewayLink {
+pub struct WsGatewayLink<R = SystemResolver> {
     cfg: Arc<WsConfig>,
+    resolver: Arc<R>,
+    tls: Option<Arc<ClientConfig>>,
 }
 
-impl WsGatewayLink {
+impl WsGatewayLink<SystemResolver> {
     pub fn new(cfg: WsConfig) -> Self {
-        Self { cfg: Arc::new(cfg) }
+        Self::with_resolver(cfg, SystemResolver)
+    }
+}
+
+impl<R: Resolver> WsGatewayLink<R> {
+    pub fn with_resolver(cfg: WsConfig, resolver: R) -> Self {
+        Self {
+            cfg: Arc::new(cfg),
+            resolver: Arc::new(resolver),
+            tls: platform_tls(),
+        }
+    }
+
+    /// Replaces the TLS configuration (tests: a private test CA). The config must verify
+    /// certificates; this crate never builds one that does not. Hidden: production wiring uses
+    /// the platform verifier from the constructors.
+    #[doc(hidden)]
+    pub fn with_tls(mut self, tls: Arc<ClientConfig>) -> Self {
+        self.tls = Some(tls);
+        self
     }
 }
 
@@ -101,7 +128,7 @@ fn ws_config(max: usize) -> WebSocketConfig {
 }
 
 pub struct WsSession {
-    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ws: WebSocketStream<Conn>,
     cfg: Arc<WsConfig>,
     closed: bool,
 }
@@ -170,35 +197,44 @@ impl LinkSession for WsSession {
             code: CloseCode::from(code),
             reason: reason.into(),
         };
-        let t = self.cfg.close_timeout;
-        let ws = &mut self.ws;
-        // RFC 6455 §7.1.1: send our close, then wait (bounded) for the server to finish.
-        let _ = tokio::time::timeout(t, async {
-            if ws.close(Some(frame)).await.is_ok() {
-                while ws.next().await.is_some() {}
-            }
-        })
-        .await;
+        // RFC 6455 §7.1.1: send our close, then wait for the server to finish. Unbounded here:
+        // the core's `close_timeout` deadline drops this future.
+        if self.ws.close(Some(frame)).await.is_ok() {
+            while self.ws.next().await.is_some() {}
+        }
         Ok(())
     }
 }
 
-impl GatewayLink for WsGatewayLink {
+impl<R: Resolver> GatewayLink for WsGatewayLink<R> {
     type Session = WsSession;
 
     async fn connect(&self, addr: &GatewayAddr) -> Result<WsSession, LinkError> {
-        WsConfig::check(addr).map_err(|_| LinkError::NotConfigured)?;
-        let url = format!("ws://{}/ws/stream", addr.authority());
-        let (ws, _resp) = tokio_tungstenite::connect_async_with_config(
-            url,
-            Some(ws_config(self.cfg.max_frame)),
-            true,
+        let cfg = &self.cfg;
+        let conn = match dial(
+            &*self.resolver,
+            self.tls.as_ref(),
+            addr,
+            cfg.attempt_timeout,
         )
         .await
-        .map_err(transport)?;
+        {
+            Ok(s) => s,
+            Err(DialError::Refused) => return Err(LinkError::NotConfigured),
+            Err(DialError::Unreachable(e) | DialError::Tls(e)) => return Err(transport(e)),
+        };
+        let scheme = match addr.scheme() {
+            Scheme::Plain => "ws",
+            Scheme::Tls => "wss",
+        };
+        let url = format!("{scheme}://{}/ws/stream", addr.authority());
+        let (ws, _resp) =
+            tokio_tungstenite::client_async_with_config(url, conn, Some(ws_config(cfg.max_frame)))
+                .await
+                .map_err(transport)?;
         Ok(WsSession {
             ws,
-            cfg: self.cfg.clone(),
+            cfg: cfg.clone(),
             closed: false,
         })
     }
@@ -214,10 +250,13 @@ mod tests {
         assert!(p("127.0.0.1:8004").is_ok());
         assert!(p("localhost").is_ok());
         assert!(p("[::1]:8004").is_ok());
-        assert_eq!(
-            p("wss://gw.example"),
-            Err(WsConfigError::TlsNotYetSupported)
+        assert!(p("100.64.0.2:8004").is_ok());
+        assert!(p("192.168.1.19").is_ok());
+        assert!(
+            p("green-house").is_ok(),
+            "names are checked after resolving"
         );
-        assert_eq!(p("100.64.0.2:8004"), Err(WsConfigError::InsecureRemote));
+        assert!(p("wss://gw.example").is_ok());
+        assert_eq!(p("203.0.113.7:8004"), Err(WsConfigError::InsecureRemote));
     }
 }

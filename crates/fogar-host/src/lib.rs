@@ -3,10 +3,14 @@
 #![forbid(unsafe_code)]
 
 mod clock;
+mod http;
 pub mod ipc_wire;
+mod net;
 mod random;
 mod ws;
 
 pub use clock::TokioClock;
+pub use http::{HttpConfig, HttpGateway};
+pub use net::{Resolver, SystemResolver};
 pub use random::PrngRandom;
 pub use ws::{WsConfig, WsConfigError, WsGatewayLink, WsSession};
