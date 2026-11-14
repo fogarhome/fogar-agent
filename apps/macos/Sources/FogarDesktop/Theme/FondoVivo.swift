@@ -1,0 +1,176 @@
+import AppKit
+import SwiftUI
+
+/// The living background (fogar-brand FondoVivo, panel mode, as in the dashboard's FondoVivo.vue):
+/// green mountain smoke and ember moving slowly, painted into a 112 × 64 bitmap and scaled up, 3 %
+/// grain, faded into the night by an elliptical mask. The ember is light (added) and never passes
+/// 42 % under text. Still under reduce motion; no work at all while the window is hidden.
+struct FondoVivo: View {
+    var calor = 0.38
+    var humo = 0.75
+    var velocidad = 0.4
+    /// A still frame, never animated (the menu bar extra).
+    var quieto = false
+
+    @Environment(\.accessibilityReduceMotion) private var reduce
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.ventanaVisible) private var visible
+
+    var body: some View {
+        let parado = quieto || reduce || !visible
+        TimelineView(.animation(minimumInterval: 1 / 30, paused: parado)) { tl in
+            let t = parado ? 0 : tl.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 100_000)
+            if let img = FondoPintor.pinta(t: t, calor: calor, humo: humo, velocidad: velocidad, oscuro: scheme == .dark) {
+                Image(decorative: img, scale: 1).resizable().interpolation(.high)
+            }
+        }
+        .overlay(Grano().opacity(0.03))
+        .mask(EllipticalGradient(stops: [.init(color: .black, location: 0), .init(color: .black, location: 0.55),
+                                         .init(color: .clear, location: 1)], endRadiusFraction: 0.5))
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct Grano: View {
+    static let textura: NSImage = {
+        let n = 128
+        var px = [UInt8](repeating: 255, count: n * n * 4)
+        var s: UInt64 = 11
+        for i in stride(from: 0, to: px.count, by: 4) {
+            s = (s * 16807) % 2_147_483_647
+            let v = UInt8(s % 256)
+            px[i] = v; px[i + 1] = v; px[i + 2] = v
+        }
+        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: n, pixelsHigh: n, bitsPerSample: 8,
+                                   samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+                                   bytesPerRow: n * 4, bitsPerPixel: 32)
+        if let dst = rep?.bitmapData { px.withUnsafeBufferPointer { src in
+            for i in 0..<src.count { dst[i] = src[i] }
+        } }
+        let img = NSImage(size: NSSize(width: n, height: n))
+        if let rep { img.addRepresentation(rep) }
+        return img
+    }()
+
+    var body: some View {
+        Image(nsImage: Self.textura).resizable(resizingMode: .tile)
+    }
+}
+
+/// Paints one frame: the dashboard's `pinta()`, literally, into a tiny CGContext.
+enum FondoPintor {
+    private static let lw = 112, lh = 64
+    private static let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+
+    private typealias RGB = (Double, Double, Double)
+    private static let rescoldo: RGB = (90, 26, 16), ascua: RGB = (184, 54, 26), llama: RGB = (238, 106, 44)
+    private static let chispa: RGB = (255, 225, 184), contra: RGB = (124, 199, 146)
+    private static let tope = 0.42
+
+    static func pinta(t: Double, calor: Double, humo: Double, velocidad: Double, oscuro: Bool) -> CGImage? {
+        guard let x = CGContext(data: nil, width: lw, height: lh, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        // Canvas coordinates: y down, like the web.
+        x.translateBy(x: 0, y: CGFloat(lh))
+        x.scaleBy(x: 1, y: -1)
+        let W = Double(lw), H = Double(lh), s = t * velocidad
+        // Materia y humo: dark = the brand; light = the same smoke, as pale mist over bone.
+        let noche: RGB = oscuro ? (11, 16, 18) : (241, 236, 227)
+        let humoC: RGB = oscuro ? (19, 32, 27) : (214, 226, 214)
+        let niebla: RGB = oscuro ? (32, 51, 42) : (200, 217, 204)
+        x.setFillColor(color(noche, 1))
+        x.fill(CGRect(x: 0, y: 0, width: W, height: H))
+        for k in 0..<3 {
+            let kd = Double(k)
+            let X = W * (0.2 + 0.6 * (0.5 + 0.5 * sin(s * 0.21 + kd * 2.1)))
+            let Y = H * (0.15 + 0.55 * (0.5 + 0.5 * sin(s * 0.17 + kd * 1.3)))
+            let r = W * (0.42 + 0.08 * sin(s * 0.3 + kd))
+            radial(x, X, Y, r, [(k == 1 ? niebla : humoC, 0.75 * humo, 0), (k == 1 ? niebla : humoC, 0, 1)])
+        }
+        // Light adds on the night; on bone it can only darken, so it multiplies (and stays fainter).
+        x.setBlendMode(oscuro ? .plusLighter : .multiply)
+        let luz = oscuro ? 1.0 : 0.55
+        let X0 = W * (0.5 + 0.45 * sin(s * 0.09 + 1)), Y0 = H * (0.25 + 0.2 * sin(s * 0.13))
+        radial(x, X0, Y0, W * 0.5, [(contra, 0.07 * humo * luz, 0), (contra, 0, 1)])
+        for k in 0..<3 {
+            let kd = Double(k)
+            let X = W * (0.18 + 0.64 * (0.5 + 0.5 * sin(s * (0.11 + 0.04 * kd) + kd * 2.3)))
+            let Y = H * (0.8 + 0.18 * sin(s * (0.23 + 0.05 * kd) + kd))
+            let r = W * (0.26 + 0.08 * sin(s * 0.6 + kd * 1.7))
+            let fl = 0.8 + 0.2 * sin(s * 1.3 + kd * 2) * sin(s * 0.41 + kd)
+            let a = calor * fl * luz
+            let tono = 0.5 + 0.5 * sin(s * 0.35 + kd * 2.1)
+            let nucleo: RGB = (ascua.0 + (llama.0 - ascua.0) * tono, ascua.1 + (llama.1 - ascua.1) * tono, ascua.2 + (llama.2 - ascua.2) * tono)
+            radial(x, X, Y, r, [(nucleo, tope * a, 0), (rescoldo, 0.28 * a, 0.5), (rescoldo, 0, 1)])
+            radial(x, X, Y, r * 0.4, [(chispa, 0.1 * a * tono, 0), (chispa, 0, 1)])
+        }
+        return x.makeImage()
+    }
+
+    private static func color(_ c: RGB, _ a: Double) -> CGColor {
+        CGColor(srgbRed: c.0 / 255, green: c.1 / 255, blue: c.2 / 255, alpha: a)
+    }
+
+    private static func radial(_ x: CGContext, _ cx: Double, _ cy: Double, _ r: Double, _ stops: [(RGB, Double, Double)]) {
+        guard let g = CGGradient(colorsSpace: space, colors: stops.map { color($0.0, $0.1) } as CFArray,
+                                 locations: stops.map { CGFloat($0.2) }) else { return }
+        x.drawRadialGradient(g, startCenter: CGPoint(x: cx, y: cy), startRadius: 0,
+                             endCenter: CGPoint(x: cx, y: cy), endRadius: r, options: [])
+    }
+}
+
+// MARK: Window visibility (no animation work while the window is hidden, closed or occluded)
+
+private struct VentanaVisibleKey: EnvironmentKey { static let defaultValue = true }
+
+extension EnvironmentValues {
+    var ventanaVisible: Bool {
+        get { self[VentanaVisibleKey.self] }
+        set { self[VentanaVisibleKey.self] = newValue }
+    }
+}
+
+extension View {
+    /// Publishes whether this view's window is on screen (`NSWindow.occlusionState`) to the subtree.
+    func vigilaVisibilidad() -> some View { modifier(VigilaVisibilidad()) }
+}
+
+private struct VigilaVisibilidad: ViewModifier {
+    @State private var visible = true
+    func body(content: Content) -> some View {
+        content
+            .environment(\.ventanaVisible, visible)
+            .background(Sonda(visible: $visible).frame(width: 0, height: 0))
+    }
+}
+
+private struct Sonda: NSViewRepresentable {
+    @Binding var visible: Bool
+
+    func makeNSView(context: Context) -> SondaView {
+        let v = SondaView()
+        v.cambio = { visible = $0 }
+        return v
+    }
+
+    func updateNSView(_ nsView: SondaView, context: Context) {}
+
+    final class SondaView: NSView {
+        var cambio: (Bool) -> Void = { _ in }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            NotificationCenter.default.removeObserver(self)
+            guard let window else { cambio(false); return }
+            // Selector-based: unregistered automatically when the view goes away.
+            NotificationCenter.default.addObserver(self, selector: #selector(informar),
+                                                   name: NSWindow.didChangeOcclusionStateNotification, object: window)
+            informar()
+        }
+
+        @objc private func informar() {
+            cambio(window?.occlusionState.contains(.visible) ?? false)
+        }
+    }
+}
