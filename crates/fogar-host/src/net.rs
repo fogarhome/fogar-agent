@@ -107,6 +107,9 @@ pub(crate) async fn dial<R: Resolver>(
     let Some((cfg, name)) = tls else {
         return Ok(Box::new(tcp));
     };
+    // shortcut: on macOS the platform verifier runs SecTrustEvaluateWithError synchronously
+    // inside this poll and may fetch revocation data online, blocking the (current_thread)
+    // runtime and this deadline with it; upgrade per fogarhome/fogar-agent#8 once measured.
     let handshake = tokio_rustls::TlsConnector::from(cfg.clone()).connect(name, tcp);
     match tokio::time::timeout(per_attempt, handshake).await {
         Ok(Ok(s)) => Ok(Box::new(s)),

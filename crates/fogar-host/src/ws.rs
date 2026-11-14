@@ -114,7 +114,9 @@ impl<R: Resolver> WsGatewayLink<R> {
     }
 
     /// Replaces the TLS configuration (tests: a private test CA). The config must verify
-    /// certificates; this crate never builds one that does not.
+    /// certificates; this crate never builds one that does not. Hidden: production wiring uses
+    /// the platform verifier from the constructors.
+    #[doc(hidden)]
     pub fn with_tls(mut self, tls: Arc<ClientConfig>) -> Self {
         self.tls = Some(tls);
         self

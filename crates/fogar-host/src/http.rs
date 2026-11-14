@@ -63,7 +63,9 @@ impl<R: Resolver> HttpGateway<R> {
     }
 
     /// Replaces the TLS configuration (tests: a private test CA). The config must verify
-    /// certificates; this crate never builds one that does not.
+    /// certificates; this crate never builds one that does not. Hidden: production wiring uses
+    /// the platform verifier from the constructors.
+    #[doc(hidden)]
     pub fn with_tls(mut self, tls: Arc<ClientConfig>) -> Self {
         self.tls = Some(tls);
         self
@@ -183,6 +185,9 @@ pub(crate) async fn read_response<S: AsyncRead + Unpin>(s: &mut S) -> Result<Htt
             s.read_exact(&mut body[n..]).await.map_err(transport)?;
             return Ok(HttpReply { status, body });
         }
+        // shortcut: over TLS a server that closes without close_notify makes this a Transport
+        // error (truncation guard); fine for uvicorn (always Content-Length), revisit if a
+        // TLS proxy drops the length.
         // Length unknown: read to EOF (we sent `Connection: close`), one byte past the cap is
         // TooLarge.
         None => Zeroizing::new(vec![0u8; MAX_BODY_BYTES + 1]),

@@ -144,6 +144,13 @@ fogar_testkit::gateway_link_contract!({
     (link, gw)
 });
 
+/// Real-time tests: a stalled handshake fails the test instead of hanging CI.
+async fn bounded<F: Future>(f: F) -> F::Output {
+    tokio::time::timeout(std::time::Duration::from_secs(15), f)
+        .await
+        .expect("TLS test timed out")
+}
+
 /// Resolves every name to 127.0.0.1.
 #[derive(Debug, Clone, Copy)]
 struct Loopback;
@@ -156,7 +163,7 @@ impl Resolver for Loopback {
 
 #[test]
 fn unknown_ca_fails_the_handshake() {
-    run_async(async {
+    run_async(bounded(async {
         let s = HttpsServer::start().await;
         let h = HttpGateway::new(HttpConfig::default()).with_tls(client(OTHER_CA));
         assert!(matches!(
@@ -173,12 +180,12 @@ fn unknown_ca_fails_the_handshake() {
             link.connect(&gw.addr()).await,
             Err(LinkError::Transport(_))
         ));
-    })
+    }))
 }
 
 #[test]
 fn name_not_in_the_certificate_fails_the_handshake() {
-    run_async(async {
+    run_async(bounded(async {
         let s = HttpsServer::start().await;
         let port = s.proxy.port;
         // Same server, reached by a name the certificate does not cover.
@@ -203,14 +210,14 @@ fn name_not_in_the_certificate_fails_the_handshake() {
             link.connect(&wrong).await,
             Err(LinkError::Transport(_))
         ));
-    })
+    }))
 }
 
 /// A TLS address never falls back to clear text: plain HTTP on the TLS port is a handshake
 /// failure, not a reply.
 #[test]
 fn tls_to_a_plain_server_is_not_downgraded() {
-    run_async(async {
+    run_async(bounded(async {
         let plain = MockHttpServer::start(HttpRoutes::fogar("gw"))
             .await
             .unwrap();
@@ -220,14 +227,14 @@ fn tls_to_a_plain_server_is_not_downgraded() {
             h.get(&addr, HttpCall::WellKnown).await,
             Err(HttpError::Transport(_))
         ));
-    })
+    }))
 }
 
 /// The production constructor builds the platform verifier (OS trust store): it must exist on
 /// every supported OS, or `https`/`wss` would silently be refused.
 #[test]
 fn platform_verifier_is_available() {
-    run_async(async {
+    run_async(bounded(async {
         let h = HttpGateway::new(HttpConfig::default());
         // A closed local port: reaching the connect step proves TLS was not refused up front.
         let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -237,5 +244,5 @@ fn platform_verifier_is_available() {
             h.get(&addr, HttpCall::WellKnown).await,
             Err(HttpError::Unreachable)
         ));
-    })
+    }))
 }
