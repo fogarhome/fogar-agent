@@ -5,13 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Portable adapters shared by every OS: tokio clock, WebSocket gateway link (tokio-tungstenite), PRNG. No cfg(target_os)."
+description = "Portable adapters shared by every OS: tokio clock, WebSocket gateway link (tokio-tungstenite), gateway HTTP client, PRNG. No cfg(target_os)."
 
 [dependencies]
 fogar-ports = { workspace = true }
 fogar-proto = { workspace = true }
-tokio = { workspace = true, features = ["time", "net"] }
-tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }
+tokio = { workspace = true, features = ["time", "net", "io-util"] }
+tokio-tungstenite = { workspace = true, features = ["handshake"] }
 futures-util = { workspace = true, features = ["sink", "std"] }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
