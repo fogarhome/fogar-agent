@@ -48,12 +48,24 @@ the signature, not the name in parentheses of the certificate):
   "connection closed" (3/3 and 2/2 runs) and the app's own `Pair` sent after its `Hello` reply is
   delivered. Recipe: `examples/signer_probe.rs` header (attack script in the PR). Consequences:
   the app must wait for the `Hello` reply before `Pair`/`Unpair` and never pipeline after them.
-  Residual: a Unix socket has no per-message identity. The check fails only if the genuine app
-  itself writes (possibly a zero-length write, not measured) after the attacker's frame and before
-  the agent reads the token; the attacker controls the app's inputs but not its code. Closing
-  that completely needs per-request proof (XPC, or a MAC with a key only the app holds): a
-  decision for S7 / the orchestrator, not a port change (a per-request verdict has the same
-  attribution problem).
+  **Still open (fresh security review of the fix, kernel primitive reproduced with a C harness,
+  not end to end):** (1) the token owner is updated only when a `sosend`/`soreceive` call is
+  entered, so a write that blocked on a full buffer BEFORE the verification keeps delivering
+  after it without moving the token; the attacker pads a harmless frame past the 8 KiB buffer,
+  appends `Pair`, moves the token to itself with `poll()`, execs the app, and the `Pair` arrives
+  "attributable". (2) A zero-length `write`, a `recv` returning EAGAIN or a `poll` by the genuine
+  app on an inherited socket fd (e.g. stdio) moves the token back to it. Closing (1) needs a
+  per-connection nonce sent only after verification and echoed in `Pair`/`Unpair` (a blocked
+  write cannot contain it; reading it moves the token to the reader): a wire change in
+  `fogar-ports` + `fogar-host::ipc_wire` + core + the Swift app, outside this adapter. (2) stays
+  an assumption: the app must not use inherited stdio as a socket.
+  **And the bigger hole on today's setup:** on the M2 `codesign` used the owner's Apple
+  Development key from a plain shell without any prompt (all probe signings in this ADR), so any
+  same-user process can sign its own `com.fogar.desktop` with the hardened runtime and get
+  `SameSigner` directly. Against same-user malware `SameSigner` is therefore not a boundary while
+  that key sits unprotected in the login keychain (mitigation: restrict the key's ACL so
+  `codesign` prompts, or keep the signing key off the machine). It still stops other users and
+  unsigned/ad-hoc tools that do not try.
 - A signed agent whose own signature cannot be read or no longer validates refuses to bind (fails
   closed) instead of downgrading to uid-only. Not exercised: a tampered bare executable is killed
   by the kernel before it runs; a tampered `.app` bundle resource is the case this covers.
