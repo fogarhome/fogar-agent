@@ -21,7 +21,7 @@ pub enum LinkState {
         attempt: u32,
         last_close: Option<CloseAction>,
     },
-    /// No client key stored: the agent is not paired. Re-checked at the backoff cap.
+    /// No pairing record: the agent is not paired. Waits (no timer) for a pairing change.
     NotPaired,
     /// Parked: retrying would loop (key revoked/invalid, agent refused, client bug). Stays alive
     /// and reports health; leaves this state only on restart or (S1) re-pairing/config change.

@@ -134,12 +134,14 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                         v.state = LinkState::NotPaired;
                         v.gateway = None;
                     });
-                    // Re-read at the backoff cap too: a record written outside the agent (the
-                    // CLI) is picked up without a restart.
-                    if self.wait(self.cfg.backoff.cap, &egress).await {
-                        continue;
+                    // No timer: the only writers are `Pair` (signals the watch) and the CLI dev
+                    // path at boot. An unpaired Mac costs no wakeups and no Keychain reads.
+                    let mut pairing = self.pairing.clone();
+                    tokio::select! {
+                        biased;
+                        () = egress.cancelled() => break,
+                        r = pairing.changed() => if r.is_ok() { continue } else { break },
                     }
-                    break;
                 }
                 Err(_) => {
                     let d = self.cfg.backoff.delay(attempt, &*self.random);

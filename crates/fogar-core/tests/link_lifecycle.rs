@@ -249,25 +249,42 @@ async fn without_keepalive_the_idle_close_is_classified_and_recovered() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn not_paired_waits_quietly_then_connects_when_a_key_appears() {
+async fn not_paired_waits_quietly() {
     let b = RigBuilder::fake(MockConfig::default());
     b.secrets.delete(SecretKey::GatewayPairing).ok();
     let mut rig = b.start();
     wait_state(&mut rig.health, |v| v.state == LinkState::NotPaired).await;
-    tokio::time::sleep(Duration::from_secs(3600)).await;
-    assert_eq!(
-        rig.health.snapshot().stats.connect_attempts,
-        0,
-        "no connects without a key"
-    );
-    // Written outside the agent (e.g. the CLI): picked up at the next re-read.
-    rig.secrets
-        .put(
-            SecretKey::GatewayPairing,
-            record(&MockConfig::default().client_key).encode(),
-        )
-        .unwrap();
+    // A store read while idle would consume this injected failure and show up as Backoff.
+    rig.secrets.fail_next(1);
+    let mut view = rig.health.clone();
+    let changed = tokio::time::timeout(
+        Duration::from_secs(24 * 3600),
+        view.wait_link(|v| v.state != LinkState::NotPaired),
+    )
+    .await;
+    assert!(changed.is_err(), "unpaired link woke up: {changed:?}");
+    assert_eq!(rig.health.snapshot().stats.connect_attempts, 0);
+    assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
+}
+
+/// Spec §0 "no reintentes en bucle": a revocation whose record cannot be read (locked
+/// keychain) parks with Repair instead of retrying the dead key.
+#[tokio::test(start_paused = true)]
+async fn revocation_with_an_unreadable_store_parks() {
+    let mut rig = RigBuilder::fake(MockConfig::default()).start();
     wait_ready(&mut rig.health).await;
+    rig.secrets.fail_next(1);
+    assert_eq!(rig.link.close_all(1008, "revoked"), 1);
+    wait_state(&mut rig.health, |v| {
+        v.state
+            == LinkState::Parked {
+                reason: CloseAction::Repair,
+            }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3600)).await;
+    assert_eq!(rig.health.snapshot().stats.connect_attempts, 1);
+    assert_eq!(rig.link.log().connections, 1);
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
 

@@ -125,7 +125,7 @@ async fn pairing_happy_path_persists_then_connects() {
     assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
 }
 
-/// Ready well before the NotPaired re-read (`backoff.cap`, 60 s): only the pairing-change
+/// Ready within 5 s: the unpaired link has no timer, so only the pairing-change
 /// signal can get it there this fast.
 async fn ready_promptly(h: &mut fogar_core::HealthProbe) {
     within(
@@ -428,7 +428,7 @@ async fn unpair_deletes_the_record_and_stops_the_link_then_repairing_works() {
     let mut c = client(&rig).await; // the first one was closed for being idle
     let r = c.request(pair_req("127.0.0.1", "482913")).await;
     assert!(matches!(r, Some(IpcResponse::Paired(_))), "{r:?}");
-    // Promptly, not at the next 60 s re-read: the pairing change restarts the link.
+    // Promptly: only the pairing change can restart an unpaired link.
     within(
         Duration::from_secs(5),
         rig.health
@@ -449,13 +449,13 @@ async fn revoked_then_repaired() {
     assert_eq!(rig.link.close_all(1008, "revoked"), 1);
     wait_state(&mut rig.health, |v| v.state == LinkState::NotPaired).await;
     assert!(!rig.secrets.contains(SecretKey::GatewayPairing));
-    // Past the post-revocation backoff: the link now sits in the 60 s NotPaired wait, so only
+    // Past the post-revocation backoff: the link now sits in the (timer-less) NotPaired wait, so only
     // the pairing-change signal can bring it back within 5 s.
     tokio::time::sleep(Duration::from_secs(90)).await;
     let mut c = client(&rig).await;
     let r = c.request(pair_req("127.0.0.1", "482913")).await;
     assert!(matches!(r, Some(IpcResponse::Paired(_))), "{r:?}");
-    // Promptly, not at the next 60 s re-read: the pairing change restarts the link.
+    // Promptly: only the pairing change can restart an unpaired link.
     within(
         Duration::from_secs(5),
         rig.health

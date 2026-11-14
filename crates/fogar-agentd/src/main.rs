@@ -379,8 +379,19 @@ fn adopt_stored_key(secrets: &dyn SecretStore, addr: GatewayAddr) {
     match secrets.put(SecretKey::GatewayPairing, record.encode()) {
         // One-time migration: once adopted, the old key must not come back after an Unpair or
         // a revocation (which delete only the record).
+        // Only once the record reads back intact (as `Pairing::persist` does).
         Ok(()) => {
-            let _ = secrets.delete(SecretKey::GatewayClientKey);
+            let stored = secrets
+                .get(SecretKey::GatewayPairing)
+                .ok()
+                .flatten()
+                .and_then(|s| PairingRecord::decode(&s));
+            if stored.is_some_and(|r| {
+                r.address() == record.address()
+                    && r.client_key().expose_secret() == record.client_key().expose_secret()
+            }) {
+                let _ = secrets.delete(SecretKey::GatewayClientKey);
+            }
         }
         Err(e) => eprintln!("fogar-agentd: could not store the pairing record: {e}"),
     }
