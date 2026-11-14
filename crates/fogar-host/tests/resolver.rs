@@ -121,20 +121,3 @@ fn ws_connects_to_the_resolved_private_address() {
             .unwrap();
     })
 }
-
-#[test]
-fn tls_is_refused_until_the_dependency_lands() {
-    run_async(async {
-        let addr = GatewayAddr::parse("https://127.0.0.1:8443").unwrap();
-        let h = HttpGateway::new(HttpConfig::default());
-        assert!(matches!(
-            bounded(h.get(&addr, HttpCall::WellKnown)).await,
-            Err(HttpError::Refused)
-        ));
-        let link = WsGatewayLink::new(WsConfig::default());
-        assert!(matches!(
-            bounded(link.connect(&addr)).await,
-            Err(LinkError::NotConfigured)
-        ));
-    })
-}

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Portable adapters shared by every OS: tokio clock, WebSocket gateway link (tokio-tungstenite), gateway HTTP client, PRNG. No cfg(target_os)."
+description = "Portable adapters shared by every OS: tokio clock, WebSocket gateway link (tokio-tungstenite), gateway HTTP client, rustls TLS, PRNG. No cfg(target_os)."
 
 [dependencies]
 fogar-ports = { workspace = true }
@@ -16,9 +16,14 @@ futures-util = { workspace = true, features = ["sink", "std"] }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
 secrecy = { workspace = true }
+rustls = { workspace = true, features = ["ring", "std", "tls12"] }
+tokio-rustls = { workspace = true, features = ["ring", "tls12"] }
+rustls-platform-verifier = { workspace = true }
 
 [dev-dependencies]
 fogar-testkit = { workspace = true }
+# TLS tests: a local TLS-terminating proxy in front of the testkit mocks (tests/tls.rs).
+tokio = { workspace = true, features = ["io-util", "net", "rt", "macros"] }
 
 [lints]
 workspace = true

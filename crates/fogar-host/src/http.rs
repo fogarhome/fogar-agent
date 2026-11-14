@@ -10,11 +10,12 @@
 //! `Content-Length` before reading, and while reading when the length is unknown); every await
 //! sits under `HttpConfig::call_timeout`, each connect attempt under `connect_timeout`.
 
-use crate::net::{DialError, Resolver, SystemResolver, dial};
+use crate::net::{DialError, Resolver, SystemResolver, dial, platform_tls};
 use fogar_ports::gateway::GatewayAddr;
 use fogar_ports::gateway_http::{GatewayHttp, HttpCall, HttpError, HttpReply, MAX_BODY_BYTES};
+use rustls::ClientConfig;
 use secrecy::zeroize::Zeroizing;
-use std::{io, time::Duration};
+use std::{io, sync::Arc, time::Duration};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 /// Largest response head (status line + headers) accepted.
@@ -42,6 +43,7 @@ impl Default for HttpConfig {
 pub struct HttpGateway<R = SystemResolver> {
     cfg: HttpConfig,
     resolver: R,
+    tls: Option<Arc<ClientConfig>>,
 }
 
 impl HttpGateway<SystemResolver> {
@@ -51,8 +53,20 @@ impl HttpGateway<SystemResolver> {
 }
 
 impl<R: Resolver> HttpGateway<R> {
+    /// `https` uses the OS trust store (or is refused if the platform verifier is unavailable).
     pub fn with_resolver(cfg: HttpConfig, resolver: R) -> Self {
-        Self { cfg, resolver }
+        Self {
+            cfg,
+            resolver,
+            tls: platform_tls(),
+        }
+    }
+
+    /// Replaces the TLS configuration (tests: a private test CA). The config must verify
+    /// certificates; this crate never builds one that does not.
+    pub fn with_tls(mut self, tls: Arc<ClientConfig>) -> Self {
+        self.tls = Some(tls);
+        self
     }
 
     async fn call(
@@ -63,12 +77,18 @@ impl<R: Resolver> HttpGateway<R> {
         body: Option<Zeroizing<Vec<u8>>>,
     ) -> Result<HttpReply, HttpError> {
         let exchange = async {
-            let mut s = dial(&self.resolver, addr, self.cfg.connect_timeout)
-                .await
-                .map_err(|e| match e {
-                    DialError::Refused => HttpError::Refused,
-                    DialError::Unreachable(_) => HttpError::Unreachable,
-                })?;
+            let mut s = dial(
+                &self.resolver,
+                self.tls.as_ref(),
+                addr,
+                self.cfg.connect_timeout,
+            )
+            .await
+            .map_err(|e| match e {
+                DialError::Refused => HttpError::Refused,
+                DialError::Unreachable(_) => HttpError::Unreachable,
+                DialError::Tls(e) => transport(e),
+            })?;
             let mut head = format!(
                 "{method} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: fogar-agent\r\nAccept: application/json\r\nConnection: close\r\n",
                 call.path(),

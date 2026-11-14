@@ -9,17 +9,17 @@
 //!
 //! Transport policy (NET-1, ADR-0006 item 4): the name is resolved ONCE by [`Resolver`],
 //! `cleartext_allowed` is applied to every resolved address, and the upgrade runs over the
-//! socket already connected to one of them (tungstenite never resolves again). `wss://` is
-//! refused until the TLS dependency is approved (see the S1 host PR).
+//! socket already connected to one of them (tungstenite never resolves again). `wss://` runs
+//! over rustls with the OS trust store (`net::platform_tls`); no clear-text fallback.
 
-use crate::net::{DialError, Resolver, SystemResolver, dial};
+use crate::net::{Conn, DialError, Resolver, SystemResolver, dial, platform_tls};
 use fogar_ports::gateway::{
     Frame, GatewayAddr, GatewayLink, LinkError, LinkEvent, LinkSession, Scheme, cleartext_allowed,
 };
 use fogar_proto::limits::WS_MAX_FRAME_BYTES;
 use futures_util::{SinkExt, StreamExt};
+use rustls::ClientConfig;
 use std::{fmt, io, sync::Arc, time::Duration};
-use tokio::net::TcpStream;
 use tokio_tungstenite::{
     WebSocketStream,
     tungstenite::{
@@ -55,8 +55,6 @@ impl Default for WsConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WsConfigError {
-    /// `https`/`wss` needs the TLS dependency (pending approval).
-    TlsNotYetSupported,
     /// Plain `ws://` to an IP outside loopback/LAN/tailnet would send the client key in clear
     /// text.
     InsecureRemote,
@@ -65,7 +63,6 @@ pub enum WsConfigError {
 impl fmt::Display for WsConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            WsConfigError::TlsNotYetSupported => "wss:// is not supported yet",
             WsConfigError::InsecureRemote => {
                 "plain ws:// is only allowed to loopback, LAN or tailnet addresses"
             }
@@ -80,7 +77,7 @@ impl WsConfig {
     /// `connect` checks every address it resolves to.
     pub fn check(addr: &GatewayAddr) -> Result<(), WsConfigError> {
         match addr.scheme() {
-            Scheme::Tls => Err(WsConfigError::TlsNotYetSupported),
+            Scheme::Tls => Ok(()),
             Scheme::Plain
                 if addr
                     .host()
@@ -98,6 +95,7 @@ impl WsConfig {
 pub struct WsGatewayLink<R = SystemResolver> {
     cfg: Arc<WsConfig>,
     resolver: Arc<R>,
+    tls: Option<Arc<ClientConfig>>,
 }
 
 impl WsGatewayLink<SystemResolver> {
@@ -111,7 +109,15 @@ impl<R: Resolver> WsGatewayLink<R> {
         Self {
             cfg: Arc::new(cfg),
             resolver: Arc::new(resolver),
+            tls: platform_tls(),
         }
+    }
+
+    /// Replaces the TLS configuration (tests: a private test CA). The config must verify
+    /// certificates; this crate never builds one that does not.
+    pub fn with_tls(mut self, tls: Arc<ClientConfig>) -> Self {
+        self.tls = Some(tls);
+        self
     }
 }
 
@@ -125,7 +131,7 @@ fn ws_config(max: usize) -> WebSocketConfig {
 }
 
 pub struct WsSession {
-    ws: WebSocketStream<TcpStream>,
+    ws: WebSocketStream<Conn>,
     cfg: Arc<WsConfig>,
     closed: bool,
 }
@@ -213,15 +219,26 @@ impl<R: Resolver> GatewayLink for WsGatewayLink<R> {
     async fn connect(&self, addr: &GatewayAddr) -> Result<WsSession, LinkError> {
         let cfg = &self.cfg;
         let connect = async {
-            let tcp = match dial(&*self.resolver, addr, cfg.attempt_timeout).await {
+            let conn = match dial(
+                &*self.resolver,
+                self.tls.as_ref(),
+                addr,
+                cfg.attempt_timeout,
+            )
+            .await
+            {
                 Ok(s) => s,
                 Err(DialError::Refused) => return Err(LinkError::NotConfigured),
-                Err(DialError::Unreachable(e)) => return Err(transport(e)),
+                Err(DialError::Unreachable(e) | DialError::Tls(e)) => return Err(transport(e)),
             };
-            let url = format!("ws://{}/ws/stream", addr.authority());
+            let scheme = match addr.scheme() {
+                Scheme::Plain => "ws",
+                Scheme::Tls => "wss",
+            };
+            let url = format!("{scheme}://{}/ws/stream", addr.authority());
             let (ws, _resp) = tokio_tungstenite::client_async_with_config(
                 url,
-                tcp,
+                conn,
                 Some(ws_config(cfg.max_frame)),
             )
             .await
@@ -254,10 +271,7 @@ mod tests {
             p("green-house").is_ok(),
             "names are checked after resolving"
         );
-        assert_eq!(
-            p("wss://gw.example"),
-            Err(WsConfigError::TlsNotYetSupported)
-        );
+        assert!(p("wss://gw.example").is_ok());
         assert_eq!(p("203.0.113.7:8004"), Err(WsConfigError::InsecureRemote));
     }
 }
