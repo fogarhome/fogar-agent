@@ -97,7 +97,7 @@ private struct Formulario: View {
             }, enfocado: $focoDireccion)
 
             Campo(etiqueta: "Código de 6 cifras", pista: "Vale una sola vez y caduca a los 10 minutos.", error: errorCodigo, campo: {
-                TextField("", text: $codigo, prompt: Text("482 913").foregroundStyle(Color.huesoTenue))
+                TextField("", text: $codigo, prompt: Text("6 cifras").foregroundStyle(Color.huesoTenue))
                     .textContentType(.oneTimeCode)
                     .autocorrectionDisabled()
                     .font(Tipo.texto(22, peso: 500)).monospacedDigit().tracking(2)
