@@ -23,7 +23,10 @@ pub(crate) struct Rig<L: GatewayLink = FakeGatewayLink> {
 }
 
 pub(crate) fn test_config() -> Config {
-    let mut c = Config::default();
+    let mut c = Config {
+        gateway: fogar_ports::gateway::GatewayAddr::parse("127.0.0.1").ok(),
+        ..Config::default()
+    };
     c.vad.hangover_chunks = 10;
     c
 }

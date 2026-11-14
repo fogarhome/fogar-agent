@@ -11,6 +11,7 @@ pub mod audio;
 pub mod clock;
 pub mod events;
 pub mod gateway;
+pub mod gateway_http;
 pub mod ipc;
 pub mod power;
 pub mod random;

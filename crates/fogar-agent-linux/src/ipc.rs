@@ -1,10 +1,13 @@
 //! Unix-domain-socket IPC (ADR-0002) with peer verification by `SO_PEERCRED` uid
-//! (fogar-secure-rust IPC-1..IPC-5). Wire format: 4-byte big-endian length + JSON, max
-//! `MAX_FRAME_BYTES`, typed messages with `deny_unknown_fields`.
+//! (fogar-secure-rust IPC-1..IPC-5). Wire format and framing: `fogar_host::ipc_wire` (shared
+//! with the macOS adapter and the Swift app).
 //!
 //! macOS adds the audit-token -> SecCode designated-requirement check in fogar-agent-macos; this
 //! Linux adapter only has the uid check (`peer_code_identity: Unsupported`).
 
+use fogar_host::ipc_wire::{
+    decode_request, decode_response, encode_request, encode_response, frame, take_frame,
+};
 use fogar_ports::{
     Support,
     ipc::{
@@ -12,7 +15,6 @@ use fogar_ports::{
         PeerIdentity,
     },
 };
-use serde::{Deserialize, Serialize};
 use std::{
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -21,33 +23,10 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
 };
+use zeroize::Zeroizing;
 
 /// `sun_path` is 108 bytes on Linux and 104 on macOS: keep the stricter limit everywhere.
 const MAX_SOCKET_PATH: usize = 103;
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum WireRequest {
-    Hello { version: u32 },
-    Status {},
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum WireResponse {
-    Hello {
-        version: u32,
-    },
-    Status {
-        link: String,
-        sessions: u64,
-        turns_completed: u64,
-        boot_mode: String,
-    },
-    Refused {
-        reason: String,
-    },
-}
 
 #[derive(Debug)]
 pub struct UdsIpcServer {
@@ -123,7 +102,7 @@ impl IpcServer for UdsIpcServer {
             let (stream, _) = self.listener.accept().await.map_err(io_err)?;
             match stream.peer_cred() {
                 Ok(c) if c.uid() == self.uid => {
-                    return Ok((PeerIdentity::new(Some(c.uid()), None), UdsConn::new(stream)));
+                    return Ok((PeerIdentity::uid_only(Some(c.uid())), UdsConn::new(stream)));
                 }
                 // Another user (or unknown): drop the connection before reading a byte.
                 _ => continue,
@@ -148,30 +127,10 @@ impl UdsConn {
     }
 }
 
-/// Pops one complete frame from `buf` if present.
-fn take_frame(buf: &mut Vec<u8>) -> Result<Option<Vec<u8>>, IpcError> {
-    let Some(hdr) = buf.first_chunk::<4>() else {
-        return Ok(None);
-    };
-    let len = usize::try_from(u32::from_be_bytes(*hdr)).unwrap_or(usize::MAX);
-    if len > MAX_FRAME_BYTES {
-        return Err(IpcError::TooLarge {
-            len,
-            max: MAX_FRAME_BYTES,
-        });
-    }
-    if buf.len() < 4 + len {
-        return Ok(None);
-    }
-    let body = buf[4..4 + len].to_vec();
-    buf.drain(..4 + len);
-    Ok(Some(body))
-}
-
 async fn read_frame(
     stream: &mut UnixStream,
     buf: &mut Vec<u8>,
-) -> Result<Option<Vec<u8>>, IpcError> {
+) -> Result<Option<Zeroizing<Vec<u8>>>, IpcError> {
     loop {
         if let Some(f) = take_frame(buf)? {
             return Ok(Some(f));
@@ -191,17 +150,7 @@ async fn read_frame(
 }
 
 async fn write_frame(stream: &mut UnixStream, body: &[u8]) -> Result<(), IpcError> {
-    if body.len() > MAX_FRAME_BYTES {
-        return Err(IpcError::TooLarge {
-            len: body.len(),
-            max: MAX_FRAME_BYTES,
-        });
-    }
-    let len = u32::try_from(body.len()).map_err(|_| IpcError::Malformed)?;
-    let mut out = Vec::with_capacity(4 + body.len());
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(body);
-    stream.write_all(&out).await.map_err(io_err)
+    stream.write_all(&frame(body)?).await.map_err(io_err)
 }
 
 impl IpcConn for UdsConn {
@@ -209,30 +158,11 @@ impl IpcConn for UdsConn {
         let Some(body) = read_frame(&mut self.stream, &mut self.buf).await? else {
             return Ok(None);
         };
-        match serde_json::from_slice::<WireRequest>(&body).map_err(|_| IpcError::Malformed)? {
-            WireRequest::Hello { version } => Ok(Some(IpcRequest::Hello { version })),
-            WireRequest::Status {} => Ok(Some(IpcRequest::Status)),
-        }
+        decode_request(&body).map(Some)
     }
 
     async fn send(&mut self, resp: IpcResponse) -> Result<(), IpcError> {
-        let w = match resp {
-            IpcResponse::Hello { version } => WireResponse::Hello { version },
-            IpcResponse::Status(s) => WireResponse::Status {
-                link: s.link,
-                sessions: s.sessions,
-                turns_completed: s.turns_completed,
-                boot_mode: s.boot_mode,
-            },
-            IpcResponse::Refused { reason } => WireResponse::Refused {
-                reason: reason.to_owned(),
-            },
-            _ => WireResponse::Refused {
-                reason: "unsupported response".to_owned(),
-            },
-        };
-        let body = serde_json::to_vec(&w).map_err(|_| IpcError::Malformed)?;
-        write_frame(&mut self.stream, &body).await
+        write_frame(&mut self.stream, &encode_response(resp)?).await
     }
 }
 
@@ -252,56 +182,27 @@ impl UdsIpcClient {
     }
 
     pub async fn request(&mut self, r: IpcRequest) -> Option<IpcResponse> {
-        let w = match r {
-            IpcRequest::Hello { version } => WireRequest::Hello { version },
-            IpcRequest::Status => WireRequest::Status {},
-            _ => return None,
-        };
-        let body = serde_json::to_vec(&w).ok()?;
+        let body = encode_request(&r).ok()?;
         write_frame(&mut self.stream, &body).await.ok()?;
+        self.next().await
+    }
+
+    /// Next message without sending (pushed events after `Subscribe`). `None` = closed.
+    pub async fn next(&mut self) -> Option<IpcResponse> {
         let resp = read_frame(&mut self.stream, &mut self.buf).await.ok()??;
-        Some(match serde_json::from_slice::<WireResponse>(&resp).ok()? {
-            WireResponse::Hello { version } => IpcResponse::Hello { version },
-            WireResponse::Status {
-                link,
-                sessions,
-                turns_completed,
-                boot_mode,
-            } => IpcResponse::Status(fogar_ports::ipc::StatusReport::new(
-                link,
-                sessions,
-                turns_completed,
-                boot_mode,
-            )),
-            WireResponse::Refused { .. } => IpcResponse::Refused { reason: "refused" },
-        })
+        decode_response(&resp).ok()
+    }
+
+    /// Writes the first (`first = true`) or second half of `r`'s frame (cancel-safety clause).
+    pub async fn send_half(&mut self, r: &IpcRequest, first: bool) -> Option<()> {
+        let f = frame(&encode_request(r).ok()?).ok()?;
+        let mid = f.len() / 2;
+        let part = if first { &f[..mid] } else { &f[mid..] };
+        self.stream.write_all(part).await.ok()
     }
 
     /// Sends raw bytes (adversarial tests: oversize frames, garbage).
     pub async fn send_raw(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.stream.write_all(bytes).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn framing_limits() {
-        let mut b = vec![0, 0, 0, 2, b'{', b'}', 9];
-        assert_eq!(take_frame(&mut b).unwrap(), Some(b"{}".to_vec()));
-        assert_eq!(b, vec![9]);
-        let mut big = (u32::try_from(MAX_FRAME_BYTES).unwrap() + 1)
-            .to_be_bytes()
-            .to_vec();
-        assert!(matches!(
-            take_frame(&mut big),
-            Err(IpcError::TooLarge { .. })
-        ));
-        assert!(
-            serde_json::from_slice::<WireRequest>(br#"{"type":"status","exec":"rm -rf"}"#).is_err()
-        );
-        assert!(serde_json::from_slice::<WireRequest>(br#"{"type":"run","cmd":"x"}"#).is_err());
     }
 }

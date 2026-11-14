@@ -31,14 +31,15 @@ fn fast_config() -> Config {
     c
 }
 
-async fn start(mock: MockConfig, cfg: Config, key: &str) -> E2e {
+async fn start(mock: MockConfig, mut cfg: Config, key: &str) -> E2e {
     let gw = MockGateway::start(mock).await.unwrap();
+    cfg.gateway = Some(gw.addr());
     let baseline = alive_tasks();
     let mic = FakeMic::healthy();
     let speaker = FakeSpeaker::healthy();
     let ports: AgentPorts<TokioClock, WsGatewayLink, NoIpc> = AgentPorts {
         clock: Arc::new(TokioClock::new()),
-        link: WsGatewayLink::new(WsConfig::new(gw.url()).unwrap()),
+        link: WsGatewayLink::new(WsConfig::default()),
         ipc: None,
         secrets: Arc::new(MemorySecretStore::with_client_key(key)),
         random: Arc::new(SeededRandom::new(3)),
@@ -323,10 +324,10 @@ async fn gateway_down_then_up_reconnects() {
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = probe.local_addr().unwrap().port();
     drop(probe);
-    let url = format!("ws://127.0.0.1:{port}/ws/stream");
+    let addr = fogar_ports::gateway::GatewayAddr::parse(&format!("127.0.0.1:{port}")).unwrap();
     let ports: AgentPorts<TokioClock, WsGatewayLink, NoIpc> = AgentPorts {
         clock: Arc::new(TokioClock::new()),
-        link: WsGatewayLink::new(WsConfig::new(url).unwrap()),
+        link: WsGatewayLink::new(WsConfig::default()),
         ipc: None,
         secrets: Arc::new(MemorySecretStore::with_client_key(
             &MockConfig::default().client_key,
@@ -336,7 +337,11 @@ async fn gateway_down_then_up_reconnects() {
         audio_out: Arc::new(FakeSpeaker::minimal()),
         probe: None,
     };
-    let agent = Agent::start(ports, fast_config(), BootMode::Normal);
+    let cfg = Config {
+        gateway: Some(addr),
+        ..fast_config()
+    };
+    let agent = Agent::start(ports, cfg, BootMode::Normal);
     let mut h = agent.health();
     within(
         Duration::from_secs(5),

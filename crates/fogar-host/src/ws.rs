@@ -5,10 +5,12 @@
 //! `max_write_buffer_size` is `usize::MAX`), small eager read buffer (energy skill pitfall).
 //! Deadlines: connect/write are applied by the core (`Config`); the close handshake here.
 //!
-//! TLS: NOT in slice 0. `wss://` is refused with an explicit error and plain `ws://` is accepted
-//! only for loopback hosts (ADR-0006, NET-1). S1 adds rustls (platform verifier).
+//! TLS: not yet. `wss://` is refused with an explicit error and plain `ws://` is accepted
+//! only for loopback hosts (ADR-0006, NET-1). The S1 host PR adds rustls and explicit LAN/tailnet.
 
-use fogar_ports::gateway::{Frame, GatewayLink, LinkError, LinkEvent, LinkSession};
+use fogar_ports::gateway::{
+    Frame, GatewayAddr, GatewayLink, LinkError, LinkEvent, LinkSession, Scheme,
+};
 use fogar_proto::limits::WS_MAX_FRAME_BYTES;
 use futures_util::{SinkExt, StreamExt};
 use std::{fmt, sync::Arc, time::Duration};
@@ -24,33 +26,25 @@ use tokio_tungstenite::{
 /// Close code reported when the peer's close frame carried no status (RFC 6455 §7.1.5).
 const CLOSE_NO_STATUS: u16 = 1005;
 
-#[derive(Clone, PartialEq, Eq)]
+/// Adapter tuning. The gateway address is per call (`GatewayLink::connect`).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WsConfig {
-    url: String,
     pub close_timeout: Duration,
     pub max_frame: usize,
 }
 
-impl fmt::Debug for WsConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The URL carries no credentials (the key travels in the first frame), but keep the
-        // userinfo out of logs anyway (LOG-2).
-        let shown = self
-            .url
-            .split_once('@')
-            .map_or(self.url.as_str(), |(_, rest)| rest);
-        f.debug_struct("WsConfig")
-            .field("url", &shown)
-            .field("close_timeout", &self.close_timeout)
-            .finish()
+impl Default for WsConfig {
+    fn default() -> Self {
+        Self {
+            close_timeout: Duration::from_secs(2),
+            max_frame: WS_MAX_FRAME_BYTES,
+        }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WsConfigError {
-    /// Not `ws://host[:port]/path`.
-    BadUrl,
-    /// `wss://` needs the S1 TLS adapter.
+    /// `https`/`wss` needs the TLS adapter (S1, fogar-host PR).
     TlsNotYetSupported,
     /// Plain `ws://` to a non-loopback host would send the client key in clear text.
     InsecureRemote,
@@ -59,8 +53,7 @@ pub enum WsConfigError {
 impl fmt::Display for WsConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            WsConfigError::BadUrl => "gateway url must look like ws://host:port/ws/stream",
-            WsConfigError::TlsNotYetSupported => "wss:// is not supported before slice S1",
+            WsConfigError::TlsNotYetSupported => "wss:// is not supported yet",
             WsConfigError::InsecureRemote => "plain ws:// is only allowed to a loopback address",
         })
     }
@@ -69,40 +62,21 @@ impl fmt::Display for WsConfigError {
 impl std::error::Error for WsConfigError {}
 
 impl WsConfig {
-    pub fn new(url: impl Into<String>) -> Result<Self, WsConfigError> {
-        let url = url.into();
-        if url.starts_with("wss://") {
-            return Err(WsConfigError::TlsNotYetSupported);
+    /// Transport policy for `addr` (NET-1, ADR-0006 item 4). Checked on every `connect`;
+    /// callers may check early to report a usage error.
+    pub fn check(addr: &GatewayAddr) -> Result<(), WsConfigError> {
+        match addr.scheme() {
+            Scheme::Tls => Err(WsConfigError::TlsNotYetSupported),
+            Scheme::Plain if !is_loopback(addr.host()) => Err(WsConfigError::InsecureRemote),
+            Scheme::Plain => Ok(()),
         }
-        let rest = url.strip_prefix("ws://").ok_or(WsConfigError::BadUrl)?;
-        let authority = rest.split('/').next().unwrap_or_default();
-        if authority.is_empty() || authority.contains('@') {
-            return Err(WsConfigError::BadUrl);
-        }
-        let host = if let Some(v6) = authority.strip_prefix('[') {
-            v6.split(']').next().unwrap_or_default()
-        } else {
-            authority.split(':').next().unwrap_or_default()
-        };
-        if !is_loopback(host) {
-            return Err(WsConfigError::InsecureRemote);
-        }
-        Ok(Self {
-            url,
-            close_timeout: Duration::from_secs(2),
-            max_frame: WS_MAX_FRAME_BYTES,
-        })
-    }
-    pub fn url(&self) -> &str {
-        &self.url
     }
 }
 
 fn is_loopback(host: &str) -> bool {
     host == "localhost"
-        || host == "::1"
         || host
-            .parse::<std::net::Ipv4Addr>()
+            .parse::<std::net::IpAddr>()
             .is_ok_and(|a| a.is_loopback())
 }
 
@@ -212,9 +186,11 @@ impl LinkSession for WsSession {
 impl GatewayLink for WsGatewayLink {
     type Session = WsSession;
 
-    async fn connect(&self) -> Result<WsSession, LinkError> {
+    async fn connect(&self, addr: &GatewayAddr) -> Result<WsSession, LinkError> {
+        WsConfig::check(addr).map_err(|_| LinkError::NotConfigured)?;
+        let url = format!("ws://{}/ws/stream", addr.authority());
         let (ws, _resp) = tokio_tungstenite::connect_async_with_config(
-            self.cfg.url(),
+            url,
             Some(ws_config(self.cfg.max_frame)),
             true,
         )
@@ -234,25 +210,14 @@ mod tests {
 
     #[test]
     fn url_policy() {
-        assert!(WsConfig::new("ws://127.0.0.1:8004/ws/stream").is_ok());
-        assert!(WsConfig::new("ws://localhost:8004/ws/stream").is_ok());
-        assert!(WsConfig::new("ws://[::1]:8004/ws/stream").is_ok());
+        let p = |s: &str| WsConfig::check(&GatewayAddr::parse(s).unwrap());
+        assert!(p("127.0.0.1:8004").is_ok());
+        assert!(p("localhost").is_ok());
+        assert!(p("[::1]:8004").is_ok());
         assert_eq!(
-            WsConfig::new("wss://gw.example/ws/stream"),
+            p("wss://gw.example"),
             Err(WsConfigError::TlsNotYetSupported)
         );
-        assert_eq!(
-            WsConfig::new("ws://100.64.0.2:8004/ws/stream"),
-            Err(WsConfigError::InsecureRemote)
-        );
-        assert_eq!(
-            WsConfig::new("ws://u:p@127.0.0.1/ws"),
-            Err(WsConfigError::BadUrl)
-        );
-        assert_eq!(
-            WsConfig::new("http://127.0.0.1/"),
-            Err(WsConfigError::BadUrl)
-        );
-        assert_eq!(WsConfig::new("ws:///x"), Err(WsConfigError::BadUrl));
+        assert_eq!(p("100.64.0.2:8004"), Err(WsConfigError::InsecureRemote));
     }
 }

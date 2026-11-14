@@ -31,6 +31,7 @@ std::cfg_select! {
 use fogar_core::{Agent, AgentPorts, LinkState, crashloop};
 use fogar_host::{PrngRandom, TokioClock, WsConfig, WsGatewayLink};
 use fogar_ports::{
+    gateway::GatewayAddr,
     power::WorkClass,
     secrets::{SecretKey, SecretString},
 };
@@ -124,13 +125,17 @@ fn store_key(state_dir: &std::path::Path) -> ExitCode {
 
 fn run(opts: cli::RunOpts) -> ExitCode {
     // Validate configuration before the boot ledger records a start: a usage error is not a crash.
-    let ws = match WsConfig::new(opts.gateway.clone()) {
-        Ok(w) => w,
+    let gateway = match GatewayAddr::parse(&opts.gateway) {
+        Ok(a) => a,
         Err(e) => {
             eprintln!("fogar-agentd: {e}");
             return ExitCode::from(64);
         }
     };
+    if let Err(e) = WsConfig::check(&gateway) {
+        eprintln!("fogar-agentd: {e}");
+        return ExitCode::from(64);
+    }
     // Review sec#3: slice 0 has no TLS; WsConfig accepts only loopback ws:// (wss:// is refused
     // until S1). Allowed, but never silent.
     eprintln!(
@@ -173,7 +178,7 @@ fn run(opts: cli::RunOpts) -> ExitCode {
                 let (stop, armed) = StopSignal::install();
                 let boot = rt_ledger.begin_boot(&armed);
                 eprintln!("fogar-agentd: boot mode {}", boot.label());
-                serve(opts, state_dir, ws, boot, stop).await
+                serve(opts, state_dir, gateway, boot, stop).await
             });
             // A stuck blocking task must not hold the exit (fogar-longrun shutdown step 4).
             rt.shutdown_timeout(Duration::from_secs(1));
@@ -226,7 +231,7 @@ struct Stopped {
 async fn serve(
     opts: cli::RunOpts,
     state_dir: std::path::PathBuf,
-    ws: WsConfig,
+    gateway: GatewayAddr,
     boot: crashloop::BootMode,
     mut stop: StopSignal,
 ) -> Stopped {
@@ -255,6 +260,7 @@ async fn serve(
     };
     let clock = TokioClock::new();
     let mut cfg = fogar_core::Config {
+        gateway: Some(gateway),
         agent: opts.agent.clone(),
         ..fogar_core::Config::default()
     };
@@ -263,7 +269,7 @@ async fn serve(
     }
     let ports = AgentPorts {
         clock: Arc::new(clock),
-        link: WsGatewayLink::new(ws),
+        link: WsGatewayLink::new(WsConfig::default()),
         ipc: p.ipc,
         secrets: p.secrets,
         random: Arc::new(PrngRandom::new()),

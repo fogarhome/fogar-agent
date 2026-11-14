@@ -33,6 +33,19 @@ pub enum LinkState {
 }
 
 impl LinkState {
+    /// What the UI shows (IPC `LinkPhase`).
+    pub fn phase(&self) -> fogar_ports::ipc::LinkPhase {
+        use fogar_ports::ipc::LinkPhase;
+        match self {
+            LinkState::Starting | LinkState::Connecting { .. } => LinkPhase::Connecting,
+            LinkState::Ready { .. } => LinkPhase::Ready,
+            LinkState::Backoff { .. } => LinkPhase::Reconnecting,
+            LinkState::NotPaired => LinkPhase::NotPaired,
+            LinkState::Parked { .. } => LinkPhase::Parked,
+            LinkState::ShuttingDown | LinkState::Stopped => LinkPhase::Stopping,
+        }
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             LinkState::Starting => "starting",

@@ -9,9 +9,8 @@ description = "ILLUSTRATIVE Linux adapters for slice 0: /proc probe, Unix-socket
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fogar-ports = { workspace = true }
+fogar-host = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util"] }
-serde = { workspace = true, features = ["derive", "std"] }
-serde_json = { workspace = true, features = ["std"] }
 zeroize = { workspace = true, features = ["alloc"] }
 
 [dev-dependencies]

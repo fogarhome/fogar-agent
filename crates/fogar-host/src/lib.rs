@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod clock;
+pub mod ipc_wire;
 mod random;
 mod ws;
 

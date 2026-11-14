@@ -10,11 +10,12 @@ description = "In-memory fakes for every port, contract suites every adapter mus
 [dependencies]
 fogar-ports = { workspace = true }
 fogar-proto = { workspace = true, features = ["std"] }
-tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "net"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "net", "io-util"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }
 futures-util = { workspace = true, features = ["sink", "std"] }
 serde_json = { workspace = true, features = ["std"] }
+secrecy = { workspace = true }
 
 [lints]
 workspace = true
