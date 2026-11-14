@@ -12,14 +12,14 @@ use crate::{
     pairing::{PairingRecord, is_revocation, load_record},
     queues::{ByteBudget, Charge},
     stats::{LinkState, Stats},
-    time::deadline,
+    time::{deadline, sleep_until_opt},
 };
 use fogar_ports::{
     clock::{Clock, Mono},
     gateway::{Frame, GatewayLink, LinkEvent, LinkSession},
     ipc::GatewayInfo,
     random::Random,
-    secrets::{ExposeSecret, SecretKey, SecretStore},
+    secrets::{ExposeSecret, SecretError, SecretKey, SecretStore},
 };
 use fogar_proto::{
     ClientMsg, CloseAction, Handshake, ServerMsg, classify_close, close::CLOSE_ABNORMAL,
@@ -129,7 +129,9 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
             self.pairing.borrow_and_update();
             let record = match load_record(&*self.secrets) {
                 Ok(Some(r)) => r,
-                Ok(None) => {
+                // A store this build cannot use (e.g. a stub) will not start working by
+                // retrying: show "not paired" instead of "reconnecting" forever.
+                Ok(None) | Err(SecretError::Unsupported(_)) => {
                     self.view.send_modify(|v| {
                         v.state = LinkState::NotPaired;
                         v.gateway = None;
@@ -172,7 +174,11 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                 if up_for >= self.cfg.backoff.stable_after {
                     attempt = 0;
                 }
-                if !self.forward(&in_tx, Inbound::SessionDown, &egress).await {
+                // An engine merely busy past the deadline misses this SessionDown; its next
+                // SessionUp resets it. Only shutdown or a dead engine end the supervisor.
+                if !self.forward(&in_tx, Inbound::SessionDown, &egress).await
+                    && !matches!(self.not_delivered(&in_tx, &egress), Outcome::LocalFault)
+                {
                     break;
                 }
             }
@@ -344,7 +350,7 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
         self.set_state(LinkState::Ready { session });
         if !self.forward(in_tx, Inbound::SessionUp, egress).await {
             self.close_quietly(&mut sess, CLOSE_NORMAL).await;
-            return (Outcome::Shutdown, true);
+            return (self.not_delivered(in_tx, egress), true);
         }
         (self.session(&mut sess, out_rx, in_tx, egress).await, true)
     }
@@ -376,11 +382,13 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                     Some(LinkEvent::Frame(Frame::Text(t))) => match decode_server(&t) {
                         Ok(ServerMsg::Ready(_)) => return Ok(()),
                         Ok(msg @ ServerMsg::Status(_)) => {
-                            let Some(charge) = self.charge(t.len(), egress).await else {
-                                return Err(Outcome::EngineGone);
+                            let delivered = match self.charge(t.len(), egress).await {
+                                Some(charge) => self.forward(in_tx, Inbound::Server(msg, charge), egress).await,
+                                None => false,
                             };
-                            if !self.forward(in_tx, Inbound::Server(msg, charge), egress).await {
-                                return Err(Outcome::EngineGone);
+                            if !delivered {
+                                self.close_quietly(sess, CLOSE_NORMAL).await;
+                                return Err(self.not_delivered(in_tx, egress));
                             }
                         }
                         Ok(_) => {}
@@ -433,16 +441,8 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                                 .deliver_draining(sess, out_rx, in_tx, msg, t.len(), egress, &mut last_sent)
                                 .await;
                             if !delivered {
-                                if egress.is_cancelled() {
-                                    self.close_quietly(sess, CLOSE_NORMAL).await;
-                                    return Outcome::Shutdown;
-                                }
-                                if in_tx.is_closed() {
-                                    self.close_quietly(sess, CLOSE_NORMAL).await;
-                                    return Outcome::EngineGone;
-                                }
                                 self.close_quietly(sess, CLOSE_NORMAL).await;
-                                return Outcome::LocalFault;
+                                return self.not_delivered(in_tx, egress);
                             }
                         }
                         Err(_) => Stats::inc(&self.stats.inbound_invalid),
@@ -488,15 +488,20 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
         }
     }
 
+    /// Why a must-deliver enqueue failed: shutdown, the engine is gone, or (the engine is only
+    /// busy past `inbound_deadline`) a local fault that ends this session and reconnects.
+    fn not_delivered(&self, in_tx: &mpsc::Sender<Inbound>, egress: &CancellationToken) -> Outcome {
+        if egress.is_cancelled() {
+            Outcome::Shutdown
+        } else if in_tx.is_closed() {
+            Outcome::EngineGone
+        } else {
+            Outcome::LocalFault
+        }
+    }
+
     async fn close_quietly(&self, sess: &mut L::Session, code: u16) {
         let _ = deadline(&*self.clock, self.cfg.close_timeout, sess.close(code, "")).await;
-    }
-}
-
-async fn sleep_until_opt<C: Clock>(clock: &C, at: Option<Mono>) {
-    match at {
-        Some(t) => clock.sleep_until(t).await,
-        None => std::future::pending().await,
     }
 }
 
@@ -652,18 +657,30 @@ mod budget_tests {
         in_rx: mpsc::Receiver<Inbound>,
         egress: CancellationToken,
         tasks: tokio_util::task::TaskTracker,
+        view_rx: watch::Receiver<LinkView>,
         /// Held so the uplink stays open (no `EngineGone`).
         _out_tx: mpsc::Sender<Frame>,
     }
 
     fn start(frames: Vec<Frame>) -> Run {
+        start_with(frames, INBOUND, 0, Arc::new(paired_store("127.0.0.1", "k")))
+    }
+
+    /// `in_cap`: inbound queue capacity; `prefill`: messages already queued (an engine that
+    /// is not draining).
+    fn start_with(
+        frames: Vec<Frame>,
+        in_cap: usize,
+        prefill: usize,
+        secrets: Arc<dyn SecretStore>,
+    ) -> Run {
         let mut script: VecDeque<Frame> = VecDeque::new();
         script.push_back(Frame::Text(READY.into()));
         script.extend(frames);
         let clock = Arc::new(TestClock::new());
         let stats = Arc::new(Stats::default());
         let budget = ByteBudget::new(INBOUND_BYTES);
-        let (view, _) = watch::channel(LinkView {
+        let (view, view_rx) = watch::channel(LinkView {
             state: LinkState::Starting,
             last_close: None,
             gateway: None,
@@ -672,7 +689,7 @@ mod budget_tests {
         let ctx = LinkCtx {
             clock: clock.clone(),
             link: Scripted(Arc::new(Mutex::new(Some(script)))),
-            secrets: Arc::new(paired_store("127.0.0.1", "k")),
+            secrets,
             random: Arc::new(SeededRandom::new(7)),
             cfg: Arc::new(Config::default()),
             stats: stats.clone(),
@@ -682,7 +699,10 @@ mod budget_tests {
             _pairing_keep: pairing_keep,
         };
         let (out_tx, out_rx) = mpsc::channel(8);
-        let (in_tx, in_rx) = mpsc::channel(INBOUND);
+        let (in_tx, in_rx) = mpsc::channel(in_cap);
+        for _ in 0..prefill {
+            in_tx.try_send(Inbound::SessionDown).unwrap();
+        }
         let egress = CancellationToken::new();
         let tasks = tokio_util::task::TaskTracker::new();
         tasks.spawn(ctx.run(out_rx, in_tx, egress.clone()));
@@ -694,8 +714,62 @@ mod budget_tests {
             in_rx,
             egress,
             tasks,
+            view_rx,
             _out_tx: out_tx,
         }
+    }
+
+    /// Audit #2: a store this build cannot use is "not paired", not "reconnecting" forever.
+    #[tokio::test(start_paused = true)]
+    async fn unsupported_secret_store_is_not_paired() {
+        struct Stub;
+        impl SecretStore for Stub {
+            fn capabilities(&self) -> fogar_ports::secrets::SecretCaps {
+                fogar_ports::secrets::SecretCaps::NONE
+            }
+            fn get(
+                &self,
+                _: SecretKey,
+            ) -> Result<Option<fogar_ports::secrets::SecretString>, SecretError> {
+                Err(SecretError::Unsupported("stub"))
+            }
+            fn put(
+                &self,
+                _: SecretKey,
+                _: fogar_ports::secrets::SecretString,
+            ) -> Result<(), SecretError> {
+                Err(SecretError::Unsupported("stub"))
+            }
+            fn delete(&self, _: SecretKey) -> Result<(), SecretError> {
+                Err(SecretError::Unsupported("stub"))
+            }
+        }
+        let r = start_with(Vec::new(), INBOUND, 0, Arc::new(Stub));
+        r.clock.sleep(Duration::from_secs(3600)).await;
+        assert_eq!(r.view_rx.borrow().state, LinkState::NotPaired);
+        assert_eq!(r.stats.snapshot().connect_attempts, 0);
+        r.egress.cancel();
+        drop(r.in_rx);
+        r.tasks.wait().await;
+    }
+
+    /// Audit #1: an engine busy past `inbound_deadline` exactly when `ready` arrives must not
+    /// end the supervisor (nothing respawns it): the session is dropped as a local fault and
+    /// the link reconnects after a backoff.
+    #[tokio::test(start_paused = true)]
+    async fn engine_busy_at_ready_is_a_local_fault_not_a_shutdown() {
+        let r = start_with(Vec::new(), 1, 1, Arc::new(paired_store("127.0.0.1", "k")));
+        r.clock.sleep(Duration::from_secs(30)).await;
+        assert_eq!(r.tasks.len(), 1, "the link supervisor must still run");
+        assert!(
+            !matches!(r.view_rx.borrow().state, LinkState::Ready { .. }),
+            "{:?}",
+            r.view_rx.borrow().state
+        );
+        assert!(r.stats.snapshot().connect_attempts >= 2, "reconnects");
+        r.egress.cancel();
+        drop(r.in_rx);
+        r.tasks.wait().await;
     }
 
     async fn settle(r: &Run) {

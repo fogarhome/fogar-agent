@@ -6,7 +6,7 @@ use crate::{
     config::Config,
     link::Inbound,
     stats::Stats,
-    time::deadline,
+    time::{deadline, sleep_until_opt},
     turn::{ClientCmd, Effects, TurnMachine},
     vad::{EnergyVad, VadEvent},
 };
@@ -240,13 +240,6 @@ impl<C: Clock> Engine<C> {
 async fn next_chunk(c: &mut Option<Capture>) -> Option<AudioChunk> {
     match c {
         Some((_, stream)) => stream.next().await,
-        None => std::future::pending().await,
-    }
-}
-
-async fn sleep_until_opt<C: Clock>(clock: &C, at: Option<Mono>) {
-    match at {
-        Some(t) => clock.sleep_until(t).await,
         None => std::future::pending().await,
     }
 }

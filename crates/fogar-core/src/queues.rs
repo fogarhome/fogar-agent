@@ -6,7 +6,7 @@
 //! |---|---|---|---|
 //! | mic chunks (`EventStream<AudioChunk>`) | audio adapter -> engine | `MIC_CHUNKS` (~1 s of 20 ms chunks) | adapter drops NEWEST, counts (`EventStream::dropped`); never blocks the audio thread |
 //! | uplink audio (`out` channel, `Frame::Binary`) | engine -> link session | shares `OUTBOUND` | shed NEWEST, count `uplink_audio_shed` (`try_send`); the gateway would close a slow client anyway |
-//! | uplink control (`out` channel, `Frame::Text`) | engine -> link session | shares `OUTBOUND` | must-deliver while connected: `reserve()` with `write_timeout`; on deadline count `uplink_control_dropped` and reset the turn (the session is then considered stalled) |
+//! | uplink control (`out` channel, `Frame::Text`) | engine -> link session | shares `OUTBOUND` | must-deliver while connected: `reserve()` with `write_timeout`; on deadline count `uplink_control_dropped` and return the turn machine to Idle (the session itself is kept) |
 //! | inbound JSON events | link session -> engine | `INBOUND` messages AND `INBOUND_BYTES` bytes | must-deliver: byte charge + `reserve()` with `inbound_deadline` (< gateway `CLIENT_SEND_TIMEOUT_S` = 10 s); on deadline the session ends as `EngineStalled` and reconnects |
 //! | inbound TTS audio | link session -> engine | shares `INBOUND` and `INBOUND_BYTES` | shed NEWEST, count `inbound_audio_shed` (`try_send` / `try_charge`); the session never waits on audio |
 //! | playback buffer | engine -> audio sink adapter | adapter-owned, bounded | `ActivePlayback::write` accepts what fits; engine counts the rest in `tts_samples_dropped` |
