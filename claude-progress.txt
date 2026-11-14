@@ -126,5 +126,5 @@ ACTION FOR A HUMAN:
 - Writing .claude/ needed approval that was not given in the build session. Review agent-team/
   and run scripts/install_agent_team.sh to install the 8 skills + 9 subagents into .claude/.
 
-NEXT: S1 (docs/ROADMAP.md) — contract PR first: WS ping/idle deadline in LinkSession, TLS config,
-pairing port, SQLite storage port; then real-gateway golden fixtures for fogar-proto.
+NEXT: S1 (docs/ROADMAP.md, reordered 2026-11-14) — Mac connected + companion app: pairing + Keychain,
+ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app in apps/macos/. SQLite and WS pings move to S2.
