@@ -139,3 +139,13 @@ ACTION FOR A HUMAN:
 
 NEXT: S1 (docs/ROADMAP.md, reordered 2026-11-14) — Mac connected + companion app: pairing + Keychain,
 ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app in apps/macos/. SQLite and WS pings move to S2.
+
+## S1 step 4 — macOS adapters (2026-11-14, on the M2)
+- MacKeychainStore: generic password, service com.fogar.agent, account per SecretKey; keychain UI
+  disabled process-wide; locked → Unavailable; ACL denial → Platform; delete falls back to a
+  tombstone when a same-signer rebuild may not delete (measured). Contract suite green on the M2.
+- MacIpcServer: UDS in ~/Library/Application Support/com.fogar.agent/run (0700/0600, <104 bytes,
+  stale-socket handling as Linux), getpeereid gate, LOCAL_PEERTOKEN → SecCode same-signer check
+  (Team ID from the agent's own signature + id com.fogar.desktop, GUESSED). Contract suite green.
+- Signed matrix verified manually with examples/signer_probe.rs (ADR-0002). UNVERIFIED: Developer
+  ID, real .app bundle peers, UI-side check of the agent, flock single instance (not done).

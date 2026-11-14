@@ -48,6 +48,12 @@ tokio = { version = "1.54.1", default-features = false }
 tokio-util = { version = "0.7.20", default-features = false }
 tokio-tungstenite = { version = "0.30.0", default-features = false }
 futures-util = { version = "0.3.34", default-features = false }
+# macOS adapter only (fogar-agent-macos target table): Keychain, SecCode peer check, getsockopt
+# LOCAL_PEERTOKEN. Verified on crates.io 2026-11-14: security-framework 3.7.0 (2026-02-20),
+# core-foundation 0.10.1 (2025-05-26), libc 0.2.191 (2026-10-16, already in Cargo.lock).
+security-framework = { version = "3.7.0", default-features = false }
+core-foundation = { version = "0.10.1", default-features = false }
+libc = { version = "0.2.191", default-features = false }
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 loom = { version = "0.7.3" }
 

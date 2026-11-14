@@ -1,5 +1,5 @@
-//! macOS wiring — UNTESTED (never compiled in slice 0). All adapters are stubs except load
-//! average and thread QoS; with the Keychain stub the agent stays `NotPaired` (no loop).
+//! macOS wiring. Keychain secrets and the UI socket are real (S1); audio is a stub, the probe and
+//! power policy partial.
 
 use fogar_agent_macos::{MacAudioSink, MacAudioSource, MacIpcServer, MacKeychainStore, MacPowerPolicy, MacSystemProbe};
 use fogar_ports::{
@@ -31,7 +31,7 @@ pub(crate) fn default_state_dir() -> Option<PathBuf> {
 }
 
 pub(crate) fn secret_store(_state_dir: &Path) -> std::io::Result<Arc<dyn SecretStore>> {
-    Ok(Arc::new(MacKeychainStore))
+    Ok(Arc::new(MacKeychainStore::new()))
 }
 
 pub(crate) fn power_policy() -> Arc<dyn PowerPolicy> {
@@ -39,11 +39,12 @@ pub(crate) fn power_policy() -> Arc<dyn PowerPolicy> {
 }
 
 pub(crate) fn build(state_dir: &Path, with_ipc: bool) -> std::io::Result<Platform> {
+    let ipc = if with_ipc { Some(MacIpcServer::bind(&state_dir.join("run"))?) } else { None };
     Ok(Platform {
         secrets: secret_store(state_dir)?,
         audio_in: Arc::new(MacAudioSource),
         audio_out: Arc::new(MacAudioSink),
         probe: Arc::new(MacSystemProbe),
-        ipc: with_ipc.then_some(MacIpcServer),
+        ipc,
     })
 }
