@@ -12,6 +12,10 @@
 //! becomes a pairing record for that address, unless one exists already.
 #![forbid(unsafe_code)] // OS calls go through adapters or rustix's safe wrappers (review sec#7)
 
+// IPC-4: the uid-only pairing opt-in must never reach an optimized (release) build.
+#[cfg(all(feature = "dev-uid-pairing", not(debug_assertions)))]
+compile_error!("the dev-uid-pairing feature is for development builds only");
+
 mod cli;
 mod crash;
 mod ledger;

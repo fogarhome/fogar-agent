@@ -449,6 +449,9 @@ async fn revoked_then_repaired() {
     assert_eq!(rig.link.close_all(1008, "revoked"), 1);
     wait_state(&mut rig.health, |v| v.state == LinkState::NotPaired).await;
     assert!(!rig.secrets.contains(SecretKey::GatewayPairing));
+    // Past the post-revocation backoff: the link now sits in the 60 s NotPaired wait, so only
+    // the pairing-change signal can bring it back within 5 s.
+    tokio::time::sleep(Duration::from_secs(90)).await;
     let mut c = client(&rig).await;
     let r = c.request(pair_req("127.0.0.1", "482913")).await;
     assert!(matches!(r, Some(IpcResponse::Paired(_))), "{r:?}");
