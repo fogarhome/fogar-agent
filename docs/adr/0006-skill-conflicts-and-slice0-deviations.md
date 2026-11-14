@@ -38,7 +38,7 @@ Status: **PROVISIONAL** (each item names what retires it)
     `scripts/install_agent_team.sh`.
 
 ## To verify on the M2
-Items 2, 3 and 6 are macOS behaviour: verify in S2 (audio), S1 (sleep/wake) and S7 (energy gate).
+Items 2, 3 and 6 are macOS behaviour: verify in S3 (audio), S2 (sleep/wake) and S7 (energy gate).
 10. **State directory (review sec#1)**: no predictable fallback when `HOME` is unset (the daemon
     refuses to start and asks for `--state-dir`); the state dir is validated (absolute, owner =
     getuid, real dir, 0700) before use; ledger/crash files `O_NOFOLLOW`, temp files `create_new`.
