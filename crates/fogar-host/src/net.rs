@@ -34,10 +34,7 @@ pub struct SystemResolver;
 
 impl Resolver for SystemResolver {
     async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-        Ok(tokio::net::lookup_host((host, port))
-            .await?
-            .take(MAX_ADDRS)
-            .collect())
+        Ok(tokio::net::lookup_host((host, port)).await?.collect())
     }
 }
 

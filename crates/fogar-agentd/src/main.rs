@@ -31,7 +31,7 @@ std::cfg_select! {
 use fogar_core::{Agent, AgentPorts, LinkState, crashloop};
 use fogar_host::{PrngRandom, TokioClock, WsConfig, WsGatewayLink};
 use fogar_ports::{
-    gateway::GatewayAddr,
+    gateway::{GatewayAddr, Scheme},
     power::WorkClass,
     secrets::{SecretKey, SecretString},
 };
@@ -136,13 +136,14 @@ fn run(opts: cli::RunOpts) -> ExitCode {
         eprintln!("fogar-agentd: {e}");
         return ExitCode::from(64);
     }
-    // Review sec#3: slice 0 has no TLS; WsConfig accepts only loopback ws:// (wss:// is refused
-    // until S1). Allowed, but never silent.
-    eprintln!(
-        "fogar-agentd: WARNING: the gateway link is UNENCRYPTED ws:// (loopback only). Local \
-         processes that can reach or proxy that port see the client key in the handshake. TLS \
-         (wss://) arrives with S1 (ADR-0006 item 4)."
-    );
+    // Review sec#3: clear text (allowed only to loopback/LAN/tailnet) is never silent.
+    if gateway.scheme() == Scheme::Plain {
+        eprintln!(
+            "fogar-agentd: WARNING: the gateway link is UNENCRYPTED ws:// (loopback/LAN/tailnet \
+             only). Anyone on that network path sees the client key in the handshake; use \
+             wss:// for TLS (ADR-0006 item 4)."
+        );
+    }
     let state_dir = match private_state_dir(opts.state_dir.clone()) {
         Ok(d) => d,
         Err(code) => return code,

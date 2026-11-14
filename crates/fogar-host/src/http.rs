@@ -5,6 +5,9 @@
 //! redirects, no pooling, no compression, and a body read into ONE pre-sized wiped buffer.
 //! hyper would add ~10 crates, its own buffering (copies of the `/pair` reply we cannot wipe)
 //! and connection reuse we would have to switch off. ~150 lines here are easier to review.
+//! shortcut: over https the decrypted `/pair` reply (client_key) also passes through rustls'
+//! internal plaintext buffers, which are not zeroized; only our own copies are wiped. Upgrade
+//! if a rustls release offers zeroizing buffers.
 //!
 //! Bounds: response head <= `MAX_HEAD_BYTES`, body <= `MAX_BODY_BYTES` (checked from
 //! `Content-Length` before reading, and while reading when the length is unknown); every await
@@ -33,7 +36,9 @@ pub struct HttpConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
-            connect_timeout: Duration::from_secs(3),
+            // Below the core's 1-2 s probe deadline, so a dead first address still leaves time
+            // for the next one.
+            connect_timeout: Duration::from_secs(1),
             call_timeout: Duration::from_secs(10),
         }
     }

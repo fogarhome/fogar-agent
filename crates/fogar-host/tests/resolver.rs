@@ -121,3 +121,23 @@ fn ws_connects_to_the_resolved_private_address() {
             .unwrap();
     })
 }
+
+/// A name whose first address is dead still reaches the gateway at the next one, well inside
+/// the core's 1-2 s probe deadline.
+#[test]
+fn http_falls_back_to_the_next_resolved_address() {
+    run_async(async {
+        let s = MockHttpServer::start(HttpRoutes::fogar("green-house"))
+            .await
+            .unwrap();
+        let addr = GatewayAddr::parse(&format!("green-house:{}", s.addr().port())).unwrap();
+        // The mock listens on 127.0.0.1 only: ::1 refuses, then 127.0.0.1 answers.
+        let h =
+            HttpGateway::with_resolver(HttpConfig::default(), Fixed::new(&["::1", "127.0.0.1"]));
+        let r = tokio::time::timeout(Duration::from_secs(2), h.get(&addr, HttpCall::WellKnown))
+            .await
+            .expect("fallback within the probe deadline")
+            .unwrap();
+        assert_eq!(r.status, 200);
+    })
+}

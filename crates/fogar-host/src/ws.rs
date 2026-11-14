@@ -3,9 +3,9 @@
 //! Bounded everything (fogar-longrun-reliability rule 2, fogar-secure-rust NET-3): inbound
 //! message/frame <= 1 MiB (the gateway's own limit), write buffer capped (tungstenite's default
 //! `max_write_buffer_size` is `usize::MAX`), small eager read buffer (energy skill pitfall).
-//! Deadlines: the whole connect (resolve + TCP + upgrade) under `connect_timeout`, each TCP
-//! attempt under `attempt_timeout`, the close handshake under `close_timeout`; send/recv are
-//! bounded by the core.
+//! Deadlines: the name lookup, each TCP attempt and the TLS handshake under `attempt_timeout`,
+//! the close handshake under `close_timeout`; the whole connect, send and recv are bounded by
+//! the core.
 //!
 //! Transport policy (NET-1, ADR-0006 item 4): the name is resolved ONCE by [`Resolver`],
 //! `cleartext_allowed` is applied to every resolved address, and the upgrade runs over the
@@ -19,7 +19,7 @@ use fogar_ports::gateway::{
 use fogar_proto::limits::WS_MAX_FRAME_BYTES;
 use futures_util::{SinkExt, StreamExt};
 use rustls::ClientConfig;
-use std::{fmt, io, sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 use tokio_tungstenite::{
     WebSocketStream,
     tungstenite::{
@@ -36,8 +36,6 @@ const CLOSE_NO_STATUS: u16 = 1005;
 pub struct WsConfig {
     pub close_timeout: Duration,
     pub max_frame: usize,
-    /// Whole `connect`: resolve + TCP + WebSocket upgrade.
-    pub connect_timeout: Duration,
     /// Per resolved address (and for the name lookup).
     pub attempt_timeout: Duration,
 }
@@ -47,7 +45,6 @@ impl Default for WsConfig {
         Self {
             close_timeout: Duration::from_secs(2),
             max_frame: WS_MAX_FRAME_BYTES,
-            connect_timeout: Duration::from_secs(10),
             attempt_timeout: Duration::from_secs(3),
         }
     }
@@ -220,40 +217,32 @@ impl<R: Resolver> GatewayLink for WsGatewayLink<R> {
 
     async fn connect(&self, addr: &GatewayAddr) -> Result<WsSession, LinkError> {
         let cfg = &self.cfg;
-        let connect = async {
-            let conn = match dial(
-                &*self.resolver,
-                self.tls.as_ref(),
-                addr,
-                cfg.attempt_timeout,
-            )
-            .await
-            {
-                Ok(s) => s,
-                Err(DialError::Refused) => return Err(LinkError::NotConfigured),
-                Err(DialError::Unreachable(e) | DialError::Tls(e)) => return Err(transport(e)),
-            };
-            let scheme = match addr.scheme() {
-                Scheme::Plain => "ws",
-                Scheme::Tls => "wss",
-            };
-            let url = format!("{scheme}://{}/ws/stream", addr.authority());
-            let (ws, _resp) = tokio_tungstenite::client_async_with_config(
-                url,
-                conn,
-                Some(ws_config(cfg.max_frame)),
-            )
-            .await
-            .map_err(transport)?;
-            Ok(WsSession {
-                ws,
-                cfg: cfg.clone(),
-                closed: false,
-            })
+        let conn = match dial(
+            &*self.resolver,
+            self.tls.as_ref(),
+            addr,
+            cfg.attempt_timeout,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(DialError::Refused) => return Err(LinkError::NotConfigured),
+            Err(DialError::Unreachable(e) | DialError::Tls(e)) => return Err(transport(e)),
         };
-        tokio::time::timeout(cfg.connect_timeout, connect)
-            .await
-            .map_err(|_| transport(io::Error::from(io::ErrorKind::TimedOut)))?
+        let scheme = match addr.scheme() {
+            Scheme::Plain => "ws",
+            Scheme::Tls => "wss",
+        };
+        let url = format!("{scheme}://{}/ws/stream", addr.authority());
+        let (ws, _resp) =
+            tokio_tungstenite::client_async_with_config(url, conn, Some(ws_config(cfg.max_frame)))
+                .await
+                .map_err(transport)?;
+        Ok(WsSession {
+            ws,
+            cfg: cfg.clone(),
+            closed: false,
+        })
     }
 }
 
