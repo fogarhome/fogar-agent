@@ -28,6 +28,12 @@ impl fogar_testkit::contract::ipc_server::IpcTestClient for Client {
     async fn next(&mut self) -> Option<fogar_ports::ipc::IpcResponse> {
         self.0.next().await
     }
+    async fn send_half(&mut self, r: &fogar_ports::ipc::IpcRequest, first: bool) {
+        assert!(
+            self.0.send_half(r, first).await.is_some(),
+            "split write failed"
+        );
+    }
 }
 
 fogar_testkit::system_probe_contract!(ProcSystemProbe);

@@ -11,10 +11,18 @@
 //! - NOT select branches: the core wraps each call in its own deadline (1–2 s per probe, spec §0)
 //!   and drops it on expiry. Dropping an in-flight call must not leak a socket or poison the
 //!   adapter: the next call works.
-//! - The adapter bounds the response body (`MAX_BODY_BYTES`) and never follows redirects (a
-//!   redirect could move the key exchange to another host).
+//! - Transport policy: `Scheme::Plain` only when `gateway::cleartext_allowed` holds for every
+//!   resolved socket address (checked before sending a byte; else `Refused`). `Scheme::Tls`
+//!   verifies the certificate against the platform roots; no "accept invalid" switch.
+//! - One request per connection (`Connection: close`), no pooling: a cancelled call can never
+//!   hand a half-read connection to the next one.
+//! - The adapter bounds the response body (`MAX_BODY_BYTES`) WHILE reading: a larger or endless
+//!   body (lying `Content-Length`, chunked) is `TooLarge` as soon as the limit is crossed, never
+//!   buffered first. It never follows redirects (a redirect could move the key exchange to
+//!   another host).
 //! - Bodies are wiped from memory on drop and never printed: the `/pair` reply carries the
-//!   `client_key` exactly once.
+//!   `client_key` exactly once. Adapters read the body into ONE buffer pre-sized from
+//!   `Content-Length` (capped at `MAX_BODY_BYTES`), so growth never leaves stray copies.
 //!
 //! How Windows/Linux would do this: the same portable HTTP/1.1 client (fogar-host); nothing OS
 //! specific, so no capabilities.
@@ -26,12 +34,16 @@ use std::{fmt, future::Future};
 /// Largest response body an adapter accepts. Both replies are tiny JSON objects.
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
 
-/// The two paths the core may call. Closed set: the port cannot be used as a generic client.
+/// The calls the core may make. Closed set with fixed paths: the port cannot be used as a
+/// generic HTTP client. Paths equal `fogar_proto::pairing::WELL_KNOWN_PATHS` (checked by a
+/// fogar-core test; ports do not depend on proto).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum HttpCall {
-    /// `GET <path>` where path is one of `fogar_proto::pairing::WELL_KNOWN_PATHS`.
-    WellKnown(&'static str),
+    /// `GET /.well-known/fogar-gateway`.
+    WellKnown,
+    /// `GET /.well-known/jota-gateway` (gateways from before the Fogar rename).
+    WellKnownLegacy,
     /// `POST /pair` with a JSON body.
     Pair,
 }
@@ -39,7 +51,8 @@ pub enum HttpCall {
 impl HttpCall {
     pub fn path(self) -> &'static str {
         match self {
-            HttpCall::WellKnown(p) => p,
+            HttpCall::WellKnown => "/.well-known/fogar-gateway",
+            HttpCall::WellKnownLegacy => "/.well-known/jota-gateway",
             HttpCall::Pair => "/pair",
         }
     }
@@ -84,8 +97,8 @@ pub enum HttpError {
 }
 
 pub trait GatewayHttp: Send + Sync + 'static {
-    /// `call` must be `HttpCall::WellKnown`; `Pair` with a GET is a core bug and returns
-    /// `Refused` without touching the network.
+    /// `call` must be a well-known call; `Pair` with a GET is a core bug and returns `Refused`
+    /// without touching the network.
     fn get(
         &self,
         addr: &GatewayAddr,

@@ -240,8 +240,9 @@ pub mod secret_store {
     /// Keys are independent items: writing or deleting one never touches another.
     pub fn keys_are_independent(s: &dyn SecretStore) {
         let (a, b) = (SecretKey::GatewayClientKey, SecretKey::GatewayPairing);
-        if s.put(a, SecretString::from("a".to_owned())).is_err() {
-            return;
+        match s.put(a, SecretString::from("a".to_owned())) {
+            Err(SecretError::Unsupported(_)) => return,
+            r => r.unwrap(),
         }
         s.put(b, SecretString::from(r#"{"json":"record"}"#.to_owned()))
             .unwrap();
@@ -627,6 +628,16 @@ pub mod gateway_link {
         }
     }
 
+    /// NET-1: clear text to a public address is refused before any byte is sent.
+    pub async fn cleartext_to_public_ip_is_refused<L: GatewayLink>(link: &L) {
+        let public = GatewayAddr::parse("203.0.113.7:8004").expect("addr");
+        let r = tokio::time::timeout(Duration::from_secs(1), link.connect(&public)).await;
+        assert!(
+            matches!(r, Ok(Err(LinkError::NotConfigured))),
+            "plain ws to a public IP must be NotConfigured at once"
+        );
+    }
+
     /// The gateway's handshake rejection is a close with the documented reason.
     pub async fn bad_key_is_closed_1008<L: GatewayLink>(link: &L, addr: &GatewayAddr) {
         let mut s = link.connect(addr).await.unwrap();
@@ -689,6 +700,13 @@ pub mod gateway_link {
                     })
                 }
                 #[test]
+                fn cleartext_to_public_ip_is_refused() {
+                    $crate::run_async(async {
+                        let (link, _gw) = $make;
+                        c::cleartext_to_public_ip_is_refused(&link).await
+                    })
+                }
+                #[test]
                 fn bad_key_is_closed_1008() {
                     $crate::run_async(async {
                         let (link, gw) = $make;
@@ -714,6 +732,8 @@ pub mod ipc_server {
         fn request(&mut self, r: IpcRequest) -> impl Future<Output = Option<IpcResponse>>;
         /// Waits for the next message without sending (pushed events). `None` = closed.
         fn next(&mut self) -> impl Future<Output = Option<IpcResponse>>;
+        /// Writes only the first (`first`) or the second half of `r`'s wire frame.
+        fn send_half(&mut self, r: &IpcRequest, first: bool) -> impl Future<Output = ()>;
     }
 
     impl IpcTestClient for crate::FakeIpcClient {
@@ -722,6 +742,9 @@ pub mod ipc_server {
         }
         async fn next(&mut self) -> Option<IpcResponse> {
             crate::FakeIpcClient::next(self).await
+        }
+        async fn send_half(&mut self, r: &IpcRequest, first: bool) {
+            crate::FakeIpcClient::send_half(self, r, first).await
         }
     }
 
@@ -875,6 +898,77 @@ pub mod ipc_server {
         bounded(async { tokio::join!(serve_one(&server, 0), client) }).await;
     }
 
+    /// Polls `f` once; drops it if it is not ready (a lost `select!` race).
+    async fn poll_once_then_drop<F: Future>(f: F) -> Option<F::Output> {
+        let mut f = std::pin::pin!(f);
+        std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(match f.as_mut().poll(cx) {
+                std::task::Poll::Ready(v) => Some(v),
+                std::task::Poll::Pending => None,
+            })
+        })
+        .await
+    }
+
+    /// The subscription loop races `recv` against status changes: a `recv` cancelled while a
+    /// request is half-received, followed by a pushed `send`, must still yield the whole
+    /// request on the next `recv`.
+    pub async fn recv_is_cancel_safe_around_pushes<S, F, Fut, K>(server: S, connect: F)
+    where
+        S: IpcServer,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = K>,
+        K: IpcTestClient,
+    {
+        let (half_tx, half_rx) = tokio::sync::oneshot::channel::<()>();
+        let (pushed_tx, pushed_rx) = tokio::sync::oneshot::channel::<()>();
+        let req = IpcRequest::Pair {
+            address: "green-house".into(),
+            code: PairCode::parse("482913"),
+        };
+        let serve = async {
+            let (_peer, mut conn) = server.accept().await.expect("accept");
+            half_rx.await.expect("half written");
+            // Let the half frame arrive, cancelling recv repeatedly meanwhile.
+            for _ in 0..20 {
+                assert!(
+                    !matches!(poll_once_then_drop(conn.recv()).await, Some(Ok(Some(_)))),
+                    "a half frame must not decode"
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            conn.send(IpcResponse::Event(report(9)))
+                .await
+                .expect("push");
+            pushed_tx.send(()).expect("client alive");
+            match conn.recv().await {
+                Ok(Some(r)) => assert_eq!(r, req_clone(), "cancel-safety: request corrupted"),
+                other => panic!("cancel-safety: request lost: {other:?}"),
+            }
+            conn.send(IpcResponse::Unpaired).await.expect("send");
+            // Keep the connection until the client read the reply.
+            let _ = conn.recv().await;
+        };
+        let client = async {
+            let mut c = connect().await;
+            c.send_half(&req, true).await;
+            half_tx.send(()).expect("server alive");
+            pushed_rx.await.expect("pushed");
+            assert_eq!(c.next().await, Some(IpcResponse::Event(report(9))));
+            c.send_half(&req, false).await;
+            assert_eq!(c.next().await, Some(IpcResponse::Unpaired));
+            drop(c);
+        };
+        bounded(async { tokio::join!(serve, client) }).await;
+    }
+
+    fn req_clone() -> IpcRequest {
+        IpcRequest::Pair {
+            address: "green-house".into(),
+            code: PairCode::parse("482913"),
+        }
+    }
+
     /// Dropping a pending `accept` must not lose the next connection.
     pub async fn accept_is_cancel_safe<S, F, Fut, K>(server: S, connect: F)
     where
@@ -918,6 +1012,13 @@ pub mod ipc_server {
                     })
                 }
                 #[test]
+                fn recv_is_cancel_safe_around_pushes() {
+                    $crate::run_async(async {
+                        let (server, connect) = $make;
+                        c::recv_is_cancel_safe_around_pushes(server, connect).await
+                    })
+                }
+                #[test]
                 fn pair_request_crosses_intact() {
                     $crate::run_async(async {
                         let (server, connect) = $make;
@@ -941,7 +1042,7 @@ pub mod gateway_http {
     use secrecy::zeroize::Zeroizing;
     use std::time::Duration;
 
-    const WK: HttpCall = HttpCall::WellKnown("/.well-known/fogar-gateway");
+    const WK: HttpCall = HttpCall::WellKnown;
 
     async fn bounded<F: std::future::Future>(f: F) -> F::Output {
         tokio::time::timeout(Duration::from_secs(5), f)
@@ -1014,7 +1115,7 @@ pub mod gateway_http {
             .await
             .expect("400 is a reply");
         assert_eq!(r.status, 400);
-        let r = bounded(h.get(addr, HttpCall::WellKnown("/nope")))
+        let r = bounded(h.get(addr, HttpCall::WellKnownLegacy))
             .await
             .expect("404 reply");
         assert_eq!(r.status, 404);
@@ -1034,6 +1135,29 @@ pub mod gateway_http {
             bounded(h.get(addr, WK)).await,
             Err(HttpError::TooLarge { .. })
         ));
+        // A lying Content-Length + an endless body: refused once the limit is crossed, not
+        // after buffering it all (the 5 s bound would fire first).
+        routes.set_endless("GET", WK.path());
+        assert!(matches!(
+            bounded(h.get(addr, WK)).await,
+            Err(HttpError::TooLarge { .. })
+        ));
+    }
+
+    /// NET-1: clear text to a public address is refused before any byte is sent.
+    pub async fn cleartext_to_public_ip_is_refused<H: GatewayHttp>(h: &H) {
+        let public = GatewayAddr::parse("203.0.113.7:8004").expect("addr");
+        let t = tokio::time::timeout(Duration::from_secs(1), h.get(&public, WK)).await;
+        assert!(
+            matches!(t, Ok(Err(HttpError::Refused))),
+            "plain http to a public IP must be Refused at once"
+        );
+        let t = tokio::time::timeout(
+            Duration::from_secs(1),
+            h.post_json(&public, HttpCall::Pair, Zeroizing::new(b"{}".to_vec())),
+        )
+        .await;
+        assert!(matches!(t, Ok(Err(HttpError::Refused))));
     }
 
     /// A redirect could move the key exchange elsewhere: it is returned, never followed.
@@ -1057,7 +1181,8 @@ pub mod gateway_http {
         ));
     }
 
-    /// Dropping an in-flight call leaves the adapter usable.
+    /// Dropping an in-flight call leaves the adapter usable: right away (while connecting) and
+    /// after the server already received the request (while waiting for the reply).
     pub async fn cancelled_call_leaves_adapter_usable<H: GatewayHttp>(
         h: &H,
         addr: &GatewayAddr,
@@ -1072,8 +1197,22 @@ pub mod gateway_http {
             })
             .await;
         }
+        routes.set_delayed("POST", "/pair", 201, "{}", Duration::from_millis(500));
+        let before = routes.seen().len();
+        {
+            let call = h.post_json(addr, HttpCall::Pair, Zeroizing::new(b"{}".to_vec()));
+            let wait_seen = async {
+                while routes.seen().len() == before {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            };
+            tokio::select! {
+                _ = call => panic!("the delayed reply cannot be ready yet"),
+                () = bounded(wait_seen) => {}
+            }
+        }
         let r = bounded(h.get(addr, WK)).await.expect("get after cancels");
-        assert_eq!(r.status, 200);
+        assert_eq!((r.status, &r.body[..]), (200, &b"{}"[..]));
     }
 
     #[macro_export]
@@ -1123,6 +1262,13 @@ pub mod gateway_http {
                     $crate::run_async(async {
                         let (h, s) = $make;
                         c::unreachable_is_reported(&h, &s.dead_addr()).await
+                    })
+                }
+                #[test]
+                fn cleartext_to_public_ip_is_refused() {
+                    $crate::run_async(async {
+                        let (h, _s) = $make;
+                        c::cleartext_to_public_ip_is_refused(&h).await
                     })
                 }
                 #[test]

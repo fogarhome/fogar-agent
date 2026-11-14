@@ -5,7 +5,6 @@ use crate::{agent::HealthProbe, queues::IPC_MAX_CONNS, stats::Stats, time::deadl
 use fogar_ports::{
     clock::Clock,
     ipc::{IPC_VERSION, IpcConn, IpcRequest, IpcResponse, IpcServer, PeerCheck, StatusReport},
-    support::Support,
 };
 use std::{sync::Arc, time::Duration};
 use tokio::task::JoinSet;
@@ -29,11 +28,6 @@ pub(crate) async fn run<C: Clock, S: IpcServer>(
     limits: Limits,
     ingress: CancellationToken,
 ) {
-    let peer_check = if server.capabilities().peer_code_identity == Support::Native {
-        PeerCheck::SameSigner
-    } else {
-        PeerCheck::UidOnly
-    };
     let mut conns = JoinSet::new();
     // Accept failures back off exponentially (250 ms .. 30 s) so a broken listener cannot spin.
     let mut fail_delay = Duration::from_millis(250);
@@ -43,7 +37,9 @@ pub(crate) async fn run<C: Clock, S: IpcServer>(
             () = ingress.cancelled() => break,
             Some(_) = conns.join_next(), if !conns.is_empty() => {}
             r = server.accept(), if conns.len() < IPC_MAX_CONNS => match r {
-                Ok((_peer, conn)) => {
+                Ok((peer, conn)) => {
+                    // Per connection, as verified by the adapter (gates Pair/Unpair, IPC-4).
+                    let peer_check = peer.check();
                     fail_delay = Duration::from_millis(250);
                     Stats::inc(&health.stats.ipc_connections);
                     conns.spawn(serve(conn, clock.clone(), health.clone(), limits, peer_check, ingress.child_token()));
@@ -86,8 +82,10 @@ async fn serve<C: Clock, K: IpcConn>(
                     version: IPC_VERSION,
                 }
             }
-            Ok(Some(IpcRequest::Hello { .. })) => IpcResponse::Refused {
-                reason: "unsupported ipc version",
+            // Version mismatch: answer with ours so the client can tell the person which side
+            // to update (it compares and stops).
+            Ok(Some(IpcRequest::Hello { .. })) => IpcResponse::Hello {
+                version: IPC_VERSION,
             },
             Ok(Some(IpcRequest::Status)) => {
                 let h = health.snapshot();
@@ -102,8 +100,10 @@ async fn serve<C: Clock, K: IpcConn>(
                     peer_check,
                 ))
             }
-            // TODO(S1 core PR): subscribe (watch, exempt from idle_timeout), discover, pair,
-            // unpair. Listed explicitly so a new variant is a conscious decision.
+            // TODO(S1 core PR): subscribe (watch, exempt from idle_timeout, push deadline closes),
+            // discover, pair, unpair (Pair/Unpair only for PeerCheck::SameSigner unless the
+            // composition root opts in). Listed explicitly so a new variant is a conscious
+            // decision.
             Ok(Some(
                 IpcRequest::Subscribe
                 | IpcRequest::Discover

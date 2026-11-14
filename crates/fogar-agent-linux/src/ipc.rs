@@ -23,6 +23,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
 };
+use zeroize::Zeroizing;
 
 /// `sun_path` is 108 bytes on Linux and 104 on macOS: keep the stricter limit everywhere.
 const MAX_SOCKET_PATH: usize = 103;
@@ -129,7 +130,7 @@ impl UdsConn {
 async fn read_frame(
     stream: &mut UnixStream,
     buf: &mut Vec<u8>,
-) -> Result<Option<Vec<u8>>, IpcError> {
+) -> Result<Option<Zeroizing<Vec<u8>>>, IpcError> {
     loop {
         if let Some(f) = take_frame(buf)? {
             return Ok(Some(f));
@@ -190,6 +191,14 @@ impl UdsIpcClient {
     pub async fn next(&mut self) -> Option<IpcResponse> {
         let resp = read_frame(&mut self.stream, &mut self.buf).await.ok()??;
         decode_response(&resp).ok()
+    }
+
+    /// Writes the first (`first = true`) or second half of `r`'s frame (cancel-safety clause).
+    pub async fn send_half(&mut self, r: &IpcRequest, first: bool) -> Option<()> {
+        let f = frame(&encode_request(r).ok()?).ok()?;
+        let mid = f.len() / 2;
+        let part = if first { &f[..mid] } else { &f[mid..] };
+        self.stream.write_all(part).await.ok()
     }
 
     /// Sends raw bytes (adversarial tests: oversize frames, garbage).

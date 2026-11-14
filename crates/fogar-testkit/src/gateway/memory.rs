@@ -43,7 +43,7 @@ impl FakeGatewayLink {
             }),
         }
     }
-    /// Any address: the in-memory gateway ignores it .
+    /// Any allowed address: the in-memory gateway ignores it (beyond the clear-text policy).
     pub fn addr(&self) -> fogar_ports::gateway::GatewayAddr {
         fogar_ports::gateway::GatewayAddr::parse("127.0.0.1").expect("addr")
     }
@@ -159,8 +159,11 @@ impl GatewayLink for FakeGatewayLink {
     type Session = FakeSession;
     async fn connect(
         &self,
-        _addr: &fogar_ports::gateway::GatewayAddr,
+        addr: &fogar_ports::gateway::GatewayAddr,
     ) -> Result<FakeSession, LinkError> {
+        if !super::http::policy_allows(addr) {
+            return Err(LinkError::NotConfigured);
+        }
         let fail = self
             .inner
             .fail_connects

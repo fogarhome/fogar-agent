@@ -28,11 +28,14 @@ pub struct SeenRequest {
     pub body: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct Reply {
     status: u16,
     body: Vec<u8>,
     location: Option<String>,
+    delay: Option<std::time::Duration>,
+    /// Declares a huge Content-Length and streams forever.
+    endless: bool,
 }
 
 /// Scripted routes shared by the fake and the real-socket mock. Unknown routes answer 404.
@@ -52,7 +55,37 @@ impl HttpRoutes {
             Reply {
                 status,
                 body: body.into(),
-                location: None,
+                ..Reply::default()
+            },
+        );
+    }
+    /// Replies after `delay` (cancellation tests).
+    pub fn set_delayed(
+        &self,
+        method: &str,
+        path: &str,
+        status: u16,
+        body: impl Into<Vec<u8>>,
+        delay: std::time::Duration,
+    ) {
+        self.routes.lock().unwrap().insert(
+            (method.into(), path.into()),
+            Reply {
+                status,
+                body: body.into(),
+                delay: Some(delay),
+                ..Reply::default()
+            },
+        );
+    }
+    /// 200 with `Content-Length: 100000000` and a body that never ends.
+    pub fn set_endless(&self, method: &str, path: &str) {
+        self.routes.lock().unwrap().insert(
+            (method.into(), path.into()),
+            Reply {
+                status: 200,
+                endless: true,
+                ..Reply::default()
             },
         );
     }
@@ -61,8 +94,8 @@ impl HttpRoutes {
             (method.into(), path.into()),
             Reply {
                 status: 302,
-                body: Vec::new(),
                 location: Some(to.into()),
+                ..Reply::default()
             },
         );
     }
@@ -87,8 +120,17 @@ impl HttpRoutes {
             .unwrap_or(Reply {
                 status: 404,
                 body: br#"{"detail":"Not Found"}"#.to_vec(),
-                location: None,
+                ..Reply::default()
             })
+    }
+}
+
+/// Fakes apply the clear-text policy to IP literals (they resolve nothing; names pass).
+pub(crate) fn policy_allows(addr: &GatewayAddr) -> bool {
+    use fogar_ports::gateway::{Scheme, cleartext_allowed};
+    match (addr.scheme(), addr.host().parse::<std::net::IpAddr>()) {
+        (Scheme::Plain, Ok(ip)) => cleartext_allowed(ip),
+        _ => true,
     }
 }
 
@@ -119,13 +161,18 @@ impl FakeGatewayHttp {
     pub fn routes(&self) -> HttpRoutes {
         self.routes.clone()
     }
-    fn call(
+    async fn call(
         &self,
         addr: &GatewayAddr,
         method: &str,
         call: HttpCall,
         body: Vec<u8>,
     ) -> Result<HttpReply, HttpError> {
+        if !policy_allows(addr) {
+            return Err(HttpError::Refused);
+        }
+        // Yield once so a dropped in-flight call is a real cancellation point.
+        tokio::task::yield_now().await;
         if *addr != self.addr {
             return Err(HttpError::Unreachable);
         }
@@ -135,7 +182,10 @@ impl FakeGatewayHttp {
             content_type: (method == "POST").then(|| "application/json".into()),
             body,
         });
-        if r.body.len() > MAX_BODY_BYTES {
+        if let Some(d) = r.delay {
+            tokio::time::sleep(d).await;
+        }
+        if r.endless || r.body.len() > MAX_BODY_BYTES {
             return Err(HttpError::TooLarge {
                 max: MAX_BODY_BYTES,
             });
@@ -146,12 +196,10 @@ impl FakeGatewayHttp {
 
 impl GatewayHttp for FakeGatewayHttp {
     async fn get(&self, addr: &GatewayAddr, call: HttpCall) -> Result<HttpReply, HttpError> {
-        if !matches!(call, HttpCall::WellKnown(_)) {
+        if matches!(call, HttpCall::Pair) {
             return Err(HttpError::Refused);
         }
-        // Yield once so a dropped in-flight call is a real cancellation point.
-        tokio::task::yield_now().await;
-        self.call(addr, "GET", call, Vec::new())
+        self.call(addr, "GET", call, Vec::new()).await
     }
     async fn post_json(
         &self,
@@ -159,8 +207,7 @@ impl GatewayHttp for FakeGatewayHttp {
         call: HttpCall,
         body: Zeroizing<Vec<u8>>,
     ) -> Result<HttpReply, HttpError> {
-        tokio::task::yield_now().await;
-        self.call(addr, "POST", call, body.to_vec())
+        self.call(addr, "POST", call, body.to_vec()).await
     }
 }
 
@@ -197,6 +244,17 @@ impl MockHttpServer {
                         return;
                     };
                     let rep = r.answer(req);
+                    if let Some(d) = rep.delay {
+                        tokio::time::sleep(d).await;
+                    }
+                    if rep.endless {
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100000000\r\n\r\n")
+                            .await;
+                        let chunk = vec![b' '; 4096];
+                        while sock.write_all(&chunk).await.is_ok() {}
+                        return;
+                    }
                     let mut head = format!(
                         "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
                         rep.status,

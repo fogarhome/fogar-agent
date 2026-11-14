@@ -39,10 +39,13 @@ async fn graceful_shutdown_returns_to_the_task_baseline() {
         Some(IpcResponse::Status(s)) => assert_eq!(s.link, "ready"),
         other => panic!("{other:?}"),
     }
-    assert!(matches!(
+    // A mismatched client learns our version (and decides itself to stop).
+    assert_eq!(
         client.request(IpcRequest::Hello { version: 99 }).await,
-        Some(IpcResponse::Refused { .. })
-    ));
+        Some(IpcResponse::Hello {
+            version: IPC_VERSION
+        })
+    );
 
     // Shut down in the middle of a streaming turn.
     speak(&rig.mic, 10).await;

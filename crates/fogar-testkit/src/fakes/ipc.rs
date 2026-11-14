@@ -24,6 +24,7 @@ pub struct FakeConn {
 pub struct FakeIpcClient {
     tx: mpsc::Sender<IpcRequest>,
     rx: mpsc::Receiver<IpcResponse>,
+    half: Option<IpcRequest>,
 }
 
 impl FakeIpc {
@@ -47,6 +48,7 @@ impl FakeIpc {
         FakeIpcClient {
             tx: req_tx,
             rx: resp_rx,
+            half: None,
         }
     }
 }
@@ -61,6 +63,14 @@ impl FakeIpcClient {
     pub async fn request(&mut self, r: IpcRequest) -> Option<IpcResponse> {
         self.tx.send(r).await.ok()?;
         self.rx.recv().await
+    }
+    /// Split write: the request is delivered only when the second half is "written".
+    pub async fn send_half(&mut self, r: &IpcRequest, first: bool) {
+        if first {
+            self.half = Some(r.clone());
+        } else if let Some(r) = self.half.take() {
+            self.tx.send(r).await.expect("ipc server gone");
+        }
     }
     /// Next pushed message (after `Subscribe`). `None` = the server closed.
     pub async fn next(&mut self) -> Option<IpcResponse> {

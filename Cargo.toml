@@ -56,7 +56,9 @@ unreachable_pub = "warn"
 missing_debug_implementations = "warn"
 unsafe_op_in_unsafe_fn = "deny"
 # `--cfg fogar_loom` is used by the loom gate (scripts/gates.sh) for fogar-core's custom primitive.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fogar_loom)"] }
+# `cfg(typeshare)` is never set: `#[cfg_attr(typeshare, typeshare)]` marks IPC wire types for the
+# typeshare CLI (Swift codegen, ADR-0004) without a runtime dependency.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fogar_loom)", "cfg(typeshare)"] }
 
 [workspace.lints.clippy]
 # clippy.toml next to each inner crate holds the disallowed-* lists; these make them errors.

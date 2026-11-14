@@ -41,13 +41,21 @@ impl IpcCaps {
 #[non_exhaustive]
 pub struct PeerIdentity {
     pub uid: Option<u32>,
-    /// Code-signing identifier when verified (macOS); `None` otherwise.
+    /// Code-signing identifier, set ONLY when the adapter verified that the peer is signed by
+    /// the same signer as the agent and carries the expected identifier (ADR-0002 amendment).
     pub code_id: Option<String>,
 }
 
 impl PeerIdentity {
     pub fn new(uid: Option<u32>, code_id: Option<String>) -> Self {
         Self { uid, code_id }
+    }
+    pub fn check(&self) -> PeerCheck {
+        if self.code_id.is_some() {
+            PeerCheck::SameSigner
+        } else {
+            PeerCheck::UidOnly
+        }
     }
 }
 
@@ -57,10 +65,14 @@ impl PeerIdentity {
 pub struct PairCode(secrecy::zeroize::Zeroizing<String>);
 
 impl PairCode {
-    /// Keeps the code only if it is exactly 6 ASCII digits once spaces are removed, so a typo
-    /// never spends one of the gateway's 5 attempts.
+    /// Keeps the code only if it is exactly 6 ASCII digits once whitespace (any kind, e.g. a
+    /// pasted no-break space) and `-` are removed, so a typo never spends one of the gateway's
+    /// 5 attempts.
     pub fn parse(typed: &str) -> Option<Self> {
-        let digits: String = typed.chars().filter(|c| *c != ' ').collect();
+        let digits: String = typed
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '-')
+            .collect();
         (digits.len() == 6 && digits.bytes().all(|b| b.is_ascii_digit()))
             .then(|| Self(secrecy::zeroize::Zeroizing::new(digits)))
     }
@@ -77,6 +89,11 @@ impl std::fmt::Debug for PairCode {
 
 /// Requests a UI may send. Closed set (no generic "exec"). The address in `Pair` is the person's
 /// raw input; the core validates it (`GatewayAddr::parse`).
+///
+/// Authorization (IPC-4): `Pair` and `Unpair` change where the agent sends the user's voice, so
+/// the core answers them only for a `PeerCheck::SameSigner` peer; a `UidOnly` peer gets
+/// `Refused` unless the composition root explicitly opts in for development builds. Everything
+/// else is read-only and open to any authenticated peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum IpcRequest {
@@ -86,7 +103,9 @@ pub enum IpcRequest {
     Status,
     /// From now on the agent pushes `IpcResponse::Event` with the latest status whenever it
     /// changes (latest value only, never a backlog). Answered with `Subscribed` + one `Event`.
-    /// A subscribed connection is not closed for being idle.
+    /// A subscribed connection is not closed for being idle, but a pushed `Event` that misses
+    /// the write deadline closes it (a client that stops reading cannot hold a slot), and
+    /// subscribers share the bounded connection slots (`IPC_MAX_CONNS`).
     Subscribe,
     /// Look for gateways (saved address, this Mac, later the tailnet). Answered with `Discovered`.
     Discover,
@@ -273,7 +292,8 @@ pub trait IpcConn: Send + 'static {
     fn recv(&mut self) -> impl Future<Output = Result<Option<IpcRequest>, IpcError>> + Send;
     /// Sends one response. Not a select branch; the core wraps it in a deadline. May be called
     /// without a preceding request (pushed `Event`s after `Subscribe`), and between a `recv`
-    /// that was cancelled and the next one: the connection stays usable both ways.
+    /// that was cancelled mid-frame and the next one: the partial request is kept and completed
+    /// by the next `recv` (contract clause `recv_is_cancel_safe_around_pushes`).
     fn send(&mut self, resp: IpcResponse) -> impl Future<Output = Result<(), IpcError>> + Send;
 }
 
@@ -282,4 +302,26 @@ pub trait IpcServer: Send + Sync + 'static {
     fn capabilities(&self) -> IpcCaps;
     /// Next authenticated connection. **Cancel-safe.**
     fn accept(&self) -> impl Future<Output = Result<(PeerIdentity, Self::Conn), IpcError>> + Send;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pair_code_accepts_what_people_paste() {
+        for ok in ["482913", "482 913", "482-913", "482\u{a0}913", " 482913\t"] {
+            assert_eq!(
+                PairCode::parse(ok)
+                    .map(|c| c.digits().to_owned())
+                    .as_deref(),
+                Some("482913"),
+                "{ok:?}"
+            );
+        }
+        for bad in ["48291", "4829134", "48a913", "", "４８２９１３"] {
+            assert!(PairCode::parse(bad).is_none(), "{bad:?}");
+        }
+        assert!(!format!("{:?}", PairCode::parse("482913")).contains("482913"));
+    }
 }

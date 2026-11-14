@@ -91,8 +91,10 @@ pub trait GatewayLink: Send + Sync + 'static {
     type Session: LinkSession;
     /// Opens a new transport session to `addr` (TCP [+TLS] + WS upgrade on `/ws/stream` for the
     /// real adapter). The address comes from the pairing record, so it can change between calls.
-    /// The adapter refuses addresses its transport policy forbids (e.g. clear text to a public
-    /// host) with `NotConfigured`. The core wraps this in its own deadline; dropping the future
+    /// For `Scheme::Plain` the adapter applies [`cleartext_allowed`] to EVERY resolved socket
+    /// address before sending a byte (not to the host string: a LAN name can resolve to a public
+    /// IP on a hostile network) and refuses with `NotConfigured`; it also refuses `Scheme::Tls`
+    /// when it has no TLS. The core wraps this in its own deadline; dropping the future
     /// must not leak a half-open socket.
     fn connect(
         &self,
@@ -102,6 +104,33 @@ pub trait GatewayLink: Send + Sync + 'static {
 
 /// Default gateway port (client-protocol §0).
 pub const DEFAULT_GATEWAY_PORT: u16 = 8004;
+/// Default port for `https://`/`wss://` addresses without one: a TLS proxy in front of the
+/// gateway. GUESSED (the protocol only names 8004 for plain LAN/tailnet access).
+pub const DEFAULT_TLS_PORT: u16 = 443;
+
+/// Single clear-text policy for every gateway transport (NET-1): the client key, the pairing
+/// code and the `/pair` reply may travel unencrypted only to loopback, private LAN (RFC 1918),
+/// Tailscale/CGNAT (100.64.0.0/10), IPv6 ULA (fc00::/7) and link-local addresses. IPv4-mapped
+/// IPv6 is judged as IPv4. Everything else needs TLS.
+pub fn cleartext_allowed(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || (o[0] == 100 && (o[1] & 0xC0) == 64)
+        }
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => cleartext_allowed(IpAddr::V4(v4)),
+            None => {
+                let seg0 = v6.segments()[0];
+                v6.is_loopback() || (seg0 & 0xfe00) == 0xfc00 || (seg0 & 0xffc0) == 0xfe80
+            }
+        },
+    }
+}
 
 /// Transport security of a gateway address. LAN and tailnet gateways speak clear text
 /// (`http`/`ws`); behind a TLS proxy, `https`/`wss` (client-protocol §0).
@@ -126,21 +155,23 @@ pub struct AddrError;
 
 impl GatewayAddr {
     /// Accepts `host`, `host:port`, `[v6]:port` and the same with `http://`, `https://`, `ws://`
-    /// or `wss://` in front (an optional trailing `/` or `/ws/stream` is ignored). Without a
-    /// scheme the address is plain text: GUESSED from client-protocol §0, which gives bare
-    /// `host:port` for LAN/tailnet and says nothing about how a client picks TLS.
+    /// or `wss://` in front (any case; an optional trailing `/`, `/ws/stream` or `/ws/stream/`
+    /// is ignored). Without a scheme the address is plain text: GUESSED from client-protocol §0,
+    /// which gives bare `host:port` for LAN/tailnet and says nothing about how a client picks
+    /// TLS; [`cleartext_allowed`] keeps such an address off the public internet. IPv6 zone ids
+    /// (`%en0`) are rejected on purpose (link-local gateways are not a supported setup).
     pub fn parse(input: &str) -> Result<Self, AddrError> {
         let s = input.trim();
         let (scheme, rest) = match s.split_once("://") {
-            Some(("http" | "ws", r)) => (Scheme::Plain, r),
-            Some(("https" | "wss", r)) => (Scheme::Tls, r),
-            Some(_) => return Err(AddrError),
+            Some((sch, r)) => match sch.to_ascii_lowercase().as_str() {
+                "http" | "ws" => (Scheme::Plain, r),
+                "https" | "wss" => (Scheme::Tls, r),
+                _ => return Err(AddrError),
+            },
             None => (Scheme::Plain, s),
         };
-        let rest = rest
-            .strip_suffix("/ws/stream")
-            .or_else(|| rest.strip_suffix('/'))
-            .unwrap_or(rest);
+        let rest = rest.strip_suffix('/').unwrap_or(rest);
+        let rest = rest.strip_suffix("/ws/stream").unwrap_or(rest);
         if rest.is_empty()
             || rest.len() > 255
             || rest
@@ -177,6 +208,7 @@ impl GatewayAddr {
             return Err(AddrError);
         }
         let port = match port {
+            None if scheme == Scheme::Tls => DEFAULT_TLS_PORT,
             None => DEFAULT_GATEWAY_PORT,
             Some(p) => match p.parse::<u16>() {
                 Ok(0) | Err(_) => return Err(AddrError),
@@ -234,11 +266,13 @@ mod tests {
         );
         let a = GatewayAddr::parse(" 192.168.1.19:9000 ").unwrap();
         assert_eq!((a.host(), a.port()), ("192.168.1.19", 9000));
-        let a = GatewayAddr::parse("https://Fogar.Example.com/").unwrap();
+        let a = GatewayAddr::parse("HTTPS://Fogar.Example.com/").unwrap();
         assert_eq!(
             (a.scheme(), a.host(), a.port()),
-            (Scheme::Tls, "fogar.example.com", 8004)
+            (Scheme::Tls, "fogar.example.com", 443)
         );
+        let a = GatewayAddr::parse("wss://gw.example:8443/ws/stream/").unwrap();
+        assert_eq!((a.scheme(), a.port()), (Scheme::Tls, 8443));
         let a = GatewayAddr::parse("ws://127.0.0.1:8004/ws/stream").unwrap();
         assert_eq!(a.authority(), "127.0.0.1:8004");
         let a = GatewayAddr::parse("[fd7a:115c::1]:8004").unwrap();
@@ -248,6 +282,39 @@ mod tests {
         );
         let a = GatewayAddr::parse("gw.tail1234.ts.net").unwrap();
         assert_eq!(GatewayAddr::parse(&a.to_string()), Ok(a));
+    }
+
+    #[test]
+    fn cleartext_only_to_private_networks() {
+        let ok = |s: &str| cleartext_allowed(s.parse().unwrap());
+        for a in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.19",
+            "100.64.0.1",
+            "100.127.255.254",
+            "169.254.1.1",
+            "::1",
+            "fd7a:115c:a1e0::1",
+            "fe80::1",
+            "::ffff:192.168.1.19",
+        ] {
+            assert!(ok(a), "{a}");
+        }
+        for a in [
+            "8.8.8.8",
+            "203.0.113.7",
+            "100.128.0.1",
+            "100.63.255.255",
+            "172.32.0.1",
+            "2001:4860::8888",
+            "::ffff:8.8.8.8",
+            "0.0.0.0",
+            "::",
+        ] {
+            assert!(!ok(a), "{a}");
+        }
     }
 
     #[test]
@@ -268,6 +335,7 @@ mod tests {
             "http://",
             "host#f",
             "h\u{0}x",
+            "[fe80::1%en0]",
         ] {
             assert_eq!(GatewayAddr::parse(bad), Err(AddrError), "{bad:?}");
         }

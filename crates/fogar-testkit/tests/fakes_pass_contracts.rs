@@ -80,8 +80,14 @@ mod mock_http_server_matches_the_fake {
         path: &str,
         body: &[u8],
     ) -> Result<fogar_ports::gateway_http::HttpReply, fogar_ports::gateway_http::HttpError> {
+        use fogar_ports::gateway::cleartext_allowed;
         use fogar_ports::gateway_http::{HttpError, HttpReply, MAX_BODY_BYTES};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        if let Ok(ip) = addr.host().parse::<std::net::IpAddr>()
+            && !cleartext_allowed(ip)
+        {
+            return Err(HttpError::Refused);
+        }
         let mut s = tokio::net::TcpStream::connect(addr.authority())
             .await
             .map_err(|_| HttpError::Unreachable)?;
@@ -92,8 +98,18 @@ mod mock_http_server_matches_the_fake {
         );
         s.write_all(req.as_bytes()).await.unwrap();
         s.write_all(body).await.unwrap();
+        // Bounded WHILE reading (an endless body must not be buffered first).
         let mut out = Vec::new();
-        s.read_to_end(&mut out).await.unwrap();
+        loop {
+            if out.len() > MAX_BODY_BYTES + 1024 {
+                return Err(HttpError::TooLarge {
+                    max: MAX_BODY_BYTES,
+                });
+            }
+            if s.read_buf(&mut out).await.unwrap() == 0 {
+                break;
+            }
+        }
         let i = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
         let status: u16 = String::from_utf8_lossy(&out[9..12]).parse().unwrap();
         let body = out[i + 4..].to_vec();

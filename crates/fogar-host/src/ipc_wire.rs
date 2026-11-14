@@ -3,7 +3,9 @@
 //! `MAX_FRAME_BYTES`, `"type"`-tagged, `deny_unknown_fields`, closed vocabulary.
 //!
 //! Sans-I/O: framing works on byte buffers; adapters own the socket and peer authentication.
-//! Pairing codes cross this layer once and are wiped on drop; no key ever does.
+//! Pairing codes cross this layer once; the frame buffers holding them are wiped. serde_json's
+//! internal scratch for escaped strings is not (codes are 6 digits, never escaped). No key
+//! ever crosses IPC.
 
 use fogar_ports::ipc::{
     GatewayCandidate, GatewayInfo, IpcError, IpcRequest, IpcResponse, LinkPhase, MAX_FRAME_BYTES,
@@ -13,6 +15,7 @@ use secrecy::zeroize::{Zeroize, Zeroizing};
 use serde::{Deserialize, Serialize};
 
 /// The pairing code on the wire: redacted `Debug`, wiped on drop.
+#[cfg_attr(typeshare, typeshare)]
 #[derive(Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct WireCode(String);
@@ -29,17 +32,45 @@ impl Drop for WireCode {
     }
 }
 
+// Shape rules (so `typeshare --lang=swift` can generate `Codable` types, ADR-0004): enums
+// that carry data are adjacently tagged `{"type": ..., "data": {...}}` with one struct per
+// variant; data-less variants are `{"type": ...}`; counters are `u64` sent as Swift `Int`.
+// Changing any of this, or adding an enum value, is an IPC_VERSION bump (the Swift enums are
+// closed). The golden JSON test below pins the shape.
+
+#[cfg_attr(typeshare, typeshare)]
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum WireRequest {
-    Hello { version: u32 },
-    Status {},
-    Subscribe {},
-    Discover {},
-    Pair { address: String, code: WireCode },
-    Unpair {},
+#[serde(deny_unknown_fields)]
+pub struct WireHello {
+    pub version: u32,
 }
 
+#[cfg_attr(typeshare, typeshare)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WirePair {
+    pub address: String,
+    pub code: WireCode,
+}
+
+#[cfg_attr(typeshare, typeshare)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    content = "data",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum WireRequest {
+    Hello(WireHello),
+    Status,
+    Subscribe,
+    Discover,
+    Pair(WirePair),
+    Unpair,
+}
+
+#[cfg_attr(typeshare, typeshare)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WirePhase {
@@ -51,6 +82,7 @@ pub enum WirePhase {
     Stopping,
 }
 
+#[cfg_attr(typeshare, typeshare)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WirePeerCheck {
@@ -58,6 +90,7 @@ pub enum WirePeerCheck {
     SameSigner,
 }
 
+#[cfg_attr(typeshare, typeshare)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WirePairFailure {
@@ -72,6 +105,7 @@ pub enum WirePairFailure {
     Busy,
 }
 
+#[cfg_attr(typeshare, typeshare)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireGateway {
@@ -81,6 +115,7 @@ pub struct WireGateway {
     pub client_name: String,
 }
 
+#[cfg_attr(typeshare, typeshare)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireCandidate {
@@ -89,37 +124,68 @@ pub struct WireCandidate {
     pub version: String,
 }
 
+#[cfg_attr(typeshare, typeshare)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireStatus {
     pub link: String,
     pub phase: WirePhase,
     pub gateway: Option<WireGateway>,
+    #[cfg_attr(typeshare, typeshare(serialized_as = "Int"))]
     pub sessions: u64,
+    #[cfg_attr(typeshare, typeshare(serialized_as = "Int"))]
     pub turns_completed: u64,
     pub boot_mode: String,
     pub peer_check: WirePeerCheck,
 }
 
+#[cfg_attr(typeshare, typeshare)]
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
+pub struct WireRefused {
+    pub reason: String,
+}
+
+#[cfg_attr(typeshare, typeshare)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireDiscovered {
+    pub gateways: Vec<WireCandidate>,
+}
+
+#[cfg_attr(typeshare, typeshare)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WirePairFailed {
+    pub reason: WirePairFailure,
+}
+
+#[cfg_attr(typeshare, typeshare)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    content = "data",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum WireResponse {
-    Hello { version: u32 },
-    Status { status: WireStatus },
-    Refused { reason: String },
-    Subscribed {},
-    Event { status: WireStatus },
-    Discovered { gateways: Vec<WireCandidate> },
-    Paired { gateway: WireGateway },
-    PairFailed { reason: WirePairFailure },
-    Unpaired {},
+    Hello(WireHello),
+    Status(WireStatus),
+    Refused(WireRefused),
+    Subscribed,
+    Event(WireStatus),
+    Discovered(WireDiscovered),
+    Paired(WireGateway),
+    PairFailed(WirePairFailed),
+    Unpaired,
 }
 
 // ---- framing -----------------------------------------------------------------------------
 
 /// Pops one complete frame body from `buf` if present (leaves partial frames in place, so a
 /// reader that keeps `buf` across cancelled reads is cancel-safe).
-pub fn take_frame(buf: &mut Vec<u8>) -> Result<Option<Vec<u8>>, IpcError> {
+/// The returned body and the consumed bytes of `buf` are wiped (a pairing code may be inside).
+pub fn take_frame(buf: &mut Vec<u8>) -> Result<Option<Zeroizing<Vec<u8>>>, IpcError> {
     let Some(hdr) = buf.first_chunk::<4>() else {
         return Ok(None);
     };
@@ -133,13 +199,14 @@ pub fn take_frame(buf: &mut Vec<u8>) -> Result<Option<Vec<u8>>, IpcError> {
     if buf.len() < 4 + len {
         return Ok(None);
     }
-    let body = buf[4..4 + len].to_vec();
+    let body = Zeroizing::new(buf[4..4 + len].to_vec());
+    buf[..4 + len].zeroize();
     buf.drain(..4 + len);
     Ok(Some(body))
 }
 
-/// Length-prefixes `body`.
-pub fn frame(body: &[u8]) -> Result<Vec<u8>, IpcError> {
+/// Length-prefixes `body` into one pre-sized, wiped-on-drop buffer.
+pub fn frame(body: &[u8]) -> Result<Zeroizing<Vec<u8>>, IpcError> {
     if body.len() > MAX_FRAME_BYTES {
         return Err(IpcError::TooLarge {
             len: body.len(),
@@ -147,7 +214,7 @@ pub fn frame(body: &[u8]) -> Result<Vec<u8>, IpcError> {
         });
     }
     let len = u32::try_from(body.len()).map_err(|_| IpcError::Malformed)?;
-    let mut out = Vec::with_capacity(4 + body.len());
+    let mut out = Zeroizing::new(Vec::with_capacity(4 + body.len()));
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(body);
     Ok(out)
@@ -159,15 +226,15 @@ pub fn frame(body: &[u8]) -> Result<Vec<u8>, IpcError> {
 pub fn decode_request(body: &[u8]) -> Result<IpcRequest, IpcError> {
     Ok(
         match serde_json::from_slice::<WireRequest>(body).map_err(|_| IpcError::Malformed)? {
-            WireRequest::Hello { version } => IpcRequest::Hello { version },
-            WireRequest::Status {} => IpcRequest::Status,
-            WireRequest::Subscribe {} => IpcRequest::Subscribe,
-            WireRequest::Discover {} => IpcRequest::Discover,
-            WireRequest::Pair { address, code } => IpcRequest::Pair {
-                address,
-                code: PairCode::parse(&code.0),
+            WireRequest::Hello(h) => IpcRequest::Hello { version: h.version },
+            WireRequest::Status => IpcRequest::Status,
+            WireRequest::Subscribe => IpcRequest::Subscribe,
+            WireRequest::Discover => IpcRequest::Discover,
+            WireRequest::Pair(p) => IpcRequest::Pair {
+                code: PairCode::parse(&p.code.0),
+                address: p.address,
             },
-            WireRequest::Unpair {} => IpcRequest::Unpair,
+            WireRequest::Unpair => IpcRequest::Unpair,
         },
     )
 }
@@ -175,19 +242,19 @@ pub fn decode_request(body: &[u8]) -> Result<IpcRequest, IpcError> {
 /// Client side (CLI, contract tests, the reference for the Swift app).
 pub fn encode_request(r: &IpcRequest) -> Result<Zeroizing<Vec<u8>>, IpcError> {
     let w = match r {
-        IpcRequest::Hello { version } => WireRequest::Hello { version: *version },
-        IpcRequest::Status => WireRequest::Status {},
-        IpcRequest::Subscribe => WireRequest::Subscribe {},
-        IpcRequest::Discover => WireRequest::Discover {},
-        IpcRequest::Pair { address, code } => WireRequest::Pair {
+        IpcRequest::Hello { version } => WireRequest::Hello(WireHello { version: *version }),
+        IpcRequest::Status => WireRequest::Status,
+        IpcRequest::Subscribe => WireRequest::Subscribe,
+        IpcRequest::Discover => WireRequest::Discover,
+        IpcRequest::Pair { address, code } => WireRequest::Pair(WirePair {
             address: address.clone(),
             code: WireCode(
                 code.as_ref()
                     .map(|c| c.digits().to_owned())
                     .unwrap_or_default(),
             ),
-        },
-        IpcRequest::Unpair => WireRequest::Unpair {},
+        }),
+        IpcRequest::Unpair => WireRequest::Unpair,
         _ => return Err(IpcError::Unsupported("request not in the wire vocabulary")),
     };
     serde_json::to_vec(&w)
@@ -295,18 +362,14 @@ fn status_from_wire(s: WireStatus) -> StatusReport {
 /// Server side: port response -> frame body.
 pub fn encode_response(r: IpcResponse) -> Result<Vec<u8>, IpcError> {
     let w = match r {
-        IpcResponse::Hello { version } => WireResponse::Hello { version },
-        IpcResponse::Status(s) => WireResponse::Status {
-            status: status_to_wire(s),
-        },
-        IpcResponse::Refused { reason } => WireResponse::Refused {
+        IpcResponse::Hello { version } => WireResponse::Hello(WireHello { version }),
+        IpcResponse::Status(s) => WireResponse::Status(status_to_wire(s)),
+        IpcResponse::Refused { reason } => WireResponse::Refused(WireRefused {
             reason: reason.to_owned(),
-        },
-        IpcResponse::Subscribed => WireResponse::Subscribed {},
-        IpcResponse::Event(s) => WireResponse::Event {
-            status: status_to_wire(s),
-        },
-        IpcResponse::Discovered(c) => WireResponse::Discovered {
+        }),
+        IpcResponse::Subscribed => WireResponse::Subscribed,
+        IpcResponse::Event(s) => WireResponse::Event(status_to_wire(s)),
+        IpcResponse::Discovered(c) => WireResponse::Discovered(WireDiscovered {
             gateways: c
                 .into_iter()
                 .map(|c| WireCandidate {
@@ -315,17 +378,15 @@ pub fn encode_response(r: IpcResponse) -> Result<Vec<u8>, IpcError> {
                     version: c.version,
                 })
                 .collect(),
-        },
-        IpcResponse::Paired(g) => WireResponse::Paired {
-            gateway: gateway_to_wire(g),
-        },
-        IpcResponse::PairFailed(f) => WireResponse::PairFailed {
+        }),
+        IpcResponse::Paired(g) => WireResponse::Paired(gateway_to_wire(g)),
+        IpcResponse::PairFailed(f) => WireResponse::PairFailed(WirePairFailed {
             reason: failure_to_wire(f),
-        },
-        IpcResponse::Unpaired => WireResponse::Unpaired {},
-        _ => WireResponse::Refused {
+        }),
+        IpcResponse::Unpaired => WireResponse::Unpaired,
+        _ => WireResponse::Refused(WireRefused {
             reason: "unsupported response".to_owned(),
-        },
+        }),
     };
     serde_json::to_vec(&w).map_err(|_| IpcError::Malformed)
 }
@@ -335,22 +396,20 @@ pub fn encode_response(r: IpcResponse) -> Result<Vec<u8>, IpcError> {
 pub fn decode_response(body: &[u8]) -> Result<IpcResponse, IpcError> {
     Ok(
         match serde_json::from_slice::<WireResponse>(body).map_err(|_| IpcError::Malformed)? {
-            WireResponse::Hello { version } => IpcResponse::Hello { version },
-            WireResponse::Status { status } => IpcResponse::Status(status_from_wire(status)),
-            WireResponse::Refused { .. } => IpcResponse::Refused { reason: "refused" },
-            WireResponse::Subscribed {} => IpcResponse::Subscribed,
-            WireResponse::Event { status } => IpcResponse::Event(status_from_wire(status)),
-            WireResponse::Discovered { gateways } => IpcResponse::Discovered(
-                gateways
+            WireResponse::Hello(h) => IpcResponse::Hello { version: h.version },
+            WireResponse::Status(s) => IpcResponse::Status(status_from_wire(s)),
+            WireResponse::Refused(_) => IpcResponse::Refused { reason: "refused" },
+            WireResponse::Subscribed => IpcResponse::Subscribed,
+            WireResponse::Event(s) => IpcResponse::Event(status_from_wire(s)),
+            WireResponse::Discovered(d) => IpcResponse::Discovered(
+                d.gateways
                     .into_iter()
                     .map(|c| GatewayCandidate::new(c.address, c.name, c.version))
                     .collect(),
             ),
-            WireResponse::Paired { gateway } => IpcResponse::Paired(gateway_from_wire(gateway)),
-            WireResponse::PairFailed { reason } => {
-                IpcResponse::PairFailed(failure_from_wire(reason))
-            }
-            WireResponse::Unpaired {} => IpcResponse::Unpaired,
+            WireResponse::Paired(g) => IpcResponse::Paired(gateway_from_wire(g)),
+            WireResponse::PairFailed(f) => IpcResponse::PairFailed(failure_from_wire(f.reason)),
+            WireResponse::Unpaired => IpcResponse::Unpaired,
         },
     )
 }
@@ -379,7 +438,10 @@ mod tests {
     #[test]
     fn framing_limits() {
         let mut b = vec![0, 0, 0, 2, b'{', b'}', 9];
-        assert_eq!(take_frame(&mut b).unwrap(), Some(b"{}".to_vec()));
+        assert_eq!(
+            take_frame(&mut b).unwrap().as_deref(),
+            Some(&b"{}".to_vec())
+        );
         assert_eq!(b, vec![9]);
         let mut big = (u32::try_from(MAX_FRAME_BYTES).unwrap() + 1)
             .to_be_bytes()
@@ -413,12 +475,17 @@ mod tests {
         ] {
             assert_eq!(decode_request(&encode_request(&r).unwrap()).unwrap(), r);
         }
+        assert_eq!(
+            decode_request(br#"{"type":"status"}"#).unwrap(),
+            IpcRequest::Status
+        );
         assert!(decode_request(br#"{"type":"status","exec":"rm -rf"}"#).is_err());
-        assert!(decode_request(br#"{"type":"run","cmd":"x"}"#).is_err());
-        assert!(decode_request(br#"{"type":"pair","address":"x"}"#).is_err());
+        assert!(decode_request(br#"{"type":"run","data":{"cmd":"x"}}"#).is_err());
+        assert!(decode_request(br#"{"type":"pair","data":{"address":"x"}}"#).is_err());
+        assert!(decode_request(br#"{"type":"hello","data":{"version":2,"admin":true}}"#).is_err());
         // A typo is decoded (so the core can answer BadCode), not dropped as malformed.
         assert_eq!(
-            decode_request(br#"{"type":"pair","address":"x","code":"12a456"}"#).unwrap(),
+            decode_request(br#"{"type":"pair","data":{"address":"x","code":"12a456"}}"#).unwrap(),
             IpcRequest::Pair {
                 address: "x".into(),
                 code: None
@@ -455,13 +522,27 @@ mod tests {
         let s = String::from_utf8(encode_response(IpcResponse::Event(report())).unwrap()).unwrap();
         assert_eq!(
             s,
-            r#"{"type":"event","status":{"link":"ready","phase":"ready","gateway":{"address":"http://green-house:8004","name":"green-house","version":"1.29.0","client_name":"Mac de Sito"},"sessions":3,"turns_completed":7,"boot_mode":"normal","peer_check":"same_signer"}}"#
+            r#"{"type":"event","data":{"link":"ready","phase":"ready","gateway":{"address":"http://green-house:8004","name":"green-house","version":"1.29.0","client_name":"Mac de Sito"},"sessions":3,"turns_completed":7,"boot_mode":"normal","peer_check":"same_signer"}}"#
         );
         let s = String::from_utf8(
             encode_response(IpcResponse::PairFailed(PairFailure::InvalidCode)).unwrap(),
         )
         .unwrap();
-        assert_eq!(s, r#"{"type":"pair_failed","reason":"invalid_code"}"#);
+        assert_eq!(
+            s,
+            r#"{"type":"pair_failed","data":{"reason":"invalid_code"}}"#
+        );
+        let s = String::from_utf8(encode_response(IpcResponse::Subscribed).unwrap()).unwrap();
+        assert_eq!(s, r#"{"type":"subscribed"}"#);
+        let r = encode_request(&IpcRequest::Pair {
+            address: "green-house".into(),
+            code: PairCode::parse("482913"),
+        })
+        .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&r).unwrap(),
+            r#"{"type":"pair","data":{"address":"green-house","code":"482913"}}"#
+        );
     }
 
     #[test]
