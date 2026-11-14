@@ -1,0 +1,4 @@
+# typeshare config for the Swift wire types (scripts/gen-wire.sh). Public generated types need
+# explicit Sendable; Equatable/Hashable let SwiftUI diff them.
+[swift]
+default_decorators = ["Sendable", "Equatable", "Hashable"]
