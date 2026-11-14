@@ -126,7 +126,6 @@ struct Nodo: ViewModifier {
             .background {
                 RoundedRectangle(cornerRadius: Medida.radioNodo)
                     .fill(punteado ? Color.clear : Color.vidrioFino)
-                    .background(punteado ? nil : RoundedRectangle(cornerRadius: Medida.radioNodo).fill(.ultraThinMaterial).opacity(0.35))
             }
             .overlay {
                 RoundedRectangle(cornerRadius: Medida.radioNodo)

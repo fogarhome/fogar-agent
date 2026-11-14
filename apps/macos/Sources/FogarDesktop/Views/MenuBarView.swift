@@ -13,7 +13,7 @@ struct MenuBarView: View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .center, spacing: 8) {
                 LineaViva(pose: .rest, etiqueta: "Fogar", quieta: true).frame(width: 58)
-                Text("Desktop").meta().padding(.top, 5)
+                Text("Desktop").meta()
             }
             .accessibilityElement(children: .combine)
             .accessibilityLabel("Fogar Desktop")

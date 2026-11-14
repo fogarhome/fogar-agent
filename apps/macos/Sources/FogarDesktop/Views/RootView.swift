@@ -62,7 +62,7 @@ struct BarraLateral: View {
             HStack(alignment: .center, spacing: 8) {
                 LineaViva(pose: .rest, etiqueta: "Fogar", quieta: true)
                     .frame(width: 74)
-                Text("Desktop").meta().padding(.top, 6)
+                Text("Desktop").meta()
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 18)

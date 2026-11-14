@@ -79,7 +79,7 @@ final class LineaMotor {
             acc -= 1.0 / 120
             k += 1
         }
-        if cur == .rest { waveFill(t - waveT0) } else { wdy = .init(repeating: 0, count: n); wmul = .init(repeating: 1, count: n) }
+        if cur == .rest { waveFill(t - waveT0) } else { for i in 0..<n { wdy[i] = 0; wmul[i] = 1 } }
         return ((0..<n).map { CGPoint(x: p[$0].x, y: p[$0].y + wdy[$0]) }, wmul)
     }
 
@@ -128,7 +128,7 @@ final class LineaMotor {
     /// 0 nothing, 1 the F's bar plucked, 2 the wave across the letters. Fills `wdy` and `wmul`.
     @discardableResult
     private func waveFill(_ tw: Double) -> Int {
-        wdy = .init(repeating: 0, count: n); wmul = .init(repeating: 1, count: n)
+        for i in 0..<n { wdy[i] = 0; wmul[i] = 1 }
         guard tw >= 0 && tw <= 2.8 else { return 0 }
         let c: Double, amp: Double
         if tw < 1 { // a plucked string: the F's arm bends 10 px and is let go; the ember runs along it

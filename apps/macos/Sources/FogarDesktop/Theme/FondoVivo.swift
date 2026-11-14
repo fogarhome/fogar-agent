@@ -15,21 +15,87 @@ struct FondoVivo: View {
     @Environment(\.accessibilityReduceMotion) private var reduce
     @Environment(\.colorScheme) private var scheme
     @Environment(\.ventanaVisible) private var visible
+    @Environment(\.controlActiveState) private var activa
 
     var body: some View {
-        let parado = quieto || reduce || !visible
-        TimelineView(.animation(minimumInterval: 1 / 30, paused: parado)) { tl in
-            let t = parado ? 0 : tl.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 100_000)
-            if let img = FondoPintor.pinta(t: t, calor: calor, humo: humo, velocidad: velocidad, oscuro: scheme == .dark) {
-                Image(decorative: img, scale: 1).resizable().interpolation(.high)
-            }
-        }
-        .overlay(Grano().opacity(0.03))
-        .mask(EllipticalGradient(stops: [.init(color: .black, location: 0), .init(color: .black, location: 0.55),
-                                         .init(color: .clear, location: 1)], endRadiusFraction: 0.5))
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
+        // Moves only while you look at it: window on screen and the app in front. The smoke is slow
+        // (velocity 0.4), so 12 frames a second read as continuous.
+        CapaFondo(calor: calor, humo: humo, velocidad: velocidad, oscuro: scheme == .dark,
+                  animado: !(quieto || reduce || !visible || activa == .inactive))
+            // The grain is a static layer of its own (never redrawn per frame), faded like the smoke.
+            .overlay(Grano().opacity(0.03).mask(FondoVivo.mascara))
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
     }
+}
+
+/// The smoke in its own Core Animation layer: each frame only swaps the layer's 112 × 64 contents
+/// and the GPU scales it. Drawing it through SwiftUI made the whole screen re-render 12 times a
+/// second (~10 % CPU on a large window); this way the rest of the view tree is untouched.
+private struct CapaFondo: NSViewRepresentable {
+    let calor: Double, humo: Double, velocidad: Double, oscuro: Bool, animado: Bool
+
+    func makeNSView(context: Context) -> Vista { Vista() }
+
+    func updateNSView(_ v: Vista, context: Context) {
+        v.parametros = (calor, humo, velocidad, oscuro)
+        v.animado = animado
+        v.pintar()
+    }
+
+    final class Vista: NSView {
+        var parametros = (0.38, 0.75, 0.4, true)
+        var animado = false { didSet { if animado != oldValue { programar() } } }
+        private var reloj: Timer?
+        /// Time keeps running only while animated, so pausing and resuming never jumps.
+        private var t = 0.0, ultimo: Date?
+
+        override init(frame: NSRect) {
+            super.init(frame: frame)
+            wantsLayer = true
+            layer?.contentsGravity = .resize
+            layer?.magnificationFilter = .linear
+        }
+
+        required init?(coder: NSCoder) { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            programar()
+        }
+
+        private func programar() {
+            reloj?.invalidate()
+            reloj = nil
+            ultimo = nil
+            guard animado, window != nil else { return }
+            let r = Timer(timeInterval: 1.0 / 12, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.pintar() }
+            }
+            r.tolerance = 0.02 // lets the system coalesce wake-ups
+            RunLoop.main.add(r, forMode: .common)
+            reloj = r
+        }
+
+        func pintar() {
+            let ahora = Date()
+            if animado, let u = ultimo { t += ahora.timeIntervalSince(u) }
+            ultimo = animado ? ahora : nil
+            let (c, h, v, o) = parametros
+            layer?.contents = FondoPintor.pinta(t: t, calor: c, humo: h, velocidad: v, oscuro: o)
+        }
+
+        override func removeFromSuperview() {
+            reloj?.invalidate()
+            super.removeFromSuperview()
+        }
+    }
+}
+
+extension FondoVivo {
+    /// `radial-gradient(closest-side, #000 55%, transparent 100%)`
+    static let mascara = EllipticalGradient(stops: [.init(color: .black, location: 0), .init(color: .black, location: 0.55),
+                                                    .init(color: .clear, location: 1)], endRadiusFraction: 0.5)
 }
 
 private struct Grano: View {
@@ -105,6 +171,13 @@ enum FondoPintor {
             radial(x, X, Y, r, [(nucleo, tope * a, 0), (rescoldo, 0.28 * a, 0.5), (rescoldo, 0, 1)])
             radial(x, X, Y, r * 0.4, [(chispa, 0.1 * a * tono, 0), (chispa, 0, 1)])
         }
+        // The elliptical fade into the night, baked into the bitmap: compositing a mask over a
+        // scaled image every frame cost more than painting the frame.
+        x.setBlendMode(.destinationIn)
+        x.saveGState()
+        x.scaleBy(x: 1, y: H / W)
+        radial(x, W / 2, W / 2, W / 2, [(noche, 1, 0), (noche, 1, 0.55), (noche, 0, 1)], hastaElBorde: true)
+        x.restoreGState()
         return x.makeImage()
     }
 
@@ -112,11 +185,15 @@ enum FondoPintor {
         CGColor(srgbRed: c.0 / 255, green: c.1 / 255, blue: c.2 / 255, alpha: a)
     }
 
-    private static func radial(_ x: CGContext, _ cx: Double, _ cy: Double, _ r: Double, _ stops: [(RGB, Double, Double)]) {
+    /// `hastaElBorde`: also paints past the end radius with the last stop (needed by the mask:
+    /// destination-in keeps whatever the gradient does not cover).
+    private static func radial(_ x: CGContext, _ cx: Double, _ cy: Double, _ r: Double, _ stops: [(RGB, Double, Double)],
+                               hastaElBorde: Bool = false) {
         guard let g = CGGradient(colorsSpace: space, colors: stops.map { color($0.0, $0.1) } as CFArray,
                                  locations: stops.map { CGFloat($0.2) }) else { return }
         x.drawRadialGradient(g, startCenter: CGPoint(x: cx, y: cy), startRadius: 0,
-                             endCenter: CGPoint(x: cx, y: cy), endRadius: r, options: [])
+                             endCenter: CGPoint(x: cx, y: cy), endRadius: r,
+                             options: hastaElBorde ? [.drawsAfterEndLocation] : [])
     }
 }
 

@@ -21,7 +21,6 @@ struct FogarDesktopApp: App {
             RootView()
                 .environment(link)
                 .environment(nav)
-                .preferredColorScheme(apariencia.esquema)
         }
         .defaultSize(width: 1100, height: 740)
         .windowToolbarStyle(.unified(showsTitle: false))
@@ -31,16 +30,17 @@ struct FogarDesktopApp: App {
             AjustesView(enVentana: false)
                 .environment(link)
                 .environment(nav)
-                .preferredColorScheme(apariencia.esquema)
         }
 
         MenuBarExtra {
             MenuBarView()
                 .environment(link)
                 .environment(nav)
-                .preferredColorScheme(apariencia.esquema)
         } label: {
+            // The label lives as long as the app: it applies the appearance to every window,
+            // the menu bar panel included (preferredColorScheme does not reach that panel).
             MenuBarIcono(state: link.state)
+                .onChange(of: apariencia, initial: true) { _, a in NSApp.appearance = a.nsAppearance }
         }
         .menuBarExtraStyle(.window)
     }
@@ -90,11 +90,11 @@ final class Navegacion {
 enum Apariencia: String, CaseIterable, Identifiable {
     case sistema, oscura, clara
     var id: Self { self }
-    var esquema: ColorScheme? {
+    var nsAppearance: NSAppearance? {
         switch self {
         case .sistema: nil
-        case .oscura: .dark
-        case .clara: .light
+        case .oscura: NSAppearance(named: .darkAqua)
+        case .clara: NSAppearance(named: .aqua)
         }
     }
 

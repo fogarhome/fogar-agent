@@ -13,7 +13,7 @@ extension Color {
     static let veta = dyn(0x252F32, 0xCBC3B4)
     static let hueso = dyn(0xECE6DC, 0x0B1012)
     static let huesoSuave = dyn(0xB8BEC2, 0x353F43)
-    static let huesoTenue = dyn(0x8B969F, 0x56616A)
+    static let huesoTenue = dyn(0x8B969F, 0x4E5961)
 
     // Acción: el botón principal es la tinta invertida.
     static let accion = dyn(0xECE6DC, 0x0B1012)
