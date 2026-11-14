@@ -101,11 +101,10 @@ fn ipc_reports_peer_check_honestly() {
             std::fs::metadata(server.path()).unwrap().uid()
         };
         assert_eq!(peer.uid, Some(me));
-        // `cargo test` binaries are linker/ad-hoc signed: no Team ID, so never SameSigner.
-        // (Signed agents are exercised by examples/signer_probe.rs; results in ADR-0002.)
-        if caps.peer_code_identity == Support::Unsupported {
-            assert_eq!(peer.check(), PeerCheck::UidOnly);
-        }
+        // The client is this test binary: never the companion app id, signed or not. Signed
+        // agents and peers are exercised by examples/signer_probe.rs (results in ADR-0002).
+        assert_eq!(peer.check(), PeerCheck::UidOnly);
+        assert_eq!(peer.code_id(), None);
     });
 }
 

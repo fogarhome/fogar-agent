@@ -6,7 +6,7 @@
 //! cargo build -p fogar-agent-macos --example signer_probe
 //! cp target/debug/examples/signer_probe agent && cp agent app && cp agent adhoc
 //! codesign -f -s "<Apple Development identity>" -i com.fogar.agent agent
-//! codesign -f -s "<Apple Development identity>" -i com.fogar.desktop app
+//! codesign -f -s "<Apple Development identity>" -o runtime -i com.fogar.desktop app
 //! codesign -f -s - -i com.fogar.desktop adhoc
 //! ./agent server /tmp/fp & sleep 0.3; ./app client /tmp/fp; wait      # SameSigner
 //! ./agent server /tmp/fp & sleep 0.3; ./adhoc client /tmp/fp; wait    # UidOnly

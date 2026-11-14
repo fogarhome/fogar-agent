@@ -19,6 +19,7 @@ use core_foundation::{
     base::{CFType, TCFType},
     data::CFData,
     dictionary::{CFDictionary, CFDictionaryRef},
+    number::CFNumber,
     string::{CFString, CFStringRef},
 };
 use fogar_host::ipc_wire::{
@@ -38,10 +39,14 @@ use std::{
         unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
     },
     path::{Path, PathBuf},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
+    sync::Mutex,
+    task::JoinSet,
+    time::Instant,
 };
 use zeroize::Zeroizing;
 
@@ -52,8 +57,14 @@ const MAX_SOCKET_PATH: usize = 103;
 /// `com.fogar.desktop` (GUESSED)"); frozen once the app ships.
 pub const COMPANION_APP_ID: &str = "com.fogar.desktop";
 
-/// `kSecCSSigningInformation` (`<Security/SecCode.h>`).
+/// `kSecCSSigningInformation` / `kSecCSDynamicInformation` (`<Security/SecCode.h>`).
 const K_SEC_CS_SIGNING_INFORMATION: u32 = 1 << 1;
+const K_SEC_CS_DYNAMIC_INFORMATION: u32 = 1 << 3;
+/// `CS_RUNTIME` (`<kern/cs_blobs.h>`): the process runs with the hardened runtime, so another
+/// same-user process cannot inject code into it (no `DYLD_INSERT_LIBRARIES`, library validation).
+const CS_RUNTIME: u32 = 0x0001_0000;
+/// Upper bound for one peer check (SecCode talks to securityd and may validate a bundle on disk).
+const PEER_CHECK_DEADLINE: Duration = Duration::from_secs(2);
 
 #[link(name = "Security", kind = "framework")]
 unsafe extern "C" {
@@ -64,6 +75,7 @@ unsafe extern "C" {
         information: *mut CFDictionaryRef,
     ) -> i32;
     static kSecCodeInfoTeamIdentifier: CFStringRef;
+    static kSecCodeInfoStatus: CFStringRef;
 }
 
 fn io_err(e: std::io::Error) -> IpcError {
@@ -110,39 +122,62 @@ fn is_identifier(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
 }
 
-/// The Team ID of the running agent, if it is signed with a certificate (not ad-hoc) and its
-/// signature is currently valid for that team.
-fn own_team_id() -> Option<String> {
-    let me = SecCode::for_self(Flags::NONE).ok()?;
+/// `SecCodeCopySigningInformation(code, flags)`; `None` on failure.
+fn signing_info(code: &SecCode, flags: u32) -> Option<CFDictionary<CFString, CFType>> {
     let mut info: CFDictionaryRef = std::ptr::null();
-    // SAFETY: `me` is a live SecCodeRef for the duration of the call (Apple documents SecCodeRef
-    // as accepted here); `info` is a valid out-pointer; on success we own the returned dictionary
-    // (Copy rule) and wrap it exactly once below.
+    // SAFETY: `code` is a live SecCodeRef for the duration of the call (Apple documents SecCodeRef
+    // as accepted where a SecStaticCodeRef is expected); `info` is a valid out-pointer; on success
+    // we own the returned dictionary (Copy rule) and wrap it exactly once below.
     let rc = unsafe {
-        SecCodeCopySigningInformation(
-            me.as_concrete_TypeRef().cast(),
-            K_SEC_CS_SIGNING_INFORMATION,
-            &mut info,
-        )
+        SecCodeCopySigningInformation(code.as_concrete_TypeRef().cast(), flags, &mut info)
     };
     if rc != 0 || info.is_null() {
         return None;
     }
     // SAFETY: non-null CFDictionaryRef returned by a Copy function: create rule, released on drop.
-    let dict: CFDictionary<CFString, CFType> =
-        unsafe { CFDictionary::wrap_under_create_rule(info) };
-    // SAFETY: an immutable CFString constant exported by Security.framework; get rule retains it.
-    let key = unsafe { CFString::wrap_under_get_rule(kSecCodeInfoTeamIdentifier) };
-    let team = dict.find(&key)?.downcast::<CFString>()?.to_string();
-    if !is_team_id(&team) {
+    Some(unsafe { CFDictionary::wrap_under_create_rule(info) })
+}
+
+/// Looks up a Security.framework `kSecCodeInfo*` key; `None` if the symbol is null or absent.
+fn info_value(dict: &CFDictionary<CFString, CFType>, key: CFStringRef) -> Option<CFType> {
+    if key.is_null() {
         return None;
     }
-    // Double check: the agent itself satisfies the team requirement it will demand of peers.
+    // SAFETY: non-null immutable CFString constant exported by Security.framework; the get rule
+    // retains it for the wrapper's lifetime.
+    let key = unsafe { CFString::wrap_under_get_rule(key) };
+    dict.find(&key).map(|v| v.clone())
+}
+
+fn bind_error(msg: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, msg)
+}
+
+/// The Team ID of the running agent: `Ok(None)` when it carries no Team ID (ad-hoc/unsigned:
+/// uid-only, as on Linux). Fails closed: a signature we cannot read, or a Team-ID signature that
+/// no longer validates (tampered bundle), is an error, never a silent downgrade to uid-only.
+fn own_team_id() -> std::io::Result<Option<String>> {
+    let me = SecCode::for_self(Flags::NONE)
+        .map_err(|_| bind_error("cannot read the agent's own code signature"))?;
+    let info = signing_info(&me, K_SEC_CS_SIGNING_INFORMATION)
+        .ok_or_else(|| bind_error("cannot read the agent's own signing information"))?;
+    // SAFETY: reading the address of an extern static constant (no dereference here).
+    let key = unsafe { kSecCodeInfoTeamIdentifier };
+    let Some(team) = info_value(&info, key) else {
+        return Ok(None);
+    };
+    let team = team
+        .downcast::<CFString>()
+        .map(|t| t.to_string())
+        .filter(|t| is_team_id(t))
+        .ok_or_else(|| bind_error("unexpected Team ID in the agent's signature"))?;
+    // The agent itself must satisfy the team requirement it will demand of peers.
     let req = format!(r#"anchor apple generic and certificate leaf[subject.OU] = "{team}""#)
         .parse()
-        .ok()?;
-    me.check_validity(Flags::NONE, &req).ok()?;
-    Some(team)
+        .map_err(|_| bind_error("cannot build the team requirement"))?;
+    me.check_validity(Flags::NONE, &req)
+        .map_err(|_| bind_error("the agent's own signature does not validate"))?;
+    Ok(Some(team))
 }
 
 /// The peer's audit token (`audit_token_t`, 8 × u32), or `None`.
@@ -165,28 +200,63 @@ fn peer_audit_token(stream: &UnixStream) -> Option<[u32; 8]> {
 }
 
 /// Whether the process behind `token` satisfies `requirement` right now.
+/// Requires the hardened runtime too, so a same-user process cannot inject into a genuine peer.
 fn token_satisfies(token: &[u32; 8], requirement: &str) -> bool {
+    let Some(code) = guest_code(token) else {
+        return false;
+    };
+    satisfies(&code, requirement) && hardened_runtime(&code)
+}
+
+/// The running code identified by an audit token (pid + pid version: no PID reuse).
+fn guest_code(token: &[u32; 8]) -> Option<SecCode> {
     let bytes: Vec<u8> = token.iter().flat_map(|v| v.to_ne_bytes()).collect();
     let data = CFData::from_buffer(&bytes);
     let mut attrs = GuestAttributes::new();
     // `data` outlives `attrs` (the dictionary retains it anyway).
     attrs.set_audit_token(data.as_concrete_TypeRef());
-    let Ok(code) = SecCode::copy_guest_with_attribues(None, &attrs, Flags::NONE) else {
-        return false;
-    };
+    SecCode::copy_guest_with_attribues(None, &attrs, Flags::NONE).ok()
+}
+
+fn satisfies(code: &SecCode, requirement: &str) -> bool {
     let Ok(req) = requirement.parse() else {
         return false;
     };
     code.check_validity(Flags::NONE, &req).is_ok()
 }
 
+/// The running peer has the hardened runtime (dynamic `kSecCodeInfoStatus` has `CS_RUNTIME`).
+fn hardened_runtime(code: &SecCode) -> bool {
+    // SAFETY: reading the address of an extern static constant (no dereference here).
+    let key = unsafe { kSecCodeInfoStatus };
+    signing_info(code, K_SEC_CS_DYNAMIC_INFORMATION)
+        .and_then(|d| info_value(&d, key))
+        .and_then(|v| v.downcast::<CFNumber>())
+        .and_then(|n| n.to_i64())
+        .is_some_and(|status| status as u32 & CS_RUNTIME != 0)
+}
+
+/// A connection whose code-signature check runs on the blocking pool. Kept in the server so a
+/// cancelled `accept` resumes it instead of losing the connection.
+#[derive(Debug)]
+struct InFlight {
+    stream: UnixStream,
+    uid: u32,
+    deadline: Instant,
+    check: Option<JoinSet<bool>>,
+}
+
 #[derive(Debug)]
 pub struct MacIpcServer {
     listener: UnixListener,
     path: PathBuf,
+    /// `(dev, ino)` of the socket we bound: `Drop` never removes someone else's socket.
+    inode: (u64, u64),
     uid: u32,
     /// `Some` only when the agent is signed with a certificate: (requirement, expected id).
     signer: Option<(String, String)>,
+    /// At most one peer check in flight; connections queue in the kernel backlog meanwhile.
+    in_flight: Mutex<Option<InFlight>>,
 }
 
 impl MacIpcServer {
@@ -238,9 +308,7 @@ impl MacIpcServer {
             }
             std::fs::remove_file(&path)?;
         }
-        let listener = UnixListener::bind(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        let signer = own_team_id().map(|team| {
+        let signer = own_team_id()?.map(|team| {
             (
                 format!(
                     r#"anchor apple generic and certificate leaf[subject.OU] = "{team}" and identifier "{peer_identifier}""#
@@ -248,11 +316,16 @@ impl MacIpcServer {
                 peer_identifier.to_owned(),
             )
         });
+        let listener = UnixListener::bind(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let md = std::fs::symlink_metadata(&path)?;
         Ok(Self {
             listener,
             path,
+            inode: (md.dev(), md.ino()),
             uid,
             signer,
+            in_flight: Mutex::new(None),
         })
     }
 
@@ -260,22 +333,43 @@ impl MacIpcServer {
         &self.path
     }
 
-    fn identify(&self, stream: &UnixStream, uid: u32) -> PeerIdentity {
-        if let Some((req, id)) = &self.signer
-            && peer_audit_token(stream).is_some_and(|t| token_satisfies(&t, req))
-        {
-            return PeerIdentity::verified_signer(Some(uid), id.clone());
+    /// Accepts the next same-uid connection; with a signer policy, starts its peer check on the
+    /// blocking pool (`check: None` = no policy, uid-only).
+    async fn next_candidate(&self) -> Result<InFlight, IpcError> {
+        loop {
+            // Cancel-safe: `UnixListener::accept` is.
+            let (stream, _) = self.listener.accept().await.map_err(io_err)?;
+            let uid = match stream.peer_cred() {
+                Ok(c) if c.uid() == self.uid => c.uid(),
+                // Another user (or unknown): drop the connection before reading a byte.
+                _ => continue,
+            };
+            let check = self.signer.as_ref().map(|(req, _)| {
+                let mut set = JoinSet::new();
+                let tok = peer_audit_token(&stream);
+                let req = req.clone();
+                set.spawn_blocking(move || tok.is_some_and(|t| token_satisfies(&t, &req)));
+                set
+            });
+            return Ok(InFlight {
+                stream,
+                uid,
+                deadline: Instant::now() + PEER_CHECK_DEADLINE,
+                check,
+            });
         }
-        PeerIdentity::uid_only(Some(uid))
     }
 }
 
 impl Drop for MacIpcServer {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let ours = std::fs::symlink_metadata(&self.path)
+            .is_ok_and(|md| (md.dev(), md.ino()) == self.inode);
+        if ours {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
-
 impl IpcServer for MacIpcServer {
     type Conn = MacIpcConn;
 
@@ -289,20 +383,31 @@ impl IpcServer for MacIpcServer {
     }
 
     async fn accept(&self) -> Result<(PeerIdentity, MacIpcConn), IpcError> {
-        loop {
-            // Cancel-safe: `UnixListener::accept` is, and nothing below awaits.
-            let (stream, _) = self.listener.accept().await.map_err(io_err)?;
-            match stream.peer_cred() {
-                Ok(c) if c.uid() == self.uid => {
-                    // shortcut: the SecCode check runs inline (a few ms, once per UI connect) so
-                    // accept stays cancel-safe; move to an owned in-flight slot if measured slow.
-                    let peer = self.identify(&stream, c.uid());
-                    return Ok((peer, MacIpcConn::new(stream)));
-                }
-                // Another user (or unknown): drop the connection before reading a byte.
-                _ => continue,
-            }
+        // Cancel-safe: the accepted connection and its pending check live in `self.in_flight`, so
+        // a dropped `accept` resumes them on the next call.
+        let mut slot = self.in_flight.lock().await;
+        if slot.is_none() {
+            *slot = Some(self.next_candidate().await?);
         }
+        let verified = match slot
+            .as_mut()
+            .and_then(|f| f.check.as_mut().map(|c| (f.deadline, c)))
+        {
+            // A check that misses the deadline (or panics) counts as "not verified".
+            Some((deadline, check)) => matches!(
+                tokio::time::timeout_at(deadline, check.join_next()).await,
+                Ok(Some(Ok(true)))
+            ),
+            None => false,
+        };
+        let Some(f) = slot.take() else {
+            return Err(IpcError::Transport("accept slot empty".into()));
+        };
+        let peer = match (&self.signer, verified) {
+            (Some((_, id)), true) => PeerIdentity::verified_signer(Some(f.uid), id.clone()),
+            _ => PeerIdentity::uid_only(Some(f.uid)),
+        };
+        Ok((peer, MacIpcConn::new(f.stream)))
     }
 }
 
@@ -310,14 +415,15 @@ impl IpcServer for MacIpcServer {
 #[derive(Debug)]
 pub struct MacIpcConn {
     stream: UnixStream,
-    buf: Vec<u8>,
+    /// Wiped on drop: a half-received `Pair` request carries the pairing code.
+    buf: Zeroizing<Vec<u8>>,
 }
 
 impl MacIpcConn {
     fn new(stream: UnixStream) -> Self {
         Self {
             stream,
-            buf: Vec::with_capacity(512),
+            buf: Zeroizing::new(Vec::with_capacity(512)),
         }
     }
 }
@@ -421,17 +527,18 @@ mod tests {
         fogar_testkit::run_async(async {
             let (a, _b) = UnixStream::pair().expect("pair");
             let tok = peer_audit_token(&a).expect("LOCAL_PEERTOKEN");
-            assert!(
-                token_satisfies(&tok, "always"),
-                "token must resolve to our SecCode"
-            );
-            assert!(!token_satisfies(
-                &tok,
+            let me = guest_code(&tok).expect("token must resolve to our SecCode");
+            assert!(satisfies(&me, "always"));
+            assert!(!satisfies(
+                &me,
                 r#"anchor apple generic and certificate leaf[subject.OU] = "ABCDE12345" and identifier "com.fogar.desktop""#
             ));
+            // `cargo test` binaries lack the hardened runtime: never verified, even for "always".
+            assert!(!hardened_runtime(&me));
+            assert!(!token_satisfies(&tok, "always"));
             assert!(
-                !token_satisfies(&[0; 8], "always"),
-                "a bogus token never passes"
+                guest_code(&[0; 8]).is_none(),
+                "a bogus token never resolves"
             );
         });
     }
