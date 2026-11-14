@@ -1,0 +1,130 @@
+fogar-agent — progress log (honest status; update at the end of every agent session)
+================================================================================
+2026-11-13  slice-0 review ROUND 2 fixes (independent reviewer F1-F8), branch slice-0, not pushed
+-----------------------------------------------------------------------------------------------
+Each fix: regression test / self-test seen FAILING on the old code first, then the fix.
+scripts/gates.sh: fmt, clippy, test --workspace (175 passed, 1 ignored), proto no_std, archtest,
+vendored hygiene + self-test (65 cases), cargo deny, cargo audit, loom, bench: PASS.
+Miri: NOT RUN (nightly unreachable). Toolchain: installed stable == 1.97.0.
+
+FIXED:
+- F1 check_vendored.sh: rejects any symlink/special file (working tree + tracked 120000), any
+  .claude* outside the root .claude/ (hidden dirs, .claude-plugin, sub/.claude), anything in
+  .claude/ but agents/ + skills/, installed copies not byte-identical to agent-team/; hash lists
+  must name exactly the file set. install_agent_team.sh now copies plain directories.
+- F2 scripts/check_frontmatter.py (python3 stdlib, gate FAILS without python3): strict non-YAML
+  grammar; reviewer role from the FILE NAME, name == stem, explicit Bash scope allowlist,
+  skills must be vendored. 39 new planted cases (+1 installed-copy pass case); 31 passed
+  the old checker (the F1 commit message says "all failed before": wrong, this is the count).
+- F3 agentd: Parked/NotPaired/ShuttingDown/Stopped never rate-limited; suppressed count flushed by
+  a timer armed on first suppression and at shutdown. Binary test (7 flaps + 1008 revoked):
+  before, no 'link parked' line in 150 s.
+- F4 crashloop: SafeMode trip persisted ('safe' ledger line); run ends only on clean/stable or a
+  quiet gap > 3 h; pruning moved to crashloop::retain (current run, <= 64 lines). 40-boot
+  simulation showed the 1920 s -> 0 s sawtooth before.
+- F5 proto: 'ready' lenient fields decoded by visitors (no serde_json::Value): 16 MiB -> < 3 MiB
+  for 1 MiB; amplification test covers all 12 server types.
+- F6 link::budget_tests (audio + JSON byte charge), records_clean() unit test, SignalsArmed token
+  (begin_boot cannot run before the signal handlers: compile-time). 5 mutations applied in a
+  scratch copy: all killed (4 tests, 1 compile error).
+- F7 archtest: token-based R5/R10 (+ cfg_select !, cfg ! (, cfg($p), std::env::consts,
+  multi-line tokio groups, comments in paths, tokio aliases), self-tests incl. negatives.
+- F8 PR_SET_DUMPABLE=0 on Linux via rustix's safe wrapper (no new unsafe).
+
+OPEN / LIMITS (honest):
+- ROOT_HASH can still be regenerated in the same PR; CI must compare it with main (ADR-0007).
+- CLAUDE.md files (any depth) are not checked by the vendored gate (instructions, not config).
+- F3 binary test takes ~30 s (exponential backoff); its suppressed-summary assertion is skipped
+  (with a note) if the flaps spread over > 55 s on a slow runner.
+- F6 signal order is enforced by types, not by a black-box test (the race window is microseconds).
+- F7 R5/R10 are still lexical: a cfg produced by a proc-macro in a dependency is not visible.
+- F8: macOS still only RLIMIT_CORE (PT_DENY_ATTACH / get-task-allow: TODO macos S2). macOS
+  compile of the changed agentd code: UNTESTED (no macOS runner).
+
+2026-11-13  slice-0 review fixes (code + security reviewers), branch slice-0, no remote, not pushed
+-----------------------------------------------------------------------------------------------
+Every fix: regression test written first and seen FAILING on the old code (or, for new types /
+the cancel-safety contract, a planted bad implementation shown to pass the old check), then fixed.
+scripts/gates.sh after the fixes: fmt, clippy, test --workspace (165 passed, 1 ignored), proto
+no_std, archtest (R1-R10 + self-tests), vendored hygiene + its new self-test gate, cargo deny,
+cargo audit, loom (gate now fails on zero matched tests; 1 loom test ran), bench: PASS.
+Miri: NOT RUN (same reason as below).
+
+FIXED:
+- code#1/sec#2 reconnect storm: attempt reset only after a session stable >= stable_after; all
+  reconnectable closes use delay(attempt). stderr link lines rate-limited (20/min + summary).
+- code#2 + code#7b: close_timeout 1 s, egress phase >= budget/2; a signal-initiated stop always
+  writes `clean` (overrun logged); SIGTERM/SIGINT registered before `start` is recorded.
+- code#3/sec#5: IPC idle/read deadline 30 s per connection.
+- code#4: archtest R5 rewritten (cfg predicate parser), R9 adapters never reach core, R10 no
+  tokio::time in core + clippy bans; self-tests plant every violation (incl. real clippy run).
+- sec#1: no /tmp fallback; state dir validated (owner/0700/not symlink); O_NOFOLLOW, create_new.
+- sec#6: agent hashes, frontmatter/tool allowlists, scoped reviewer/implementer Bash, root hash
+  in ADR-0007. LIMIT: same-PR regeneration possible; CI must compare ROOT_HASH with main (not
+  implemented, no CI yet).
+- code#5: lenient `ready`. sec#4: two-pass decode (1 MiB frame peaked at 32 MiB before; now
+  <= 3x), args/extras skipped, inbound queue byte cap 4 MiB.
+- code#6: link drains the uplink while waiting for inbound room.
+- code#7a: run-based crash-loop escalation reaches 32 min; ADR-0003 aligned.
+- code#8: cancel-safety contract cancels with frames in flight; loom gate zero-test guard.
+- sec#7: RLIMIT_CORE=0 (Linux; macOS same call, UNVERIFIED), redacting Debug for user content,
+  Zeroizing for the key where we read it, forbid(unsafe_code) in agentd/bench/archtest.
+- sec#3: loud WARNING for loopback ws:// at every start; TLS stays S1.
+
+PARTIAL / OPEN (honest):
+- sec#7: the handshake String with the key goes into tungstenite un-zeroized (needs a port change;
+  S1). macOS core-dump behaviour unverified.
+- sec#6: ROOT_HASH comparison against main must be a CI step (S1 roadmap). Reviewers keep
+  Bash(git diff|log|show) (read-only) in addition to cargo test/clippy; `cargo test` still runs
+  the code under review -> sandbox it.
+- code#7b: a SIGTERM in the few ms between process start and handler registration still kills the
+  process, but before `start` is written, so the breaker does not count it.
+- sec#1: a planted *regular* ledger inside our own 0700 dir is indistinguishable from ours.
+- Not for now (roadmap): capture-consent choke point = S2 hard requirement (+ TODO in
+  engine.rs); cargo vet / cargo geiger / fuzz targets = S1 gates.
+- New deps: rustix 1.1.6 (agentd, cfg(unix)), zeroize 1.9.1 (agentd, agent-linux); verified on
+  crates.io 2026-11-13.
+
+2026-11-13  slice-0 walking skeleton, branch slice-0 (no remote; nothing pushed)
+
+PASSES (automated, on Linux x86_64, rustc 1.97.0):
+- scripts/gates.sh: fmt, clippy -D warnings, 131 tests, proto no_std build, archtest R1-R8,
+  vendored-skill hygiene, cargo deny 0.20.2, cargo audit 0.23.0, loom, bench placeholder.
+- E2E over a REAL WebSocket to the protocol-v1 mock gateway: handshake (no `type`), status before
+  ready, end -> transcription -> send, turn_start/token/turn_end, 0xA1 PCM16 bit-exact to the fake
+  player; barge-in; close codes; keepalive vs idle close; gateway down then up.
+- Paused-time core tests: all spec §11 close rows + 1006, backoff bounds (incl. 500 failures),
+  keepalive 30/h, not-paired, locked keychain, backpressure, shutdown to task baseline.
+- 72 simulated hours with hourly drops: tasks and queues flat, live heap growth 0 B after
+  hour 1; leak canary (planted leak) detected (~31 KB / 23 h).
+- loom: heartbeat primitive, 21808 iterations; a planted lost-update race fails as expected.
+- fogar-agentd binary on Linux: connects, status over Unix socket, SIGTERM -> exit 0 < 5 s,
+  close frame sent, ledger start/clean, key absent from stderr.
+
+NOT RUN:
+- Miri (fogar-testalloc is the only crate with unsafe compiled on Linux): nightly/miri could not
+  be installed (static.rust-lang.org unreachable from the sandbox). CI job `miri` defined.
+- .github/workflows/ci.yml: written, never executed (actions/checkout pinned by verified SHA).
+- Pinned toolchain download: 1.97.0 not downloadable; gates used installed stable == 1.97.0.
+
+STUBBED / UNTESTED:
+- fogar-agent-macos: every adapter is a stub (Unsupported) except getloadavg and thread QoS via
+  pthread_set_qos_class_self_np. Never compiled for a darwin target; only type-checked on Linux
+  with the cfg gate removed. platform_macos.rs in fogar-agentd never compiled.
+- No real audio anywhere (Linux reports Unsupported). VAD is a toy RMS threshold.
+- OS-thread watchdog abort path: implemented, not exercised by a test.
+- Crash-loop SafeMode: decision unit-tested; never exercised by real crashes.
+- No TLS (wss refused), no WS ping/half-open detection, no pairing, no SQLite, no UI.
+
+NEEDS A MAC (M2):
+- macOS CI green for fogar-agent-macos + its contract suites (first compile ever).
+- TCC mic prompt attribution, LaunchAgent/SMAppService, Keychain, LOCAL_PEERTOKEN/SecCode.
+- Energy gate: idle CPU, wakeups/s, phys_footprint (targets are unmeasured).
+- Instant/tokio time across sleep/wake; QoS placement.
+
+ACTION FOR A HUMAN:
+- Writing .claude/ needed approval that was not given in the build session. Review agent-team/
+  and run scripts/install_agent_team.sh to install the 8 skills + 9 subagents into .claude/.
+
+NEXT: S1 (docs/ROADMAP.md) — contract PR first: WS ping/idle deadline in LinkSession, TLS config,
+pairing port, SQLite storage port; then real-gateway golden fixtures for fogar-proto.

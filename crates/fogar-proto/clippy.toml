@@ -1,0 +1,14 @@
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+# fogar-proto is sans-I/O: no clocks, threads, env, files or sockets. (Errors via [workspace.lints.clippy].)
+disallowed-methods = [
+  { path = "std::time::Instant::now", reason = "proto is sans-I/O" },
+  { path = "std::time::SystemTime::now", reason = "proto is sans-I/O" },
+  { path = "std::thread::sleep", reason = "proto is sans-I/O" },
+  { path = "std::thread::spawn", reason = "proto is sans-I/O" },
+  { path = "std::env::var", reason = "proto is sans-I/O" },
+]
+disallowed-types = [
+  { path = "std::fs::File", reason = "proto is sans-I/O" },
+  { path = "std::net::TcpStream", reason = "proto is sans-I/O" },
+]

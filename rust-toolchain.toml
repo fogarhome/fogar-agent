@@ -1,0 +1,6 @@
+# Pinned toolchain. If 1.97.0 cannot be downloaded (offline sandbox), scripts/gates.sh falls back to
+# an installed `stable` ONLY if it is exactly 1.97.0, and says so.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

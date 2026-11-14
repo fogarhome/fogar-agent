@@ -1,0 +1,4 @@
+# Default clippy config for crates without their own clippy.toml (adapters, composition root,
+# testkit, archtest, bench). Inner crates (proto, ports, core) have stricter per-crate files.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

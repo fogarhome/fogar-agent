@@ -1,0 +1,18 @@
+[package]
+name = "fogar-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Engine. Depends only on ports + proto. No OS APIs, no cfg(target_os), no runtime."
+
+[dependencies]
+fogar-ports = { workspace = true }
+fogar-proto = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+fogar-testkit = { workspace = true }
+
+[lints]
+workspace = true

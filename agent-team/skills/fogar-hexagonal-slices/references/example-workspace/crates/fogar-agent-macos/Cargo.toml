@@ -1,0 +1,27 @@
+[package]
+name = "fogar-agent-macos"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "macOS adapters + composition root (the daemon binary)."
+
+# The crate builds on EVERY host (empty-ish on non-macOS) so that
+# `cargo check --workspace` / clippy / archtest work on Linux CI and in any agent worktree.
+[dependencies]
+fogar-ports = { workspace = true }
+fogar-core = { workspace = true }
+fogar-host = { path = "../fogar-host" }
+tokio = { workspace = true, features = ["rt", "macros", "time", "signal"] }
+
+# OS crates ONLY behind a target cfg, ONLY in adapter crates (enforced by deny.toml + archtest).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+# objc2 / objc2-foundation / core-foundation would go here for thermal state, IOKit power, etc.
+
+[dev-dependencies]
+fogar-testkit = { workspace = true }
+
+[lints]
+workspace = true

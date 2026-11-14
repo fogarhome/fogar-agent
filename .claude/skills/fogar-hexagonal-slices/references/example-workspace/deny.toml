@@ -1,0 +1,41 @@
+# cargo-deny config (cargo-deny 0.20.x). Complements crates/fogar-archtest:
+# - archtest = crate-to-crate layering rules inside the workspace (no install needed)
+# - cargo-deny = third-party OS crates may only be pulled in by adapter crates,
+#   plus licenses / advisories / duplicate versions.
+# NOT executed in the research sandbox; semantics taken from cargo-deny docs + source:
+#   `wrappers`: "allows specific crates to have a direct dependency on the banned crate
+#   but denies all transitive dependencies on it" (docs/src/checks/bans/cfg.md).
+#   Implementation checks every *direct dependent* of the banned crate (src/bans.rs).
+
+[graph]
+# Without this, cargo-deny considers all targets anyway; listing them documents what we ship
+# and keeps Linux CI honest about macOS/Windows-only deps.
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+  "x86_64-unknown-linux-gnu",
+]
+all-features = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+  # OS bindings: only adapter crates (and the binding crates' own families) may depend on them.
+  # Add each new adapter crate to `wrappers` explicitly - that is the review gate.
+  { crate = "objc2", wrappers = ["fogar-agent-macos", "objc2-foundation", "objc2-core-foundation", "block2", "dispatch2"], reason = "macOS APIs only via fogar-agent-macos" },
+  { crate = "windows", wrappers = ["fogar-agent-windows"], reason = "Win32 only via fogar-agent-windows" },
+  # windows-sys / libc are used directly by many ecosystem crates (tokio, mio, getrandom...),
+  # so a wrappers list for them is fragile; rely on archtest R4 (inner crates never reach
+  # OS crates) instead, and generate any wrappers list from a real `cargo deny check` run.
+  # Banned outright with a pointer to the chosen alternative.
+  { crate = "openssl", use-instead = "rustls" },
+  { crate = "bincode", reason = "unmaintained; pick postcard/minicbor for fogar-proto (no_std friendly)" },
+]
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "Unicode-3.0", "BSD-3-Clause", "ISC"]
+
+[advisories]
+# defaults: deny vulnerabilities, warn unmaintained

@@ -1,0 +1,19 @@
+[package]
+name = "fogar-agent-macos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "macOS adapters. SLICE 0: UNTESTED STUBS (never compiled on the Linux dev box). Compiles to an empty crate on other hosts."
+
+# Only fogar-ports on macOS. Apple binding crates (objc2*, dispatch2, block2, security-framework,
+# cpal) are added by the slice that needs them, under this target table only (deny.toml wrappers).
+[target.'cfg(target_os = "macos")'.dependencies]
+fogar-ports = { workspace = true }
+
+[dev-dependencies]
+fogar-testkit = { workspace = true }
+
+[lints]
+workspace = true

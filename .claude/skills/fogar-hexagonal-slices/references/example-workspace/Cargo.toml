@@ -1,0 +1,38 @@
+# Example workspace skeleton for fogar-agent (compile-checked on Linux, Rust 1.97, 2026-11-12).
+# Illustrative: names/versions are real, the protocol in fogar-proto is a PLACEHOLDER.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95" # cfg_select! is stable since 1.95
+license = "MIT OR Apache-2.0"
+publish = false
+
+# One place for versions -> fewer duplicate builds, easier review of new deps.
+[workspace.dependencies]
+fogar-proto = { path = "crates/fogar-proto", default-features = false }
+fogar-ports = { path = "crates/fogar-ports" }
+fogar-core = { path = "crates/fogar-core" }
+fogar-testkit = { path = "crates/fogar-testkit" }
+thiserror = { version = "2", default-features = false }
+# tokio::sync is runtime-agnostic (tokio docs, sync/mod.rs); ports only need "sync".
+tokio = { version = "1", default-features = false }
+serde_json = "1"
+
+[workspace.lints.rust]
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+# clippy.toml next to each crate adds the disallowed-* lists; these make them errors.
+disallowed_methods = "deny"
+disallowed_types = "deny"
+
+[profile.release]
+# Long-running daemon: favour size + predictable perf.
+lto = "thin"
+codegen-units = 1
+panic = "abort"   # daemon is supervised (launchd/systemd/SCM) and restarts on crash
+strip = "symbols"

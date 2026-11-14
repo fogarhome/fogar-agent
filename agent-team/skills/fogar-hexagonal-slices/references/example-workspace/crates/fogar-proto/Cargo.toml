@@ -1,0 +1,19 @@
+[package]
+name = "fogar-proto"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Wire protocol codec. no_std + alloc. No I/O, no async, no OS."
+
+[features]
+default = []
+# `std` only adds conveniences (e.g. std::error::Error is core::error::Error since 1.81 anyway).
+std = ["thiserror/std"]
+
+[dependencies]
+thiserror = { workspace = true } # default-features = false -> no_std
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "fogar-testkit"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "In-memory fakes for every port + contract suites every adapter must pass."
+
+# Adapters and core use this ONLY as a [dev-dependency].
+# The archtest crate enforces that no crate has it as a normal dependency.
+[dependencies]
+fogar-ports = { workspace = true }
+
+[lints]
+workspace = true

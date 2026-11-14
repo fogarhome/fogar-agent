@@ -1,0 +1,23 @@
+[package]
+name = "fogar-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "In-memory fakes for every port, contract suites every adapter must pass, and a protocol-v1 mock gateway over a real local WebSocket. DEV-DEPENDENCY ONLY (archtest R2)."
+
+[dependencies]
+fogar-ports = { workspace = true }
+fogar-proto = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "net"] }
+tokio-util = { workspace = true, features = ["rt"] }
+tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }
+futures-util = { workspace = true, features = ["sink", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde_json = { workspace = true, features = ["std"] }
