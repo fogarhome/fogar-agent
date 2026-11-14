@@ -25,6 +25,8 @@
 //! (the verified process wrote last) and nothing else is queued or buffered behind it (nobody else
 //! wrote after it). The companion app therefore sends `Pair`/`Unpair` only after its `Hello` was
 //! answered, and waits for each answer before writing again.
+//! This is a mitigation, not per-message identity: a write that blocked before the verification,
+//! or I/O by the genuine app on an inherited fd, defeats it (open residuals, ADR-0002).
 
 use core_foundation::{
     base::{CFType, TCFType},
