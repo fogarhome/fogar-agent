@@ -5,15 +5,25 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "macOS adapters. SLICE 0: UNTESTED STUBS (never compiled on the Linux dev box). Compiles to an empty crate on other hosts."
+description = "macOS adapters: Keychain secret store and Unix-socket IPC with a same-signer peer check (S1); probe/power partial, audio stubs. Compiles to an empty crate on other hosts."
 
-# Only fogar-ports on macOS. Apple binding crates (objc2*, dispatch2, block2, security-framework,
-# cpal) are added by the slice that needs them, under this target table only (deny.toml wrappers).
+# Apple binding crates only under this target table (deny.toml wrappers).
 [target.'cfg(target_os = "macos")'.dependencies]
 fogar-ports = { workspace = true }
+fogar-host = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util"] }
+zeroize = { workspace = true, features = ["alloc"] }
+security-framework = { workspace = true }
+core-foundation = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 fogar-testkit = { workspace = true }
+fogar-ports = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+security-framework = { workspace = true }
 
 [lints]
 workspace = true
