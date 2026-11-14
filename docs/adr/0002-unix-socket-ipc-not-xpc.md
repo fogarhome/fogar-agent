@@ -24,13 +24,17 @@ the signature, not the name in parentheses of the certificate):
 - [x] `LOCAL_PEERTOKEN` yields the peer's audit token (server side; also from a socketpair in the
   unit test). Client side (UI verifying the agent) NOT tested: that is the Swift app's job.
 - [x] `SecCodeCheckValidity` with `anchor apple generic and certificate leaf[subject.OU] =
-  "<TEAM>" and identifier "com.fogar.desktop"`, plus the peer's dynamic status must carry
-  `CS_RUNTIME` (hardened runtime, so a same-user process cannot inject a dylib into the genuine
-  app): same Personal Team + `com.fogar.desktop` + `-o runtime` → `SameSigner`; same but without
-  the hardened runtime → `UidOnly`; client ad-hoc → `UidOnly`; same signer but id `com.otro` or
+  "<TEAM>" and identifier "com.fogar.desktop" and !(entitlement[allow-dyld-environment-variables]
+  exists) and !(entitlement[disable-library-validation] exists)`, plus the peer's dynamic status
+  must carry `CS_RUNTIME` (hardened runtime; with those two entitlements banned, a same-user
+  process cannot load a dylib into the genuine app). The app MUST be built with "Enable Hardened
+  Runtime" and without those entitlements. Same Personal Team + `com.fogar.desktop` +
+  `-o runtime` → `SameSigner`; same without the hardened runtime → `UidOnly`; same with
+  `disable-library-validation` → `UidOnly`; client ad-hoc → `UidOnly`; same signer but id `com.otro` or
   `com.fogar.agent` → `UidOnly`; ad-hoc agent → caps `peer_code_identity: Unsupported` and
   `UidOnly` for every client. Check cost 1–8 ms, run on the blocking pool with a 2 s deadline
-  (timeout = `UidOnly`), one check in flight, `accept` stays cancel-safe.
+  (timeout = `UidOnly`), one check in flight; a timed-out check that still runs blocks new checks
+  (peers get `UidOnly`) so at most one thread is ever stuck; `accept` stays cancel-safe.
 - A signed agent whose own signature cannot be read or no longer validates refuses to bind (fails
   closed) instead of downgrading to uid-only. Not exercised: a tampered bare executable is killed
   by the kernel before it runs; a tampered `.app` bundle resource is the case this covers.

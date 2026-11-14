@@ -60,8 +60,9 @@ pub const COMPANION_APP_ID: &str = "com.fogar.desktop";
 /// `kSecCSSigningInformation` / `kSecCSDynamicInformation` (`<Security/SecCode.h>`).
 const K_SEC_CS_SIGNING_INFORMATION: u32 = 1 << 1;
 const K_SEC_CS_DYNAMIC_INFORMATION: u32 = 1 << 3;
-/// `CS_RUNTIME` (`<kern/cs_blobs.h>`): the process runs with the hardened runtime, so another
-/// same-user process cannot inject code into it (no `DYLD_INSERT_LIBRARIES`, library validation).
+/// `CS_RUNTIME` (`<kern/cs_blobs.h>`): the process runs with the hardened runtime. Together with
+/// the requirement's ban on the `allow-dyld-environment-variables` and
+/// `disable-library-validation` entitlements, another same-user process cannot load code into it.
 const CS_RUNTIME: u32 = 0x0001_0000;
 /// Upper bound for one peer check (SecCode talks to securityd and may validate a bundle on disk).
 const PEER_CHECK_DEADLINE: Duration = Duration::from_secs(2);
@@ -161,7 +162,8 @@ fn own_team_id() -> std::io::Result<Option<String>> {
         .map_err(|_| bind_error("cannot read the agent's own code signature"))?;
     let info = signing_info(&me, K_SEC_CS_SIGNING_INFORMATION)
         .ok_or_else(|| bind_error("cannot read the agent's own signing information"))?;
-    // SAFETY: reading the address of an extern static constant (no dereference here).
+    // SAFETY: loads an extern static `CFStringRef` that Security.framework initialises before any
+    // of its functions can be called and never mutates; `info_value` null-checks it.
     let key = unsafe { kSecCodeInfoTeamIdentifier };
     let Some(team) = info_value(&info, key) else {
         return Ok(None);
@@ -200,7 +202,7 @@ fn peer_audit_token(stream: &UnixStream) -> Option<[u32; 8]> {
 }
 
 /// Whether the process behind `token` satisfies `requirement` right now.
-/// Requires the hardened runtime too, so a same-user process cannot inject into a genuine peer.
+/// Requires the hardened runtime too (see [`CS_RUNTIME`]).
 fn token_satisfies(token: &[u32; 8], requirement: &str) -> bool {
     let Some(code) = guest_code(token) else {
         return false;
@@ -227,7 +229,8 @@ fn satisfies(code: &SecCode, requirement: &str) -> bool {
 
 /// The running peer has the hardened runtime (dynamic `kSecCodeInfoStatus` has `CS_RUNTIME`).
 fn hardened_runtime(code: &SecCode) -> bool {
-    // SAFETY: reading the address of an extern static constant (no dereference here).
+    // SAFETY: loads an extern static `CFStringRef` that Security.framework initialises before any
+    // of its functions can be called and never mutates; `info_value` null-checks it.
     let key = unsafe { kSecCodeInfoStatus };
     signing_info(code, K_SEC_CS_DYNAMIC_INFORMATION)
         .and_then(|d| info_value(&d, key))
@@ -256,7 +259,17 @@ pub struct MacIpcServer {
     /// `Some` only when the agent is signed with a certificate: (requirement, expected id).
     signer: Option<(String, String)>,
     /// At most one peer check in flight; connections queue in the kernel backlog meanwhile.
-    in_flight: Mutex<Option<InFlight>>,
+    in_flight: Mutex<Slot>,
+    /// [`PEER_CHECK_DEADLINE`]; shorter only in tests.
+    check_deadline: Duration,
+}
+
+#[derive(Debug, Default)]
+struct Slot {
+    pending: Option<InFlight>,
+    /// A check that missed its deadline. A blocking task cannot be aborted, so while it still
+    /// runs no new check is started (peers get `UidOnly`): at most one blocked thread, ever.
+    stuck: Option<JoinSet<bool>>,
 }
 
 impl MacIpcServer {
@@ -311,7 +324,7 @@ impl MacIpcServer {
         let signer = own_team_id()?.map(|team| {
             (
                 format!(
-                    r#"anchor apple generic and certificate leaf[subject.OU] = "{team}" and identifier "{peer_identifier}""#
+                    r#"anchor apple generic and certificate leaf[subject.OU] = "{team}" and identifier "{peer_identifier}" and !(entitlement["com.apple.security.cs.allow-dyld-environment-variables"] exists) and !(entitlement["com.apple.security.cs.disable-library-validation"] exists)"#
                 ),
                 peer_identifier.to_owned(),
             )
@@ -325,7 +338,8 @@ impl MacIpcServer {
             inode: (md.dev(), md.ino()),
             uid,
             signer,
-            in_flight: Mutex::new(None),
+            in_flight: Mutex::new(Slot::default()),
+            check_deadline: PEER_CHECK_DEADLINE,
         })
     }
 
@@ -335,7 +349,10 @@ impl MacIpcServer {
 
     /// Accepts the next same-uid connection; with a signer policy, starts its peer check on the
     /// blocking pool (`check: None` = no policy, uid-only).
-    async fn next_candidate(&self) -> Result<InFlight, IpcError> {
+    async fn next_candidate(
+        &self,
+        stuck: &mut Option<JoinSet<bool>>,
+    ) -> Result<InFlight, IpcError> {
         loop {
             // Cancel-safe: `UnixListener::accept` is.
             let (stream, _) = self.listener.accept().await.map_err(io_err)?;
@@ -344,17 +361,27 @@ impl MacIpcServer {
                 // Another user (or unknown): drop the connection before reading a byte.
                 _ => continue,
             };
-            let check = self.signer.as_ref().map(|(req, _)| {
-                let mut set = JoinSet::new();
-                let tok = peer_audit_token(&stream);
-                let req = req.clone();
-                set.spawn_blocking(move || tok.is_some_and(|t| token_satisfies(&t, &req)));
-                set
-            });
+            if let Some(set) = stuck {
+                while set.try_join_next().is_some() {}
+                if set.is_empty() {
+                    *stuck = None;
+                }
+            }
+            let check = self
+                .signer
+                .as_ref()
+                .filter(|_| stuck.is_none())
+                .map(|(req, _)| {
+                    let mut set = JoinSet::new();
+                    let tok = peer_audit_token(&stream);
+                    let req = req.clone();
+                    set.spawn_blocking(move || tok.is_some_and(|t| token_satisfies(&t, &req)));
+                    set
+                });
             return Ok(InFlight {
                 stream,
                 uid,
-                deadline: Instant::now() + PEER_CHECK_DEADLINE,
+                deadline: Instant::now() + self.check_deadline,
                 check,
             });
         }
@@ -385,24 +412,32 @@ impl IpcServer for MacIpcServer {
     async fn accept(&self) -> Result<(PeerIdentity, MacIpcConn), IpcError> {
         // Cancel-safe: the accepted connection and its pending check live in `self.in_flight`, so
         // a dropped `accept` resumes them on the next call.
-        let mut slot = self.in_flight.lock().await;
-        if slot.is_none() {
-            *slot = Some(self.next_candidate().await?);
+        let mut guard = self.in_flight.lock().await;
+        let slot = &mut *guard;
+        if slot.pending.is_none() {
+            slot.pending = Some(self.next_candidate(&mut slot.stuck).await?);
         }
         let verified = match slot
+            .pending
             .as_mut()
             .and_then(|f| f.check.as_mut().map(|c| (f.deadline, c)))
         {
             // A check that misses the deadline (or panics) counts as "not verified".
-            Some((deadline, check)) => matches!(
-                tokio::time::timeout_at(deadline, check.join_next()).await,
-                Ok(Some(Ok(true)))
-            ),
+            Some((deadline, check)) => {
+                match tokio::time::timeout_at(deadline, check.join_next()).await {
+                    Ok(r) => matches!(r, Some(Ok(true))),
+                    Err(_) => false,
+                }
+            }
             None => false,
         };
-        let Some(f) = slot.take() else {
+        let Some(mut f) = slot.pending.take() else {
+            // Unreachable: `pending` was filled above and only taken here.
             return Err(IpcError::Transport("accept slot empty".into()));
         };
+        if let Some(check) = f.check.take().filter(|c| !c.is_empty()) {
+            slot.stuck = Some(check);
+        }
         let peer = match (&self.signer, verified) {
             (Some((_, id)), true) => PeerIdentity::verified_signer(Some(f.uid), id.clone()),
             _ => PeerIdentity::uid_only(Some(f.uid)),
@@ -540,6 +575,42 @@ mod tests {
                 guest_code(&[0; 8]).is_none(),
                 "a bogus token never resolves"
             );
+        });
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("fogar-unit-{tag}-{}", std::process::id()))
+    }
+
+    /// The signed-agent path (`cargo test` binaries are unsigned, so force a policy): the check
+    /// runs on the blocking pool, a cancelled `accept` resumes the same connection, a missed
+    /// deadline is `UidOnly` and never loses the next connection.
+    #[test]
+    fn in_flight_check_survives_cancel_and_deadline() {
+        fogar_testkit::run_async(async {
+            let mut server = MacIpcServer::bind(&scratch("inflight")).expect("bind");
+            server.signer = Some(("always".into(), COMPANION_APP_ID.into()));
+            let path = server.path().to_path_buf();
+            let _c1 = MacIpcClient::connect(&path).await.expect("connect");
+            // Cancel accept repeatedly while the check may still be running.
+            for _ in 0..5 {
+                let _ = tokio::time::timeout(Duration::ZERO, server.accept()).await;
+            }
+            let (peer, _conn) = server.accept().await.expect("accept");
+            // "always" passes the requirement, but this binary lacks the hardened runtime.
+            assert_eq!(peer.check(), fogar_ports::ipc::PeerCheck::UidOnly);
+            assert!(server.in_flight.lock().await.pending.is_none());
+
+            server.check_deadline = Duration::ZERO;
+            let _c2 = MacIpcClient::connect(&path).await.expect("connect");
+            let _c3 = MacIpcClient::connect(&path).await.expect("connect");
+            for _ in 0..2 {
+                let (peer, _conn) = tokio::time::timeout(Duration::from_secs(5), server.accept())
+                    .await
+                    .expect("no connection lost")
+                    .expect("accept");
+                assert_eq!(peer.check(), fogar_ports::ipc::PeerCheck::UidOnly);
+            }
         });
     }
 }
