@@ -12,8 +12,19 @@
 //! Our Team ID is read from the agent's OWN signature at bind time, so the same code works with a
 //! free Personal Team now and Developer ID later. An unsigned/ad-hoc agent has no Team ID: it
 //! skips step 2 and reports `peer_code_identity: Unsupported`. Never authorized by PID.
-//! Known limit (skill ipc.md §1): identity is checked at connect time; a verified peer could hand
-//! its connected fd to another same-user process.
+//!
+//! `LOCAL_PEERTOKEN` names the process that did the LAST I/O on the peer socket, in its CURRENT
+//! image (pid version is re-read: an exec shows the new program), not the process that
+//! connected. So a verdict at accept says nothing about who writes later: an unsigned process can
+//! connect, fork (the child keeps the fd), exec the genuine app and let the agent verify the app,
+//! then write from the child; or write a request and exec the app before the agent looks
+//! (reproduced on the M2, ADR-0002). A Unix socket has no per-message identity, so on a verified
+//! connection every request that needs it (anything but `Hello`/`Status`/`Subscribe`/`Discover`)
+//! must be attributable to the verified process, else the connection is closed: none of its bytes
+//! were queued before the verification, the token read after the frame is still the verified one
+//! (the verified process wrote last) and nothing else is queued or buffered behind it (nobody else
+//! wrote after it). The companion app therefore sends `Pair`/`Unpair` only after its `Hello` was
+//! answered, and waits for each answer before writing again.
 
 use core_foundation::{
     base::{CFType, TCFType},
@@ -182,6 +193,15 @@ fn own_team_id() -> std::io::Result<Option<String>> {
     Ok(Some(team))
 }
 
+/// Bytes queued in our receive buffer, or `None` on error.
+fn queued_bytes(stream: &UnixStream) -> Option<usize> {
+    let mut n: libc::c_int = 0;
+    // SAFETY: the fd is a live socket owned by `stream`; FIONREAD writes one `int` through the
+    // pointer, which points to a valid, aligned, writable `c_int` that outlives the call.
+    let rc = unsafe { libc::ioctl(stream.as_raw_fd(), libc::FIONREAD, &mut n) };
+    (rc == 0).then(|| usize::try_from(n).ok()).flatten()
+}
+
 /// The peer's audit token (`audit_token_t`, 8 × u32), or `None`.
 fn peer_audit_token(stream: &UnixStream) -> Option<[u32; 8]> {
     let mut tok = [0u32; 8];
@@ -210,7 +230,8 @@ fn token_satisfies(token: &[u32; 8], requirement: &str) -> bool {
     satisfies(&code, requirement) && hardened_runtime(&code)
 }
 
-/// The running code identified by an audit token (pid + pid version: no PID reuse).
+/// The running code identified by an audit token (pid + pid version: no PID reuse; it is the
+/// process that last did I/O on the peer socket, in its current image).
 fn guest_code(token: &[u32; 8]) -> Option<SecCode> {
     let bytes: Vec<u8> = token.iter().flat_map(|v| v.to_ne_bytes()).collect();
     let data = CFData::from_buffer(&bytes);
@@ -247,6 +268,8 @@ struct InFlight {
     uid: u32,
     deadline: Instant,
     check: Option<JoinSet<bool>>,
+    /// The token the check runs on and the bytes already queued right after reading it.
+    seen: Option<Attribution>,
 }
 
 #[derive(Debug)]
@@ -273,15 +296,6 @@ struct Slot {
 }
 
 impl MacIpcServer {
-    /// `~/Library/Application Support/com.fogar.agent/run` (ADR-0002); `None` without an absolute
-    /// `HOME`.
-    pub fn default_dir() -> Option<PathBuf> {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .filter(|h| h.is_absolute())
-            .map(|h| h.join("Library/Application Support/com.fogar.agent/run"))
-    }
-
     /// Binds `<dir>/agent.sock` for the companion app ([`COMPANION_APP_ID`]).
     pub fn bind(dir: &Path) -> std::io::Result<Self> {
         Self::bind_for(dir, COMPANION_APP_ID)
@@ -367,15 +381,26 @@ impl MacIpcServer {
                     *stuck = None;
                 }
             }
+            let mut seen = None;
             let check = self
                 .signer
                 .as_ref()
                 .filter(|_| stuck.is_none())
                 .map(|(req, _)| {
                     let mut set = JoinSet::new();
+                    // Token first, then the queue: bytes written by anyone before the token was
+                    // read (e.g. before an exec) are counted as not attributable.
                     let tok = peer_audit_token(&stream);
+                    let queued = queued_bytes(&stream);
+                    seen = tok.zip(queued).map(|(token, unattributed)| Attribution {
+                        token,
+                        unattributed,
+                    });
                     let req = req.clone();
-                    set.spawn_blocking(move || tok.is_some_and(|t| token_satisfies(&t, &req)));
+                    let ok = seen.is_some();
+                    set.spawn_blocking(move || {
+                        ok && tok.is_some_and(|t| token_satisfies(&t, &req))
+                    });
                     set
                 });
             return Ok(InFlight {
@@ -383,6 +408,7 @@ impl MacIpcServer {
                 uid,
                 deadline: Instant::now() + self.check_deadline,
                 check,
+                seen,
             });
         }
     }
@@ -438,11 +464,16 @@ impl IpcServer for MacIpcServer {
         if let Some(check) = f.check.take().filter(|c| !c.is_empty()) {
             slot.stuck = Some(check);
         }
-        let peer = match (&self.signer, verified) {
-            (Some((_, id)), true) => PeerIdentity::verified_signer(Some(f.uid), id.clone()),
-            _ => PeerIdentity::uid_only(Some(f.uid)),
-        };
-        Ok((peer, MacIpcConn::new(f.stream)))
+        match (&self.signer, verified, f.seen) {
+            (Some((_, id)), true, Some(seen)) => Ok((
+                PeerIdentity::verified_signer(Some(f.uid), id.clone()),
+                MacIpcConn::new(f.stream, Some(seen)),
+            )),
+            _ => Ok((
+                PeerIdentity::uid_only(Some(f.uid)),
+                MacIpcConn::new(f.stream, None),
+            )),
+        }
     }
 }
 
@@ -452,14 +483,53 @@ pub struct MacIpcConn {
     stream: UnixStream,
     /// Wiped on drop: a half-received `Pair` request carries the pairing code.
     buf: Zeroizing<Vec<u8>>,
+    /// `Some` on a verified (`SameSigner`) connection: who may send privileged requests.
+    verified: Option<Attribution>,
+}
+
+/// What a verified connection's privileged requests are checked against (module docs).
+#[derive(Debug, Clone, Copy)]
+struct Attribution {
+    /// The verified process's audit token.
+    token: [u32; 8],
+    /// Stream bytes queued before the verification: whoever wrote them is unknown.
+    unattributed: usize,
+}
+
+/// Requests any same-uid peer may send (the core answers them for `UidOnly` too).
+fn needs_no_attribution(r: &IpcRequest) -> bool {
+    matches!(
+        r,
+        IpcRequest::Hello { .. }
+            | IpcRequest::Status
+            | IpcRequest::Subscribe
+            | IpcRequest::Discover
+    )
 }
 
 impl MacIpcConn {
-    fn new(stream: UnixStream) -> Self {
+    fn new(stream: UnixStream, verified: Option<Attribution>) -> Self {
         Self {
             stream,
             buf: Zeroizing::new(Vec::with_capacity(512)),
+            verified,
         }
+    }
+
+    /// Whether the frame just taken (`frame_len` stream bytes) came from the verified process
+    /// alone. Order matters: token first (the verified process wrote last), then the queue and
+    /// the buffer (nobody wrote after it).
+    fn attributable(&mut self, frame_len: usize) -> bool {
+        let Some(v) = self.verified.as_mut() else {
+            return true;
+        };
+        let before_verification = v.unattributed > 0;
+        v.unattributed = v.unattributed.saturating_sub(frame_len);
+        let token = v.token;
+        !before_verification
+            && peer_audit_token(&self.stream) == Some(token)
+            && queued_bytes(&self.stream) == Some(0)
+            && self.buf.is_empty()
     }
 }
 
@@ -494,7 +564,15 @@ impl IpcConn for MacIpcConn {
         let Some(body) = read_frame(&mut self.stream, &mut self.buf).await? else {
             return Ok(None);
         };
-        decode_request(&body).map(Some)
+        // Synchronous from here on: no await between taking the frame and checking it.
+        let attributable = self.attributable(4 + body.len());
+        let req = decode_request(&body)?;
+        if self.verified.is_some() && !attributable && !needs_no_attribution(&req) {
+            return Err(IpcError::Transport(
+                "privileged request not attributable to the verified peer".into(),
+            ));
+        }
+        Ok(Some(req))
     }
 
     async fn send(&mut self, resp: IpcResponse) -> Result<(), IpcError> {
@@ -611,6 +689,101 @@ mod tests {
                     .expect("accept");
                 assert_eq!(peer.check(), fogar_ports::ipc::PeerCheck::UidOnly);
             }
+        });
+    }
+
+    /// A verified connection over a socketpair: this process is the verified peer.
+    fn verified_pair(
+        queued_before: bool,
+        pre: &[u8],
+    ) -> (MacIpcConn, std::os::unix::net::UnixStream) {
+        use std::io::Write;
+        let (srv, mut cli) = std::os::unix::net::UnixStream::pair().expect("pair");
+        cli.write_all(pre).expect("write");
+        srv.set_nonblocking(true).expect("nonblocking");
+        let srv = UnixStream::from_std(srv).expect("tokio stream");
+        let token = peer_audit_token(&srv).expect("token");
+        let unattributed = if queued_before {
+            queued_bytes(&srv).expect("FIONREAD")
+        } else {
+            0
+        };
+        (
+            MacIpcConn::new(
+                srv,
+                Some(Attribution {
+                    token,
+                    unattributed,
+                }),
+            ),
+            cli,
+        )
+    }
+
+    fn wire(r: &IpcRequest) -> Vec<u8> {
+        frame(&encode_request(r).expect("encode"))
+            .expect("frame")
+            .to_vec()
+    }
+
+    fn pair_req() -> IpcRequest {
+        IpcRequest::Pair {
+            address: "evil:8004".into(),
+            code: fogar_ports::ipc::PairCode::parse("482913"),
+        }
+    }
+
+    /// ADR-0002 attack: whoever shares the verified connection's fd cannot send a privileged
+    /// request; the verified process itself still can (also after a pipelined `Hello`).
+    #[test]
+    fn privileged_requests_must_come_from_the_verified_process() {
+        use std::io::Write;
+        fogar_testkit::run_async(async {
+            let hello = wire(&IpcRequest::Hello { version: 2 });
+
+            // Legit: Hello sent before the verification, Pair after it, both by us.
+            let (mut conn, mut cli) = verified_pair(true, &hello);
+            assert!(matches!(
+                conn.recv().await,
+                Ok(Some(IpcRequest::Hello { .. }))
+            ));
+            cli.write_all(&wire(&pair_req())).expect("write");
+            assert!(matches!(
+                conn.recv().await,
+                Ok(Some(IpcRequest::Pair { .. }))
+            ));
+
+            // Another process (cat) writes on the shared fd: refused, connection closes.
+            let (mut conn, cli) = verified_pair(false, &[]);
+            let f = std::env::temp_dir().join(format!("fogar-unit-frame-{}", std::process::id()));
+            std::fs::write(&f, wire(&pair_req())).expect("frame file");
+            let out = std::process::Stdio::from(std::os::fd::OwnedFd::from(
+                cli.try_clone().expect("dup"),
+            ));
+            let st = std::process::Command::new("/bin/cat")
+                .arg(&f)
+                .stdout(out)
+                .status()
+                .expect("cat");
+            assert!(st.success());
+            let _ = std::fs::remove_file(&f);
+            assert!(
+                conn.recv().await.is_err(),
+                "a frame written by cat must be refused"
+            );
+            // A harmless request from it would still pass (the core answers it to anyone).
+
+            // Written before the verification (the pre-exec parent): refused.
+            let (mut conn, _cli) = verified_pair(true, &wire(&pair_req()));
+            assert!(conn.recv().await.is_err());
+
+            // Something queued behind the privileged frame: nobody can tell who wrote last.
+            let mut both = wire(&pair_req());
+            both.extend(wire(&IpcRequest::Status));
+            let (mut conn, mut cli) = verified_pair(false, &[]);
+            cli.write_all(&both).expect("write");
+            assert!(conn.recv().await.is_err());
+            drop(cli);
         });
     }
 }

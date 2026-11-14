@@ -147,7 +147,5 @@ fn socket_is_private_and_long_paths_are_refused() {
         assert_eq!(mode(s.path()), 0o600);
         let long = scratch_dir(&"x".repeat(100));
         assert!(MacIpcServer::bind(&long).is_err());
-        let default = MacIpcServer::default_dir().unwrap().join("agent.sock");
-        assert!(default.as_os_str().len() <= 103, "{default:?}");
     });
 }

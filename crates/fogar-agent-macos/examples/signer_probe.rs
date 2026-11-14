@@ -12,8 +12,13 @@
 //! ./agent server /tmp/fp & sleep 0.3; ./adhoc client /tmp/fp; wait    # UidOnly
 //! ```
 //!
+//! fd-sharing attack (ADR-0002, `tests/fixtures/fd_share_attack.py`): an unsigned script connects, then forks + execs `./app idle`;
+//! the child (mode `child`) or the parent before the exec (mode `pre`) writes a `Pair` frame.
+//! Expected: `peer SameSigner` then `recv REFUSED` (never `recv DELIVERED Pair`).
+//!
 //! `server <dir> [peer-identifier]` accepts ONE connection after 1 s (so the measured `accept`
-//! time is the peer check alone) and prints caps and the verdict. `client <dir>` sends `Hello`.
+//! time is the peer check alone), prints caps, the verdict and what each request became.
+//! `client <dir>` sends `Hello`, then `Pair` after the reply. `idle` just holds inherited fds.
 
 #[cfg(target_os = "macos")]
 fn main() {
@@ -23,7 +28,7 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let (Some(mode), Some(dir)) = (args.get(1).cloned(), args.get(2).map(PathBuf::from)) else {
-        eprintln!("usage: signer_probe server|client <dir> [peer-identifier]");
+        eprintln!("usage: signer_probe server|client|idle <dir> [peer-identifier]");
         std::process::exit(2);
     };
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -46,10 +51,30 @@ fn main() {
                     peer.uid,
                     t.elapsed().as_secs_f64() * 1e3
                 );
-                if let Ok(Some(IpcRequest::Hello { version })) = conn.recv().await {
-                    let _ = conn.send(IpcResponse::Hello { version }).await;
+                // Serve until the peer closes; print what each request turned into.
+                loop {
+                    match conn.recv().await {
+                        Ok(Some(IpcRequest::Hello { version })) => {
+                            println!("recv Hello");
+                            let _ = conn.send(IpcResponse::Hello { version }).await;
+                        }
+                        Ok(Some(r)) => {
+                            println!("recv DELIVERED {r:?}");
+                            let _ = conn.send(IpcResponse::Unpaired).await;
+                        }
+                        Ok(None) => {
+                            println!("recv closed");
+                            break;
+                        }
+                        Err(e) => {
+                            println!("recv REFUSED {e}");
+                            break;
+                        }
+                    }
                 }
             }
+            // Holds whatever fds it inherited and does nothing (the exec target of the attack).
+            "idle" => tokio::time::sleep(Duration::from_secs(4)).await,
             "client" => {
                 let mut c = MacIpcClient::connect(&dir.join("agent.sock"))
                     .await
@@ -58,6 +83,12 @@ fn main() {
                     "reply {:?}",
                     c.request(IpcRequest::Hello { version: 2 }).await
                 );
+                // A privileged request, sent only after the Hello was answered (as the app must).
+                let pair = IpcRequest::Pair {
+                    address: "green-house:8004".into(),
+                    code: fogar_ports::ipc::PairCode::parse("482913"),
+                };
+                println!("reply {:?}", c.request(pair).await);
             }
             _ => std::process::exit(2),
         }
