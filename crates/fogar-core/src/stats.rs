@@ -59,6 +59,9 @@ impl LinkState {
             LinkState::Parked {
                 reason: CloseAction::AgentRefused,
             } => "parked_agent_refused",
+            LinkState::Parked {
+                reason: CloseAction::ConversationTaken,
+            } => "parked_conversation_taken",
             LinkState::Parked { .. } => "parked_client_error",
             LinkState::ShuttingDown => "shutting_down",
             LinkState::Stopped => "stopped",

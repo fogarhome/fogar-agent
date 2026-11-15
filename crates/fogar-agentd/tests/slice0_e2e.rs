@@ -305,7 +305,7 @@ async fn wrong_key_is_rejected_at_handshake_and_unpairs() {
         e.health.wait_link(|v| v.state == LinkState::NotPaired),
     )
     .await;
-    assert_eq!(v.last_close, Some((1008, CloseAction::Repair)));
+    assert_eq!(v.last_close, Some((4010, CloseAction::Repair)));
     assert_eq!(e.gw.log().handshakes_rejected, 1);
     assert!(e.agent.shutdown(Duration::from_secs(5)).await.clean);
     e.gw.shutdown().await;

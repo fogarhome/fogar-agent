@@ -28,3 +28,20 @@ retried after reconnect may duplicate; no desktop `client_type`.
 - Golden JSON fixtures from the gateway repo's `docs/client-protocol.md` / e2e harness replace the
   vault-derived vectors (turns every LIKELY/GUESSED mark into CERTAIN or fixes it).
 - Real close reasons byte-for-byte (Spanish strings, accents) and the silence-watchdog code.
+
+## Amendment (2026-11-15): gateway M19 ("v3") compatibility
+The gateway's M19 (conversations, OpenClaw routing; branch `claude/hopeful-pasteur-phx8ad`, not yet
+released) changes the client protocol. The agent speaks BOTH generations until every gateway is on
+M19:
+- Closes: M19 gives each application reason its own 4xxx code and the code is the contract
+  (`fogar_proto::close::classify_close`): 4010/4200 re-pair, 4020/4021 agent refused, 4102
+  conversation taken (park, never auto-reconnect), other 4000–4899 park, 4900–4999 backoff. The
+  old 1008 + text mapping stays for gateways <= 2.x.
+- `turn_end.reason` (done/error/cancelled/interrupted/replaced/timeout/closed; unknown = error)
+  replaces the `interrupted` message; `interrupted`/`replaced` stop playback. The old message is
+  still handled.
+- `turn_start.origin` (user/push) is trusted when present; otherwise inferred as before.
+- Not adopted yet (conversations slice): the handshake `conversation` field (we omit it, so the
+  gateway uses the "conversation of the day"), `ready.conversation`, `turn_start.conversation`
+  (decoded, unused), `turn_progress` (we never request `status`).
+The mock gateway speaks M19 by default (`MockConfig::m19 = false` plays a 2.x gateway).

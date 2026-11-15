@@ -228,7 +228,8 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                         // Repair without one of the two exact texts keeps the key (spec §0).
                         CloseAction::Repair
                         | CloseAction::AgentRefused
-                        | CloseAction::FixClient => {
+                        | CloseAction::FixClient
+                        | CloseAction::ConversationTaken => {
                             if self.park(action, &egress).await {
                                 attempt = 0;
                                 continue;

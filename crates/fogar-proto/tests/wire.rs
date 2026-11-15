@@ -167,11 +167,20 @@ fn arb_server_msg() -> impl Strategy<Value = ServerMsg> {
             }),
         arb_text().prop_map(|text| ServerMsg::TranscriptionPartial(Transcription { text })),
         arb_text().prop_map(|text| ServerMsg::Transcription(Transcription { text })),
-        (arb_text(), any::<u16>())
-            .prop_map(|(turn_id, turn_seq)| ServerMsg::TurnStart(TurnStart { turn_id, turn_seq })),
+        (arb_text(), any::<u16>()).prop_map(|(turn_id, turn_seq)| ServerMsg::TurnStart(
+            TurnStart {
+                turn_id,
+                turn_seq,
+                origin: None,
+                conversation: None
+            }
+        )),
         (arb_text(), arb_text())
             .prop_map(|(turn_id, text)| ServerMsg::Token(Token { turn_id, text })),
-        arb_text().prop_map(|turn_id| ServerMsg::TurnEnd(TurnEnd { turn_id })),
+        arb_text().prop_map(|turn_id| ServerMsg::TurnEnd(TurnEnd {
+            turn_id,
+            reason: None
+        })),
         proptest::option::of(arb_text())
             .prop_map(|turn_id| ServerMsg::Interrupted(Interrupted { turn_id })),
         (arb_text(), arb_text(), proptest::option::of(arb_text())).prop_map(
@@ -317,4 +326,59 @@ fn debug_output_redacts_user_content() {
         assert!(!dbg.contains(secret), "{dbg}");
         assert!(dbg.contains("redacted"), "{dbg}");
     }
+}
+
+/// Gateway M19 ("v3", client-protocol §5, §12): new fields decode; unknown values stay lenient.
+#[test]
+fn m19_turn_vectors_decode() {
+    use fogar_proto::server::{TurnEndReason, TurnOrigin};
+    let start = decode_server(
+        r#"{"type":"turn_start","turn_id":"t-2","turn_seq":2,"conversation":"0b9d6c1e","origin":"push"}"#,
+    )
+    .unwrap();
+    match start {
+        ServerMsg::TurnStart(ts) => {
+            assert_eq!(ts.origin, Some(TurnOrigin::Push));
+            assert_eq!(ts.conversation.as_deref(), Some("0b9d6c1e"));
+        }
+        other => panic!("{other:?}"),
+    }
+    let start = decode_server(
+        r#"{"type":"turn_start","turn_id":"t-3","turn_seq":3,"conversation":null,"origin":"robot"}"#,
+    )
+    .unwrap();
+    assert!(
+        matches!(start, ServerMsg::TurnStart(ts) if ts.origin.is_none() && ts.conversation.is_none())
+    );
+    for (raw, want) in [
+        ("done", TurnEndReason::Done),
+        ("error", TurnEndReason::Error),
+        ("cancelled", TurnEndReason::Cancelled),
+        ("interrupted", TurnEndReason::Interrupted),
+        ("replaced", TurnEndReason::Replaced),
+        ("timeout", TurnEndReason::Timeout),
+        ("closed", TurnEndReason::Closed),
+        ("a-future-reason", TurnEndReason::Error),
+    ] {
+        let m = decode_server(&format!(
+            r#"{{"type":"turn_end","turn_id":"t-1","reason":"{raw}"}}"#
+        ))
+        .unwrap();
+        assert!(
+            matches!(m, ServerMsg::TurnEnd(te) if te.reason == Some(want)),
+            "{raw}"
+        );
+    }
+    let m = decode_server(r#"{"type":"turn_end","turn_id":"t-1","reason":7}"#).unwrap();
+    assert!(matches!(m, ServerMsg::TurnEnd(te) if te.reason.is_none()));
+    // ready with the M19 conversation object, and turn_progress (not requested by us): no break.
+    assert!(matches!(
+        decode_server(r#"{"type":"ready","session_id":"c:1","agent":"main","conversation":{"id":"x","agent":"main"}}"#).unwrap(),
+        ServerMsg::Ready(_)
+    ));
+    assert!(matches!(
+        decode_server(r#"{"type":"turn_progress","turn_id":"t-1","phase":"thinking","tool":null}"#)
+            .unwrap(),
+        ServerMsg::Unknown
+    ));
 }
