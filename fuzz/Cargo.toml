@@ -1,0 +1,50 @@
+# Fuzz targets (cargo-fuzz / libFuzzer) for the parsers that read untrusted bytes.
+# Outside the main workspace on purpose (own [workspace] table, own Cargo.lock): the gates,
+# cargo-deny, cargo-vet and archtest never see it. Run: `cargo +nightly fuzz run <target>`.
+# Stable smoke check over the seed corpus: `cargo test --manifest-path fuzz/Cargo.toml`.
+[package]
+name = "fogar-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+# Verified on crates.io 2026-11-16 (cargo info): libfuzzer-sys 0.4.13.
+libfuzzer-sys = "=0.4.13"
+fogar-proto = { path = "../crates/fogar-proto" }
+fogar-ports = { path = "../crates/fogar-ports" }
+fogar-host = { path = "../crates/fogar-host" }
+
+[[bin]]
+name = "decode_server"
+path = "fuzz_targets/decode_server.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tts_frame"
+path = "fuzz_targets/tts_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "close_code"
+path = "fuzz_targets/close_code.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_frames"
+path = "fuzz_targets/ipc_frames.rs"
+test = false
+doc = false
+bench = false
