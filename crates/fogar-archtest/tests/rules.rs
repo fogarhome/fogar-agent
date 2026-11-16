@@ -803,9 +803,10 @@ fn selftest_r10_sees_the_time_feature() {
             .current_dir(&dir)
             .output()
             .expect("run cargo check");
+        let err = String::from_utf8_lossy(&out.stderr);
         assert!(
-            !out.status.success(),
-            "tokio::time compiled without the feature: {src}"
+            !out.status.success() && (err.contains("E0432") || err.contains("E0433")),
+            "tokio::time compiled without the feature (or the fixture broke): {src}: {err}"
         );
     }
     let _ = std::fs::remove_dir_all(&dir);

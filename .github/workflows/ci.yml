@@ -30,8 +30,9 @@ jobs:
       - name: Agent config and gates unchanged (ADR-0007)
         run: |
           set -f # git, not the shell, matches crates/*/clippy.toml (in both trees)
-          paths="agent-team .claude scripts .github deny.toml clippy.toml crates/*/clippy.toml
-            crates/fogar-archtest docs/adr/0007-agent-config-integrity.md"
+          paths="agent-team .claude scripts .github .cargo rust-toolchain.toml deny.toml clippy.toml
+            crates/*/clippy.toml crates/fogar-archtest docs/adr/0007-agent-config-integrity.md
+            CLAUDE.md **/CLAUDE.md"
           # shellcheck disable=SC2086 # word-split on purpose: one pathspec per word
           if ! git diff --stat --exit-code HEAD^1 HEAD -- $paths; then
             echo "::error::This PR changes agent config or the gates (above): a human must merge it knowingly (ADR-0007)"
