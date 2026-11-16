@@ -72,7 +72,11 @@ impl MockGateway {
                 tasks.spawn(async move {
                     let _ = sock.set_nodelay(true);
                     // Same port as the real gateway: `/ws/...` upgrades, anything else is REST.
-                    if !is_websocket(&sock).await {
+                    let ws = tokio::select! {
+                        () = cancel.cancelled() => return,
+                        ws = is_websocket(&sock) => ws,
+                    };
+                    if !ws {
                         tokio::select! {
                             () = cancel.cancelled() => {}
                             () = serve_http(sock, routes) => {}

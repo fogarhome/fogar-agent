@@ -4,7 +4,8 @@
 //!   like the real one: always runs, covers v3 (4200) and 2.x (1008 "revoked");
 //! - the REAL fogar-gateway (Python) with its own fake OpenClaw and no STT/TTS, started by
 //!   `real_gateway/launch.py` from the checkout in `FOGAR_GATEWAY_DIR` (skipped when unset; CI
-//!   checks out the ref in `real_gateway/GATEWAY_REF`).
+//!   is meant to check out the gateway commit in `real_gateway/GATEWAY_REF`;
+//!   that job is not wired yet).
 //!
 //! The app side of the IPC is the in-memory `FakeIpc` (the real socket's code-signing check
 //! cannot accept a test binary). Real sockets, so real time, not paused time.
@@ -316,6 +317,7 @@ async fn pairing_lifecycle_against_the_real_gateway() {
         eprintln!("FOGAR_GATEWAY_DIR not set: real-gateway E2E skipped");
         return;
     };
+    let baseline = alive_tasks();
     let (agent, secrets, ipc) = start_agent();
     let mut h = agent.health();
     within(
@@ -352,12 +354,12 @@ async fn pairing_lifecycle_against_the_real_gateway() {
     )
     .await;
     assert_eq!(v.last_close.map(|c| c.0), Some(4200));
-    let sessions = h.snapshot().stats.sessions_started;
+    let attempts = h.snapshot().stats.connect_attempts;
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(phase(&mut app).await, LinkPhase::NotPaired);
     assert_eq!(
-        h.snapshot().stats.sessions_started,
-        sessions,
+        h.snapshot().stats.connect_attempts,
+        attempts,
         "no reconnect after revocation"
     );
     assert_eq!(secrets.pairing_deletes.load(Ordering::SeqCst), 1);
@@ -374,5 +376,11 @@ async fn pairing_lifecycle_against_the_real_gateway() {
 
     drop(app);
     assert!(agent.shutdown(Duration::from_secs(5)).await.clean);
+    within(Duration::from_secs(5), async {
+        while alive_tasks() != baseline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
     gw.stop().await;
 }

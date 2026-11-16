@@ -100,13 +100,14 @@ async def main() -> None:
                                 (await c.delete(f"/admin/clients/{i}")).raise_for_status()
                             print(f"revoked {len(ids)}", flush=True)
                         elif cmd == "restart":
-                            stop(gw)
+                            # Off the loop: the fake OpenClaw keeps answering while uvicorn drains.
+                            await loop.run_in_executor(None, stop, gw)
                             gw = await start(env, port)
                             print("restarted", flush=True)
                         else:
                             print(f"error unknown command {cmd!r}", flush=True)
             finally:
-                stop(gw)
+                await loop.run_in_executor(None, stop, gw)
 
 
 asyncio.run(main())
