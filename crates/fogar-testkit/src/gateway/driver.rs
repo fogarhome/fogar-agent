@@ -5,7 +5,7 @@ use fogar_proto::{
     limits::HANDSHAKE_MAX_CHARS,
     server::{
         Capabilities, ErrorMsg, Ready, ServerMsg, Status, Token, Transcription, TurnEnd,
-        TurnEndReason, TurnStart,
+        TurnEndReason, TurnOrigin, TurnStart,
     },
 };
 use std::{
@@ -139,6 +139,8 @@ struct Conn {
     output_audio: bool,
     turn_n: u32,
     streaming: Option<Streaming>,
+    /// Pushes queued behind the streaming turn: M19 never replaces a turn with a push (§10).
+    pending_pushes: u32,
     utterance_audio: u64,
     last_client: Instant,
 }
@@ -172,6 +174,7 @@ pub(crate) async fn run_conn<T: ServerTransport>(
         output_audio: false,
         turn_n: 0,
         streaming: None,
+        pending_pushes: 0,
         utterance_audio: 0,
         last_client: Instant::now(),
     };
@@ -253,7 +256,11 @@ impl Conn {
                 Step::Stop
             }
             Ctl::Abort => Step::Stop,
-            Ctl::Push => self.start_turn(t).await,
+            Ctl::Push if self.streaming.is_some() => {
+                self.pending_pushes += 1;
+                Step::Continue
+            }
+            Ctl::Push => self.start_turn(t, TurnOrigin::Push).await,
         }
     }
 
@@ -425,7 +432,7 @@ impl Conn {
                 ) {
                     return Step::Stop;
                 }
-                self.start_turn(t).await
+                self.start_turn(t, TurnOrigin::User).await
             }
             ClientMsg::Cancel => self.cancel_turn(t, TurnEndReason::Cancelled).await,
         }
@@ -443,13 +450,7 @@ impl Conn {
         Step::Continue
     }
 
-    async fn start_turn<T: ServerTransport>(&mut self, t: &mut T) -> Step {
-        if matches!(
-            self.cancel_turn(t, TurnEndReason::Replaced).await,
-            Step::Stop
-        ) {
-            return Step::Stop;
-        }
+    async fn start_turn<T: ServerTransport>(&mut self, t: &mut T, origin: TurnOrigin) -> Step {
         self.turn_n += 1;
         let turn_id = format!("t-{}", self.turn_n);
         let seq = (self.turn_n & 0xFFFF) as u16;
@@ -457,7 +458,7 @@ impl Conn {
         let start = ServerMsg::TurnStart(TurnStart {
             turn_id: turn_id.clone(),
             turn_seq: seq,
-            origin: None,
+            origin: self.cfg.m19.then_some(origin),
             conversation: None,
         });
         if matches!(self.send(t, &start).await, Step::Stop) {
@@ -506,7 +507,14 @@ impl Conn {
                 turn_id: id,
                 reason: self.end_reason(TurnEndReason::Done),
             };
-            return self.send(t, &ServerMsg::TurnEnd(end)).await;
+            if matches!(self.send(t, &ServerMsg::TurnEnd(end)).await, Step::Stop) {
+                return Step::Stop;
+            }
+            if self.pending_pushes > 0 {
+                self.pending_pushes -= 1;
+                return self.start_turn(t, TurnOrigin::Push).await;
+            }
+            return Step::Continue;
         }
         s.left -= 1;
         s.next_at = Instant::now() + self.cfg.frame_interval;

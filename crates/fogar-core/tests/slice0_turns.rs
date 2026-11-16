@@ -101,6 +101,21 @@ async fn push_turn_is_played_without_a_request() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn push_during_a_turn_waits_for_it_instead_of_replacing_it() {
+    let mut rig = RigBuilder::fake(MockConfig::default()).start();
+    wait_ready(&mut rig.health).await;
+    assert_eq!(rig.link.control(Ctl::Push), 1);
+    assert_eq!(rig.link.control(Ctl::Push), 1);
+    eventually(Duration::from_secs(10), || {
+        rig.health.snapshot().stats.tts_frames_played == 10
+    })
+    .await;
+    let log = rig.link.log();
+    assert_eq!((log.turns_started, log.turns_cancelled), (2, 0));
+    assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
+}
+
+#[tokio::test(start_paused = true)]
 async fn minimal_platform_without_audio_still_connects_and_shuts_down() {
     let mut b = RigBuilder::fake(MockConfig::default());
     b.mic = fogar_testkit::FakeMic::minimal();

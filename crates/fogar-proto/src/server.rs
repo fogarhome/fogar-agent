@@ -477,9 +477,13 @@ pub enum TurnEndReason {
 }
 
 impl TurnEndReason {
-    /// The turn was cut short by the gateway in favour of the user: stop what is still playing.
+    /// The turn was cut short in favour of the user, or its session is closing (`closed` comes
+    /// right before a 4102/4200 close): stop what is still playing.
     pub fn stops_playback(self) -> bool {
-        matches!(self, TurnEndReason::Interrupted | TurnEndReason::Replaced)
+        matches!(
+            self,
+            TurnEndReason::Interrupted | TurnEndReason::Replaced | TurnEndReason::Closed
+        )
     }
 }
 
