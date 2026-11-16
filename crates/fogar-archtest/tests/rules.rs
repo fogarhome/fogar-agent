@@ -15,6 +15,7 @@
 //!  R9 adapter crates (fogar-host, fogar-agent-*) never reach fogar-core
 //!  R10 fogar-core's own build never enables tokio's `time` feature, so `tokio::time` does not
 //!     exist for it; gates.sh compiles fogar-core alone, where any use is a compile error
+//!     (production code only: test-only code in `src/` gets `time` from the dev-dependencies)
 //!
 //! Every checker has a self-test (`selftest_*`) that plants the violation in a temporary
 //! fixture and asserts the rule fires (review code#4: a rule that cannot fail proves nothing).
@@ -516,11 +517,17 @@ fn r9_adapters_never_depend_on_core() {
 /// `cargo tree -p`, not the workspace-unified set). Replaces a token scan of the sources: without
 /// the `time` feature the compiler rejects every spelling of `tokio::time`, aliases included.
 fn tokio_features_in(dir: &Path, krate: &str) -> BTreeSet<String> {
+    // Fixtures resolve from the local cache; the real workspace may need the index (CI runner).
+    let offline = if dir == root() {
+        "--locked"
+    } else {
+        "--offline"
+    };
     cargo_in(
         dir,
         &[
             "tree",
-            "--offline",
+            offline,
             "-p",
             krate,
             "--target",
@@ -547,8 +554,15 @@ fn r10_core_build_has_no_tokio_time() {
         "R10 checker saw no tokio features: {f:?}"
     );
     assert!(
-        !f.contains("time") && !f.contains("full"),
+        !f.contains("time"),
         "fogar-core enables tokio time: {f:?} (use the Clock port)"
+    );
+    // The feature check only matters if fogar-core is also compiled on its own.
+    let gates = std::fs::read_to_string(root().join("scripts/gates.sh")).unwrap();
+    assert!(
+        gates.lines().any(|l| l.starts_with("run_gate ")
+            && l.ends_with(" cargo check -p fogar-core --lib --locked")),
+        "scripts/gates.sh must compile fogar-core alone (R10)"
     );
 }
 
@@ -775,6 +789,23 @@ fn selftest_r10_sees_the_time_feature() {
             f.contains("time"),
             has_time,
             "R10 checker on [{features}]: {f:?}"
+        );
+    }
+    // And the premise: without the feature, any spelling of tokio::time does not compile.
+    for src in [
+        "pub use tokio::time;",
+        "use tokio as t; pub fn f() { let _ = t::time::Instant::now(); }",
+    ] {
+        write(&dir.join("src/lib.rs"), src);
+        let out = Command::new(env!("CARGO"))
+            .args(["check", "--offline", "--quiet"])
+            .env("CARGO_TARGET_DIR", root().join("target/archtest-fixture"))
+            .current_dir(&dir)
+            .output()
+            .expect("run cargo check");
+        assert!(
+            !out.status.success(),
+            "tokio::time compiled without the feature: {src}"
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
