@@ -7,7 +7,10 @@ Usage: geiger_check.py REPORT.json BASELINE.txt [--write]
 Baseline lines (sorted): `unsafe <crate> <count>` = `unsafe` items geiger counts as *used* by the
 build, summed over every version of that crate (a version bump alone does not trip the gate), and
 `unscanned <file>` = a used .rs file geiger could not parse (its unsafe is invisible, so a new one
-fails like a count increase). Exit 1 on growth or a new unscanned file; decreases only print a note.
+fails like a count increase). Exit 1 on ANY difference: growth must be visible in the PR diff, and
+a drop must be ratcheted in (else it could silently grow back; an empty or partial report also
+shows up as drops). Known blind spot: geiger does not count `unsafe` written inside a
+`macro_rules!` body, so the first-party adapter crates need their own check (follow-up).
 """
 import json
 import os
@@ -61,18 +64,13 @@ def parse(text):
 
 
 def compare(base, now):
-    """Returns (failures, notes) as lists of strings."""
+    """Returns every difference from the baseline as a list of strings (empty = match)."""
     (bc, bu), (nc, nu) = base, now
-    failures, notes = [], []
-    for name in sorted(set(bc) | set(nc)):
-        b, n = bc.get(name, 0), nc.get(name, 0)
-        if n > b:
-            failures.append(f"{name}: unsafe {b} -> {n}")
-        elif n < b:
-            notes.append(f"{name}: unsafe {b} -> {n} (baseline can be lowered)")
+    failures = [f"{name}: unsafe {bc.get(name, 0)} -> {nc.get(name, 0)}"
+                for name in sorted(set(bc) | set(nc)) if bc.get(name, 0) != nc.get(name, 0)]
     failures += [f"new unscanned file (unsafe not counted): {f}" for f in sorted(nu - bu)]
-    notes += [f"no longer unscanned: {f}" for f in sorted(bu - nu)]
-    return failures, notes
+    failures += [f"no longer unscanned: {f}" for f in sorted(bu - nu)]
+    return failures
 
 
 def self_test():
@@ -96,13 +94,14 @@ def self_test():
     assert now == ({"a": 6, "b": 0}, {"sig-reg/src/lib.rs", "build:serde/out/private.rs"}), now
     text = render(*now)
     assert "unsafe b" not in text and parse(text) == ({"a": 6}, now[1]), text
-    assert compare(parse(text), now) == ([], [])
+    assert compare(parse(text), now) == []
     grown = ({"a": 7, "c": 1}, now[1] | {"new/src/lib.rs"})
-    fails, _ = compare(parse(text), grown)
+    fails = compare(parse(text), grown)
     assert fails == ["a: unsafe 6 -> 7", "c: unsafe 0 -> 1",
                      "new unscanned file (unsafe not counted): new/src/lib.rs"], fails
-    fails, notes = compare(parse(text), ({"a": 5}, set()))
-    assert fails == [] and len(notes) == 3, notes
+    assert len(compare(parse(text), ({"a": 5}, set()))) == 3  # drops fail too (ratchet)
+    empty = summarize({"packages": [], "used_but_not_scanned_files": []}, root)
+    assert len(compare(parse(text), empty)) == 3  # an empty report never passes
     print("geiger_check self-test: ok")
 
 
@@ -127,18 +126,19 @@ def main(argv):
         return 1
     with open(baseline_path) as f:
         base = parse(f.read())
-    failures, notes = compare(base, now)
+    failures = compare(base, now)
     total = sum(now[0].values())
     summary = [f"geiger: {total} used unsafe items in {sum(1 for c in now[0].values() if c)} "
                f"crates, {len(now[1])} unscanned files (baseline {baseline_path})"]
-    summary += [f"FAIL {x}" for x in failures] + [f"note {x}" for x in notes]
+    summary += [f"FAIL {x}" for x in failures]
     print("\n".join(summary))
     step = os.environ.get("GITHUB_STEP_SUMMARY")
     if step:
         with open(step, "a") as f:
             f.write("### cargo geiger\n\n```\n" + "\n".join(summary) + "\n```\n")
     if failures:
-        print(f"unsafe grew: if intended, regenerate {baseline_path} with --write in this PR")
+        print(f"unsafe count changed: if intended, run `scripts/geiger.sh --write` on this OS and "
+              f"commit {baseline_path} in this PR")
         return 1
     return 0
 
