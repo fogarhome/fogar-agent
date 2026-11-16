@@ -252,6 +252,13 @@ impl Conn {
     async fn ctl<T: ServerTransport>(&mut self, t: &mut T, cmd: Ctl) -> Step {
         match cmd {
             Ctl::Close { code, reason } => {
+                // M19 ends the open turn with `closed` before these closes (spec §13).
+                if self.cfg.m19
+                    && matches!(code, 4102 | 4200)
+                    && matches!(self.cancel_turn(t, TurnEndReason::Closed).await, Step::Stop)
+                {
+                    return Step::Stop;
+                }
                 self.close(t, code, &reason).await;
                 Step::Stop
             }
@@ -434,7 +441,15 @@ impl Conn {
                 }
                 self.start_turn(t, TurnOrigin::User).await
             }
-            ClientMsg::Cancel => self.cancel_turn(t, TurnEndReason::Cancelled).await,
+            ClientMsg::Cancel => {
+                if matches!(
+                    self.cancel_turn(t, TurnEndReason::Cancelled).await,
+                    Step::Stop
+                ) {
+                    return Step::Stop;
+                }
+                self.next_push(t).await
+            }
         }
     }
 
@@ -448,6 +463,15 @@ impl Conn {
             return self.send(t, &ServerMsg::TurnEnd(end)).await;
         }
         Step::Continue
+    }
+
+    /// A queued push goes out after the turn_end of the turn it waited for (spec §10).
+    async fn next_push<T: ServerTransport>(&mut self, t: &mut T) -> Step {
+        if self.pending_pushes == 0 {
+            return Step::Continue;
+        }
+        self.pending_pushes -= 1;
+        self.start_turn(t, TurnOrigin::Push).await
     }
 
     async fn start_turn<T: ServerTransport>(&mut self, t: &mut T, origin: TurnOrigin) -> Step {
@@ -510,11 +534,7 @@ impl Conn {
             if matches!(self.send(t, &ServerMsg::TurnEnd(end)).await, Step::Stop) {
                 return Step::Stop;
             }
-            if self.pending_pushes > 0 {
-                self.pending_pushes -= 1;
-                return self.start_turn(t, TurnOrigin::Push).await;
-            }
-            return Step::Continue;
+            return self.next_push(t).await;
         }
         s.left -= 1;
         s.next_at = Instant::now() + self.cfg.frame_interval;
