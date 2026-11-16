@@ -6,6 +6,8 @@ on:
   push:
     branches: [main, "slice-*"]
   pull_request:
+    # labeled/unlabeled: the ROOT_HASH acknowledgement below is a label.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   contents: read
@@ -28,6 +30,24 @@ jobs:
           cargo install --locked cargo-audit --version 0.23.0
       - name: Gates
         run: scripts/gates.sh
+      # ADR-0007: a PR can regenerate the hash lists and ROOT_HASH together, so compare with the
+      # base branch; a change needs the `agent-config-change` label (human/orchestrator ack).
+      - name: Agent-team ROOT_HASH unchanged vs base (ADR-0007)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.base_ref }}
+          ACK: ${{ contains(github.event.pull_request.labels.*.name, 'agent-config-change') }}
+        run: |
+          adr=docs/adr/0007-agent-config-integrity.md
+          hash() { sed -n 's/^ROOT_HASH: *\([0-9a-f]*\).*/\1/p' | head -1; }
+          git fetch --no-tags --depth=1 origin "refs/heads/$BASE"
+          old=$(git show "FETCH_HEAD:$adr" | hash)
+          new=$(hash < "$adr")
+          echo "base $old / PR $new / ack $ACK"
+          [ -n "$new" ] && { [ "$old" = "$new" ] || [ "$ACK" = true ]; } || {
+            echo "::error::ROOT_HASH changed; needs the agent-config-change label (ADR-0007)"
+            exit 1
+          }
 
   miri:
     runs-on: ubuntu-latest

@@ -50,7 +50,9 @@ line above in the same PR.
 - The hash lists and this ADR live in the same repository: a PR can regenerate all three, so
   the hashes only make changes *visible*; they do not prevent them. **CI must compare
   `ROOT_HASH` against the value on the main branch** and require an explicit human/orchestrator
-  acknowledgement when it changes (not implemented in slice 0: there is no remote/CI run yet).
+  acknowledgement when it changes. Done in S1: the CI step "Agent-team ROOT_HASH unchanged vs
+  base" fails a PR whose value differs from its base branch unless it carries the
+  `agent-config-change` label.
 - `Bash(cargo test:*)` still executes the code under review (tests, build scripts). Reviewers
   must run it in a sandbox without secrets or network (the security-reviewer's `security-audit`
   helper scripts likewise).
