@@ -75,6 +75,10 @@ pub(crate) struct LinkCtx<C, L> {
     /// Keeps the pairing channel open while the link runs: a closed `watch` would make every
     /// `changed()` branch above resolve at once (a hot loop).
     pub(crate) _pairing_keep: watch::Sender<()>,
+    /// Bumped by an IPC `Reconnect`; wakes `park` only for [`LinkState::user_may_reconnect`].
+    pub(crate) reconnect: watch::Receiver<()>,
+    /// Same reason as `_pairing_keep` (and there is no IPC sender at all without an IPC port).
+    pub(crate) _reconnect_keep: watch::Sender<()>,
 }
 
 /// Why a connection attempt / session ended.
@@ -264,15 +268,23 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
     }
 
     /// Stays alive but stops retrying (retrying would loop: fogar-longrun "config/auth errors do
-    /// not exit"). `true` = the pairing record changed (re-paired/unpaired): start over;
+    /// not exit"). `true` = the pairing record changed (re-paired/unpaired) or the person asked
+    /// to reconnect (only for [`LinkState::user_may_reconnect`] reasons): start over;
     /// `false` = shutdown.
     async fn park(&self, reason: CloseAction, egress: &CancellationToken) -> bool {
-        self.set_state(LinkState::Parked { reason });
         let mut pairing = self.pairing.clone();
+        let mut reconnect = self.reconnect.clone();
+        // Before publishing Parked: a request sent earlier (while connected) must not count, one
+        // the IPC service sends after seeing Parked must.
+        reconnect.borrow_and_update();
+        let state = LinkState::Parked { reason };
+        let user_may_reconnect = state.user_may_reconnect();
+        self.set_state(state);
         tokio::select! {
             biased;
             () = egress.cancelled() => false,
             r = pairing.changed() => r.is_ok(),
+            r = reconnect.changed(), if user_may_reconnect => r.is_ok(),
         }
     }
 
@@ -687,6 +699,7 @@ mod budget_tests {
             gateway: None,
         });
         let (pairing_keep, pairing) = watch::channel(());
+        let (reconnect_keep, reconnect) = watch::channel(());
         let ctx = LinkCtx {
             clock: clock.clone(),
             link: Scripted(Arc::new(Mutex::new(Some(script)))),
@@ -698,6 +711,8 @@ mod budget_tests {
             budget: budget.clone(),
             pairing,
             _pairing_keep: pairing_keep,
+            reconnect,
+            _reconnect_keep: reconnect_keep,
         };
         let (out_tx, out_rx) = mpsc::channel(8);
         let (in_tx, in_rx) = mpsc::channel(in_cap);

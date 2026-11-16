@@ -34,6 +34,8 @@ private struct Cabecera: View {
     let since: Date
     @Environment(AgentLink.self) private var link
     @Environment(Navegacion.self) private var nav
+    @State private var trabajando = false
+    @State private var error: String?
 
     var body: some View {
         HStack(alignment: .top, spacing: 16) {
@@ -45,6 +47,14 @@ private struct Cabecera: View {
                     .fixedSize(horizontal: false, vertical: true)
                 TimelineView(.everyMinute) { tl in
                     Text(frescura(tl.date)).meta()
+                }
+                if let error {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        EstadoIcono(tono: .bad, tam: 12)
+                        Text(error).font(Tipo.cuerpo).foregroundStyle(Color.hueso)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .accessibilityElement(children: .combine)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -60,11 +70,24 @@ private struct Cabecera: View {
         case .live(let s) where s.link == "parked_repair":
             Button("Ir a Ajustes") { nav.seccion = .ajustes }
                 .buttonStyle(Pildora(variante: .principal))
+        case .live(let s) where s.link == "parked_conversation_taken" || s.link == "parked_agent_refused":
+            Button("Reconectar", action: reconectar)
+                .buttonStyle(Pildora(variante: .principal))
+                .disabled(trabajando)
         case .notRunning, .refused, .noLiveStatus, .unintelligible:
             Button("Volver a llamar") { link.retryNow() }
                 .buttonStyle(Pildora())
         default:
             EmptyView()
+        }
+    }
+
+    private func reconectar() {
+        trabajando = true
+        error = nil
+        Task {
+            defer { trabajando = false }
+            do { try await link.reconnect() } catch { self.error = Textos.falloReconectar(error) }
         }
     }
 

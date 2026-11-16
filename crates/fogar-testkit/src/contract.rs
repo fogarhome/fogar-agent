@@ -803,6 +803,7 @@ pub mod ipc_server {
                     ))
                 }
                 IpcRequest::Unpair => IpcResponse::Unpaired,
+                IpcRequest::Reconnect => IpcResponse::Reconnecting,
                 _ => IpcResponse::Refused {
                     reason: "unsupported request",
                 },
@@ -836,6 +837,10 @@ pub mod ipc_server {
             assert_eq!(
                 c.request(IpcRequest::Unpair).await,
                 Some(IpcResponse::Unpaired)
+            );
+            assert_eq!(
+                c.request(IpcRequest::Reconnect).await,
+                Some(IpcResponse::Reconnecting)
             );
             drop(c);
         };
