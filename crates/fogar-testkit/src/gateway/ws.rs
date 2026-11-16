@@ -1,7 +1,10 @@
 //! Protocol-v1 mock gateway over a REAL local WebSocket (127.0.0.1, ephemeral port).
 
-use super::driver::{
-    ClientIn, Ctl, GatewayLog, MockConfig, ServerOut, ServerTransport, SharedLog, run_conn,
+use super::{
+    driver::{
+        ClientIn, Ctl, GatewayLog, MockConfig, ServerOut, ServerTransport, SharedLog, run_conn,
+    },
+    http::{HttpRoutes, serve_http},
 };
 use futures_util::{SinkExt, StreamExt};
 use std::{
@@ -28,6 +31,7 @@ pub struct MockGateway {
     log: SharedLog,
     cfg: Arc<Mutex<MockConfig>>,
     ctls: Arc<Mutex<Vec<mpsc::Sender<Ctl>>>>,
+    routes: HttpRoutes,
     cancel: CancellationToken,
     tasks: TaskTracker,
 }
@@ -45,13 +49,15 @@ impl MockGateway {
             log: Arc::default(),
             cfg: Arc::new(Mutex::new(cfg)),
             ctls: Arc::default(),
+            routes: HttpRoutes::fogar("mock"),
             cancel: CancellationToken::new(),
             tasks: TaskTracker::new(),
         };
-        let (log, cfg, ctls, cancel, tasks) = (
+        let (log, cfg, ctls, routes, cancel, tasks) = (
             gw.log.clone(),
             gw.cfg.clone(),
             gw.ctls.clone(),
+            gw.routes.clone(),
             gw.cancel.clone(),
             gw.tasks.clone(),
         );
@@ -62,10 +68,19 @@ impl MockGateway {
                     r = listener.accept() => match r { Ok(v) => v, Err(_) => continue },
                 };
                 let (log, cfg, cancel) = (log.clone(), cfg.lock().unwrap().clone(), cancel.clone());
-                let (ctl_tx, ctl_rx) = mpsc::channel(8);
-                ctls.lock().unwrap().push(ctl_tx);
+                let (ctls, routes) = (ctls.clone(), routes.clone());
                 tasks.spawn(async move {
                     let _ = sock.set_nodelay(true);
+                    // Same port as the real gateway: `/ws/...` upgrades, anything else is REST.
+                    if !is_websocket(&sock).await {
+                        tokio::select! {
+                            () = cancel.cancelled() => {}
+                            () = serve_http(sock, routes) => {}
+                        }
+                        return;
+                    }
+                    let (ctl_tx, ctl_rx) = mpsc::channel(8);
+                    ctls.lock().unwrap().push(ctl_tx);
                     let Ok(ws) = tokio_tungstenite::accept_async(sock).await else {
                         return;
                     };
@@ -86,6 +101,10 @@ impl MockGateway {
     /// The mock's address as the core and the link adapters see it.
     pub fn addr(&self) -> fogar_ports::gateway::GatewayAddr {
         fogar_ports::gateway::GatewayAddr::parse(&self.addr.to_string()).expect("mock addr")
+    }
+    /// The REST routes served on the same port (`/.well-known/fogar-gateway`, `POST /pair`).
+    pub fn routes(&self) -> HttpRoutes {
+        self.routes.clone()
     }
     pub fn log(&self) -> GatewayLog {
         self.log.lock().unwrap().clone()
@@ -112,6 +131,23 @@ impl MockGateway {
         self.tasks.close();
         self.tasks.wait().await;
     }
+}
+
+/// Peeks (without consuming) until the request line is in: does it ask for `/ws/`? Bounded:
+/// a client that never finishes its request line counts as HTTP and gets dropped there.
+async fn is_websocket(sock: &TcpStream) -> bool {
+    let mut buf = [0u8; 64];
+    for _ in 0..500 {
+        let n = match sock.peek(&mut buf).await {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => n,
+        };
+        if buf[..n].contains(&b'\n') || n == buf.len() {
+            return buf[..n].starts_with(b"GET /ws/");
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    false
 }
 
 struct WsTransport {

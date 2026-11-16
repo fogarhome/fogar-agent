@@ -10,7 +10,19 @@
 //! active turn [§9]; `turn_start`/`token`/paced `0xA1` audio/`turn_end` [§7, §12]; `cancel` ->
 //! `turn_end` [§6]; idle close 1000 after client silence [§13]; malformed JSON ->
 //! `INVALID_MESSAGE` (non-fatal) [§6]; scripted closes with any code/reason and abrupt drops.
+//! The REST surface (`/.well-known/fogar-gateway`, `POST /pair`) is served on the same port as
+//! scripted [`HttpRoutes`] (`MockGateway::routes`).
 //! NOT modelled: STT/barge-in from audio partials, push queueing, tool calls, pipeline events.
+//!
+//! The spec this mock follows is pinned below; `tests/spec_pin.rs` fails when a gateway checkout
+//! (`FOGAR_GATEWAY_DIR`) has a different `docs/client-protocol.md`: review the diff, update the
+//! mock, then bump both constants.
+
+/// fogar-gateway commit (branch `claude/hopeful-pasteur-phx8ad`, M19 / "v3") whose
+/// `docs/client-protocol.md` this mock was last checked against.
+pub const SPEC_GATEWAY_COMMIT: &str = "832e1de429819ea2ac83f746cb482ba99d77d3bb";
+/// `git hash-object docs/client-protocol.md` at [`SPEC_GATEWAY_COMMIT`].
+pub const SPEC_BLOB: &str = "5505f4ec56b52ad76894816bbf31f8fef83b9dd0";
 
 mod driver;
 mod http;
