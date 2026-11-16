@@ -34,3 +34,8 @@ fn close_code() {
 fn ipc_frames() {
     run("ipc_frames", fogar_fuzz::ipc_frames);
 }
+
+#[test]
+fn gateway_addr() {
+    run("gateway_addr", fogar_fuzz::gateway_addr);
+}

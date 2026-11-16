@@ -15,7 +15,9 @@ cargo-fuzz = true
 members = ["."]
 
 [dependencies]
-# Verified on crates.io 2026-11-16 (cargo info): libfuzzer-sys 0.4.13.
+# Verified on crates.io 2026-11-16 (cargo info): libfuzzer-sys 0.4.13. Not in the root
+# [workspace.dependencies] because this crate is its own workspace; dev-only, never linked into
+# the daemon. Shared crates in fuzz/Cargo.lock are pinned to the root Cargo.lock versions.
 libfuzzer-sys = "=0.4.13"
 fogar-proto = { path = "../crates/fogar-proto" }
 fogar-ports = { path = "../crates/fogar-ports" }
@@ -45,6 +47,13 @@ bench = false
 [[bin]]
 name = "ipc_frames"
 path = "fuzz_targets/ipc_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gateway_addr"
+path = "fuzz_targets/gateway_addr.rs"
 test = false
 doc = false
 bench = false

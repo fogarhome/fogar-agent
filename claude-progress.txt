@@ -154,7 +154,9 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
 - fuzz/ (cargo-fuzz, libfuzzer-sys =0.4.13), its own [workspace] + Cargo.lock, outside the main
   workspace: gates/deny/vet/archtest do not see it. Targets: decode_server, tts_frame, close_code,
   ipc_frames (take_frame + decode_request/decode_response, request re-encode round-trip,
-  GatewayAddr round-trip for Pair addresses). Bodies in fuzz/src/lib.rs, shared with a stable
+  GatewayAddr round-trip for Pair addresses), gateway_addr.
+- Bug found: GatewayAddr accepted 251-255 char hosts whose Display form did not parse again
+  (stored pairing unreadable). Fixed in fogar-ports (bound on host, 253) with a regression test. Bodies in fuzz/src/lib.rs, shared with a stable
   smoke test over the committed seeds (`cargo test --manifest-path fuzz/Cargo.toml --locked`).
-- Run locally on nightly for 3 min each (ASan); results in the PR. NOT DONE: CI build on every
+- After the fix, run locally on nightly for 3 min each (ASan), no crash; results in the PR. NOT DONE: CI build on every
   PR + scheduled runs (CI is owned by another PR; recipe in the fuzz PR description).

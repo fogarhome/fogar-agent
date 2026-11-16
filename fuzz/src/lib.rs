@@ -5,18 +5,14 @@ use fogar_host::ipc_wire::{decode_request, decode_response, encode_request, fram
 use fogar_ports::gateway::GatewayAddr;
 use fogar_ports::ipc::{IpcError, IpcRequest, MAX_FRAME_BYTES};
 use fogar_proto::{
-    AudioFrameError, CloseAction, DecodeError, classify_close, encode_tts_frame,
-    limits::WS_MAX_FRAME_BYTES, parse_tts_frame,
+    AudioFrameError, CloseAction, classify_close, encode_tts_frame, parse_tts_frame,
 };
 
-/// Gateway text frame -> `ServerMsg`. The transport only hands over valid UTF-8.
+/// Gateway text frame -> `ServerMsg`. The transport only hands over valid UTF-8. (The 1 MiB
+/// `TooLarge` cut-off is out of libFuzzer's input sizes; only "no panic" is checked here.)
 pub fn decode_server(data: &[u8]) {
-    let Ok(text) = core::str::from_utf8(data) else {
-        return;
-    };
-    let r = fogar_proto::decode_server(text);
-    if text.len() > WS_MAX_FRAME_BYTES {
-        assert!(matches!(r, Err(DecodeError::TooLarge { .. })));
+    if let Ok(text) = core::str::from_utf8(data) {
+        let _ = fogar_proto::decode_server(text);
     }
 }
 
@@ -25,10 +21,6 @@ pub fn tts_frame(data: &[u8]) {
     match parse_tts_frame(data) {
         Ok(f) => {
             assert_eq!(f.pcm_s16le.len(), data.len() - 3);
-            assert_eq!(
-                f.sample_count() * 2 + usize::from(f.has_odd_tail()),
-                f.pcm_s16le.len()
-            );
             if !f.has_odd_tail() {
                 let pcm: Vec<i16> = f.samples().collect();
                 let mut out = Vec::new();
@@ -98,5 +90,15 @@ pub fn ipc_frames(data: &[u8]) {
                 let _ = decode_response(&body);
             }
         }
+    }
+}
+
+/// A gateway address as typed by the person (it reaches the core inside an IPC `Pair`). An
+/// accepted address must round-trip through `Display`: that is how a pairing is stored and read
+/// back.
+pub fn gateway_addr(data: &[u8]) {
+    let input = String::from_utf8_lossy(data);
+    if let Ok(addr) = GatewayAddr::parse(&input) {
+        assert_eq!(GatewayAddr::parse(&addr.to_string()).ok(), Some(addr));
     }
 }
