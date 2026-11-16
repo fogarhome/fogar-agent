@@ -1,7 +1,12 @@
 //! User-initiated reconnect (IPC `Reconnect`): after the gateway closes 4102 ("conversation
 //! opened elsewhere", spec §13) or 4020/4021 the link parks and only the person may bring it
 //! back. Paused time, in-memory gateway, IPC through the fake adapter.
-#![allow(clippy::disallowed_methods, clippy::disallowed_types)] // the harness drives tokio's paused clock directly
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::unwrap_used,
+    clippy::expect_used
+)] // the harness drives tokio's paused clock directly
 
 mod common;
 use common::*;
@@ -39,7 +44,7 @@ async fn park(rig: &mut Rig, code: u16, text: &str, reason: CloseAction) {
 }
 
 /// No new attempt for an hour.
-async fn stays_parked(rig: &Rig, attempts: u64) {
+async fn no_new_attempts(rig: &Rig, attempts: u64) {
     tokio::time::sleep(Duration::from_secs(3600)).await;
     assert_eq!(rig.health.snapshot().stats.connect_attempts, attempts);
 }
@@ -55,7 +60,7 @@ async fn conversation_taken_then_reconnect_is_ready_again() {
         CloseAction::ConversationTaken,
     )
     .await;
-    stays_parked(&rig, 1).await;
+    no_new_attempts(&rig, 1).await;
     let mut c = client(&rig).await;
     assert_eq!(
         c.request(IpcRequest::Reconnect).await,
@@ -71,7 +76,7 @@ async fn conversation_taken_then_reconnect_is_ready_again() {
         c.request(IpcRequest::Reconnect).await,
         Some(IpcResponse::Refused { .. })
     ));
-    // Taken again: parked again, and the earlier (refused) click does not wake it.
+    // Taken again: parked again, and the click that ended the first park does not end this one.
     park(
         &mut rig,
         4102,
@@ -79,7 +84,7 @@ async fn conversation_taken_then_reconnect_is_ready_again() {
         CloseAction::ConversationTaken,
     )
     .await;
-    stays_parked(&rig, 2).await;
+    no_new_attempts(&rig, 2).await;
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
 
@@ -99,8 +104,8 @@ async fn agent_refused_gets_one_attempt_per_reconnect() {
         c.request(IpcRequest::Reconnect).await,
         Some(IpcResponse::Reconnecting)
     );
-    // More clicks either coalesce (link still parked) or are refused (it already left): never
-    // a second attempt.
+    // More clicks either coalesce (link still parked) or are refused (it already left). Here
+    // this only shows 4020 takes a reconnect; the stale-click rule is covered by the 4102 test.
     for _ in 0..2 {
         assert!(matches!(
             c.request(IpcRequest::Reconnect).await,
@@ -111,8 +116,7 @@ async fn agent_refused_gets_one_attempt_per_reconnect() {
         matches!(v.state, LinkState::Ready { session: 2 })
     })
     .await;
-    // Ready stays ready: the three clicks were one attempt.
-    stays_parked(&rig, 2).await;
+    no_new_attempts(&rig, 2).await;
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
 
@@ -132,7 +136,7 @@ async fn reconnect_needs_the_signed_app() {
         c.request(IpcRequest::Reconnect).await,
         Some(IpcResponse::Refused { .. })
     ));
-    stays_parked(&rig, 1).await;
+    no_new_attempts(&rig, 1).await;
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
 
@@ -146,6 +150,6 @@ async fn reconnect_does_not_retry_a_client_bug() {
         c.request(IpcRequest::Reconnect).await,
         Some(IpcResponse::Refused { .. })
     ));
-    stays_parked(&rig, 1).await;
+    no_new_attempts(&rig, 1).await;
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }

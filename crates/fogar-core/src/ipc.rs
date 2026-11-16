@@ -208,7 +208,7 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp>(mut c: Conn<K, C, H>) {
                 if !c.may_pair() =>
             {
                 IpcResponse::Refused {
-                    reason: "pairing needs the signed Fogar app",
+                    reason: "needs the signed Fogar app",
                 }
             }
             IpcRequest::Pair { address, code } => {

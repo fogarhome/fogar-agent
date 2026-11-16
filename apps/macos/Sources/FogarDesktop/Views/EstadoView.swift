@@ -60,6 +60,8 @@ private struct Cabecera: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             accion
         }
+        // A failed click is about the pause it was made in, not whatever the link does next.
+        .onChange(of: state) { error = nil }
     }
 
     @ViewBuilder private var accion: some View {

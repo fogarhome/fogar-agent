@@ -274,8 +274,10 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
     async fn park(&self, reason: CloseAction, egress: &CancellationToken) -> bool {
         let mut pairing = self.pairing.clone();
         let mut reconnect = self.reconnect.clone();
-        // Before publishing Parked: a request sent earlier (while connected) must not count, one
-        // the IPC service sends after seeing Parked must.
+        // Load-bearing: `self.reconnect` is never advanced, so a fresh clone still sees every past
+        // request as new; without this, each park after the first accepted Reconnect would wake
+        // at once (a 4102 ping-pong, NET-4). Before publishing Parked, so a request sent after
+        // the IPC service saw Parked does wake it.
         reconnect.borrow_and_update();
         let state = LinkState::Parked { reason };
         let user_may_reconnect = state.user_may_reconnect();
