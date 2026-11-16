@@ -1,8 +1,13 @@
 //! S1 end-to-end: the whole pairing lifecycle over the REAL transport. Real HTTP
-//! (`fogar_host::HttpGateway`) and real WebSocket (`WsGatewayLink`) against the mock gateway,
-//! which serves `/pair` and `/ws/stream` on one loopback port like the real one. The app side of
-//! the IPC is the in-memory `FakeIpc` (the real socket's code-signing check cannot accept a test
-//! binary). Real sockets, so real time (a few seconds), not paused time.
+//! (`fogar_host::HttpGateway`) and real WebSocket (`WsGatewayLink`), against two gateways:
+//! - the Rust mock (`MockGateway`), which serves `/pair` and `/ws/stream` on one loopback port
+//!   like the real one: always runs, covers v3 (4200) and 2.x (1008 "revoked");
+//! - the REAL fogar-gateway (Python) with its own fake OpenClaw and no STT/TTS, started by
+//!   `real_gateway/launch.py` from the checkout in `FOGAR_GATEWAY_DIR` (skipped when unset; CI
+//!   checks out the ref in `real_gateway/GATEWAY_REF`).
+//!
+//! The app side of the IPC is the in-memory `FakeIpc` (the real socket's code-signing check
+//! cannot accept a test binary). Real sockets, so real time, not paused time.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use fogar_core::{Agent, AgentPorts, Config, HealthProbe, LinkState, crashloop::BootMode};
@@ -95,10 +100,10 @@ async fn ready(h: &mut HealthProbe, session: u64) {
     .await;
 }
 
-async fn pair(c: &mut FakeIpcClient, gw: &MockGateway, code: &str) {
+async fn pair(c: &mut FakeIpcClient, address: &str, code: &str) {
     let r = c
         .request(IpcRequest::Pair {
-            address: gw.addr().to_string(),
+            address: address.into(),
             code: PairCode::parse(code),
         })
         .await;
@@ -118,17 +123,8 @@ fn alive_tasks() -> usize {
         .num_alive_tasks()
 }
 
-/// unpaired -> pair -> ready -> gateway restart (1012) -> ready again -> revoked -> key deleted
-/// once, not_paired, no retry -> pair again with a new key -> ready.
-async fn lifecycle(m19: bool, revoke: (u16, &str)) {
-    let mock = MockConfig {
-        client_key: "key-1".into(),
-        m19,
-        ..MockConfig::default()
-    };
-    let gw = MockGateway::start(mock.clone()).await.unwrap();
-    gw.routes().set("POST", "/pair", 201, pair_ok("key-1"));
-    let baseline = alive_tasks();
+/// An unpaired agent on the real adapters, with a counting store and a signed fake IPC.
+fn start_agent() -> (Agent<TokioClock>, Arc<CountingStore>, FakeIpc) {
     let secrets = Arc::new(CountingStore::default());
     let ipc = FakeIpc::new();
     let ports = AgentPorts {
@@ -143,6 +139,21 @@ async fn lifecycle(m19: bool, revoke: (u16, &str)) {
         probe: None,
     };
     let agent = Agent::start(ports, fast_config(), BootMode::Normal);
+    (agent, secrets, ipc)
+}
+
+/// unpaired -> pair -> ready -> gateway restart (1012) -> ready again -> revoked -> key deleted
+/// once, not_paired, no retry -> pair again with a new key -> ready.
+async fn lifecycle(m19: bool, revoke: (u16, &str)) {
+    let mock = MockConfig {
+        client_key: "key-1".into(),
+        m19,
+        ..MockConfig::default()
+    };
+    let gw = MockGateway::start(mock.clone()).await.unwrap();
+    gw.routes().set("POST", "/pair", 201, pair_ok("key-1"));
+    let baseline = alive_tasks();
+    let (agent, secrets, ipc) = start_agent();
     let mut h = agent.health();
     within(
         Duration::from_secs(10),
@@ -153,7 +164,7 @@ async fn lifecycle(m19: bool, revoke: (u16, &str)) {
     assert_eq!(phase(&mut app).await, LinkPhase::NotPaired);
 
     // Pair over HTTP, then the link comes up over WebSocket with the key /pair handed out.
-    pair(&mut app, &gw, "482 913").await;
+    pair(&mut app, &gw.addr().to_string(), "482 913").await;
     ready(&mut h, 1).await;
     let post = gw
         .routes()
@@ -199,7 +210,7 @@ async fn lifecycle(m19: bool, revoke: (u16, &str)) {
     assert!(!secrets.inner.contains(SecretKey::GatewayPairing));
 
     // Pairing again works and the link comes up with the new key.
-    pair(&mut app, &gw, "105 772").await;
+    pair(&mut app, &gw.addr().to_string(), "105 772").await;
     within(
         Duration::from_secs(10),
         h.wait_link(|v| matches!(v.state, LinkState::Ready { .. })),
@@ -228,4 +239,140 @@ async fn pairing_lifecycle_v3_gateway_revokes_with_4200() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pairing_lifecycle_v2_gateway_revokes_with_1008() {
     lifecycle(false, (1008, "revoked")).await;
+}
+
+/// The real gateway, driven over `launch.py`'s line protocol. Dropping it closes stdin, which
+/// stops the gateway and its fakes.
+struct RealGateway {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    out: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    addr: String,
+}
+
+impl RealGateway {
+    /// `None` when `FOGAR_GATEWAY_DIR` is unset.
+    async fn start() -> Option<Self> {
+        use tokio::io::AsyncBufReadExt as _;
+        let dir = std::env::var_os("FOGAR_GATEWAY_DIR")?;
+        let launch =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/real_gateway/launch.py");
+        let mut child = tokio::process::Command::new("uv")
+            .args(["run", "--locked", "python"])
+            .arg(launch)
+            .current_dir(&dir)
+            .env("PYTHONPATH", &dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("uv (https://docs.astral.sh/uv/) runs the gateway");
+        let stdin = child.stdin.take().unwrap();
+        let out = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut gw = Self {
+            child,
+            stdin,
+            out,
+            addr: String::new(),
+        };
+        let port = gw.line("ready", Duration::from_secs(180)).await;
+        gw.addr = format!("127.0.0.1:{port}");
+        Some(gw)
+    }
+
+    /// Next stdout line, which must start with `word`; returns the rest.
+    async fn line(&mut self, word: &str, d: Duration) -> String {
+        let l = within(d, self.out.next_line())
+            .await
+            .unwrap()
+            .expect("launcher exited");
+        let rest = l
+            .strip_prefix(word)
+            .unwrap_or_else(|| panic!("expected {word}, got {l:?}"));
+        rest.trim().to_owned()
+    }
+
+    async fn cmd(&mut self, cmd: &str, reply: &str, d: Duration) -> String {
+        use tokio::io::AsyncWriteExt as _;
+        self.stdin
+            .write_all(format!("{cmd}\n").as_bytes())
+            .await
+            .unwrap();
+        self.stdin.flush().await.unwrap();
+        self.line(reply, d).await
+    }
+
+    async fn stop(self) {
+        let Self {
+            mut child, stdin, ..
+        } = self;
+        drop(stdin);
+        within(Duration::from_secs(30), child.wait()).await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pairing_lifecycle_against_the_real_gateway() {
+    let Some(mut gw) = RealGateway::start().await else {
+        eprintln!("FOGAR_GATEWAY_DIR not set: real-gateway E2E skipped");
+        return;
+    };
+    let (agent, secrets, ipc) = start_agent();
+    let mut h = agent.health();
+    within(
+        Duration::from_secs(10),
+        h.wait_link(|v| v.state == LinkState::NotPaired),
+    )
+    .await;
+    let mut app = ipc.client().await;
+
+    // Pair with a code the admin opened, then the session comes up.
+    let code = gw.cmd("code", "code", Duration::from_secs(10)).await;
+    pair(&mut app, &gw.addr, &code).await;
+    ready(&mut h, 1).await;
+
+    // Restart (uvicorn closes with 1012): reconnects by itself once it is back, same key.
+    gw.cmd("restart", "restarted", Duration::from_secs(180))
+        .await;
+    let v = within(
+        Duration::from_secs(30),
+        h.wait_link(|v| matches!(v.state, LinkState::Ready { session } if session > 1)),
+    )
+    .await;
+    assert_eq!(v.last_close.map(|c| c.0), Some(1012));
+    assert_eq!(secrets.pairing_deletes.load(Ordering::SeqCst), 0);
+
+    // The admin deletes the client: 4200 on the live session, key deleted once, no retry.
+    assert_eq!(
+        gw.cmd("revoke", "revoked", Duration::from_secs(10)).await,
+        "1"
+    );
+    let v = within(
+        Duration::from_secs(10),
+        h.wait_link(|v| v.state == LinkState::NotPaired),
+    )
+    .await;
+    assert_eq!(v.last_close.map(|c| c.0), Some(4200));
+    let sessions = h.snapshot().stats.sessions_started;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(phase(&mut app).await, LinkPhase::NotPaired);
+    assert_eq!(
+        h.snapshot().stats.sessions_started,
+        sessions,
+        "no reconnect after revocation"
+    );
+    assert_eq!(secrets.pairing_deletes.load(Ordering::SeqCst), 1);
+
+    // A new code pairs again.
+    let code = gw.cmd("code", "code", Duration::from_secs(10)).await;
+    pair(&mut app, &gw.addr, &code).await;
+    within(
+        Duration::from_secs(10),
+        h.wait_link(|v| matches!(v.state, LinkState::Ready { .. })),
+    )
+    .await;
+    assert_eq!(secrets.pairing_deletes.load(Ordering::SeqCst), 1);
+
+    drop(app);
+    assert!(agent.shutdown(Duration::from_secs(5)).await.clean);
+    gw.stop().await;
 }
