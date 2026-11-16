@@ -65,3 +65,21 @@ jobs:
         run: cargo install --locked typeshare-cli --version 1.13.4
       - name: Fogar Desktop tests and Wire.swift check
         run: cd apps/macos && swift test && scripts/gen-wire.sh --check
+
+  supply-chain:
+    # cargo vet + the unsafe-count baseline (scripts/geiger.sh). Own job: building the two tools takes
+    # long enough to strain linux-gates' timeout. Versions verified on crates.io on 2026-11-16.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - name: Tools (pinned versions)
+        run: |
+          cargo install --locked cargo-vet --version 0.10.3
+          cargo install --locked cargo-geiger --version 0.14.0
+      - name: cargo vet (no fetching; supply-chain/imports.lock is committed)
+        run: cargo vet --locked
+      - name: cargo geiger vs supply-chain/geiger-linux.txt
+        run: python3 -I scripts/geiger_check.py --self-test && scripts/geiger.sh

@@ -1,0 +1,46 @@
+unsafe block-buffer 76
+unsafe bytes 849
+unsafe chacha20 244
+unsafe const-oid 5
+unsafe cpufeatures 12
+unsafe data-encoding 12
+unsafe errno 35
+unsafe futures-core 38
+unsafe futures-sink 2
+unsafe futures-task 112
+unsafe futures-util 537
+unsafe getrandom 91
+unsafe http 181
+unsafe httparse 224
+unsafe hybrid-array 136
+unsafe itoa 149
+unsafe libc 20
+unsafe log 21
+unsafe memchr 1831
+unsafe mio 187
+unsafe once_cell 89
+unsafe pin-project-lite 13
+unsafe proc-macro2 17
+unsafe rand 35
+unsafe ring 389
+unsafe rustix 1734
+unsafe rustls-pki-types 2
+unsafe rustls-platform-verifier 1
+unsafe serde_core 5
+unsafe serde_json 75
+unsafe sha1 230
+unsafe signal-hook-registry 12
+unsafe slab 32
+unsafe socket2 674
+unsafe subtle 8
+unsafe syn 93
+unsafe tokio 2459
+unsafe tokio-util 38
+unsafe tungstenite 8
+unsafe unicode-ident 4
+unsafe zeroize 28
+unsafe zmij 621
+unscanned build:serde/out/private.rs
+unscanned build:serde_core/out/private.rs
+unscanned build:thiserror/out/private.rs
+unscanned signal-hook-registry/src/lib.rs
