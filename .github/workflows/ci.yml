@@ -67,9 +67,14 @@ jobs:
         run: cd apps/macos && swift test && scripts/gen-wire.sh --check
 
   supply-chain:
-    # cargo vet + the unsafe-count baseline (scripts/geiger.sh). Own job: building the two tools takes
-    # long enough to strain linux-gates' timeout. Versions verified on crates.io on 2026-11-16.
-    runs-on: ubuntu-latest
+    # cargo vet + the unsafe-count baseline (scripts/geiger.sh) on both OSes: the macOS adapter and its
+    # Security.framework deps only build on macOS. Own job: building the two tools takes long enough
+    # to strain linux-gates' timeout. Versions verified on crates.io on 2026-11-16.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -81,5 +86,5 @@ jobs:
           cargo install --locked cargo-geiger --version 0.14.0
       - name: cargo vet (no fetching; supply-chain/imports.lock is committed)
         run: cargo vet --locked
-      - name: cargo geiger vs supply-chain/geiger-linux.txt
+      - name: cargo geiger vs supply-chain/geiger-<os>.txt
         run: python3 -I scripts/geiger_check.py --self-test && scripts/geiger.sh

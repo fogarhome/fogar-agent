@@ -6,10 +6,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 os="$(uname -s | tr '[:upper:]' '[:lower:]')"
-report="$(mktemp)"
-trap 'rm -f "$report"' EXIT
+report="$(mktemp)"; err="$(mktemp)"
+trap 'rm -f "$report" "$err"' EXIT
 # Own target dir: geiger cleans and rebuilds the packages it scans.
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}/geiger" \
-  cargo geiger --manifest-path "$PWD/crates/fogar-agentd/Cargo.toml" --locked --output-format Json >"$report" \
-  2> >(grep -v '"\$message_type"' >&2) # drop cargo's JSON artifact chatter, keep real errors
+  cargo geiger --manifest-path "$PWD/crates/fogar-agentd/Cargo.toml" --locked --output-format Json >"$report" 2>"$err" \
+  || { grep -v '"\$message_type"' "$err" >&2; exit 1; }
+grep -v '"\$message_type"' "$err" >&2 || true # cargo's JSON artifact chatter dropped, warnings kept
 python3 -I scripts/geiger_check.py "$report" "supply-chain/geiger-${os}.txt" "$@"
