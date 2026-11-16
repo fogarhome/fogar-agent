@@ -11,7 +11,7 @@
 //! `turn_start` (compare by equality; it wraps) and was not cancelled locally (barge-in).
 
 use fogar_ports::clock::Mono;
-use fogar_proto::server::{ErrorMsg, ServerMsg};
+use fogar_proto::server::{ErrorMsg, ServerMsg, TurnOrigin};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,12 +226,18 @@ impl TurnMachine {
                 }
             }
             ServerMsg::TurnStart(ts) => {
-                let origin = if let UserPhase::AwaitTurn { .. } = self.phase {
-                    self.phase = UserPhase::Idle;
-                    Origin::User
-                } else {
-                    Origin::Push
+                let awaiting = matches!(self.phase, UserPhase::AwaitTurn { .. });
+                // M19 says who started the turn; older gateways do not, so infer it from
+                // whether we were waiting for an answer.
+                let origin = match ts.origin {
+                    Some(TurnOrigin::Push) => Origin::Push,
+                    Some(TurnOrigin::User) => Origin::User,
+                    None if awaiting => Origin::User,
+                    None => Origin::Push,
                 };
+                if awaiting && origin == Origin::User {
+                    self.phase = UserPhase::Idle;
+                }
                 if self.suppressed_seq == Some(ts.turn_seq) {
                     self.suppressed_seq = None;
                 }
@@ -248,10 +254,15 @@ impl TurnMachine {
                 if self.turn.as_ref().is_some_and(|t| t.turn_id == te.turn_id) {
                     self.turn = None;
                     fx.turn_completed = true;
+                    // M19 gateway-side barge-in (the old `interrupted` message) or a `send`
+                    // that replaced the turn: what is still buffered must not play on.
+                    if te.reason.is_some_and(|r| r.stops_playback()) {
+                        fx.stop_playback = true;
+                    }
                 }
             }
             ServerMsg::Interrupted(_) => {
-                // Gateway-side barge-in; arrives after the cancelled turn's turn_end.
+                // Gateway <= 2.x barge-in; arrives after the cancelled turn's turn_end.
                 self.turn = None;
                 fx.stop_playback = true;
             }
@@ -299,16 +310,21 @@ mod redaction_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fogar_proto::server::{Interrupted, Transcription, TurnEnd, TurnStart};
+    use fogar_proto::server::{Interrupted, Transcription, TurnEnd, TurnEndReason, TurnStart};
 
     fn ts(id: &str, seq: u16) -> ServerMsg {
         ServerMsg::TurnStart(TurnStart {
             turn_id: id.into(),
             turn_seq: seq,
+            origin: None,
+            conversation: None,
         })
     }
     fn te(id: &str) -> ServerMsg {
-        ServerMsg::TurnEnd(TurnEnd { turn_id: id.into() })
+        ServerMsg::TurnEnd(TurnEnd {
+            turn_id: id.into(),
+            reason: None,
+        })
     }
     const T0: Mono = Mono::ZERO;
 
@@ -362,6 +378,58 @@ mod tests {
             .stop_playback
         );
         assert!(m.is_listening());
+    }
+
+    /// Gateway M19: no `interrupted` message; the turn_end carries the reason.
+    #[test]
+    fn m19_turn_end_reason_stops_playback_and_origin_is_trusted() {
+        let end = |id: &str, r: TurnEndReason| {
+            ServerMsg::TurnEnd(TurnEnd {
+                turn_id: id.into(),
+                reason: Some(r),
+            })
+        };
+        let start = |id: &str, seq: u16, o: TurnOrigin| {
+            ServerMsg::TurnStart(TurnStart {
+                turn_id: id.into(),
+                turn_seq: seq,
+                origin: Some(o),
+                conversation: Some("c".into()),
+            })
+        };
+        let mut m = TurnMachine::new(TurnTimeouts::default());
+        m.link_up();
+        // Waiting for our answer, but the server says this turn is a push: trust it.
+        m.speech_start(false);
+        m.speech_end(T0);
+        m.on_server(
+            &ServerMsg::Transcription(Transcription {
+                text: "hola".into(),
+            }),
+            T0,
+        );
+        m.on_server(&start("t-1", 1, TurnOrigin::Push), T0);
+        assert_eq!(m.turn().map(|t| t.origin), Some(Origin::Push));
+        let fx = m.on_server(&end("t-1", TurnEndReason::Interrupted), T0);
+        assert!(fx.turn_completed && fx.stop_playback);
+        m.on_server(&start("t-2", 2, TurnOrigin::User), T0);
+        assert_eq!(m.turn().map(|t| t.origin), Some(Origin::User));
+        assert!(
+            m.on_server(&end("t-2", TurnEndReason::Replaced), T0)
+                .stop_playback
+        );
+        m.on_server(&start("t-3", 3, TurnOrigin::User), T0);
+        let fx = m.on_server(&end("t-3", TurnEndReason::Done), T0);
+        assert!(
+            fx.turn_completed && !fx.stop_playback,
+            "a finished turn plays to the end"
+        );
+        // `closed` precedes a 4102/4200 close: the tail must not play on a dead session.
+        m.on_server(&start("t-4", 4, TurnOrigin::User), T0);
+        assert!(
+            m.on_server(&end("t-4", TurnEndReason::Closed), T0)
+                .stop_playback
+        );
     }
 
     #[test]

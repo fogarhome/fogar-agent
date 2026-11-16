@@ -103,6 +103,30 @@ impl FromJsonStr for OutputMode {
     }
 }
 
+impl FromJsonStr for TurnOrigin {
+    fn from_json_str<E: de::Error>(s: &str) -> Option<Self> {
+        TurnOrigin::deserialize(StrDeserializer::<E>::new(s)).ok()
+    }
+}
+
+impl FromJsonStr for TurnEndReason {
+    /// Unknown strings are `Error` (spec M19 §5); non-strings stay `None`.
+    fn from_json_str<E: de::Error>(s: &str) -> Option<Self> {
+        Some(
+            TurnEndReason::deserialize(StrDeserializer::<E>::new(s))
+                .unwrap_or(TurnEndReason::Error),
+        )
+    }
+}
+
+fn lenient_origin<'de, D: Deserializer<'de>>(d: D) -> Result<Option<TurnOrigin>, D::Error> {
+    d.deserialize_any(Lenient::<TurnOrigin>(PhantomData))
+}
+
+fn lenient_end_reason<'de, D: Deserializer<'de>>(d: D) -> Result<Option<TurnEndReason>, D::Error> {
+    d.deserialize_any(Lenient::<TurnEndReason>(PhantomData))
+}
+
 fn drain_seq<'de, A: SeqAccess<'de>>(mut a: A) -> Result<(), A::Error> {
     while a.next_element::<IgnoredAny>()?.is_some() {}
     Ok(())
@@ -376,11 +400,34 @@ impl fmt::Debug for Transcription {
 }
 
 /// CERTAIN names. `turn_seq` = N & 0xFFFF (wraps; compare by equality). `turn_id` is "t-N" and
-/// restarts at t-1 on every connection. No `origin` field: pushes are indistinguishable.
+/// restarts at t-1 on every connection. `origin` and `conversation` are new in gateway M19
+/// (absent from older gateways, so both optional and lenient).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnStart {
     pub turn_id: String,
     pub turn_seq: u16,
+    /// M19: `"user"` or `"push"`; `None` from older gateways or for an unknown value.
+    #[serde(
+        default,
+        deserialize_with = "lenient_origin",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub origin: Option<TurnOrigin>,
+    /// M19: the conversation id this turn runs in (changes at the daily cut-over).
+    #[serde(
+        default,
+        deserialize_with = "lenient_opt_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub conversation: Option<String>,
+}
+
+/// M19 `turn_start.origin`. CERTAIN values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TurnOrigin {
+    User,
+    Push,
 }
 
 /// CERTAIN
@@ -399,13 +446,49 @@ impl fmt::Debug for Token {
     }
 }
 
-/// CERTAIN: exactly one per TurnStart (known exception JGW-286: silent push).
+/// CERTAIN: exactly one per TurnStart (known exception JGW-286: silent push). `reason` is new in
+/// gateway M19 and replaces the separate `interrupted` message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnEnd {
     pub turn_id: String,
+    /// M19; `None` from older gateways. An unknown value decodes as `Error` (spec: "treat any
+    /// other value as error: the list can grow").
+    #[serde(
+        default,
+        deserialize_with = "lenient_end_reason",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reason: Option<TurnEndReason>,
 }
 
-/// CERTAIN since v1.19.4; arrives after the cancelled turn's TurnEnd. Optional for old servers.
+/// M19 `turn_end.reason`. CERTAIN values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TurnEndReason {
+    Done,
+    Error,
+    Cancelled,
+    /// Barge-in or a final transcription during the turn (was the `interrupted` message).
+    Interrupted,
+    /// A new `send` replaced it.
+    Replaced,
+    Timeout,
+    Closed,
+}
+
+impl TurnEndReason {
+    /// The turn was cut short in favour of the user, or its session is closing (`closed` comes
+    /// right before a 4102/4200 close): stop what is still playing.
+    pub fn stops_playback(self) -> bool {
+        matches!(
+            self,
+            TurnEndReason::Interrupted | TurnEndReason::Replaced | TurnEndReason::Closed
+        )
+    }
+}
+
+/// Gateways v1.19.4 to 2.x; arrives after the cancelled turn's TurnEnd. Gone in M19 (now
+/// `turn_end.reason = "interrupted"`); kept for gateways not yet on M19.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Interrupted {
     #[serde(default)]

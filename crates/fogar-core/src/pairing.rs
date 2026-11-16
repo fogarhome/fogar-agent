@@ -27,7 +27,8 @@ use tokio::sync::{Semaphore, watch};
 const FOGAR_SERVICES: [&str; 2] = ["fogar-gateway", "jota-gateway"];
 /// Same-machine gateway (spec §0 step 2).
 const LOCAL_GATEWAY: &str = "127.0.0.1:8004";
-/// The two close reasons that mean "this key is dead" (spec §0, compared verbatim).
+/// Gateway <= 2.x: the two 1008 reasons that mean "this key is dead" (compared verbatim). M19
+/// gateways say it with codes 4010 / 4200 instead (client-protocol §13).
 const REVOKED_REASONS: [&str; 2] = ["Clave de cliente invalida o inactiva.", "revoked"];
 /// Longest `client_key` we accept from `/pair` (it travels in the 4096-char handshake).
 const MAX_KEY_LEN: usize = 1024;
@@ -48,9 +49,10 @@ fn label(s: String) -> String {
         .collect()
 }
 
-/// The key is dead: delete the record and show the pairing screen. Any other 1008 keeps it.
+/// The key is dead: delete the record and show the pairing screen. M19: 4010 or 4200, whatever
+/// the text; older gateways: 1008 with one of the two exact texts. Nothing else deletes the key.
 pub(crate) fn is_revocation(code: u16, reason: &str) -> bool {
-    code == 1008 && REVOKED_REASONS.contains(&reason)
+    matches!(code, 4010 | 4200) || (code == 1008 && REVOKED_REASONS.contains(&reason))
 }
 
 /// What the agent stores after pairing. `Debug` never shows the key (`SecretString`).
@@ -441,6 +443,12 @@ mod tests {
         assert!(!is_revocation(1008, "Clave de cliente invalida"));
         assert!(!is_revocation(1008, "Revoked"));
         assert!(!is_revocation(1000, "revoked"));
+        // M19: by code; the text is informational.
+        assert!(is_revocation(4010, "invalid or inactive credential"));
+        assert!(is_revocation(4200, "credential revoked"));
+        assert!(is_revocation(4200, ""));
+        assert!(!is_revocation(4020, "agent not permitted"));
+        assert!(!is_revocation(4102, "conversation opened elsewhere"));
         assert!(!is_revocation(1008, "Handshake timeout"));
     }
 }

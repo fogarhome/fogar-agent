@@ -73,6 +73,47 @@ async fn every_close_code_is_classified_and_acted_on() {
             CloseAction::RetryBackoff,
             Expect::Reconnects,
         ),
+        // Gateway M19 ("v3", client-protocol §13): the code is the contract.
+        (
+            Some((4010, "invalid or inactive credential")),
+            CloseAction::Repair,
+            Expect::Unpairs,
+        ),
+        (
+            Some((4200, "credential revoked")),
+            CloseAction::Repair,
+            Expect::Unpairs,
+        ),
+        (
+            Some((4020, "agent not permitted")),
+            CloseAction::AgentRefused,
+            Expect::Parks(CloseAction::AgentRefused),
+        ),
+        (
+            Some((4000, "invalid handshake")),
+            CloseAction::FixClient,
+            Expect::Parks(CloseAction::FixClient),
+        ),
+        (
+            Some((4102, "conversation opened elsewhere")),
+            CloseAction::ConversationTaken,
+            Expect::Parks(CloseAction::ConversationTaken),
+        ),
+        (
+            Some((4500, "a future refusal")),
+            CloseAction::FixClient,
+            Expect::Parks(CloseAction::FixClient),
+        ),
+        (
+            Some((4900, "handshake timeout")),
+            CloseAction::RetryBackoff,
+            Expect::Reconnects,
+        ),
+        (
+            Some((1011, "internal error")),
+            CloseAction::RetryBackoff,
+            Expect::Reconnects,
+        ),
         (
             Some((
                 1011,
@@ -101,7 +142,8 @@ async fn every_close_code_is_classified_and_acted_on() {
             CloseAction::FixClient,
             Expect::Parks(CloseAction::FixClient),
         ),
-        (Some((4000, "")), CloseAction::Unknown, Expect::Reconnects),
+        // A code outside every known range (M19 4000–4999 are classified above).
+        (Some((3000, "")), CloseAction::Unknown, Expect::Reconnects),
         (None, CloseAction::RetryBackoff, Expect::Reconnects), // abort -> 1006
     ];
     for &(close, action, expect) in cases {
@@ -154,9 +196,26 @@ async fn every_close_code_is_classified_and_acted_on() {
 
 #[tokio::test(start_paused = true)]
 async fn handshake_rejection_of_the_key_unpairs() {
-    // Wrong key stored locally: the gateway closes 1008 "Clave de cliente invalida o inactiva."
-    // before `ready`: the record is deleted and the link waits for a new pairing.
+    // Wrong key stored locally: an M19 gateway closes 4010 before `ready`: the record is deleted
+    // and the link waits for a new pairing.
     let mut b = RigBuilder::fake(MockConfig::default());
+    b.secrets = std::sync::Arc::new(paired_store("wrong"));
+    let mut rig = b.start();
+    let v = wait_state(&mut rig.health, |v| v.last_close.is_some()).await;
+    assert_eq!(v.last_close, Some((4010, CloseAction::Repair)));
+    wait_state(&mut rig.health, |v| v.state == LinkState::NotPaired).await;
+    assert!(!rig.secrets.contains(SecretKey::GatewayPairing));
+    assert_eq!(rig.health.snapshot().stats.sessions_started, 0);
+    assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
+}
+
+#[tokio::test(start_paused = true)]
+async fn handshake_rejection_of_the_key_unpairs_on_a_v2_gateway() {
+    // Gateway <= 2.x: 1008 "Clave de cliente invalida o inactiva." means the same.
+    let mut b = RigBuilder::fake(MockConfig {
+        m19: false,
+        ..MockConfig::default()
+    });
     b.secrets = std::sync::Arc::new(paired_store("wrong"));
     let mut rig = b.start();
     let v = wait_state(&mut rig.health, |v| v.last_close.is_some()).await;

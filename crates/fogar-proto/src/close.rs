@@ -1,6 +1,12 @@
-//! Close classification (spec §11). The gateway never sends an `error` before closing, so the
-//! client classifies by close code + reason string. Mapping CERTAIN for the listed reasons; the
-//! policy (what to do) is ours.
+//! Close classification. The gateway never sends an `error` before closing.
+//! - Gateway M19 ("v3", client-protocol §13 «Códigos de cierre»): the CODE is the contract
+//!   (4xxx per application reason; reason text is informational and must not be compared).
+//!   Range rule for unknown codes: 4000–4899 do not reconnect on our own, 4900–4999 reconnect
+//!   with backoff. CERTAIN.
+//! - Gateway <= 2.x: almost everything was 1008 + a reason text; kept for gateways not yet on
+//!   M19. CERTAIN for the listed texts.
+//!
+//! The policy (what to do) is ours.
 
 /// What the agent should do after the gateway closed the socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -9,8 +15,12 @@ pub enum CloseAction {
     Repair,
     /// Agent not permitted or unavailable: keep the key; surface it. No retry loop.
     AgentRefused,
-    /// Bug on our side (bad handshake, oversize): do not loop.
+    /// Bug on our side (bad handshake, oversize) or an application refusal we cannot fix by
+    /// retrying (M19 4000–4899 we do not know): do not loop.
     FixClient,
+    /// M19 4102: another session of this client opened our conversation. Reconnecting on our own
+    /// would close it, and it would do the same: the two would evict each other forever. Park.
+    ConversationTaken,
     /// Idle (1000): reconnect lazily, not an error.
     IdleOrNormal,
     /// 1011 critical service, 1013 slow, 1006: reconnect with backoff.
@@ -28,6 +38,13 @@ pub const CLOSE_NORMAL: u16 = 1000;
 
 pub fn classify_close(code: u16, reason: &str) -> CloseAction {
     match code {
+        // M19 (gateway v3): the code is the contract.
+        4010 | 4200 => CloseAction::Repair,
+        4020 | 4021 => CloseAction::AgentRefused,
+        4102 => CloseAction::ConversationTaken,
+        4000..=4899 => CloseAction::FixClient,
+        4900..=4999 => CloseAction::RetryBackoff,
+        // Gateway <= 2.x.
         1008 => {
             if reason == "revoked" || reason.starts_with("Clave de cliente invalida") {
                 CloseAction::Repair
@@ -91,7 +108,29 @@ mod tests {
             (1000, "", CloseAction::IdleOrNormal),
             (1012, "", CloseAction::ServerRestart),
             (1009, "", CloseAction::FixClient),
-            (4000, "", CloseAction::Unknown),
+            // M19: by code, whatever the reason text says.
+            (4010, "invalid or inactive credential", CloseAction::Repair),
+            (4200, "credential revoked", CloseAction::Repair),
+            (4200, "", CloseAction::Repair),
+            (4020, "agent not permitted", CloseAction::AgentRefused),
+            (4021, "agent not available", CloseAction::AgentRefused),
+            (4000, "invalid handshake", CloseAction::FixClient),
+            (4001, "", CloseAction::FixClient),
+            (4002, "", CloseAction::FixClient),
+            (4100, "conversation not found", CloseAction::FixClient),
+            (4101, "", CloseAction::FixClient),
+            (
+                4102,
+                "conversation opened elsewhere",
+                CloseAction::ConversationTaken,
+            ),
+            (4300, "a future refusal", CloseAction::FixClient),
+            (4899, "", CloseAction::FixClient),
+            (4900, "handshake timeout", CloseAction::RetryBackoff),
+            (4999, "a future transient", CloseAction::RetryBackoff),
+            (1011, "internal error", CloseAction::RetryBackoff),
+            (3000, "", CloseAction::Unknown),
+            (5000, "", CloseAction::Unknown),
         ];
         for (code, reason, want) in cases {
             assert_eq!(classify_close(code, reason), want, "{code} {reason}");

@@ -4,7 +4,8 @@ use fogar_proto::{
     ClientMsg, Handshake, OutputMode, decode_client, encode_tts_frame,
     limits::HANDSHAKE_MAX_CHARS,
     server::{
-        Capabilities, ErrorMsg, Ready, ServerMsg, Status, Token, Transcription, TurnEnd, TurnStart,
+        Capabilities, ErrorMsg, Ready, ServerMsg, Status, Token, Transcription, TurnEnd,
+        TurnEndReason, TurnOrigin, TurnStart,
     },
 };
 use std::{
@@ -36,6 +37,9 @@ pub struct MockConfig {
     /// Close with 1000 after this much client silence while no turn is streaming (spec: 300 s).
     pub idle_timeout: Option<Duration>,
     pub handshake_timeout: Duration,
+    /// Speak gateway M19 ("v3"): 4xxx close codes instead of 1008 + text, `turn_end.reason`.
+    /// `false` plays a gateway <= 2.x (default `true`).
+    pub m19: bool,
     /// Keep per-message records (`client_msgs`, `sends`, `closes_sent`). Turn it off for soaks:
     /// the log would otherwise be the only thing growing.
     pub record: bool,
@@ -53,6 +57,7 @@ impl Default for MockConfig {
             status_before_ready: true,
             idle_timeout: Some(Duration::from_secs(300)),
             handshake_timeout: Duration::from_secs(5),
+            m19: true,
             record: true,
         }
     }
@@ -134,6 +139,8 @@ struct Conn {
     output_audio: bool,
     turn_n: u32,
     streaming: Option<Streaming>,
+    /// Pushes queued behind the streaming turn: M19 never replaces a turn with a push (§10).
+    pending_pushes: u32,
     utterance_audio: u64,
     last_client: Instant,
 }
@@ -167,6 +174,7 @@ pub(crate) async fn run_conn<T: ServerTransport>(
         output_audio: false,
         turn_n: 0,
         streaming: None,
+        pending_pushes: 0,
         utterance_audio: 0,
         last_client: Instant::now(),
     };
@@ -179,7 +187,8 @@ pub(crate) async fn run_conn<T: ServerTransport>(
         }
         inp = t.recv() => c.handshake(&mut t, inp).await,
         () = tokio::time::sleep_until(handshake_by) => {
-            c.close(&mut t, 1008, REASON_TIMEOUT).await;
+            let (code, reason) = c.refusal(REASON_TIMEOUT);
+            c.close(&mut t, code, reason).await;
             false
         }
     };
@@ -243,11 +252,22 @@ impl Conn {
     async fn ctl<T: ServerTransport>(&mut self, t: &mut T, cmd: Ctl) -> Step {
         match cmd {
             Ctl::Close { code, reason } => {
+                // M19 ends the open turn with `closed` before these closes (spec §13).
+                if self.cfg.m19
+                    && matches!(code, 4102 | 4200)
+                    && matches!(self.cancel_turn(t, TurnEndReason::Closed).await, Step::Stop)
+                {
+                    return Step::Stop;
+                }
                 self.close(t, code, &reason).await;
                 Step::Stop
             }
             Ctl::Abort => Step::Stop,
-            Ctl::Push => self.start_turn(t).await,
+            Ctl::Push if self.streaming.is_some() => {
+                self.pending_pushes += 1;
+                Step::Continue
+            }
+            Ctl::Push => self.start_turn(t, TurnOrigin::Push).await,
         }
     }
 
@@ -317,9 +337,28 @@ impl Conn {
         matches!(self.send(t, &ready).await, Step::Continue)
     }
 
-    async fn reject<T: ServerTransport>(&mut self, t: &mut T, reason: &str) {
+    async fn reject<T: ServerTransport>(&mut self, t: &mut T, reason: &'static str) {
         self.log.lock().unwrap().handshakes_rejected += 1;
-        self.close(t, 1008, reason).await;
+        let (code, reason) = self.refusal(reason);
+        self.close(t, code, reason).await;
+    }
+
+    /// The close for a handshake refusal: M19 code + English reason, or 1008 + the old text.
+    fn refusal(&self, legacy: &'static str) -> (u16, &'static str) {
+        if !self.cfg.m19 {
+            return (1008, legacy);
+        }
+        match legacy {
+            REASON_BAD_KEY => (4010, "invalid or inactive credential"),
+            REASON_NOT_TEXT => (4001, "handshake must be a text frame"),
+            REASON_TOO_LARGE => (4002, "handshake too large"),
+            REASON_TIMEOUT => (4900, "handshake timeout"),
+            _ => (4000, "invalid handshake"),
+        }
+    }
+
+    fn end_reason(&self, r: TurnEndReason) -> Option<TurnEndReason> {
+        self.cfg.m19.then_some(r)
     }
 
     async fn on_client<T: ServerTransport>(&mut self, t: &mut T, inp: Option<ClientIn>) -> Step {
@@ -394,29 +433,48 @@ impl Conn {
                     self.log.lock().unwrap().sends.push(text.into_owned());
                 }
                 // `send` replaces any active turn: its turn_end first.
-                if matches!(self.cancel_turn(t).await, Step::Stop) {
+                if matches!(
+                    self.cancel_turn(t, TurnEndReason::Replaced).await,
+                    Step::Stop
+                ) {
                     return Step::Stop;
                 }
-                self.start_turn(t).await
+                self.start_turn(t, TurnOrigin::User).await
             }
-            ClientMsg::Cancel => self.cancel_turn(t).await,
+            ClientMsg::Cancel => {
+                if matches!(
+                    self.cancel_turn(t, TurnEndReason::Cancelled).await,
+                    Step::Stop
+                ) {
+                    return Step::Stop;
+                }
+                self.next_push(t).await
+            }
         }
     }
 
-    async fn cancel_turn<T: ServerTransport>(&mut self, t: &mut T) -> Step {
+    async fn cancel_turn<T: ServerTransport>(&mut self, t: &mut T, why: TurnEndReason) -> Step {
         if let Some(s) = self.streaming.take() {
             self.log.lock().unwrap().turns_cancelled += 1;
-            return self
-                .send(t, &ServerMsg::TurnEnd(TurnEnd { turn_id: s.turn_id }))
-                .await;
+            let end = TurnEnd {
+                turn_id: s.turn_id,
+                reason: self.end_reason(why),
+            };
+            return self.send(t, &ServerMsg::TurnEnd(end)).await;
         }
         Step::Continue
     }
 
-    async fn start_turn<T: ServerTransport>(&mut self, t: &mut T) -> Step {
-        if matches!(self.cancel_turn(t).await, Step::Stop) {
-            return Step::Stop;
+    /// A queued push goes out after the turn_end of the turn it waited for (spec §10).
+    async fn next_push<T: ServerTransport>(&mut self, t: &mut T) -> Step {
+        if self.pending_pushes == 0 {
+            return Step::Continue;
         }
+        self.pending_pushes -= 1;
+        self.start_turn(t, TurnOrigin::Push).await
+    }
+
+    async fn start_turn<T: ServerTransport>(&mut self, t: &mut T, origin: TurnOrigin) -> Step {
         self.turn_n += 1;
         let turn_id = format!("t-{}", self.turn_n);
         let seq = (self.turn_n & 0xFFFF) as u16;
@@ -424,6 +482,8 @@ impl Conn {
         let start = ServerMsg::TurnStart(TurnStart {
             turn_id: turn_id.clone(),
             turn_seq: seq,
+            origin: self.cfg.m19.then_some(origin),
+            conversation: None,
         });
         if matches!(self.send(t, &start).await, Step::Stop) {
             return Step::Stop;
@@ -467,9 +527,14 @@ impl Conn {
             let id = s.turn_id.clone();
             self.streaming = None;
             // turn_end is sent after the last audio chunk (spec §7).
-            return self
-                .send(t, &ServerMsg::TurnEnd(TurnEnd { turn_id: id }))
-                .await;
+            let end = TurnEnd {
+                turn_id: id,
+                reason: self.end_reason(TurnEndReason::Done),
+            };
+            if matches!(self.send(t, &ServerMsg::TurnEnd(end)).await, Step::Stop) {
+                return Step::Stop;
+            }
+            return self.next_push(t).await;
         }
         s.left -= 1;
         s.next_at = Instant::now() + self.cfg.frame_interval;

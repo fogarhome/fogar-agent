@@ -73,6 +73,12 @@ enum Textos {
             return Titular(titulo: "Hay que volver a emparejar este Mac",
                            sub: "\(nombre.map { "El gateway \($0)" } ?? "El gateway") ya no reconoce la clave de este Mac. Desemparéjalo en Ajustes y emparéjalo con un código nuevo.",
                            tono: .bad)
+        case "parked_conversation_taken":
+            // Gateway M19 close 4102: reconnecting by itself would evict the other session, which
+            // would evict this one back (spec §13). A "Reconectar" button needs a new IPC request.
+            return Titular(titulo: "Otra sesión abrió la conversación de este Mac",
+                           sub: "Algo más (otra pestaña del panel u otro cliente) abrió en \(gw) la conversación que usaba este Mac, así que este Mac se ha apartado. Reinicia el agente cuando quieras volver.",
+                           tono: .bad)
         default:
             return Titular(titulo: "El agente se ha parado",
                            sub: "La conexión con \(gw) falló por un error del propio agente. Reiniciar el agente puede arreglarlo; si vuelve a pasar, hay que corregirlo.",

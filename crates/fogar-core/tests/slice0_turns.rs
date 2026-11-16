@@ -101,6 +101,52 @@ async fn push_turn_is_played_without_a_request() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn push_during_a_turn_waits_for_it_instead_of_replacing_it() {
+    let mut rig = RigBuilder::fake(MockConfig::default()).start();
+    wait_ready(&mut rig.health).await;
+    assert_eq!(rig.link.control(Ctl::Push), 1);
+    assert_eq!(rig.link.control(Ctl::Push), 1);
+    eventually(Duration::from_secs(10), || {
+        rig.health.snapshot().stats.tts_frames_played == 10
+    })
+    .await;
+    let log = rig.link.log();
+    assert_eq!((log.turns_started, log.turns_cancelled), (2, 0));
+    assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
+}
+
+#[tokio::test(start_paused = true)]
+async fn conversation_taken_mid_answer_stops_playback_and_parks() {
+    let mock = MockConfig {
+        tts_frames: 400,
+        frame_interval: Duration::from_millis(20),
+        ..MockConfig::default()
+    };
+    let mut rig = RigBuilder::fake(mock).start();
+    wait_ready(&mut rig.health).await;
+    assert_eq!(rig.link.control(Ctl::Push), 1);
+    eventually(Duration::from_secs(30), || {
+        rig.health.snapshot().stats.tts_frames_played >= 10
+    })
+    .await;
+    // M19: turn_end{closed} first, then 4102. The turn is gone before the link drops, so only
+    // `closed` itself can stop the buffered tail.
+    assert_eq!(rig.link.close_all(4102, "conversation opened elsewhere"), 1);
+    eventually(Duration::from_secs(10), || {
+        matches!(
+            rig.health.snapshot().link,
+            fogar_core::LinkState::Parked {
+                reason: fogar_proto::CloseAction::ConversationTaken
+            }
+        )
+    })
+    .await;
+    assert!(rig.speaker.snapshot().stops >= 1, "the tail is not played");
+    assert_eq!(rig.link.log().turns_cancelled, 1);
+    assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
+}
+
+#[tokio::test(start_paused = true)]
 async fn minimal_platform_without_audio_still_connects_and_shuts_down() {
     let mut b = RigBuilder::fake(MockConfig::default());
     b.mic = fogar_testkit::FakeMic::minimal();

@@ -639,7 +639,9 @@ pub mod gateway_link {
     }
 
     /// The gateway's handshake rejection is a close with the documented reason.
-    pub async fn bad_key_is_closed_1008<L: GatewayLink>(link: &L, addr: &GatewayAddr) {
+    /// Whatever protocol generation the mock speaks (M19 4010, or 1008 + the old text), the
+    /// close reaches the core intact and classifies as "re-pair".
+    pub async fn bad_key_is_closed_as_repair<L: GatewayLink>(link: &L, addr: &GatewayAddr) {
         let mut s = link.connect(addr).await.unwrap();
         s.send(Frame::Text(
             r#"{"client_key":"wrong","input_mode":"audio","output_mode":["audio"]}"#.into(),
@@ -652,8 +654,11 @@ pub mod gateway_link {
                 .expect("timed out")
             {
                 Some(LinkEvent::Closed { code, reason }) => {
-                    assert_eq!(code, 1008);
-                    assert_eq!(reason, crate::gateway::REASON_BAD_KEY);
+                    assert_eq!(
+                        fogar_proto::close::classify_close(code, &reason),
+                        fogar_proto::close::CloseAction::Repair,
+                        "{code} {reason:?}"
+                    );
                     break;
                 }
                 Some(LinkEvent::Frame(_)) => continue,
@@ -707,10 +712,10 @@ pub mod gateway_link {
                     })
                 }
                 #[test]
-                fn bad_key_is_closed_1008() {
+                fn bad_key_is_closed_as_repair() {
                     $crate::run_async(async {
                         let (link, gw) = $make;
-                        c::bad_key_is_closed_1008(&link, &gw.addr()).await
+                        c::bad_key_is_closed_as_repair(&link, &gw.addr()).await
                     })
                 }
             }
