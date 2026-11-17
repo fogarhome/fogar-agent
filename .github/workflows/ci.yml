@@ -15,6 +15,30 @@ env:
   RUST_TOOLCHAIN: "1.97.0"
 
 jobs:
+  # ADR-0007: a PR can rewrite the agent config, the hash lists and the checkers together (even
+  # this workflow), so nothing inside the PR can approve itself. This job only makes such a change
+  # loud: it is red whenever a PR touches them, and a human merging over it is the
+  # acknowledgement. Enforcing that needs branch protection + CODEOWNERS (a repository setting).
+  agent-config:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 2 # the PR merge commit and its first parent, the base
+      - name: Agent config and gates unchanged (ADR-0007)
+        run: |
+          set -f # git, not the shell, matches crates/*/clippy.toml (in both trees)
+          paths="agent-team .claude scripts .github .cargo rust-toolchain.toml deny.toml clippy.toml
+            crates/*/clippy.toml crates/fogar-archtest docs/adr/0007-agent-config-integrity.md
+            CLAUDE.md **/CLAUDE.md"
+          # shellcheck disable=SC2086 # word-split on purpose: one pathspec per word
+          if ! git diff --stat --exit-code HEAD^1 HEAD -- $paths; then
+            echo "::error::This PR changes agent config or the gates (above): a human must merge it knowingly (ADR-0007)"
+            exit 1
+          fi
+
   linux-gates:
     runs-on: ubuntu-latest
     timeout-minutes: 45
