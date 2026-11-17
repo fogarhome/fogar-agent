@@ -9,6 +9,10 @@ mod healthy {
     fogar_testkit::power_policy_contract!(FakePowerPolicy::healthy());
     fogar_testkit::random_contract!(SeededRandom::new(42));
     fogar_testkit::clock_contract!(TestClock::new());
+    fogar_testkit::tailnet_contract!(FakeTailnet::with_peers(&[
+        "100.109.57.116",
+        "fd7a:115c:a1e0::1"
+    ]));
     fogar_testkit::gateway_link_contract!({
         let link = FakeGatewayLink::new(MockConfig::default());
         (link.clone(), link)
@@ -26,6 +30,7 @@ mod healthy {
 
 mod minimal {
     use fogar_testkit::*;
+    fogar_testkit::tailnet_contract!(FakeTailnet::unsupported());
     fogar_testkit::system_probe_contract!(FakeSystemProbe::minimal());
     fogar_testkit::audio_source_contract!(FakeMic::minimal());
     fogar_testkit::audio_sink_contract!(FakeSpeaker::minimal());

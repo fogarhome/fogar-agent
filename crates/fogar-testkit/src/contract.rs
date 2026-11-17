@@ -1040,6 +1040,58 @@ pub mod ipc_server {
     }
 }
 
+pub mod tailnet {
+    use fogar_ports::tailnet::{MAX_TAILNET_PEERS, TailnetError, TailnetPeers, is_tailnet_ip};
+    use std::time::Duration;
+
+    async fn bounded<F: std::future::Future>(f: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(5), f)
+            .await
+            .expect("tailnet clause timed out")
+    }
+
+    /// Unsupported answers `Unavailable`; any list is bounded, unique and tailnet-only.
+    pub async fn answer_matches_caps_and_bounds<T: TailnetPeers>(t: &T) {
+        let caps = t.capabilities();
+        let r = bounded(t.peers()).await;
+        if !caps.is_available() {
+            assert_eq!(r, Err(TailnetError::Unavailable));
+        }
+        if let Ok(ips) = r {
+            assert!(ips.len() <= MAX_TAILNET_PEERS, "{} peers", ips.len());
+            assert!(ips.iter().all(|ip| is_tailnet_ip(*ip)), "{ips:?}");
+            let unique: std::collections::BTreeSet<_> = ips.iter().collect();
+            assert_eq!(unique.len(), ips.len(), "duplicates: {ips:?}");
+        }
+        assert_eq!(caps, t.capabilities(), "caps must not change");
+    }
+
+    /// The core drops a call on its deadline: the next call still answers.
+    pub async fn dropped_call_is_harmless<T: TailnetPeers>(t: &T) {
+        let _ = tokio::time::timeout(Duration::from_millis(1), t.peers()).await;
+        let _ = bounded(t.peers()).await;
+    }
+
+    #[macro_export]
+    macro_rules! tailnet_contract {
+        ($make:expr) => {
+            mod tailnet_contract {
+                #[allow(unused_imports)]
+                use super::*;
+                use $crate::contract::tailnet as c;
+                #[test]
+                fn answer_matches_caps_and_bounds() {
+                    $crate::run_async(async { c::answer_matches_caps_and_bounds(&$make).await })
+                }
+                #[test]
+                fn dropped_call_is_harmless() {
+                    $crate::run_async(async { c::dropped_call_is_harmless(&$make).await })
+                }
+            }
+        };
+    }
+}
+
 pub mod gateway_http {
     //! `$make` evaluates (inside the runtime) to `(http, server)` where `server` has
     //! `.addr()`, `.dead_addr()` and `.routes() -> HttpRoutes` (a `MockHttpServer` for real

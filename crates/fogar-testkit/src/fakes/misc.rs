@@ -3,7 +3,9 @@ use fogar_ports::{
     power::{Applied, PowerCaps, PowerError, PowerPolicy, WorkClass},
     random::Random,
     secrets::{ExposeSecret, SecretCaps, SecretError, SecretKey, SecretStore, SecretString},
+    tailnet::{TailnetError, TailnetPeers},
 };
+use std::net::IpAddr;
 use std::{
     collections::HashMap,
     sync::{
@@ -136,5 +138,59 @@ impl PowerPolicy for FakePowerPolicy {
         } else {
             Applied::NotSupported
         })
+    }
+}
+
+/// Scripted tailnet: a fixed answer, or one that never comes (`hanging`, for the core's deadline).
+#[derive(Debug)]
+pub struct FakeTailnet {
+    /// `None` = never answers.
+    answer: Option<Result<Vec<IpAddr>, TailnetError>>,
+    caps: Support,
+    pub calls: AtomicU64,
+}
+
+impl FakeTailnet {
+    pub fn with_peers(ips: &[&str]) -> Self {
+        let ips = ips.iter().map(|s| s.parse().expect("ip")).collect();
+        Self {
+            answer: Some(Ok(ips)),
+            caps: Support::Native,
+            calls: AtomicU64::new(0),
+        }
+    }
+    pub fn unsupported() -> Self {
+        Self {
+            answer: Some(Err(TailnetError::Unavailable)),
+            caps: Support::Unsupported,
+            calls: AtomicU64::new(0),
+        }
+    }
+    pub fn not_running() -> Self {
+        Self {
+            answer: Some(Err(TailnetError::NotRunning)),
+            caps: Support::Native,
+            calls: AtomicU64::new(0),
+        }
+    }
+    pub fn hanging() -> Self {
+        Self {
+            answer: None,
+            caps: Support::Native,
+            calls: AtomicU64::new(0),
+        }
+    }
+}
+
+impl TailnetPeers for FakeTailnet {
+    fn capabilities(&self) -> Support {
+        self.caps
+    }
+    async fn peers(&self) -> Result<Vec<IpAddr>, TailnetError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        match &self.answer {
+            Some(a) => a.clone(),
+            None => std::future::pending().await,
+        }
     }
 }

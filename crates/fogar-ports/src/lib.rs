@@ -18,5 +18,6 @@ pub mod random;
 pub mod secrets;
 pub mod support;
 pub mod system_probe;
+pub mod tailnet;
 
 pub use support::Support;
