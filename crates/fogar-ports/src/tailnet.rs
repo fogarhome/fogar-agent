@@ -8,6 +8,8 @@
 //!   Dropping an in-flight call must not leave anything behind (the adapter kills its child).
 //! - Answers are data, not trust: every address is checked with [`is_tailnet_ip`] by the
 //!   adapter, and the core still probes each one through `GatewayHttp` with its cleartext policy.
+//!   A peer is not necessarily the user's own machine (nodes can be shared into a tailnet), so a
+//!   gateway found there is only a suggestion: the UI shows its address and the user picks it.
 //!
 //! How Windows/Linux would do this: the same `tailscale status --json` (CLI on PATH or the
 //! LocalAPI socket of `tailscaled`); until then they use the core's `NoTailnet` (Unsupported).

@@ -147,7 +147,8 @@ pub struct FakeTailnet {
     /// `None` = never answers.
     answer: Option<Result<Vec<IpAddr>, TailnetError>>,
     caps: Support,
-    pub calls: AtomicU64,
+    /// Shared: keep a clone before moving the fake into the agent.
+    pub calls: std::sync::Arc<AtomicU64>,
 }
 
 impl FakeTailnet {
@@ -156,28 +157,28 @@ impl FakeTailnet {
         Self {
             answer: Some(Ok(ips)),
             caps: Support::Native,
-            calls: AtomicU64::new(0),
+            calls: std::sync::Arc::default(),
         }
     }
     pub fn unsupported() -> Self {
         Self {
             answer: Some(Err(TailnetError::Unavailable)),
             caps: Support::Unsupported,
-            calls: AtomicU64::new(0),
+            calls: std::sync::Arc::default(),
         }
     }
     pub fn not_running() -> Self {
         Self {
             answer: Some(Err(TailnetError::NotRunning)),
             caps: Support::Native,
-            calls: AtomicU64::new(0),
+            calls: std::sync::Arc::default(),
         }
     }
     pub fn hanging() -> Self {
         Self {
             answer: None,
             caps: Support::Native,
-            calls: AtomicU64::new(0),
+            calls: std::sync::Arc::default(),
         }
     }
 }
