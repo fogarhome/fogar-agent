@@ -128,6 +128,7 @@ public enum WireRequest: Codable, Sendable, Equatable, Hashable {
 	case discover
 	case pair(WirePair)
 	case unpair
+	case reconnect
 
 	enum CodingKeys: String, CodingKey, Codable {
 		case hello,
@@ -135,7 +136,8 @@ public enum WireRequest: Codable, Sendable, Equatable, Hashable {
 			subscribe,
 			discover,
 			pair,
-			unpair
+			unpair,
+			reconnect
 	}
 
 	private enum ContainerCodingKeys: String, CodingKey {
@@ -168,6 +170,9 @@ public enum WireRequest: Codable, Sendable, Equatable, Hashable {
 			case .unpair:
 				self = .unpair
 				return
+			case .reconnect:
+				self = .reconnect
+				return
 			}
 		}
 		throw DecodingError.typeMismatch(WireRequest.self, DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Wrong type for WireRequest"))
@@ -190,6 +195,8 @@ public enum WireRequest: Codable, Sendable, Equatable, Hashable {
 			try container.encode(content, forKey: .data)
 		case .unpair:
 			try container.encode(CodingKeys.unpair, forKey: .type)
+		case .reconnect:
+			try container.encode(CodingKeys.reconnect, forKey: .type)
 		}
 	}
 }
@@ -204,6 +211,7 @@ public enum WireResponse: Codable, Sendable, Equatable, Hashable {
 	case paired(WireGateway)
 	case pairFailed(WirePairFailed)
 	case unpaired
+	case reconnecting
 
 	enum CodingKeys: String, CodingKey, Codable {
 		case hello,
@@ -214,7 +222,8 @@ public enum WireResponse: Codable, Sendable, Equatable, Hashable {
 			discovered,
 			paired,
 			pairFailed = "pair_failed",
-			unpaired
+			unpaired,
+			reconnecting
 	}
 
 	private enum ContainerCodingKeys: String, CodingKey {
@@ -266,6 +275,9 @@ public enum WireResponse: Codable, Sendable, Equatable, Hashable {
 			case .unpaired:
 				self = .unpaired
 				return
+			case .reconnecting:
+				self = .reconnecting
+				return
 			}
 		}
 		throw DecodingError.typeMismatch(WireResponse.self, DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Wrong type for WireResponse"))
@@ -299,6 +311,8 @@ public enum WireResponse: Codable, Sendable, Equatable, Hashable {
 			try container.encode(content, forKey: .data)
 		case .unpaired:
 			try container.encode(CodingKeys.unpaired, forKey: .type)
+		case .reconnecting:
+			try container.encode(CodingKeys.reconnecting, forKey: .type)
 		}
 	}
 }

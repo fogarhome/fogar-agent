@@ -2,7 +2,8 @@
 // the Rust agent. It speaks the same frames (FogarWire) and plays scripted states. Synthetic data.
 //
 //   swift run fogar-standin [--socket PATH] [--phase not_paired|connecting|ready|reconnecting|
-//       parked_repair|parked_agent_refused|parked_client_error|stopping] [--version N]
+//       parked_repair|parked_agent_refused|parked_conversation_taken|parked_client_error|stopping]
+//       [--version N]
 //       [--gateways 0|1|2] [--refuse-pair] [--peer uid_only|same_signer] [--boot safe] [--old]
 //
 // Pairing codes decide the outcome: 482913 pairs; 111111 invalid_code, 222222 unreachable,
@@ -146,6 +147,18 @@ actor StandIn {
             if options.refusePair || options.peer == .uidOnly { return .refused(WireRefused(reason: "peer not allowed to unpair")) }
             await set(link: "not_paired")
             return .unpaired
+        case .reconnect:
+            // Like the core: signed peers only, and only from a pause the person can settle.
+            if options.refusePair || options.peer == .uidOnly { return .refused(WireRefused(reason: "peer not allowed to reconnect")) }
+            guard link == "parked_conversation_taken" || link == "parked_agent_refused" else {
+                return .refused(WireRefused(reason: "nothing to reconnect"))
+            }
+            await set(link: "connecting")
+            Task {
+                try? await Task.sleep(for: .milliseconds(1500))
+                await self.set(link: "ready")
+            }
+            return .reconnecting
         }
     }
 }

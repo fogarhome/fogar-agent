@@ -199,6 +199,8 @@ pub(crate) struct Pairing<C, H> {
     pub(crate) cfg: Arc<Config>,
     /// Bumped after every record write/delete; the link restarts on it.
     pub(crate) changed: watch::Sender<()>,
+    /// Bumped by an IPC `Reconnect`; the parked link makes one new attempt on it.
+    pub(crate) reconnect: watch::Sender<()>,
     /// One permit (`queues::PAIRING`).
     pub(crate) lock: Arc<Semaphore>,
 }
@@ -211,6 +213,7 @@ impl<C, H> Clone for Pairing<C, H> {
             secrets: self.secrets.clone(),
             cfg: self.cfg.clone(),
             changed: self.changed.clone(),
+            reconnect: self.reconnect.clone(),
             lock: self.lock.clone(),
         }
     }

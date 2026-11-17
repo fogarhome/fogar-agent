@@ -1,0 +1,76 @@
+# E2E of fogar-agent against the REAL fogar-gateway (Python, its fake OpenClaw, no STT/TTS), and
+# the drift check of the Rust mock against the gateway spec (crates/fogar-testkit/tests/spec_pin.rs).
+# - push / pull_request: BLOCKING, at the gateway commit pinned in
+#   crates/fogar-agentd/tests/real_gateway/GATEWAY_REF (bump that one line to move it).
+# - daily / manual: the newest gateway development line (GATEWAY_LATEST). Not a PR check, so a red
+#   run only warns that the gateway moved: update the mock / the agent, then bump GATEWAY_REF.
+# The job runs the gateway's own code (uv sync + its tests/fakes), so it holds no secret and a
+# read-only token; checkouts keep no credentials. Actions pinned by SHA (verified with
+# `git ls-remote` on 2026-11-17: checkout v6.1.0, setup-uv v10.3.3 of 2026-10-28).
+name: e2e-gateway
+on:
+  push:
+    branches: [main, "slice-*"]
+  pull_request:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.97.0"
+  # The newest gateway development line ("latest"). Switch to main once v3 lands there.
+  GATEWAY_LATEST: claude/hopeful-pasteur-phx8ad
+
+jobs:
+  real-gateway:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Gateway ref (pinned commit, or the latest line on schedule/manual runs)
+        run: |
+          case "$GITHUB_EVENT_NAME" in
+            schedule|workflow_dispatch) ref="$GATEWAY_LATEST" ;;
+            *)
+              ref=$(tr -d '[:space:]' < crates/fogar-agentd/tests/real_gateway/GATEWAY_REF)
+              echo "$ref" | grep -Eqx '[0-9a-f]{40}' || { echo "::error::GATEWAY_REF must be a full commit SHA"; exit 1; }
+              ;;
+          esac
+          echo "GATEWAY_CHECKOUT_REF=$ref" >> "$GITHUB_ENV"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: fogarhome/fogar-gateway
+          ref: ${{ env.GATEWAY_CHECKOUT_REF }}
+          path: fogar-gateway
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.7"
+          enable-cache: false
+      - name: Toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - name: Gateway environment (locked)
+        working-directory: fogar-gateway
+        run: |
+          git log -1 --format='gateway %H %s'
+          uv sync --locked
+      # With FOGAR_GATEWAY_DIR set the tests cannot skip; `1 passed` proves the filter matched.
+      - name: Pairing lifecycle against the real gateway
+        env:
+          FOGAR_GATEWAY_DIR: ${{ github.workspace }}/fogar-gateway
+        run: |
+          cargo test --locked -p fogar-agentd --test s1_pairing_e2e -- --exact pairing_lifecycle_against_the_real_gateway --nocapture | tee "$RUNNER_TEMP/e2e.out"
+          grep -q "test result: ok. 1 passed" "$RUNNER_TEMP/e2e.out"
+      - name: Mock follows the gateway spec
+        if: ${{ !cancelled() }}
+        env:
+          FOGAR_GATEWAY_DIR: ${{ github.workspace }}/fogar-gateway
+        run: |
+          cargo test --locked -p fogar-testkit --test spec_pin -- --exact mock_follows_the_gateway_spec | tee "$RUNNER_TEMP/pin.out"
+          grep -q "test result: ok. 1 passed" "$RUNNER_TEMP/pin.out"

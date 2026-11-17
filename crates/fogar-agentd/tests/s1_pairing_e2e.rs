@@ -4,8 +4,7 @@
 //!   like the real one: always runs, covers v3 (4200) and 2.x (1008 "revoked");
 //! - the REAL fogar-gateway (Python) with its own fake OpenClaw and no STT/TTS, started by
 //!   `real_gateway/launch.py` from the checkout in `FOGAR_GATEWAY_DIR` (skipped when unset; CI
-//!   is meant to check out the gateway commit in `real_gateway/GATEWAY_REF`;
-//!   that job is not wired yet).
+//!   job `.github/workflows/e2e-gateway.yml` checks out the commit in `real_gateway/GATEWAY_REF`).
 //!
 //! The app side of the IPC is the in-memory `FakeIpc` (the real socket's code-signing check
 //! cannot accept a test binary). Real sockets, so real time, not paused time.
@@ -14,9 +13,7 @@
 use fogar_core::{Agent, AgentPorts, Config, HealthProbe, LinkState, crashloop::BootMode};
 use fogar_host::{HttpConfig, HttpGateway, TokioClock, WsConfig, WsGatewayLink};
 use fogar_ports::{
-    ipc::{
-        IpcCaps, IpcError, IpcRequest, IpcResponse, IpcServer, LinkPhase, PairCode, PeerIdentity,
-    },
+    ipc::{IpcRequest, IpcResponse, LinkPhase, PairCode},
     secrets::{SecretCaps, SecretError, SecretKey, SecretStore, SecretString},
 };
 use fogar_testkit::{
@@ -30,24 +27,6 @@ use std::{
     },
     time::Duration,
 };
-
-/// `FakeIpc` whose peers count as the same signer as the agent (IPC-4 lets them pair).
-#[derive(Debug, Clone)]
-struct SignedIpc(FakeIpc);
-
-impl IpcServer for SignedIpc {
-    type Conn = <FakeIpc as IpcServer>::Conn;
-    fn capabilities(&self) -> IpcCaps {
-        self.0.capabilities()
-    }
-    async fn accept(&self) -> Result<(PeerIdentity, Self::Conn), IpcError> {
-        let (peer, conn) = self.0.accept().await?;
-        Ok((
-            PeerIdentity::verified_signer(peer.uid, "com.fogar.desktop".into()),
-            conn,
-        ))
-    }
-}
 
 /// Memory store that counts deletions of the pairing record.
 #[derive(Debug, Default)]
@@ -127,11 +106,11 @@ fn alive_tasks() -> usize {
 /// An unpaired agent on the real adapters, with a counting store and a signed fake IPC.
 fn start_agent() -> (Agent<TokioClock>, Arc<CountingStore>, FakeIpc) {
     let secrets = Arc::new(CountingStore::default());
-    let ipc = FakeIpc::new();
+    let ipc = FakeIpc::signed();
     let ports = AgentPorts {
         clock: Arc::new(TokioClock::new()),
         link: WsGatewayLink::new(WsConfig::default()),
-        ipc: Some(SignedIpc(ipc.clone())),
+        ipc: Some(ipc.clone()),
         http: HttpGateway::new(HttpConfig::default()),
         secrets: secrets.clone(),
         random: Arc::new(SeededRandom::new(11)),

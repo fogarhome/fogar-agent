@@ -100,7 +100,8 @@ PARTIAL / OPEN (honest):
 
 PASSES (automated, on Linux x86_64, rustc 1.97.0):
 - scripts/gates.sh: fmt, clippy -D warnings, 131 tests, proto no_std build, archtest R1-R8,
-  vendored-skill hygiene, cargo deny 0.20.2, cargo audit 0.23.0, loom, bench placeholder.
+  vendored-skill hygiene, cargo deny 0.20.2, cargo audit 0.23.0, loom, bench placeholder
+  (that gate was removed in S1: informational only).
 - E2E over a REAL WebSocket to the protocol-v1 mock gateway: handshake (no `type`), status before
   ready, end -> transcription -> send, turn_start/token/turn_end, 0xA1 PCM16 bit-exact to the fake
   player; barge-in; close codes; keepalive vs idle close; gateway down then up.
@@ -154,6 +155,24 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
 - s1_pairing_e2e.rs: ciclo completo (pair -> ready -> 1012 -> revocación 4200/1008 -> pair otra
   vez) con HTTP y WS reales contra el mock, que ahora sirve REST y WS en un puerto.
 - Segundo nivel contra el fogar-gateway REAL (launch.py, fake OpenClaw, sin STT/TTS); pasa en
-  local contra 8f4770e. Se salta sin FOGAR_GATEWAY_DIR: el job de CI está propuesto en la PR,
-  no montado (lo monta la sesión padre después de #11).
+  local contra 8f4770e. Se salta sin FOGAR_GATEWAY_DIR. CI: .github/workflows/e2e-gateway.yml,
+  bloqueante en el commit de GATEWAY_REF y diario contra la rama más nueva del gateway.
 - Pin del spec del mock (SPEC_GATEWAY_COMMIT/SPEC_BLOB) + tests/spec_pin.rs para detectar deriva.
+
+## S1 — user-initiated reconnect (2026-11-16)
+- IPC v3: Reconnect / Reconnecting. A link parked by 4102 (conversation taken, spec v3 §13) or
+  4020/4021 makes one new attempt when the signed app asks (SameSigner gate, like Pair/Unpair).
+  Repair/FixClient parks are not retried. Old app vs new agent (or reverse) = version mismatch.
+- Tests: fogar-core tests/reconnect.rs (paused time, mock gateway), wire golden, IPC contract.
+  UNVERIFIED: the park-side `user_may_reconnect` guard (the IPC refuses first), button by eye.
+
+## S1 — fuzz targets (2026-11-16)
+- fuzz/ (cargo-fuzz, libfuzzer-sys =0.4.13), its own [workspace] + Cargo.lock, outside the main
+  workspace: gates/deny/vet/archtest do not see it. Targets: decode_server, tts_frame, close_code,
+  ipc_frames (take_frame + decode_request/decode_response, request re-encode round-trip,
+  GatewayAddr round-trip for Pair addresses), gateway_addr.
+- Bug found: GatewayAddr accepted 251-255 char hosts whose Display form did not parse again
+  (stored pairing unreadable). Fixed in fogar-ports (bound on host, 253) with a regression test. Bodies in fuzz/src/lib.rs, shared with a stable
+  smoke test over the committed seeds (`cargo test --manifest-path fuzz/Cargo.toml --locked`).
+- After the fix, run locally on nightly for 3 min each (ASan), no crash; results in the PR. NOT DONE: CI build on every
+  PR + scheduled runs (CI is owned by another PR; recipe in the fuzz PR description).

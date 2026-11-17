@@ -2,7 +2,9 @@
 //! subscription, discovery and pairing. Connections live in a JoinSet drained in the same loop
 //! and aborted on shutdown.
 //!
-//! Authorization (IPC-4): `Pair`/`Unpair` change where the user's voice goes, so they are
+//! Authorization (IPC-4): `Pair`/`Unpair` change where the user's voice goes and `Reconnect`
+//! makes the agent spend the stored key to take the conversation back from another session (any
+//! same-user process could otherwise drive the 4102 ping-pong spec §13 forbids), so they are
 //! answered only for a `PeerCheck::SameSigner` peer, unless the composition root opted in to
 //! `UidOnly` peers at compile time (`Config::pair_from_uid_only_peers`). The rest is read-only.
 
@@ -202,9 +204,13 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp>(mut c: Conn<K, C, H>) {
                 Some(found) => IpcResponse::Discovered(found),
                 None => return,
             },
-            IpcRequest::Pair { .. } | IpcRequest::Unpair if !c.may_pair() => IpcResponse::Refused {
-                reason: "pairing needs the signed Fogar app",
-            },
+            IpcRequest::Pair { .. } | IpcRequest::Unpair | IpcRequest::Reconnect
+                if !c.may_pair() =>
+            {
+                IpcResponse::Refused {
+                    reason: "needs the signed Fogar app",
+                }
+            }
             IpcRequest::Pair { address, code } => {
                 match op(&c.cancel, c.pairing.pair(&address, code.as_ref())).await {
                     Some(Ok(info)) => IpcResponse::Paired(info),
@@ -218,6 +224,15 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp>(mut c: Conn<K, C, H>) {
                     reason: "could not delete the pairing",
                 },
                 None => return,
+            },
+            // Checked against the published state: the link only listens while parked for such a
+            // reason, and discards a request it saw before parking.
+            IpcRequest::Reconnect if view.borrow().state.user_may_reconnect() => {
+                c.pairing.reconnect.send_replace(());
+                IpcResponse::Reconnecting
+            }
+            IpcRequest::Reconnect => IpcResponse::Refused {
+                reason: "nothing to reconnect",
             },
             _ => IpcResponse::Refused {
                 reason: "unsupported request",

@@ -67,7 +67,7 @@ enum Textos {
         switch link {
         case "parked_agent_refused":
             return Titular(titulo: "El gateway no acepta a este Mac",
-                           sub: "El gateway rechaza el agente que pide este Mac. Revisa la ficha de este Mac en el gateway; después reinicia el agente.",
+                           sub: "El gateway rechaza el agente que pide este Mac. Revisa la ficha de este Mac en el gateway; después pulsa Reconectar.",
                            tono: .bad)
         case "parked_repair":
             return Titular(titulo: "Hay que volver a emparejar este Mac",
@@ -75,9 +75,9 @@ enum Textos {
                            tono: .bad)
         case "parked_conversation_taken":
             // Gateway M19 close 4102: reconnecting by itself would evict the other session, which
-            // would evict this one back (spec §13). A "Reconectar" button needs a new IPC request.
+            // would evict this one back (spec §13), so only the person's «Reconectar» does it.
             return Titular(titulo: "Otra sesión abrió la conversación de este Mac",
-                           sub: "Algo más (otra pestaña del panel u otro cliente) abrió en \(gw) la conversación que usaba este Mac, así que este Mac se ha apartado. Reinicia el agente cuando quieras volver.",
+                           sub: "Algo más (otra pestaña del panel u otro cliente) abrió en \(gw) la conversación que usaba este Mac, así que este Mac se ha apartado. Pulsa Reconectar cuando quieras volver: la otra sesión se cerrará.",
                            tono: .bad)
         default:
             return Titular(titulo: "El agente se ha parado",
@@ -156,6 +156,14 @@ enum Textos {
         case .refused: "El agente no deja hacer esto desde esta app: no está firmada por el mismo firmante que el agente."
         case .noAnswer: "El agente no ha contestado a tiempo. Prueba otra vez."
         case .unexpected: "El agente ha contestado algo que esta app no esperaba. Prueba otra vez."
+        }
+    }
+
+    /// `refused` on reconnect: either the pause ended meanwhile or this app is not signed.
+    static func falloReconectar(_ e: any Error) -> String {
+        switch (e as? CommandError) ?? .unexpected {
+        case .refused: "El agente no ha reconectado: o ya no estaba en pausa, o esta app no está firmada por el mismo firmante que el agente."
+        case let other: fallo(other)
         }
     }
 

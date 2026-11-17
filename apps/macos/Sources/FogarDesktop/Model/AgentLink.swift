@@ -28,7 +28,8 @@ enum AgentState: Equatable {
 enum CommandError: Error, Equatable {
     case agentNotRunning
     case versionMismatch(agent: UInt32)
-    /// `refused`: on pair/unpair, the agent did not verify this app's signer (uid_only).
+    /// `refused`: on pair/unpair/reconnect, the agent did not verify this app's signer (uid_only);
+    /// on reconnect also «nothing to reconnect» (the link left the pause meanwhile).
     case refused
     case noAnswer
     case unexpected
@@ -159,6 +160,12 @@ final class AgentLink {
 
     func unpair() async throws(CommandError) {
         guard case .unpaired = try await command(.unpair, timeout: .seconds(5)) else { throw .unexpected }
+    }
+
+    /// One new attempt from a link parked by the gateway (`parked_conversation_taken`,
+    /// `parked_agent_refused`); how it goes arrives as live status.
+    func reconnect() async throws(CommandError) {
+        guard case .reconnecting = try await command(.reconnect, timeout: .seconds(5)) else { throw .unexpected }
     }
 
     private func command(_ request: WireRequest, timeout: Duration) async throws(CommandError) -> WireResponse {

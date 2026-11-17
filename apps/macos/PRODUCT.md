@@ -24,7 +24,7 @@ Es la cara en el Mac del mismo asistente casero que el dashboard del gateway y l
 
 ## Operating Context
 
-- La app habla con el agente por un socket Unix local (`~/Library/Application Support/com.fogar.agent/run/agent.sock`), tramas de 4 bytes + JSON, protocolo IPC v2. Si el agente no corre, la app lo dice.
+- La app habla con el agente por un socket Unix local (`~/Library/Application Support/com.fogar.agent/run/agent.sock`), tramas de 4 bytes + JSON, protocolo IPC v3. Si el agente no corre, la app lo dice.
 - Pantallas del S1: Estado, Emparejar (gateways encontrados o dirección a mano + código), Ajustes (desemparejar). Vista rápida en la barra de menús.
 - Los slices siguientes añaden sesiones, chat, escucha y monitorización sobre la misma estructura.
 - Sin cuenta de Apple Developer de pago: firma ad hoc o Personal Team; bundle id `com.fogar.desktop` (GUESSED).
