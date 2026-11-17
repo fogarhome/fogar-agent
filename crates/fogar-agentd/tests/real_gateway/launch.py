@@ -1,7 +1,7 @@
 """Runs the REAL fogar-gateway locally for fogar-agent's E2E tier, with the gateway's own fake
 OpenClaw and no STT/TTS. Run from the gateway checkout (its `tests.fakes` must import):
 
-    uv run --project "$FOGAR_GATEWAY_DIR" --locked python launch.py
+    cd "$FOGAR_GATEWAY_DIR" && PYTHONPATH=. uv run --locked python <path>/launch.py
 
 Line protocol. stdout: `ready <port>` once the gateway answers, then one line per command.
 stdin commands:
