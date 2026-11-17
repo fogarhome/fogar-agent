@@ -102,10 +102,11 @@ impl std::fmt::Debug for PairCode {
 /// Requests a UI may send. Closed set (no generic "exec"). The address in `Pair` is the person's
 /// raw input; the core validates it (`GatewayAddr::parse`).
 ///
-/// Authorization (IPC-4): `Pair` and `Unpair` change where the agent sends the user's voice, so
-/// the core answers them only for a `PeerCheck::SameSigner` peer; a `UidOnly` peer gets
-/// `Refused` unless the composition root explicitly opts in for development builds. Everything
-/// else is read-only and open to any authenticated peer.
+/// Authorization (IPC-4): `Pair` and `Unpair` change where the agent sends the user's voice, and
+/// `Reconnect` makes the agent spend the stored key to take the conversation back from another
+/// session of the user, so the core answers the three only for a `PeerCheck::SameSigner` peer; a
+/// `UidOnly` peer gets `Refused` unless the composition root explicitly opts in for development
+/// builds. Everything else is read-only and open to any authenticated peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum IpcRequest {
@@ -130,6 +131,11 @@ pub enum IpcRequest {
     },
     /// Forget the pairing (delete the record) and stop the link. Answered with `Unpaired`.
     Unpair,
+    /// The person asks to connect again after the link parked for a reason only they can settle
+    /// (gateway close 4102 "conversation opened elsewhere", 4020/4021 agent refused once the
+    /// admin fixed it). Answered with `Reconnecting` (one new attempt; progress arrives as status
+    /// `Event`s), or `Refused` when the link is not parked for such a reason.
+    Reconnect,
 }
 
 /// Link state as the UI shows it. Mirrors fogar-core's link states without their internals.
@@ -142,7 +148,8 @@ pub enum LinkPhase {
     Ready,
     /// Waiting before the next attempt.
     Reconnecting,
-    /// The gateway refused us in a way retrying will not fix (bad config, client bug).
+    /// The gateway refused us in a way retrying on our own will not fix (bad config, client bug,
+    /// conversation taken by another session). Some reasons accept a `Reconnect`.
     Parked,
     Stopping,
 }
@@ -281,10 +288,13 @@ pub enum IpcResponse {
     Paired(GatewayInfo),
     PairFailed(PairFailure),
     Unpaired,
+    /// `Reconnect` accepted: the parked link makes one new attempt.
+    Reconnecting,
 }
 
-/// IPC protocol version spoken by this build. 2 = S1 (subscribe, discover, pair, unpair).
-pub const IPC_VERSION: u32 = 2;
+/// IPC protocol version spoken by this build. 2 = S1 (subscribe, discover, pair, unpair);
+/// 3 = reconnect.
+pub const IPC_VERSION: u32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

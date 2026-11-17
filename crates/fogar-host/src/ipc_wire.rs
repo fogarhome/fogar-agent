@@ -68,6 +68,7 @@ pub enum WireRequest {
     Discover,
     Pair(WirePair),
     Unpair,
+    Reconnect,
 }
 
 #[cfg_attr(typeshare, typeshare)]
@@ -178,6 +179,7 @@ pub enum WireResponse {
     Paired(WireGateway),
     PairFailed(WirePairFailed),
     Unpaired,
+    Reconnecting,
 }
 
 // ---- framing -----------------------------------------------------------------------------
@@ -235,6 +237,7 @@ pub fn decode_request(body: &[u8]) -> Result<IpcRequest, IpcError> {
                 address: p.address,
             },
             WireRequest::Unpair => IpcRequest::Unpair,
+            WireRequest::Reconnect => IpcRequest::Reconnect,
         },
     )
 }
@@ -255,6 +258,7 @@ pub fn encode_request(r: &IpcRequest) -> Result<Zeroizing<Vec<u8>>, IpcError> {
             ),
         }),
         IpcRequest::Unpair => WireRequest::Unpair,
+        IpcRequest::Reconnect => WireRequest::Reconnect,
         _ => return Err(IpcError::Unsupported("request not in the wire vocabulary")),
     };
     serde_json::to_vec(&w)
@@ -384,6 +388,7 @@ pub fn encode_response(r: IpcResponse) -> Result<Vec<u8>, IpcError> {
             reason: failure_to_wire(f),
         }),
         IpcResponse::Unpaired => WireResponse::Unpaired,
+        IpcResponse::Reconnecting => WireResponse::Reconnecting,
         _ => WireResponse::Refused(WireRefused {
             reason: "unsupported response".to_owned(),
         }),
@@ -410,6 +415,7 @@ pub fn decode_response(body: &[u8]) -> Result<IpcResponse, IpcError> {
             WireResponse::Paired(g) => IpcResponse::Paired(gateway_from_wire(g)),
             WireResponse::PairFailed(f) => IpcResponse::PairFailed(failure_from_wire(f.reason)),
             WireResponse::Unpaired => IpcResponse::Unpaired,
+            WireResponse::Reconnecting => IpcResponse::Reconnecting,
         },
     )
 }
@@ -468,6 +474,7 @@ mod tests {
             IpcRequest::Subscribe,
             IpcRequest::Discover,
             IpcRequest::Unpair,
+            IpcRequest::Reconnect,
             IpcRequest::Pair {
                 address: "green-house".into(),
                 code: PairCode::parse("482 913"),
@@ -508,6 +515,7 @@ mod tests {
             IpcResponse::Paired(report().gateway.unwrap()),
             IpcResponse::PairFailed(PairFailure::InvalidCode),
             IpcResponse::Unpaired,
+            IpcResponse::Reconnecting,
         ] {
             assert_eq!(
                 decode_response(&encode_response(r.clone()).unwrap()).unwrap(),
@@ -534,6 +542,10 @@ mod tests {
         );
         let s = String::from_utf8(encode_response(IpcResponse::Subscribed).unwrap()).unwrap();
         assert_eq!(s, r#"{"type":"subscribed"}"#);
+        let s = String::from_utf8(encode_response(IpcResponse::Reconnecting).unwrap()).unwrap();
+        assert_eq!(s, r#"{"type":"reconnecting"}"#);
+        let r = encode_request(&IpcRequest::Reconnect).unwrap();
+        assert_eq!(std::str::from_utf8(&r).unwrap(), r#"{"type":"reconnect"}"#);
         let r = encode_request(&IpcRequest::Pair {
             address: "green-house".into(),
             code: PairCode::parse("482913"),

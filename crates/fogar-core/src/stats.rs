@@ -23,8 +23,9 @@ pub enum LinkState {
     },
     /// No pairing record: the agent is not paired. Waits (no timer) for a pairing change.
     NotPaired,
-    /// Parked: retrying would loop (key revoked/invalid, agent refused, client bug). Stays alive
-    /// and reports health; leaves this state only on restart or (S1) re-pairing/config change.
+    /// Parked: retrying would loop (key revoked/invalid, agent refused, client bug, conversation
+    /// taken). Stays alive and reports health; leaves this state on restart, re-pairing, or an
+    /// IPC `Reconnect` when [`LinkState::user_may_reconnect`].
     Parked {
         reason: CloseAction,
     },
@@ -33,6 +34,18 @@ pub enum LinkState {
 }
 
 impl LinkState {
+    /// Parked for a reason only the person can settle, so their `Reconnect` gets one new attempt:
+    /// 4102 (spec §13: "reconecta solo si lo pide el usuario") and 4020/4021 (the admin may have
+    /// allowed the agent meanwhile). Not `Repair`/`FixClient`: the same request fails the same way.
+    pub fn user_may_reconnect(&self) -> bool {
+        matches!(
+            self,
+            LinkState::Parked {
+                reason: CloseAction::ConversationTaken | CloseAction::AgentRefused
+            }
+        )
+    }
+
     /// What the UI shows (IPC `LinkPhase`).
     pub fn phase(&self) -> fogar_ports::ipc::LinkPhase {
         use fogar_ports::ipc::LinkPhase;
