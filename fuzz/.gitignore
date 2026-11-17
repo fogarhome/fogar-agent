@@ -1,0 +1,6 @@
+target
+artifacts
+coverage
+# libFuzzer grows these while running; only the hand-written seeds under corpus/ are committed.
+corpus/*/*
+!corpus/*/seed-*

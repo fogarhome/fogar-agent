@@ -173,7 +173,6 @@ impl GatewayAddr {
         let rest = rest.strip_suffix('/').unwrap_or(rest);
         let rest = rest.strip_suffix("/ws/stream").unwrap_or(rest);
         if rest.is_empty()
-            || rest.len() > 255
             || rest
                 .chars()
                 .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '@' | '?' | '#'))
@@ -200,7 +199,10 @@ impl GatewayAddr {
                 None => (rest, None),
             }
         };
+        // The bound is on the host, not on the whole input: `Display` always adds `:port`, and
+        // what it prints must parse again (a stored pairing is read back that way).
         if host.is_empty()
+            || host.len() > 253
             || !host
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | ':' | '_'))
@@ -256,6 +258,29 @@ impl fmt::Display for GatewayAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fuzz find (fuzz/ ipc_frames): a 251-255 char host without a port parsed, but its
+    /// `Display` form (which always adds `:port`) did not, so a stored pairing could not be read back.
+    #[test]
+    fn every_accepted_address_round_trips_through_display() {
+        for n in 245..=260 {
+            for input in [
+                "a".repeat(n),
+                format!("https://{}", "a".repeat(n)),
+                format!("[{}]", "1".repeat(n)),
+                format!("{}:65535", "a".repeat(n)),
+            ] {
+                if let Ok(a) = GatewayAddr::parse(&input) {
+                    assert_eq!(
+                        GatewayAddr::parse(&a.to_string()).ok(),
+                        Some(a),
+                        "{n}: {input}"
+                    );
+                }
+            }
+        }
+        assert!(GatewayAddr::parse(&"a".repeat(253)).is_ok());
+    }
 
     #[test]
     fn parses_the_forms_people_type() {
