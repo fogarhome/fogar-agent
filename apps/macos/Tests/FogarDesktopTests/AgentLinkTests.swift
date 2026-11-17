@@ -56,7 +56,7 @@ nonisolated let ready = WireStatus(link: "ready", phase: .ready,
                        gateway: WireGateway(address: "http://green-house:8004", name: "green-house", version: "1.29.0", client_name: "Mac"),
                        sessions: 1, turns_completed: 2, boot_mode: "normal", peer_check: .sameSigner)
 
-func answers(version: UInt32 = 2, pair: WireResponse = .unpaired) -> @Sendable (WireRequest) -> [WireResponse] {
+func answers(version: UInt32 = ipcVersion, pair: WireResponse = .unpaired) -> @Sendable (WireRequest) -> [WireResponse] {
     { req in
         switch req {
         case .hello: [.hello(WireHello(version: version))]
@@ -64,6 +64,7 @@ func answers(version: UInt32 = 2, pair: WireResponse = .unpaired) -> @Sendable (
         case .discover: [.event(ready), .discovered(WireDiscovered(gateways: []))] // a stray event must not be the answer
         case .pair: [pair]
         case .unpair: [.unpaired]
+        case .reconnect: [.event(ready), .reconnecting]
         case .status: [.status(ready)]
         }
     }
@@ -96,12 +97,12 @@ func waitFor(_ link: AgentLink, _ ok: (AgentState) -> Bool) async -> Bool {
     }
 
     @Test func versionMismatchNamesTheAgentVersion() async throws {
-        let agent = try FakeAgent(answers(version: 3))
+        let agent = try FakeAgent(answers(version: ipcVersion + 1))
         try await Task.sleep(for: .milliseconds(200))
         let link = AgentLink(socketPath: agent.path)
         link.start()
         defer { link.stop() }
-        #expect(await waitFor(link) { $0 == .versionMismatch(agent: 3) })
+        #expect(await waitFor(link) { $0 == .versionMismatch(agent: ipcVersion + 1) })
         #expect(Textos.titular(link.state).titulo == "Actualiza Fogar Desktop")
     }
 
@@ -112,6 +113,7 @@ func waitFor(_ link: AgentLink, _ ok: (AgentState) -> Bool) async -> Bool {
         #expect(try await link.discover().isEmpty)
         #expect(try await link.pair(address: "green-house", code: "111111") == .failed(.invalidCode))
         try await link.unpair()
+        try await link.reconnect()
     }
 
     @Test func refusedPairIsTheSignerSentence() async throws {
@@ -127,7 +129,7 @@ extension AgentLinkOverASocket {
     /// reconnect loop (review finding).
     @Test func refusedSubscribeIsAnOlderAgentNotALoop() async throws {
         let agent = try FakeAgent { req in
-            if case .hello = req { return [.hello(WireHello(version: 2))] }
+            if case .hello = req { return [.hello(WireHello(version: ipcVersion))] }
             return [.refused(WireRefused(reason: "not implemented yet"))]
         }
         try await Task.sleep(for: .milliseconds(200))
@@ -156,7 +158,7 @@ extension AgentLinkOverASocket {
         FakeAgent.rawAfterSubscribe = #"{"type":"event","data":{"phase":"dancing"}}"#
         defer { FakeAgent.rawAfterSubscribe = nil }
         let agent = try FakeAgent { req in
-            if case .hello = req { return [.hello(WireHello(version: 2))] }
+            if case .hello = req { return [.hello(WireHello(version: ipcVersion))] }
             return [.subscribed]
         }
         try await Task.sleep(for: .milliseconds(200))
@@ -183,5 +185,16 @@ extension AgentLinkOverASocket {
             #expect(!Textos.titular(.live(s)).titulo.isEmpty)
         }
         #expect(Textos.titular(.versionMismatch(agent: 1)).titulo == "Actualiza el agente de Fogar")
+    }
+
+    /// The two pauses the person can lift say how, and no longer send them to restart the agent.
+    @Test func pausesWithReconnectSayReconectar() {
+        for link in ["parked_conversation_taken", "parked_agent_refused"] {
+            let s = WireStatus(link: link, phase: .parked, gateway: ready.gateway, sessions: 0,
+                               turns_completed: 0, boot_mode: "normal", peer_check: .sameSigner)
+            let sub = Textos.titular(.live(s)).sub
+            #expect(sub.contains("Reconectar"))
+            #expect(!sub.contains("einicia"))
+        }
     }
 }

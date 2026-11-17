@@ -148,6 +148,8 @@ impl<C: Clock> Agent<C> {
         });
         // Pairing generation (`queues`: watch, coalescing): IPC pair/unpair -> link.
         let (pairing_tx, pairing_rx) = watch::channel(());
+        // IPC reconnect -> parked link (`queues`: watch, coalescing).
+        let (reconnect_tx, reconnect_rx) = watch::channel(());
         let (out_tx, out_rx) = mpsc::channel::<Frame>(queues::OUTBOUND);
         let (in_tx, in_rx) = mpsc::channel::<Inbound>(queues::INBOUND);
         let health = HealthProbe {
@@ -192,6 +194,8 @@ impl<C: Clock> Agent<C> {
             budget: queues::ByteBudget::new(queues::INBOUND_BYTES),
             pairing: pairing_rx,
             _pairing_keep: pairing_tx.clone(),
+            reconnect: reconnect_rx,
+            _reconnect_keep: reconnect_tx.clone(),
         };
         io.spawn(link.run(out_rx, in_tx, egress.clone()));
 
@@ -202,6 +206,7 @@ impl<C: Clock> Agent<C> {
                 secrets: ports.secrets,
                 cfg: cfg.clone(),
                 changed: pairing_tx,
+                reconnect: reconnect_tx,
                 lock: Arc::new(Semaphore::new(queues::PAIRING)),
             };
             edge.spawn(crate::ipc::run(

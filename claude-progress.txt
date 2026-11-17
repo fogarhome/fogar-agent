@@ -150,3 +150,10 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
   (Team ID from the agent's own signature + id com.fogar.desktop, GUESSED). Contract suite green.
 - Signed matrix verified manually with examples/signer_probe.rs (ADR-0002). UNVERIFIED: Developer
   ID, real .app bundle peers, UI-side check of the agent, flock single instance (not done).
+
+## S1 — user-initiated reconnect (2026-11-16)
+- IPC v3: Reconnect / Reconnecting. A link parked by 4102 (conversation taken, spec v3 §13) or
+  4020/4021 makes one new attempt when the signed app asks (SameSigner gate, like Pair/Unpair).
+  Repair/FixClient parks are not retried. Old app vs new agent (or reverse) = version mismatch.
+- Tests: fogar-core tests/reconnect.rs (paused time, mock gateway), wire golden, IPC contract.
+  UNVERIFIED: the park-side `user_may_reconnect` guard (the IPC refuses first), button by eye.
