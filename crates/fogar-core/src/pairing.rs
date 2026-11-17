@@ -12,7 +12,7 @@
 use crate::{config::Config, time::deadline};
 use fogar_ports::{
     clock::Clock,
-    gateway::GatewayAddr,
+    gateway::{DEFAULT_GATEWAY_PORT, GatewayAddr},
     gateway_http::{GatewayHttp, HttpCall, HttpError},
     ipc::{GatewayCandidate, GatewayInfo, PairCode, PairFailure},
     secrets::{ExposeSecret, SecretError, SecretKey, SecretStore, SecretString},
@@ -31,8 +31,6 @@ use tokio::{
 const FOGAR_SERVICES: [&str; 2] = ["fogar-gateway", "jota-gateway"];
 /// Same-machine gateway (spec §0 step 2).
 const LOCAL_GATEWAY: &str = "127.0.0.1:8004";
-/// Port of a gateway on a tailnet peer (plain HTTP, like LAN; `GatewayAddr` default port).
-const TAILNET_GATEWAY_PORT: u16 = 8004;
 /// Gateway <= 2.x: the two 1008 reasons that mean "this key is dead" (compared verbatim). M19
 /// gateways say it with codes 4010 / 4200 instead (client-protocol §13).
 const REVOKED_REASONS: [&str; 2] = ["Clave de cliente invalida o inactiva.", "revoked"];
@@ -42,10 +40,13 @@ const RECORD_VERSION: u8 = 1;
 /// Longest gateway-supplied label we keep (names, versions, ids).
 const MAX_LABEL_CHARS: usize = 128;
 
-/// Gateway-supplied text shown in the UI and stored in the record: no control or bidi
-/// characters (UI spoofing), at most `MAX_LABEL_CHARS`.
+/// Gateway-supplied text shown in the UI and stored in the record: no control, bidi or
+/// invisible format characters (UI spoofing), at most `MAX_LABEL_CHARS`.
 fn label(s: String) -> String {
-    let bidi = |c: char| matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    let bidi = |c: char| {
+        matches!(c, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+    };
     if s.chars().count() <= MAX_LABEL_CHARS && !s.chars().any(|c| c.is_control() || bidi(c)) {
         return s;
     }
@@ -264,43 +265,47 @@ impl<C: Clock, H: GatewayHttp, T: TailnetPeers> Pairing<C, H, T> {
     }
 
     /// Saved address, this machine, then one address per tailnet peer (spec §0 steps 1–3;
-    /// manual entry is the UI's). All are probed at once (at most `MAX_TAILNET_PEERS + 2`
-    /// probes, see `queues`), so the whole call takes at most `tailnet_timeout +
-    /// probe_timeout`. Every Fogar that answers is returned, in that order.
-    pub(crate) async fn discover(&self) -> Vec<GatewayCandidate> {
+    /// manual entry is the UI's). The tailnet is asked only for a `SameSigner` app
+    /// (`with_tailnet`): only it may pair, and it keeps uid-only peers from making the agent run
+    /// a child process. Every address is probed at once (at most `MAX_TAILNET_PEERS + 2`
+    /// probes, see `queues`); the first two start before the tailnet answers, so the whole call
+    /// takes at most `tailnet_timeout + probe_timeout`. Every Fogar that answers is returned,
+    /// in that order.
+    pub(crate) async fn discover(&self, with_tailnet: bool) -> Vec<GatewayCandidate> {
         let saved = load_record(&*self.secrets)
             .ok()
             .flatten()
             .map(|r| r.address.clone());
         let local = GatewayAddr::parse(LOCAL_GATEWAY).ok();
-        let peers = if self.tailnet.capabilities().is_available() {
-            deadline(&*self.clock, self.cfg.tailnet_timeout, self.tailnet.peers())
+        // Dropped with this future (agent shutdown): aborts every probe still running.
+        let mut probes = JoinSet::new();
+        let mut addrs: Vec<GatewayAddr> = Vec::with_capacity(MAX_TAILNET_PEERS + 2);
+        let mut start = |addr: GatewayAddr, probes: &mut JoinSet<_>| {
+            if addrs.contains(&addr) {
+                return;
+            }
+            let (i, me, a) = (addrs.len(), self.clone(), addr.clone());
+            addrs.push(addr);
+            probes.spawn(async move {
+                let probe = me.probe(&a).await;
+                (i, a, probe)
+            });
+        };
+        for addr in saved.into_iter().chain(local) {
+            start(addr, &mut probes);
+        }
+        if with_tailnet && self.tailnet.capabilities().is_available() {
+            let peers = deadline(&*self.clock, self.cfg.tailnet_timeout, self.tailnet.peers())
                 .await
                 .and_then(Result::ok)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let tailnet = peers
-            .into_iter()
-            .take(MAX_TAILNET_PEERS) // the adapter promises it; the core does not rely on it
-            .filter_map(|ip| {
-                GatewayAddr::parse(&SocketAddr::new(ip, TAILNET_GATEWAY_PORT).to_string()).ok()
-            });
-        let mut addrs: Vec<GatewayAddr> = Vec::with_capacity(MAX_TAILNET_PEERS + 2);
-        for addr in saved.into_iter().chain(local).chain(tailnet) {
-            if !addrs.contains(&addr) {
-                addrs.push(addr);
+                .unwrap_or_default();
+            // The adapter promises the cap; the core does not rely on it.
+            for ip in peers.into_iter().take(MAX_TAILNET_PEERS) {
+                let addr = SocketAddr::new(ip, DEFAULT_GATEWAY_PORT).to_string();
+                if let Ok(addr) = GatewayAddr::parse(&addr) {
+                    start(addr, &mut probes);
+                }
             }
-        }
-        // Dropping the set (IPC connection cancelled) aborts every probe still running.
-        let mut probes = JoinSet::new();
-        for (i, addr) in addrs.into_iter().enumerate() {
-            let me = self.clone();
-            probes.spawn(async move {
-                let probe = me.probe(&addr).await;
-                (i, addr, probe)
-            });
         }
         let mut found = Vec::new();
         while let Some(r) = probes.join_next().await {
@@ -472,6 +477,10 @@ mod tests {
     fn gateway_labels_are_cleaned_and_capped() {
         assert_eq!(label("green-house".into()), "green-house");
         assert_eq!(label("a\u{202E}b\nc\u{0}".into()), "abc");
+        assert_eq!(
+            label("green\u{200B}-house\u{FEFF}\u{2060}".into()),
+            "green-house"
+        );
         assert_eq!(label("ñ".repeat(500)).chars().count(), MAX_LABEL_CHARS);
     }
 

@@ -100,6 +100,8 @@ pub(crate) struct RigBuilder<L: GatewayLink> {
 }
 
 /// Several `FakeGatewayHttp`s, one per address (discovery may find more than one gateway).
+/// An unknown address goes to the first one: it applies the cleartext policy, then answers
+/// `Unreachable`. `http_addrs` must not be empty.
 #[derive(Debug)]
 pub(crate) struct MultiHttp(Vec<FakeGatewayHttp>);
 

@@ -201,7 +201,7 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
                 last_pushed = Some(rep.clone());
                 IpcResponse::Event(rep)
             }
-            IpcRequest::Discover => match op(&c.cancel, c.pairing.discover()).await {
+            IpcRequest::Discover => match op(&c.cancel, c.pairing.discover(c.may_pair())).await {
                 Some(found) => IpcResponse::Discovered(found),
                 None => return,
             },

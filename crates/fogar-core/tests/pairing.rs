@@ -486,6 +486,46 @@ async fn discover_finds_gateways_on_tailnet_peers() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn discover_asks_the_tailnet_only_for_the_signed_app() {
+    // A uid-only peer (another local app) cannot make the agent run the tailnet client.
+    let mut b = unpaired();
+    b.signed_peer = false;
+    b.http_addrs = vec!["127.0.0.1:8004", "100.109.57.116:8004"];
+    b.tailnet = FakeTailnet::with_peers(&["100.109.57.116"]);
+    let calls = b.tailnet.calls.clone();
+    let rig = b.start();
+    let mut c = client(&rig).await;
+    let r = c.request(IpcRequest::Discover).await;
+    let Some(IpcResponse::Discovered(found)) = r else {
+        panic!("{r:?}")
+    };
+    assert_eq!(found.len(), 1, "this machine only: {found:?}");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_during_discover_is_quick_and_clean() {
+    let mut b = unpaired();
+    b.tailnet = FakeTailnet::hanging();
+    b.routes.set_delayed(
+        "GET",
+        "/.well-known/fogar-gateway",
+        200,
+        r#"{"service":"fogar-gateway","version":"2.0.0","name":"green-house"}"#,
+        Duration::from_secs(3600),
+    );
+    let rig = b.start();
+    let mut c = client(&rig).await;
+    let pending = tokio::spawn(async move { c.request(IpcRequest::Discover).await });
+    tokio::time::sleep(Duration::from_millis(100)).await; // local probe + tailnet query in flight
+    let t0 = tokio::time::Instant::now();
+    assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
+    assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+    let _ = pending.await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn discover_survives_a_tailnet_that_never_answers() {
     for tailnet in [FakeTailnet::hanging(), FakeTailnet::not_running()] {
         let mut b = unpaired();
@@ -508,8 +548,10 @@ async fn discover_survives_a_tailnet_that_never_answers() {
 
 #[tokio::test(start_paused = true)]
 async fn discover_tries_the_saved_address_then_this_machine() {
-    // Unpaired: this machine answers.
-    let rig = unpaired().start();
+    // Unpaired: this machine answers. No tailnet adapter: never asked (no I/O).
+    let b = unpaired();
+    let tailnet_calls = b.tailnet.calls.clone();
+    let rig = b.start();
     let mut c = client(&rig).await;
     let r = c.request(IpcRequest::Discover).await;
     let Some(IpcResponse::Discovered(found)) = r else {
@@ -520,6 +562,7 @@ async fn discover_tries_the_saved_address_then_this_machine() {
         (found[0].address.as_str(), found[0].name.as_str()),
         ("http://127.0.0.1:8004", "green-house")
     );
+    assert_eq!(tailnet_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
 
     // Paired at the same address: probed once, not twice.
