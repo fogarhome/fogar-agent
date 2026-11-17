@@ -16,17 +16,23 @@ use fogar_ports::{
     gateway_http::{GatewayHttp, HttpCall, HttpError},
     ipc::{GatewayCandidate, GatewayInfo, PairCode, PairFailure},
     secrets::{ExposeSecret, SecretError, SecretKey, SecretStore, SecretString},
+    tailnet::{MAX_TAILNET_PEERS, TailnetPeers},
 };
 use fogar_proto::pairing::{ClientType, PairRequest, PairResponse, WellKnown};
 use secrecy::zeroize::Zeroizing;
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, sync::Arc};
-use tokio::sync::{Semaphore, watch};
+use std::{borrow::Cow, net::SocketAddr, sync::Arc};
+use tokio::{
+    sync::{Semaphore, watch},
+    task::JoinSet,
+};
 
 /// `service` values of a Fogar gateway (before and after the jota -> fogar rename).
 const FOGAR_SERVICES: [&str; 2] = ["fogar-gateway", "jota-gateway"];
 /// Same-machine gateway (spec §0 step 2).
 const LOCAL_GATEWAY: &str = "127.0.0.1:8004";
+/// Port of a gateway on a tailnet peer (plain HTTP, like LAN; `GatewayAddr` default port).
+const TAILNET_GATEWAY_PORT: u16 = 8004;
 /// Gateway <= 2.x: the two 1008 reasons that mean "this key is dead" (compared verbatim). M19
 /// gateways say it with codes 4010 / 4200 instead (client-protocol §13).
 const REVOKED_REASONS: [&str; 2] = ["Clave de cliente invalida o inactiva.", "revoked"];
@@ -192,9 +198,11 @@ enum Probe {
 }
 
 /// Pairing operations of the IPC service. Cheap to clone (all shared).
-pub(crate) struct Pairing<C, H> {
+pub(crate) struct Pairing<C, H, T> {
     pub(crate) clock: Arc<C>,
     pub(crate) http: Arc<H>,
+    /// Where discovery looks after the saved address and this machine.
+    pub(crate) tailnet: Arc<T>,
     pub(crate) secrets: Arc<dyn SecretStore>,
     pub(crate) cfg: Arc<Config>,
     /// Bumped after every record write/delete; the link restarts on it.
@@ -205,11 +213,12 @@ pub(crate) struct Pairing<C, H> {
     pub(crate) lock: Arc<Semaphore>,
 }
 
-impl<C, H> Clone for Pairing<C, H> {
+impl<C, H, T> Clone for Pairing<C, H, T> {
     fn clone(&self) -> Self {
         Self {
             clock: self.clock.clone(),
             http: self.http.clone(),
+            tailnet: self.tailnet.clone(),
             secrets: self.secrets.clone(),
             cfg: self.cfg.clone(),
             changed: self.changed.clone(),
@@ -219,7 +228,7 @@ impl<C, H> Clone for Pairing<C, H> {
     }
 }
 
-impl<C: Clock, H: GatewayHttp> Pairing<C, H> {
+impl<C: Clock, H: GatewayHttp, T: TailnetPeers> Pairing<C, H, T> {
     /// `/.well-known/fogar-gateway`, then the pre-rename path; the whole probe of one address
     /// is bounded by `probe_timeout`.
     async fn probe(&self, addr: &GatewayAddr) -> Probe {
@@ -254,29 +263,56 @@ impl<C: Clock, H: GatewayHttp> Pairing<C, H> {
             .unwrap_or(Probe::Unreachable)
     }
 
-    /// Saved address, then this machine; the first Fogar that answers (spec §0 steps 1–2; the
-    /// tailnet step arrives with the integration PR, manual entry is the UI's).
+    /// Saved address, this machine, then one address per tailnet peer (spec §0 steps 1–3;
+    /// manual entry is the UI's). All are probed at once (at most `MAX_TAILNET_PEERS + 2`
+    /// probes, see `queues`), so the whole call takes at most `tailnet_timeout +
+    /// probe_timeout`. Every Fogar that answers is returned, in that order.
     pub(crate) async fn discover(&self) -> Vec<GatewayCandidate> {
         let saved = load_record(&*self.secrets)
             .ok()
             .flatten()
             .map(|r| r.address.clone());
         let local = GatewayAddr::parse(LOCAL_GATEWAY).ok();
-        let mut tried: Vec<GatewayAddr> = Vec::with_capacity(2);
-        for addr in saved.into_iter().chain(local) {
-            if tried.contains(&addr) {
-                continue;
+        let peers = if self.tailnet.capabilities().is_available() {
+            deadline(&*self.clock, self.cfg.tailnet_timeout, self.tailnet.peers())
+                .await
+                .and_then(Result::ok)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let tailnet = peers
+            .into_iter()
+            .take(MAX_TAILNET_PEERS) // the adapter promises it; the core does not rely on it
+            .filter_map(|ip| {
+                GatewayAddr::parse(&SocketAddr::new(ip, TAILNET_GATEWAY_PORT).to_string()).ok()
+            });
+        let mut addrs: Vec<GatewayAddr> = Vec::with_capacity(MAX_TAILNET_PEERS + 2);
+        for addr in saved.into_iter().chain(local).chain(tailnet) {
+            if !addrs.contains(&addr) {
+                addrs.push(addr);
             }
-            if let Probe::Fogar(wk) = self.probe(&addr).await {
-                return vec![GatewayCandidate::new(
-                    addr.to_string(),
-                    label(wk.name),
-                    label(wk.version),
-                )];
-            }
-            tried.push(addr);
         }
-        Vec::new()
+        // Dropping the set (IPC connection cancelled) aborts every probe still running.
+        let mut probes = JoinSet::new();
+        for (i, addr) in addrs.into_iter().enumerate() {
+            let me = self.clone();
+            probes.spawn(async move {
+                let probe = me.probe(&addr).await;
+                (i, addr, probe)
+            });
+        }
+        let mut found = Vec::new();
+        while let Some(r) = probes.join_next().await {
+            if let Ok((i, addr, Probe::Fogar(wk))) = r {
+                found.push((
+                    i,
+                    GatewayCandidate::new(addr.to_string(), label(wk.name), label(wk.version)),
+                ));
+            }
+        }
+        found.sort_by_key(|(i, _)| *i);
+        found.into_iter().map(|(_, c)| c).collect()
     }
 
     pub(crate) async fn pair(

@@ -13,9 +13,11 @@ mod ipc;
 mod power;
 mod probe;
 mod secrets;
+mod tailnet;
 
 pub use audio::{MacAudioSink, MacAudioSource};
 pub use ipc::{COMPANION_APP_ID, MacIpcClient, MacIpcConn, MacIpcServer, ensure_private_dir};
 pub use power::MacPowerPolicy;
 pub use probe::MacSystemProbe;
 pub use secrets::{KEYCHAIN_SERVICE, MacKeychainStore};
+pub use tailnet::MacTailnet;

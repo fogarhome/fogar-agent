@@ -1,7 +1,7 @@
 //! macOS wiring. Keychain secrets and the UI socket are real (S1); audio is a stub, the probe and
 //! power policy partial.
 
-use fogar_agent_macos::{MacAudioSink, MacAudioSource, MacIpcServer, MacKeychainStore, MacPowerPolicy, MacSystemProbe};
+use fogar_agent_macos::{MacAudioSink, MacAudioSource, MacIpcServer, MacKeychainStore, MacPowerPolicy, MacSystemProbe, MacTailnet};
 use fogar_ports::{
     audio::{AudioSink, AudioSource},
     power::PowerPolicy,
@@ -19,6 +19,7 @@ pub(crate) struct Platform {
     pub(crate) audio_out: Arc<dyn AudioSink>,
     pub(crate) probe: Arc<dyn SystemProbe>,
     pub(crate) ipc: Option<MacIpcServer>,
+    pub(crate) tailnet: MacTailnet,
 }
 
 /// Frozen identity (fogar-macos-daemon hard rule 2): never change across versions.
@@ -46,5 +47,6 @@ pub(crate) fn build(state_dir: &Path, with_ipc: bool) -> std::io::Result<Platfor
         audio_out: Arc::new(MacAudioSink),
         probe: Arc::new(MacSystemProbe),
         ipc,
+        tailnet: MacTailnet::default(),
     })
 }

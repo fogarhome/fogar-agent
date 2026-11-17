@@ -289,6 +289,7 @@ async fn serve(
         link: WsGatewayLink::new(WsConfig::default()),
         ipc: p.ipc,
         http: HttpGateway::new(HttpConfig::default()),
+        tailnet: p.tailnet,
         secrets: p.secrets,
         random: Arc::new(PrngRandom::new()),
         audio_in: p.audio_in,

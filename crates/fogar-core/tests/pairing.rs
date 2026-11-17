@@ -10,7 +10,7 @@ use fogar_ports::{
     ipc::{IPC_VERSION, IpcRequest, IpcResponse, LinkPhase, PairCode, PairFailure, StatusReport},
     secrets::SecretKey,
 };
-use fogar_testkit::{FakeIpcClient, HttpRoutes, MemorySecretStore, MockConfig};
+use fogar_testkit::{FakeIpcClient, FakeTailnet, HttpRoutes, MemorySecretStore, MockConfig};
 use std::{sync::Arc, time::Duration};
 
 const PAIR_OK: &str = r#"{"client_id":"c-9","name":"Mac de Sito","client_key":"test-client-key","gateway":{"name":"green-house","version":"1.29.0"}}"#;
@@ -463,6 +463,47 @@ async fn revoked_then_repaired() {
     )
     .await;
     assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
+}
+
+#[tokio::test(start_paused = true)]
+async fn discover_finds_gateways_on_tailnet_peers() {
+    // A gateway on this machine and one on a tailnet peer; another peer runs no gateway.
+    let mut b = unpaired();
+    b.http_addrs = vec!["127.0.0.1:8004", "100.109.57.116:8004"];
+    b.tailnet = FakeTailnet::with_peers(&["100.126.18.95", "100.109.57.116"]);
+    let rig = b.start();
+    let mut c = client(&rig).await;
+    let r = c.request(IpcRequest::Discover).await;
+    let Some(IpcResponse::Discovered(found)) = r else {
+        panic!("{r:?}")
+    };
+    let addrs: Vec<&str> = found.iter().map(|g| g.address.as_str()).collect();
+    assert_eq!(
+        addrs,
+        ["http://127.0.0.1:8004", "http://100.109.57.116:8004"]
+    );
+    assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
+}
+
+#[tokio::test(start_paused = true)]
+async fn discover_survives_a_tailnet_that_never_answers() {
+    for tailnet in [FakeTailnet::hanging(), FakeTailnet::not_running()] {
+        let mut b = unpaired();
+        b.tailnet = tailnet;
+        let budget = b.cfg.tailnet_timeout + b.cfg.probe_timeout;
+        let rig = b.start();
+        let mut c = client(&rig).await;
+        let r = within(
+            budget + Duration::from_millis(100),
+            c.request(IpcRequest::Discover),
+        )
+        .await;
+        let Some(IpcResponse::Discovered(found)) = r else {
+            panic!("{r:?}")
+        };
+        assert_eq!(found.len(), 1, "this machine is still found");
+        assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
+    }
 }
 
 #[tokio::test(start_paused = true)]

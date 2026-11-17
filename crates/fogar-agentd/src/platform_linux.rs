@@ -18,6 +18,7 @@ pub(crate) struct Platform {
     pub(crate) audio_out: Arc<dyn AudioSink>,
     pub(crate) probe: Arc<dyn SystemProbe>,
     pub(crate) ipc: Option<UdsIpcServer>,
+    pub(crate) tailnet: fogar_core::NoTailnet,
 }
 
 /// `$XDG_STATE_HOME/fogar-agent` or `$HOME/.local/state/fogar-agent` (absolute values only).
@@ -47,5 +48,6 @@ pub(crate) fn build(state_dir: &Path, with_ipc: bool) -> std::io::Result<Platfor
         audio_out: Arc::new(NoAudioSink),
         probe: Arc::new(ProcSystemProbe),
         ipc,
+        tailnet: fogar_core::NoTailnet,
     })
 }

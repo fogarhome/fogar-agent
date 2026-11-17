@@ -15,6 +15,7 @@
 //! | status subscription | link view -> each subscribed connection | `watch` (1) | coalesce: latest value wins, a push is skipped when the status did not change; never a backlog |
 //! | pairing generation | IPC pair/unpair -> link | `watch` (1) | coalesce: the link only needs "the record changed", then re-reads it |
 //! | reconnect request | IPC reconnect -> parked link | `watch` (1) | coalesce: many clicks are one new attempt; a request seen before the link parked is discarded |
+//! | discovery probes | IPC `Discover` -> gateway `/.well-known` | one `JoinSet` per request, at most `MAX_TAILNET_PEERS + 2` probes (saved, local, tailnet peers) | no queue: every probe runs at once under `probe_timeout`, after the tailnet query under `tailnet_timeout`; a cancelled request drops the set and aborts them |
 //! | pairing operations | IPC connections -> gateway `/pair` | `PAIRING` in flight | admission control: a second `Pair` gets `PairFailure::Busy` at once (`try_acquire`); `Unpair` waits for the running one, which is bounded by its HTTP deadlines |
 //!
 //! Stale uplink frames left in the `out` channel when a session dies are discarded (and counted)

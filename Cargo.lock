@@ -175,6 +175,8 @@ dependencies = [
  "fogar-testkit",
  "libc",
  "security-framework",
+ "serde",
+ "serde_json",
  "tokio",
  "zeroize",
 ]
