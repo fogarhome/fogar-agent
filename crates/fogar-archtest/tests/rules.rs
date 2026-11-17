@@ -13,8 +13,9 @@
 //!  R7 every inner crate has a clippy.toml banning ambient time/threads/env/fs
 //!  R8 no `unsafe` in inner crates, and each declares `#![forbid(unsafe_code)]`
 //!  R9 adapter crates (fogar-host, fogar-agent-*) never reach fogar-core
-//!  R10 fogar-core sources never name the `tokio::time` module at all, nor rename `tokio`
-//!     (token-based)
+//!  R10 fogar-core's own build never enables tokio's `time` feature, so `tokio::time` does not
+//!     exist for it; gates.sh compiles fogar-core alone, where any use is a compile error
+//!     (production code only: test-only code in `src/` gets `time` from the dev-dependencies)
 //!
 //! Every checker has a self-test (`selftest_*`) that plants the violation in a temporary
 //! fixture and asserts the rule fires (review code#4: a rule that cannot fail proves nothing).
@@ -54,18 +55,7 @@ const OS_CRATE_PREFIXES: &[&str] = &[
     "coreaudio",
 ];
 /// Entries fogar-core/clippy.toml must carry (R7).
-const CORE_CLIPPY_BANS: &[&str] = &[
-    "tokio::spawn",
-    "unbounded_channel",
-    "tokio::time::sleep",
-    "tokio::time::sleep_until",
-    "tokio::time::timeout",
-    "tokio::time::timeout_at",
-    "tokio::time::interval",
-    "tokio::time::interval_at",
-    "tokio::time::Instant",
-    "tokio::time::Sleep",
-];
+const CORE_CLIPPY_BANS: &[&str] = &["tokio::spawn", "unbounded_channel"];
 const PROTO_ALLOWED: &[&str] = &[
     "serde",
     "serde_core",
@@ -523,46 +513,56 @@ fn r9_adapters_never_depend_on_core() {
     assert!(bad.is_empty(), "adapters depend on fogar-core: {bad:?}");
 }
 
-/// R10 checker: the whole `tokio::time` module is banned in core sources (clippy.toml bans the
-/// individual items; this catches anything it does not list, e.g. `use tokio::time;`). Token-based
-/// (round-2 review F7): multi-line `use tokio::{ .., time, }` groups and comments inside paths are
-/// seen; renaming `tokio` (`use tokio as t`, `extern crate tokio as t`, `tokio::{self as t}`) is
-/// rejected outright, since an alias would hide every later path.
-fn tokio_time_uses(sources: &[(PathBuf, String)]) -> Vec<String> {
-    let mut bad = Vec::new();
-    for (p, text) in sources {
-        let t = tokens(text);
-        for (i, (tok, line)) in t.iter().enumerate() {
-            if !matches!(tok, Tok::Ident(s) if s == "tokio") {
-                continue;
-            }
-            let at = format!("{}:{line}", p.display());
-            if names_segment(&t, i + 1, "time") {
-                bad.push(format!("{at}: tokio::time"));
-            }
-            if is_ident(t.get(i + 1), "as") {
-                bad.push(format!("{at}: tokio renamed"));
-            }
-            if path_sep(&t, i + 1).is_some_and(|j| is_punct(t.get(j), '{')) {
-                let g = group(&t, i + 3);
-                if g.windows(2).any(|w| {
-                    matches!(&w[0].0, Tok::Ident(s) if s == "self")
-                        && matches!(&w[1].0, Tok::Ident(s) if s == "as")
-                }) {
-                    bad.push(format!("{at}: tokio renamed"));
-                }
-            }
-        }
-    }
-    bad
+/// R10 checker: the tokio features `krate`'s own normal build enables (per-package resolution:
+/// `cargo tree -p`, not the workspace-unified set). Replaces a token scan of the sources: without
+/// the `time` feature the compiler rejects every spelling of `tokio::time`, aliases included.
+fn tokio_features_in(dir: &Path, krate: &str) -> BTreeSet<String> {
+    // Fixtures resolve from the local cache; the real workspace may need the index (CI runner).
+    let offline = if dir == root() {
+        "--locked"
+    } else {
+        "--offline"
+    };
+    cargo_in(
+        dir,
+        &[
+            "tree",
+            offline,
+            "-p",
+            krate,
+            "--target",
+            "all",
+            "-e",
+            "normal,features",
+            "-i",
+            "tokio",
+            "--prefix",
+            "none",
+        ],
+    )
+    .lines()
+    .filter_map(|l| l.strip_prefix("tokio feature \"")?.split('"').next())
+    .map(str::to_owned)
+    .collect()
 }
 
 #[test]
-fn r10_core_never_uses_tokio_time() {
-    let bad = tokio_time_uses(&rust_sources("fogar-core"));
+fn r10_core_build_has_no_tokio_time() {
+    let f = tokio_features_in(&root(), "fogar-core");
     assert!(
-        bad.is_empty(),
-        "tokio::time in fogar-core: {bad:?} (use the Clock port)"
+        f.contains("sync"),
+        "R10 checker saw no tokio features: {f:?}"
+    );
+    assert!(
+        !f.contains("time"),
+        "fogar-core enables tokio time: {f:?} (use the Clock port)"
+    );
+    // The feature check only matters if fogar-core is also compiled on its own.
+    let gates = std::fs::read_to_string(root().join("scripts/gates.sh")).unwrap();
+    assert!(
+        gates.lines().any(|l| l.starts_with("run_gate ")
+            && l.ends_with(" cargo check -p fogar-core --lib --locked")),
+        "scripts/gates.sh must compile fogar-core alone (R10)"
     );
 }
 
@@ -770,45 +770,52 @@ fn selftest_r9_fires_when_an_adapter_reaches_core() {
 }
 
 #[test]
-fn selftest_r10_fires_on_any_tokio_time_use() {
+fn selftest_r10_sees_the_time_feature() {
     let dir = fixture_dir("r10");
-    for src in [
-        "use tokio::time;",
-        "use tokio::{sync, time::Instant};",
-        "fn f() { let _ = tokio::time::Instant::now(); }",
-        "async fn f() { tokio :: time :: sleep_until(x).await }",
-        // Round-2 review F7: multi-line groups, comments inside paths, aliases.
-        "use tokio::{\n    sync,\n    time,\n};",
-        "use tokio::{\n    sync::mpsc,\n    time::{\n        Instant,\n    },\n};",
-        "use ::tokio::/* x */time::Instant;",
-        "use tokio as tk; fn f() { let _ = tk::time::Instant::now(); }",
-        "extern crate tokio as tk;",
-        "use tokio::{self as tk}; fn f() {}",
-    ] {
-        write(&dir.join("crates/fogar-core/src/lib.rs"), src);
-        assert!(
-            !tokio_time_uses(&rust_sources_in(&dir, "fogar-core")).is_empty(),
-            "R10 missed {src}"
+    std::fs::copy(root().join("Cargo.lock"), dir.join("Cargo.lock")).unwrap();
+    write(&dir.join("src/lib.rs"), "");
+    for (features, has_time) in [("\"sync\", \"time\"", true), ("\"sync\", \"rt\"", false)] {
+        write(
+            &dir.join("Cargo.toml"),
+            &format!(
+                "[package]\nname = \"fogar-core\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n\
+                 [dependencies]\ntokio = {{ version = \"=1.54.1\", default-features = false, \
+                 features = [{features}] }}\n"
+            ),
+        );
+        let f = tokio_features_in(&dir, "fogar-core");
+        assert!(f.contains("sync"), "fixture: no features seen {f:?}");
+        assert_eq!(
+            f.contains("time"),
+            has_time,
+            "R10 checker on [{features}]: {f:?}"
         );
     }
-    for ok in [
-        "// tokio::time is banned\nfn f() {}",
-        "/* use tokio::time; */ fn f() {}",
-        "fn f() -> &'static str { \"tokio::time\" }",
-        "use tokio::{sync::mpsc, task::JoinSet}; fn time() {}",
-        "use tokio_util::time::DelayQueue;",
+    // And the premise: without the feature, any spelling of tokio::time does not compile.
+    for src in [
+        "pub use tokio::time;",
+        "use tokio as t; pub fn f() { let _ = t::time::Instant::now(); }",
     ] {
-        write(&dir.join("crates/fogar-core/src/lib.rs"), ok);
-        let bad = tokio_time_uses(&rust_sources_in(&dir, "fogar-core"));
-        assert!(bad.is_empty(), "R10 false positive on {ok}: {bad:?}");
+        write(&dir.join("src/lib.rs"), src);
+        let out = Command::new(env!("CARGO"))
+            .args(["check", "--offline", "--quiet"])
+            .env("CARGO_TARGET_DIR", root().join("target/archtest-fixture"))
+            .current_dir(&dir)
+            .output()
+            .expect("run cargo check");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && (err.contains("E0432") || err.contains("E0433")),
+            "tokio::time compiled without the feature (or the fixture broke): {src}: {err}"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// R7 self-test with the real tool: a fixture crate using fogar-core's clippy.toml must fail
-/// clippy for each planted ambient-time use (the module-wide ban is R10).
+/// clippy for each planted ambient-time use (`tokio::time` is R10's: it does not compile there).
 #[test]
-fn selftest_r7_core_clippy_toml_rejects_tokio_time() {
+fn selftest_r7_core_clippy_toml_rejects_ambient_time() {
     let dir = fixture_dir("r7");
     std::fs::copy(
         root().join("crates/fogar-core/clippy.toml"),
@@ -819,15 +826,13 @@ fn selftest_r7_core_clippy_toml_rejects_tokio_time() {
     write(
         &dir.join("Cargo.toml"),
         "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n\
-         [dependencies]\ntokio = { version = \"=1.54.1\", default-features = false, features = [\"time\", \"sync\", \"test-util\"] }\n",
+         [dependencies]\ntokio = { version = \"=1.54.1\", default-features = false, features = [\"sync\"] }\n",
     );
     let target = root().join("target/archtest-fixture");
     for (i, body) in [
-        "pub async fn f() { tokio::time::sleep_until(tokio::time::Instant::now()).await }",
-        "pub fn f() -> Option<tokio::time::Interval> { None }",
-        "pub async fn f() { let _ = tokio::time::timeout_at(todo_at(), async {}).await; }\n\
-         fn todo_at() -> tokio::time::Instant { unreachable!() }",
-        "pub fn f() { tokio::time::pause(); }",
+        "pub fn f() { let _ = std::time::Instant::now(); }",
+        "pub fn f() -> Option<std::time::Instant> { None }",
+        "pub fn f() { std::thread::sleep(std::time::Duration::ZERO); }",
     ]
     .iter()
     .enumerate()

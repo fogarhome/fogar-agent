@@ -100,7 +100,8 @@ PARTIAL / OPEN (honest):
 
 PASSES (automated, on Linux x86_64, rustc 1.97.0):
 - scripts/gates.sh: fmt, clippy -D warnings, 131 tests, proto no_std build, archtest R1-R8,
-  vendored-skill hygiene, cargo deny 0.20.2, cargo audit 0.23.0, loom, bench placeholder.
+  vendored-skill hygiene, cargo deny 0.20.2, cargo audit 0.23.0, loom, bench placeholder
+  (that gate was removed in S1: informational only).
 - E2E over a REAL WebSocket to the protocol-v1 mock gateway: handshake (no `type`), status before
   ready, end -> transcription -> send, turn_start/token/turn_end, 0xA1 PCM16 bit-exact to the fake
   player; barge-in; close codes; keepalive vs idle close; gateway down then up.
