@@ -168,3 +168,13 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
   smoke test over the committed seeds (`cargo test --manifest-path fuzz/Cargo.toml --locked`).
 - After the fix, run locally on nightly for 3 min each (ASan), no crash; results in the PR. NOT DONE: CI build on every
   PR + scheduled runs (CI is owned by another PR; recipe in the fuzz PR description).
+
+## S1 — gateways on the tailnet (2026-11-17)
+- New port TailnetPeers (owner-approved 2026-11-17; contract commit first: port + FakeTailnet +
+  suite). MacTailnet runs /Applications/Tailscale.app/Contents/MacOS/Tailscale status --json with
+  an empty env + TAILSCALE_BE_CLI=1 (without it, started outside a shell, the app binary runs as
+  the GUI and never answers), stdout capped at 1 MiB, kill_on_drop. One tailnet IP per online peer.
+- discover(): tailnet query under tailnet_timeout (2 s), then saved + local + peers probed at once
+  (<= 34), every Fogar returned. Worst case 3.5 s, app timeout 10 s.
+- Verified on the M2: the app lists green-house (100.109.57.116:8004). UNVERIFIED: Homebrew
+  tailscaled; saved-by-name vs found-by-IP shows the same gateway twice (no instance_id in proto).
