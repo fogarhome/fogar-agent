@@ -137,7 +137,7 @@ enum Textos {
     /// One sentence per `pair_failed` reason (gateway client protocol §0).
     static func fallo(_ f: WirePairFailure) -> String {
         switch f {
-        case .badAddress: "Esa dirección no parece válida. Escribe algo como green-house o 192.168.1.20:8004."
+        case .badAddress: "Esa dirección no parece válida. Escribe algo como gateway.local o 192.168.0.10:8004."
         case .badCode: "El código son 6 cifras. Revísalo."
         case .unreachable: "No llego a esa dirección. Comprueba que el gateway está encendido y en tu red o en Tailscale."
         case .notAGateway: "En esa dirección responde algo, pero no es un gateway de Fogar."

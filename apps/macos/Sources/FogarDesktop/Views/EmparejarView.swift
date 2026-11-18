@@ -91,7 +91,7 @@ private struct Formulario: View {
             encontrados
 
             Campo(etiqueta: "Dirección del gateway", pista: "Sin http://; si no pones puerto, es el 8004.", error: errorDireccion, campo: {
-                TextField("", text: $direccion, prompt: Text("green-house o 192.168.1.20:8004").foregroundStyle(Color.huesoTenue))
+                TextField("", text: $direccion, prompt: Text("gateway.local o 192.168.0.10:8004").foregroundStyle(Color.huesoTenue))
                     .autocorrectionDisabled()
                     .onChange(of: direccion) { errorDireccion = nil }
             }, enfocado: $focoDireccion)
