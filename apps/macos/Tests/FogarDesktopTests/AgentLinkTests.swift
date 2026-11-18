@@ -198,3 +198,51 @@ extension AgentLinkOverASocket {
         }
     }
 }
+
+nonisolated let notPaired = WireStatus(link: "not_paired", phase: .notPaired, gateway: nil, sessions: 1,
+                                       turns_completed: 2, boot_mode: "normal", peer_check: .sameSigner)
+
+/// Revocation (gateway 4200/4010): the agent goes from paired to `not_paired` by itself.
+@Suite struct AccesoRetirado {
+    @Test func pairedToNotPairedWithoutAskingIsARevocation() {
+        #expect(AgentLink.retirado(antes: .live(ready), despues: .live(notPaired), desemparejando: false, yaRetirado: false))
+    }
+
+    @Test func unpairingFromThisAppIsNot() {
+        #expect(!AgentLink.retirado(antes: .live(ready), despues: .live(notPaired), desemparejando: true, yaRetirado: false))
+    }
+
+    @Test func neverPairedIsNot() {
+        #expect(!AgentLink.retirado(antes: .looking, despues: .live(notPaired), desemparejando: false, yaRetirado: false))
+        #expect(!AgentLink.retirado(antes: .notRunning, despues: .live(notPaired), desemparejando: false, yaRetirado: false))
+    }
+
+    @Test func survivesAnAgentRestartAndEndsWhenPairedAgain() {
+        #expect(AgentLink.retirado(antes: .live(notPaired), despues: .notRunning, desemparejando: false, yaRetirado: true))
+        #expect(AgentLink.retirado(antes: .notRunning, despues: .live(notPaired), desemparejando: false, yaRetirado: true))
+        #expect(!AgentLink.retirado(antes: .live(notPaired), despues: .live(ready), desemparejando: false, yaRetirado: true))
+    }
+
+    @Test func theHeadlineSaysAccessWasWithdrawn() {
+        #expect(Textos.titular(.live(notPaired), retirado: true).titulo == "Se retiró el acceso a este Mac")
+        #expect(Textos.titular(.live(notPaired)).titulo == "Este Mac aún no está emparejado")
+    }
+}
+
+extension AgentLinkOverASocket {
+    @Test func liveRevocationRaisesTheNotice() async throws {
+        let agent = try FakeAgent { req in
+            switch req {
+            case .hello: [.hello(WireHello(version: ipcVersion))]
+            case .subscribe: [.subscribed, .event(ready), .event(notPaired)]
+            default: [.refused(WireRefused(reason: "x"))]
+            }
+        }
+        try await Task.sleep(for: .milliseconds(200))
+        let link = AgentLink(socketPath: agent.path)
+        link.start()
+        defer { link.stop() }
+        #expect(await waitFor(link) { $0 == .live(notPaired) })
+        #expect(link.accesoRetirado)
+    }
+}

@@ -81,6 +81,14 @@ private struct Formulario: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
             VStack(alignment: .leading, spacing: 12) {
+                if link.accesoRetirado {
+                    let t = Textos.titular(link.state, retirado: true)
+                    Estado(tono: t.tono, texto: t.titulo)
+                        .font(Tipo.texto(15, peso: 600)).foregroundStyle(Color.hueso)
+                    Text(t.sub).font(Tipo.cuerpo).foregroundStyle(Color.hueso)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.bottom, 12)
+                }
                 Text("Hola. Emparejemos este Mac.").titularFogar()
                     .fixedSize(horizontal: false, vertical: true)
                 Text("Abre un código en tu gateway: en su panel, en Clientes → Emparejar, o con fogar-gw pair. Aquí solo hace falta escribirlo.")

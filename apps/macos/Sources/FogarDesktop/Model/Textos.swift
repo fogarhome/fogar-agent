@@ -10,7 +10,8 @@ enum Textos {
         let tono: Tono
     }
 
-    static func titular(_ state: AgentState) -> Titular {
+    /// `retirado`: `AgentLink.accesoRetirado` (the gateway withdrew this Mac's access).
+    static func titular(_ state: AgentState, retirado: Bool = false) -> Titular {
         switch state {
         case .looking:
             return Titular(titulo: "Buscando al agente…", sub: "Un momento: la app está llamando al agente de este Mac.", tono: .off)
@@ -50,6 +51,12 @@ enum Textos {
             case .reconnecting:
                 return Titular(titulo: nombre.map { "Reconectando con \($0)" } ?? "Reconectando",
                                sub: "El gateway no responde. El agente lo vuelve a intentar solo, cada vez más espaciado.", tono: .warn)
+            case .notPaired where retirado:
+                // Gateway M19 close 4200 (or 4010): the agent deleted the dead key. Without this
+                // the person lands on «Hola. Emparejemos este Mac» with no idea why.
+                return Titular(titulo: "Se retiró el acceso a este Mac",
+                               sub: "El gateway ya no reconoce a este Mac: le han retirado el acceso. Para volver a usar Fogar aquí, abre un código nuevo en el gateway y empareja este Mac otra vez.",
+                               tono: .bad)
             case .notPaired:
                 return Titular(titulo: "Este Mac aún no está emparejado",
                                sub: "Empareja este Mac con el gateway de tu casa para que Fogar lo reconozca.", tono: .off)

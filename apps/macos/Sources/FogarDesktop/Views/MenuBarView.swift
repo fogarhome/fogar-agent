@@ -9,7 +9,7 @@ struct MenuBarView: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        let t = Textos.titular(link.state)
+        let t = Textos.titular(link.state, retirado: link.accesoRetirado)
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .center, spacing: 8) {
                 LineaViva(pose: .rest, etiqueta: "Fogar", quieta: true).frame(width: 58)
@@ -72,11 +72,12 @@ struct MenuBarView: View {
 /// with a small mark when Fogar is not connected. VoiceOver reads the state.
 struct MenuBarIcono: View {
     let state: AgentState
+    var retirado = false
 
     var body: some View {
         let ok = state.status?.phase == .ready
         Image(nsImage: Self.icono(marca: !ok))
-            .accessibilityLabel("Fogar: \(Textos.titular(state).titulo)")
+            .accessibilityLabel("Fogar: \(Textos.titular(state, retirado: retirado).titulo)")
     }
 
     private static var cache: [Bool: NSImage] = [:]

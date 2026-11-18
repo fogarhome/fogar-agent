@@ -40,7 +40,7 @@ struct FogarDesktopApp: App {
         } label: {
             // The label lives as long as the app: it applies the appearance to every window,
             // the menu bar panel included (preferredColorScheme does not reach that panel).
-            MenuBarIcono(state: link.state)
+            MenuBarIcono(state: link.state, retirado: link.accesoRetirado)
                 .onChange(of: apariencia, initial: true) { _, a in NSApp.appearance = a.nsAppearance }
         }
         .menuBarExtraStyle(.window)

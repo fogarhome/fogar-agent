@@ -9,7 +9,7 @@ struct EstadoView: View {
 
     var body: some View {
         let state = link.state
-        let t = Textos.titular(state)
+        let t = Textos.titular(state, retirado: link.accesoRetirado)
         ScrollView {
             VStack(alignment: .leading, spacing: 40) {
                 Cabecera(titular: t, state: state, since: link.since)

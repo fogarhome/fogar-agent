@@ -45,6 +45,12 @@ final class AgentLink {
     private(set) var state: AgentState = .looking
     /// When the current state began (for «desde hace…» and the log in later slices).
     private(set) var since = Date()
+    /// The agent went from paired to `not_paired` without this app asking (gateway revocation).
+    // shortcut: only seen while the app runs; an app opened after the revocation cannot tell it from
+    // «never paired». Upgrade with the close code in `WireStatus` (contract PR: fogar-ports/testkit).
+    private(set) var accesoRetirado = false
+    /// Set before this app's own `unpair` goes out: its `not_paired` event can beat the answer.
+    @ObservationIgnored private var desemparejando = false
 
     @ObservationIgnored let socketPath: String
     @ObservationIgnored private var loop: Task<Void, Never>?
@@ -131,8 +137,18 @@ final class AgentLink {
 
     private func set(_ new: AgentState) {
         guard new != state else { return }
+        accesoRetirado = Self.retirado(antes: state, despues: new, desemparejando: desemparejando, yaRetirado: accesoRetirado)
+        if new.status?.phase == .notPaired { desemparejando = false }
         if new.phaseKey != state.phaseKey { since = Date() }
         state = new
+    }
+
+    /// Whether the notice «se retiró el acceso» holds after `antes` → `despues`.
+    static func retirado(antes: AgentState, despues: AgentState, desemparejando: Bool, yaRetirado: Bool) -> Bool {
+        guard let fase = despues.status?.phase else { return yaRetirado } // agent silent: keep what we knew
+        guard fase == .notPaired else { return false }
+        if let previa = antes.status?.phase, previa != .notPaired { return !desemparejando }
+        return yaRetirado
     }
 
     // MARK: Commands
@@ -159,7 +175,13 @@ final class AgentLink {
     }
 
     func unpair() async throws(CommandError) {
-        guard case .unpaired = try await command(.unpair, timeout: .seconds(5)) else { throw .unexpected }
+        desemparejando = true
+        do throws(CommandError) {
+            guard case .unpaired = try await command(.unpair, timeout: .seconds(5)) else { throw CommandError.unexpected }
+        } catch {
+            desemparejando = false
+            throw error
+        }
     }
 
     /// One new attempt from a link parked by the gateway (`parked_conversation_taken`,
