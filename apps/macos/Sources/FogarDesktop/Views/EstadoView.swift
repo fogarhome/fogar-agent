@@ -20,7 +20,8 @@ struct EstadoView: View {
             .padding(.horizontal, 40)
             .padding(.top, 28)
             .padding(.bottom, 56)
-            .frame(maxWidth: 1240, alignment: .leading)
+            // The whole width, sidebar shown or hidden: no empty band on the right. Prose keeps
+            // its own reading width (620).
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .scrollIndicators(.automatic)
