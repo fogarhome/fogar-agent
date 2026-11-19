@@ -16,7 +16,7 @@ idle CPU <= 1 %, wakeups <= 0.5/s target / 2/s hard, phys_footprint <= 50 MB, no
 |---|---|---|---|---|
 | S0 | Walking skeleton | E2E with fakes + mock gateway over a real WS; daemon binary on Linux | Linux only: soak flat in simulated 72 h | Done |
 | S1 | Mac connected + companion app | Pairing (`/.well-known`, `POST /pair`) with the key in Keychain; real gateway link (`ws://` on LAN/tailnet, `wss://` via rustls); UI IPC over the Unix socket with peer code-signature check; SwiftUI app in `apps/macos/` styled after the gateway dashboard | macOS CI contract suites for Keychain + IPC; agent and app idle cost on the M2 as the baseline | Done except the energy baseline (#12) |
-| **S2** | **Talk and type to Fogar from the Mac** | Conversation window in the app: type and read the reply as it streams; **push-to-talk** (no wake word, no automatic VAD) and the reply plays on the Mac; turn progress (`turn_progress`) and cancel. The gateway's daily conversation, no history list | Turn latencies (first token, first audio) against the gateway's `pipeline_event`; mic-closed idle equal to the S1 baseline, cost while capturing and playing on the M2; xrun/drop counters. **Hard requirement:** single capture-consent choke point | **Spec under review** |
+| **S2** | **Talk and type to Fogar from the Mac** | Conversation window in the app: type and read the reply as it streams; mic button in the composer (hold and release to send, or click to record and then review or send directly; no wake word, no automatic VAD) and the reply plays on the Mac, never without something visible on screen; turn progress (`turn_progress`) and cancel. The gateway's daily conversation, no history list | Turn latencies (first token, first audio) against the gateway's `pipeline_event`; mic-closed idle equal to the S1 baseline, cost while capturing and playing on the M2; xrun/drop counters. **Hard requirement:** single capture-consent choke point | **Spec under review** |
 | S3 | Connection that survives everything | Survives gateway restarts, network flaps and sleep/wake with a turn in flight; WS pings + half-open detection | 24 h churn soak on Linux CI + 24 h on the M2: RSS/fd/tasks flat | Pending |
 | S4 | Login, administration and history | The agent signs in with the person's account (personal device); admin panel by role; the person's and the home's conversations; agents | Per the gateway | **Waits** for the gateway's users slice |
 | S5 | Wake word with our own model | "ok fogar" opens a turn hands-free | False accepts/h, false rejects, duty-cycled CPU on battery | Pending |
@@ -37,7 +37,7 @@ an offline cache is needed.
 - `fogar-core::turn` is built for continuous VAD; it has no typed text (`send`), no user cancel, no
   push-to-talk entry, and it drops the reply text.
 - `fogar-core::engine` opens the microphone at startup and keeps it open: S2 inverts that (mic
-  closed except while the person holds the talk control). There is no IPC -> engine channel, and
+  closed except during an utterance the person started). There is no IPC -> engine channel, and
   `SessionUp` does not carry the `ready` capabilities.
 - The audio port has no way to request the OS permission (`mic_permission()` never prompts).
 - The macOS audio adapter is a stub (`Unsupported`).
@@ -51,15 +51,35 @@ an offline cache is needed.
 **S2 — HARD requirement before any real capture ships (review sec#8; was S3):** a single
 capture-consent choke point in fogar-core. Every capture start (mic now, screen in S7) goes through
 one function that checks local consent state and is unit-tested; gateway messages can never start
-capture by themselves (allowlist, fogar-secure-rust NET-3/CAP). Proposed shape (S2 spec, pending
-approval): `fogar-core::capture::CaptureGate` is the only owner of the `AudioSource` and the only
-caller of `open`; it needs a `TalkPermit` that only the core IPC module can build from a
-same-signer, conversation-subscribed `talk_start`; it also requires OS permission `Granted`, a ready
-link with a live transcriber and no other capture; the capture closes on release, on that IPC
-connection closing, after a 60 s hold, on link loss and on shutdown. Enforced by an archtest rule
-and by a property test (no gateway message sequence ever opens the fake mic). The contract PR
-carries the audio-port change (permission request), the fakes and a consent suite in
-`fogar-testkit`.
+capture by themselves (allowlist, fogar-secure-rust NET-3/CAP). Proposed shape (S2 spec v2,
+pending approval):
+- The audio path is split in three: **capture** (the `AudioSource` adapter: 16 kHz mono chunks,
+  knows nothing about turns or UI), the **utterance** in `fogar-core::capture` (an audio segment
+  with a `Start`, an `End` and a `Then` = send / review / discard), and **playback**. UI gestures
+  (hold-and-release, click-to-start then stop-to-review or send-now) and, later, VAD and wake word
+  are only sources of `Start`/`End`; capture and what happens after the end do not change.
+- `CaptureGate` is the only owner of the `AudioSource` and the only caller of `open`. In S2 the
+  only `Start` is `UserAct`, which only the core IPC module can build from a same-signer,
+  conversation-subscribed `capture_start`; it also requires OS permission `Granted`, a ready link
+  with a live transcriber and no other open utterance. It closes on the user's `End`, on that IPC
+  connection closing (discard), on a privacy backstop for click-started utterances, on link loss
+  and on shutdown. The wake-word `Start` (S5) will need its own explicit opt-in.
+- Consent is core logic, not a port: what comes from outside already has ports (OS permission in
+  `AudioSource`, the user's act over IPC). Enforced by an archtest rule and by a property test (no
+  gateway message sequence ever opens the fake mic). The contract PR carries the audio-port change
+  (permission request), the fakes and a consent suite in `fogar-testkit`.
+
+**S2 — product requirement (Sito, 2026-11-19): Fogar never plays audio without something visible
+on screen.** `PlaybackGate` is the only writer to the `AudioSink`; a turn's audio plays only after
+the app confirms it is showing that turn (`turn_visible`), e.g. a floating notice for a push. Audio
+waiting for that confirmation is bounded (3 s) and dropped after 2 s without it; with no app open,
+nothing plays.
+
+**Gateway constraint found in the S2 review:** the gateway's silence watchdog closes the session
+(1000, `silence_timeout`) after ~6–8 s of audio without any transcription, with the per-client
+defaults (`silence_timeout_s` 2, `max_silence_turns` 3). A click-to-record utterance with a
+thinking pause can hit it. To settle (gateway issue and/or a per-client setting) before the real
+test on the Mac.
 
 **S1 gates (done):** `cargo vet` and `cargo geiger` in `scripts/gates.sh` + CI (#15); fuzz targets
 for `decode_server`, `parse_tts_frame` and the IPC framing (#13); the agent-team `ROOT_HASH`
