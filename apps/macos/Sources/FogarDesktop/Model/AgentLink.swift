@@ -147,7 +147,9 @@ final class AgentLink {
     static func retirado(antes: AgentState, despues: AgentState, desemparejando: Bool, yaRetirado: Bool) -> Bool {
         guard let fase = despues.status?.phase else { return yaRetirado } // agent silent: keep what we knew
         guard fase == .notPaired else { return false }
-        if let previa = antes.status?.phase, previa != .notPaired { return !desemparejando }
+        // Paired before = a phase with a gateway (a Keychain error at boot shows `reconnecting`
+        // with none, then `not_paired`: never paired, nothing was withdrawn).
+        if let previa = antes.status, previa.phase != .notPaired, previa.gateway != nil { return !desemparejando }
         return yaRetirado
     }
 
@@ -179,7 +181,12 @@ final class AgentLink {
         do throws(CommandError) {
             guard case .unpaired = try await command(.unpair, timeout: .seconds(5)) else { throw CommandError.unexpected }
         } catch {
-            desemparejando = false
+            // Only when the agent surely did nothing: after `noAnswer` it may still unpair, and its
+            // `not_paired` must not read as a revocation (the next `not_paired` clears the flag).
+            switch error {
+            case .agentNotRunning, .refused, .versionMismatch: desemparejando = false
+            case .noAnswer, .unexpected: break
+            }
             throw error
         }
     }

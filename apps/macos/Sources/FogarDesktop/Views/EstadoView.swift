@@ -316,7 +316,8 @@ private struct Datos: View {
                 Fila(clave: "Arranque del agente", valor: Textos.arranque(status.boot_mode))
             }
         }
-        .frame(minWidth: 380, maxWidth: .infinity, alignment: .leading)
+        // Ideal 380: ViewThatFits stacks below a fixed 820, not whenever a long value is unwrapped.
+        .frame(minWidth: 380, idealWidth: 380, maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .contain)
     }
 

@@ -72,7 +72,7 @@ struct MenuBarView: View {
 /// with a small mark when Fogar is not connected. VoiceOver reads the state.
 struct MenuBarIcono: View {
     let state: AgentState
-    var retirado = false
+    let retirado: Bool
 
     var body: some View {
         let ok = state.status?.phase == .ready

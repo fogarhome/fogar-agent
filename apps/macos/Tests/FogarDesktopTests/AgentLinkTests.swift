@@ -215,6 +215,10 @@ nonisolated let notPaired = WireStatus(link: "not_paired", phase: .notPaired, ga
     @Test func neverPairedIsNot() {
         #expect(!AgentLink.retirado(antes: .looking, despues: .live(notPaired), desemparejando: false, yaRetirado: false))
         #expect(!AgentLink.retirado(antes: .notRunning, despues: .live(notPaired), desemparejando: false, yaRetirado: false))
+        // Keychain error at boot: `reconnecting` with no gateway, then `not_paired`.
+        let sinClave = WireStatus(link: "backoff", phase: .reconnecting, gateway: nil, sessions: 0,
+                                  turns_completed: 0, boot_mode: "normal", peer_check: .sameSigner)
+        #expect(!AgentLink.retirado(antes: .live(sinClave), despues: .live(notPaired), desemparejando: false, yaRetirado: false))
     }
 
     @Test func survivesAnAgentRestartAndEndsWhenPairedAgain() {
