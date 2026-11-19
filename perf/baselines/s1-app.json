@@ -1,0 +1,18 @@
+{
+  "slice": "S1",
+  "scenario": "Fogar Desktop app (FogarDesktop) connected to an unpaired agent over IPC, hands-off",
+  "date": "2026-11-16",
+  "machine": "Mac14,15 (MacBook Air 15-inch, Apple M2), macOS 26.5.1 (25F80), AC power, Low Power Mode off",
+  "method": "perf/measure.sh with no warm-up (both processes up > 90 min), 600 s windows; app = apps/macos/build/Fogar Desktop.app; agent = release build of e0d66a2 (same source tree as main 9013fea), signed com.fogar.agent / Q6UYYP85B7",
+  "app": {
+    "window_open": {"cpu_pct_mean": 0.0163, "ri_interrupt_wkups_per_s": 0.384, "footprint_end_mb": 43.24, "footprint_lifetime_max_mb": 91.28, "threads_max": 4, "power_top_max": 0.0},
+    "window_closed_then_reopened": {"cpu_pct_mean": 0.0232, "ri_interrupt_wkups_per_s": 0.382, "footprint_end_mb": 43.24, "footprint_lifetime_max_mb": 91.28, "threads_max": 4, "power_top_max": 0.2}
+  },
+  "agent_with_app_connected": {"cpu_pct_mean": 0.0036, "ri_interrupt_wkups_per_s": 0.402, "footprint_end_mb": 5.92, "footprint_lifetime_max_mb": 7.5, "threads_max": 4},
+  "notes": [
+    "NOT a controlled open/closed comparison: the window (\"Emparejar\") was open at the start of run 1 and closed at its end; closed at the start of run 2 and open again at its end. Someone used the app during the runs. The app cost the same in both: ~0.02 % CPU, 0.38 wakeups/s.",
+    "The 12 Hz FondoVivo timer cannot have run for long in either window (it alone would be >= 12 wakeups/s); it only ticks while animated.",
+    "App phys_footprint 43 MB idle, lifetime peak 91 MB. The 50 MB budget is the daemon's; no app budget is declared.",
+    "Machine load average 15 -> 4 over these runs (other sessions), lower than in s1-unpaired.json."
+  ]
+}
