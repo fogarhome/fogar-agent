@@ -51,6 +51,19 @@ else
   record "cargo audit" "NOT RUN" "cargo-audit not installed (cargo install --locked cargo-audit --version 0.23.0)"
 fi
 
+# --- supply chain: cargo vet (supply-chain/, no fetching) and the unsafe count (scripts/geiger.sh).
+if cargo vet --version >/dev/null 2>&1; then
+  run_gate "cargo vet"            cargo vet --locked
+else
+  record "cargo vet" "NOT RUN" "cargo-vet not installed (cargo install --locked cargo-vet --version 0.10.3)"
+fi
+run_gate "geiger check self-test" python3 -I scripts/geiger_check.py --self-test
+if cargo geiger --version >/dev/null 2>&1; then
+  run_gate "cargo geiger (baseline)" scripts/geiger.sh
+else
+  record "cargo geiger (baseline)" "NOT RUN" "cargo-geiger not installed (cargo install --locked cargo-geiger --version 0.14.0)"
+fi
+
 # --- Miri on every crate compiled on this host that contains `unsafe` (macOS adapters are
 # cfg-gated out on Linux and need a macOS runner).
 UNSAFE_CRATES=()

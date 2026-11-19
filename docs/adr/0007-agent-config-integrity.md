@@ -52,7 +52,8 @@ line above in the same PR.
   `ROOT_HASH` against the value on the main branch** and require an explicit human/orchestrator
   acknowledgement when it changes. S1: the CI job `agent-config` is red whenever a PR touches the
   agent config, the hash lists or the gates (`agent-team`, `.claude`, `scripts`, `.github`, `.cargo`, `rust-toolchain.toml`, `CLAUDE.md`s,
-  `deny.toml`, `clippy.toml`s, `fogar-archtest`, this ADR); a human merging over it is the
+  `deny.toml`, `supply-chain` (cargo vet exemptions/imports, geiger baselines), `clippy.toml`s,
+  `fogar-archtest`, this ADR); a human merging over it is the
   acknowledgement. Nothing inside a PR can grant it (a PR can even edit the workflow), so making
   it binding needs branch protection with CODEOWNERS on those paths — a repository setting —
   and `agent-config` as a required status check (a PR that deletes the job is otherwise silent).
