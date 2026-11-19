@@ -90,6 +90,8 @@ pub struct GatewayLog {
     pub audio_bytes: u64,
     pub turns_started: u32,
     pub turns_cancelled: u32,
+    /// Pushes dropped because another push was open (3.0.1 §10).
+    pub pushes_dropped: u32,
     pub tts_frames_sent: u64,
     pub closes_sent: Vec<(u16, String)>,
     pub client_closes: u32,
@@ -126,6 +128,7 @@ pub(crate) trait ServerTransport: Send {
 }
 
 struct Streaming {
+    push: bool,
     turn_id: String,
     seq: u16,
     left: u32,
@@ -139,7 +142,7 @@ struct Conn {
     output_audio: bool,
     turn_n: u32,
     streaming: Option<Streaming>,
-    /// Pushes queued behind the streaming turn: M19 never replaces a turn with a push (§10).
+    /// Pushes queued behind the user's streaming turn: M19 never replaces a turn with a push (§10).
     pending_pushes: u32,
     utterance_audio: u64,
     last_client: Instant,
@@ -265,6 +268,12 @@ impl Conn {
                 Step::Stop
             }
             Ctl::Abort => Step::Stop,
+            // 3.0.1 §10: never two pushes open at once. Another conversation's push is dropped
+            // (the same conversation's folds in; the mock has no conversations).
+            Ctl::Push if self.streaming.as_ref().is_some_and(|s| s.push) => {
+                self.log.lock().unwrap().pushes_dropped += 1;
+                Step::Continue
+            }
             Ctl::Push if self.streaming.is_some() => {
                 self.pending_pushes += 1;
                 Step::Continue
@@ -513,6 +522,7 @@ impl Conn {
             0
         };
         self.streaming = Some(Streaming {
+            push: origin == TurnOrigin::Push,
             turn_id,
             seq,
             left: frames,

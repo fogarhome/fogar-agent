@@ -12,7 +12,10 @@
 //! `INVALID_MESSAGE` (non-fatal) [§6]; scripted closes with any code/reason and abrupt drops.
 //! The REST surface (`/.well-known/fogar-gateway`, `POST /pair`) is served on the same port as
 //! scripted [`HttpRoutes`] (`MockGateway::routes`).
-//! NOT modelled: STT/barge-in from audio partials, push queueing, tool calls, pipeline events.
+//! A push waits behind the user's streaming turn; a push arriving while another push is open is
+//! dropped (3.0.1 §10: another conversation's push; the same conversation's would fold in).
+//! NOT modelled: STT/barge-in from audio partials, conversations, tool calls, pipeline events,
+//! `phrase_interrupted`.
 //!
 //! The spec this mock follows is pinned below; `tests/spec_pin.rs` fails when a gateway checkout
 //! (`FOGAR_GATEWAY_DIR`) has a different `docs/client-protocol.md`: review the diff, update the
