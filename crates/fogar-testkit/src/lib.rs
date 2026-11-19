@@ -12,7 +12,7 @@ pub mod fakes;
 pub mod gateway;
 
 pub use fakes::{
-    FakeIpc, FakeIpcClient, FakeMic, FakePowerPolicy, FakeSpeaker, FakeSystemProbe,
+    FakeIpc, FakeIpcClient, FakeMic, FakePowerPolicy, FakeSpeaker, FakeSystemProbe, FakeTailnet,
     MemorySecretStore, SeededRandom, TestClock, silence_chunks, tone_chunks,
 };
 pub use gateway::{
