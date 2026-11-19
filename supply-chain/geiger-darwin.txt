@@ -38,7 +38,7 @@ unsafe slab 32
 unsafe socket2 674
 unsafe subtle 8
 unsafe syn 93
-unsafe tokio 2459
+unsafe tokio 2484
 unsafe tokio-util 38
 unsafe tungstenite 8
 unsafe unicode-ident 4
