@@ -81,6 +81,14 @@ private struct Formulario: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
             VStack(alignment: .leading, spacing: 12) {
+                if link.accesoRetirado {
+                    let t = Textos.titular(link.state, retirado: true)
+                    Estado(tono: t.tono, texto: t.titulo)
+                        .font(Tipo.texto(15, peso: 600)).foregroundStyle(Color.hueso)
+                    Text(t.sub).font(Tipo.cuerpo).foregroundStyle(Color.hueso)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.bottom, 12)
+                }
                 Text("Hola. Emparejemos este Mac.").titularFogar()
                     .fixedSize(horizontal: false, vertical: true)
                 Text("Abre un código en tu gateway: en su panel, en Clientes → Emparejar, o con fogar-gw pair. Aquí solo hace falta escribirlo.")
@@ -91,7 +99,7 @@ private struct Formulario: View {
             encontrados
 
             Campo(etiqueta: "Dirección del gateway", pista: "Sin http://; si no pones puerto, es el 8004.", error: errorDireccion, campo: {
-                TextField("", text: $direccion, prompt: Text("green-house o 192.168.1.20:8004").foregroundStyle(Color.huesoTenue))
+                TextField("", text: $direccion, prompt: Text("gateway.local o 192.168.0.10:8004").foregroundStyle(Color.huesoTenue))
                     .autocorrectionDisabled()
                     .onChange(of: direccion) { errorDireccion = nil }
             }, enfocado: $focoDireccion)

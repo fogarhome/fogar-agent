@@ -22,7 +22,8 @@ struct AjustesView: View {
             .padding(.top, enVentana ? 28 : 24)
             .padding(.bottom, 40)
             .frame(maxWidth: enVentana ? 720 : .infinity, alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            // A form keeps its column; centred, so a wide window has no empty band on one side.
+            .frame(maxWidth: .infinity)
         }
         // Settings window: the usual macOS width, never stretched across the screen.
         .frame(width: enVentana ? nil : 580, height: enVentana ? nil : 640)
