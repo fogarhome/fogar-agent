@@ -65,9 +65,9 @@ mod tests {
         let t = |s: &str| is_tailnet_ip(s.parse().unwrap());
         for ok in [
             "100.64.0.1",
-            "100.109.57.116",
+            "100.64.0.10",
             "100.127.255.255",
-            "fd7a:115c:a1e0::2e3b:3976",
+            "fd7a:115c:a1e0::10",
         ] {
             assert!(t(ok), "{ok}");
         }

@@ -10,7 +10,7 @@ mod healthy {
     fogar_testkit::random_contract!(SeededRandom::new(42));
     fogar_testkit::clock_contract!(TestClock::new());
     fogar_testkit::tailnet_contract!(FakeTailnet::with_peers(&[
-        "100.109.57.116",
+        "100.64.0.10",
         "fd7a:115c:a1e0::1"
     ]));
     fogar_testkit::gateway_link_contract!({
