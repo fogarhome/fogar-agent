@@ -22,7 +22,7 @@ idle CPU <= 1 %, wakeups <= 0.5/s target / 2/s hard, phys_footprint <= 50 MB, no
 | S5 | Wake word with our own model | "ok fogar" opens a turn hands-free | False accepts/h, false rejects, duty-cycled CPU on battery | Pending |
 | S6 | Mac state to the gateway + optional monitoring module | Gateway sees libre/ocupado/no_molestar (needs a gateway contract change) | Probe < 0.1 % CPU, < 1 wake/s; module off = zero threads | Pending |
 | S7 | Screenshots / ScreenCaptureKit | Agent captures the screen on request | TCC re-approval handled; capture cost per frame | Pending |
-| S8 | Packaging: SMAppService/.app, signing, notarization | Installable, auto-starting, updatable Fogar Desktop | 72 h soak on the M2 (sleep/wake cycles, battery/AC), idle gate vs baseline | Pending |
+| S8 | Packaging: signing, notarization, updates (the agent inside the .app comes in S2) | Installable, auto-starting, updatable Fogar Desktop | 72 h soak on the M2 (sleep/wake cycles, battery/AC), idle gate vs baseline | Pending |
 | S9 | Windows / Linux adapters | Same features on a second OS via new adapter crates, no core change | Per-OS idle gate (ETW/powercfg, perf/PSI) | Pending |
 
 No local SQLite for now: the conversation history lives in the gateway (S4). It comes back only if
@@ -69,14 +69,21 @@ pending approval):
   gateway message sequence ever opens the fake mic). The contract PR carries the audio-port change
   (permission request), the fakes and a consent suite in `fogar-testkit`.
 
-**S2 — product requirement (Sito, 2026-11-19): Fogar may speak at any time, also with the app
-closed, but never without something visible on screen.** `PlaybackGate` is the only writer to the
-`AudioSink`; a turn's audio plays only after the app confirms it is showing that turn
-(`turn_visible`): a floating notice (non-activating, above full-screen apps) with the live text of
-what Fogar says and a Stop button. If no app is connected, the agent opens it hidden through a new
-`UiLauncher` port (`open -g -j -b com.fogar.desktop` on macOS; GUESSED from a LaunchAgent, checked
-in the TCC spike). Audio waiting for confirmation is bounded (8 s) and dropped after 5 s without it;
-the turn then stays as text. Word-by-word text/voice sync comes later.
+**S2 — product requirement (Sito, 2026-11-19): Fogar never plays audio without something visible
+on screen.** `PlaybackGate` is the only writer to the `AudioSink`; a turn's audio plays only after
+the app confirms it is showing that turn (`turn_visible`). In S2 the app confirms the user's own
+turns (the menu-bar icon shows "speaking") and pushes only while the conversation window is
+visible; otherwise a push stays as text. Audio waiting for confirmation is bounded (3 s) and dropped
+after 2 s without it. With the app fully quit (no menu-bar icon) nothing plays and the agent never
+opens the app by itself. Floating notices for pushes (live text, Stop, above full-screen apps) and
+text/voice sync come in a later slice; they will be one more way to confirm `turn_visible`.
+
+**S2 — minimal packaging brought forward from S8 (Sito, 2026-11-19):** `fogar-agentd` ships inside
+`Fogar Desktop.app` (`Contents/MacOS/`), with an embedded `Info.plist`
+(`NSMicrophoneUsageDescription`), the `audio-input` entitlement and the same signing identity, and is
+registered by the app with `SMAppService.agent` (plist in `Contents/Library/LaunchAgents/`), so the
+microphone permission belongs to Fogar Desktop and never to a terminal. GUESSED until the spike on
+the Mac. Developer ID, notarization and updates stay in S8.
 
 **Gateway constraint found in the S2 review:** the gateway's silence watchdog closes the session
 (1000, `silence_timeout`) after ~6–8 s of audio without any transcription, with the per-client
@@ -84,8 +91,8 @@ defaults (`silence_timeout_s` 2, `max_silence_turns` 3). Rule (Sito): an automat
 In S2 the agent ends the utterance itself after 5 s without a new partial (or at the gateway's
 second silence notice) with `Then = Review`: the transcription goes to the composer, unsent. Same
 for a 5-minute privacy backstop. With a client VAD (S5) the cut uses the VAD and still never sends;
-only the wake-word mode sends on its own, after a short pause. A gateway issue (don't close the
-session during an explicit utterance) is proposed, not blocking.
+only the wake-word mode sends on its own, after a short pause. Gateway issue fogarhome/fogar-gateway#394
+(don't close the session during an explicit utterance), not blocking.
 
 **S1 gates (done):** `cargo vet` and `cargo geiger` in `scripts/gates.sh` + CI (#15); fuzz targets
 for `decode_server`, `parse_tts_frame` and the IPC framing (#13); the agent-team `ROOT_HASH`
