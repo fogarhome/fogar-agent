@@ -481,7 +481,9 @@ impl Conn {
         if self.pending_pushes == 0 {
             return Step::Continue;
         }
-        self.pending_pushes -= 1;
+        // Only one opens; the rest now find a push open and are dropped (3.0.1 §10).
+        self.log.lock().unwrap().pushes_dropped += self.pending_pushes - 1;
+        self.pending_pushes = 0;
         self.start_turn(t, TurnOrigin::Push).await
     }
 

@@ -115,14 +115,24 @@ async fn push_during_a_turn_waits_for_it_instead_of_replacing_it() {
         rig.health.snapshot().stats.tts_frames_played >= 1
     })
     .await;
-    // The push arrives while the user's answer plays: it goes out after that turn_end.
+    // Two pushes arrive while the user's answer plays: one goes out after that turn_end, the
+    // other then finds a push open and is dropped.
+    assert_eq!(
+        rig.link.log().turns_started,
+        1,
+        "the user turn is still streaming"
+    );
+    assert_eq!(rig.link.control(Ctl::Push), 1);
     assert_eq!(rig.link.control(Ctl::Push), 1);
     eventually(Duration::from_secs(30), || {
         rig.health.snapshot().stats.tts_frames_played == 100
     })
     .await;
     let log = rig.link.log();
-    assert_eq!((log.turns_started, log.turns_cancelled), (2, 0));
+    assert_eq!(
+        (log.turns_started, log.turns_cancelled, log.pushes_dropped),
+        (2, 0, 1)
+    );
     assert_eq!(rig.health.snapshot().stats.turns_completed, 1);
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
