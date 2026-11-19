@@ -69,17 +69,23 @@ pending approval):
   gateway message sequence ever opens the fake mic). The contract PR carries the audio-port change
   (permission request), the fakes and a consent suite in `fogar-testkit`.
 
-**S2 — product requirement (Sito, 2026-11-19): Fogar never plays audio without something visible
-on screen.** `PlaybackGate` is the only writer to the `AudioSink`; a turn's audio plays only after
-the app confirms it is showing that turn (`turn_visible`), e.g. a floating notice for a push. Audio
-waiting for that confirmation is bounded (3 s) and dropped after 2 s without it; with no app open,
-nothing plays.
+**S2 — product requirement (Sito, 2026-11-19): Fogar may speak at any time, also with the app
+closed, but never without something visible on screen.** `PlaybackGate` is the only writer to the
+`AudioSink`; a turn's audio plays only after the app confirms it is showing that turn
+(`turn_visible`): a floating notice (non-activating, above full-screen apps) with the live text of
+what Fogar says and a Stop button. If no app is connected, the agent opens it hidden through a new
+`UiLauncher` port (`open -g -j -b com.fogar.desktop` on macOS; GUESSED from a LaunchAgent, checked
+in the TCC spike). Audio waiting for confirmation is bounded (8 s) and dropped after 5 s without it;
+the turn then stays as text. Word-by-word text/voice sync comes later.
 
 **Gateway constraint found in the S2 review:** the gateway's silence watchdog closes the session
 (1000, `silence_timeout`) after ~6–8 s of audio without any transcription, with the per-client
-defaults (`silence_timeout_s` 2, `max_silence_turns` 3). A click-to-record utterance with a
-thinking pause can hit it. To settle (gateway issue and/or a per-client setting) before the real
-test on the Mac.
+defaults (`silence_timeout_s` 2, `max_silence_turns` 3). Rule (Sito): an automatic cut never sends.
+In S2 the agent ends the utterance itself after 5 s without a new partial (or at the gateway's
+second silence notice) with `Then = Review`: the transcription goes to the composer, unsent. Same
+for a 5-minute privacy backstop. With a client VAD (S5) the cut uses the VAD and still never sends;
+only the wake-word mode sends on its own, after a short pause. A gateway issue (don't close the
+session during an explicit utterance) is proposed, not blocking.
 
 **S1 gates (done):** `cargo vet` and `cargo geiger` in `scripts/gates.sh` + CI (#15); fuzz targets
 for `decode_server`, `parse_tts_frame` and the IPC framing (#13); the agent-team `ROOT_HASH`
