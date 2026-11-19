@@ -6,11 +6,12 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
 /// In-memory IPC server (cloneable handle). `client()` opens a connection the next `accept`
-/// returns.
+/// returns. Peers are uid-only (`new`) or verified as the same signer (`signed`, IPC-4).
 #[derive(Debug, Clone)]
 pub struct FakeIpc {
     tx: mpsc::Sender<FakeConn>,
     rx: Arc<Mutex<mpsc::Receiver<FakeConn>>>,
+    signed: bool,
 }
 
 #[derive(Debug)]
@@ -33,6 +34,14 @@ impl FakeIpc {
         Self {
             tx,
             rx: Arc::new(Mutex::new(rx)),
+            signed: false,
+        }
+    }
+    /// Peers count as the agent's own signed app (`com.fogar.desktop`): may Pair/Unpair.
+    pub fn signed() -> Self {
+        Self {
+            signed: true,
+            ..Self::new()
         }
     }
     pub async fn client(&self) -> FakeIpcClient {
@@ -102,6 +111,10 @@ impl IpcServer for FakeIpc {
         // accept loses no connection.
         let mut rx = self.rx.lock().await;
         match rx.recv().await {
+            Some(c) if self.signed => Ok((
+                PeerIdentity::verified_signer(Some(0), "com.fogar.desktop".into()),
+                c,
+            )),
             Some(c) => Ok((PeerIdentity::uid_only(Some(0)), c)),
             None => std::future::pending().await,
         }

@@ -151,6 +151,14 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
 - Signed matrix verified manually with examples/signer_probe.rs (ADR-0002). UNVERIFIED: Developer
   ID, real .app bundle peers, UI-side check of the agent, flock single instance (not done).
 
+## S1 — E2E del emparejamiento (2026-11-16)
+- s1_pairing_e2e.rs: ciclo completo (pair -> ready -> 1012 -> revocación 4200/1008 -> pair otra
+  vez) con HTTP y WS reales contra el mock, que ahora sirve REST y WS en un puerto.
+- Segundo nivel contra el fogar-gateway REAL (launch.py, fake OpenClaw, sin STT/TTS); pasa en
+  local contra 8f4770e y, desde 2026-11-19, contra main del gateway (3.0.1, d09ce82). Se salta sin FOGAR_GATEWAY_DIR. CI: .github/workflows/e2e-gateway.yml,
+  bloqueante en el commit de GATEWAY_REF y diario contra la rama más nueva del gateway.
+- Pin del spec del mock (SPEC_GATEWAY_COMMIT/SPEC_BLOB) + tests/spec_pin.rs para detectar deriva.
+
 ## S1 — user-initiated reconnect (2026-11-16)
 - IPC v3: Reconnect / Reconnecting. A link parked by 4102 (conversation taken, spec v3 §13) or
   4020/4021 makes one new attempt when the signed app asks (SameSigner gate, like Pair/Unpair).
@@ -168,3 +176,6 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
   smoke test over the committed seeds (`cargo test --manifest-path fuzz/Cargo.toml --locked`).
 - After the fix, run locally on nightly for 3 min each (ASan), no crash; results in the PR. NOT DONE: CI build on every
   PR + scheduled runs (CI is owned by another PR; recipe in the fuzz PR description).
+- 2026-11-19: E2E movido a fogar-gateway main 3.0.1 (GATEWAY_REF d09ce82, job diario contra main).
+  Pin del spec al mismo commit; el mock manda turn_end{closed} también antes de 4020 y de 1011
+  `session setup failed` a mitad de sesión (spec 3.0.1 §13).
