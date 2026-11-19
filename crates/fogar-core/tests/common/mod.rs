@@ -9,7 +9,6 @@ use fogar_core::{
 use fogar_ports::{
     gateway::{GatewayAddr, GatewayLink},
     gateway_http::{GatewayHttp, HttpCall, HttpError, HttpReply},
-    ipc::{IpcCaps, IpcError, IpcServer, PeerIdentity},
     secrets::{SecretKey, SecretStore},
 };
 use fogar_testkit::{
@@ -59,29 +58,6 @@ pub(crate) fn paired_store(key: &str) -> MemorySecretStore {
     s.put(SecretKey::GatewayPairing, record(key).encode())
         .unwrap();
     s
-}
-
-/// `FakeIpc` whose peers the "adapter" verified as the same signer (`signed`) or by uid only.
-#[derive(Debug, Clone)]
-pub(crate) struct TestIpc {
-    pub(crate) inner: FakeIpc,
-    pub(crate) signed: bool,
-}
-
-impl IpcServer for TestIpc {
-    type Conn = <FakeIpc as IpcServer>::Conn;
-    fn capabilities(&self) -> IpcCaps {
-        self.inner.capabilities()
-    }
-    async fn accept(&self) -> Result<(PeerIdentity, Self::Conn), IpcError> {
-        let (peer, conn) = self.inner.accept().await?;
-        let peer = if self.signed {
-            PeerIdentity::verified_signer(peer.uid, "com.fogar.desktop".into())
-        } else {
-            peer
-        };
-        Ok((peer, conn))
-    }
 }
 
 pub(crate) struct RigBuilder<L: GatewayLink> {
@@ -153,14 +129,18 @@ impl<L: GatewayLink + Clone> RigBuilder<L> {
 
     pub(crate) fn start(self) -> Rig<L> {
         let clock = TestClock::new();
-        let ipc = self.with_ipc.then(FakeIpc::new);
+        let signed = self.signed_peer;
+        let ipc = self.with_ipc.then(|| {
+            if signed {
+                FakeIpc::signed()
+            } else {
+                FakeIpc::new()
+            }
+        });
         let ports = AgentPorts {
             clock: Arc::new(clock),
             link: self.link.clone(),
-            ipc: ipc.clone().map(|inner| TestIpc {
-                inner,
-                signed: self.signed_peer,
-            }),
+            ipc: ipc.clone(),
             http: MultiHttp(
                 self.http_addrs
                     .iter()

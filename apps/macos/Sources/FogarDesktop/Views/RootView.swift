@@ -31,7 +31,7 @@ struct RootView: View {
             if new == .notPaired, let old, old != .notPaired { nav.seccion = .emparejar }
         }
         // Announce a new headline, not every counter tick.
-        .onChange(of: Textos.titular(link.state).titulo) { _, titulo in
+        .onChange(of: Textos.titular(link.state, retirado: link.accesoRetirado).titulo) { _, titulo in
             AccessibilityNotification.Announcement(titulo).post()
         }
     }

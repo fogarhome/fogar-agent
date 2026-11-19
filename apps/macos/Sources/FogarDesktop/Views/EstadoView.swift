@@ -9,7 +9,7 @@ struct EstadoView: View {
 
     var body: some View {
         let state = link.state
-        let t = Textos.titular(state)
+        let t = Textos.titular(state, retirado: link.accesoRetirado)
         ScrollView {
             VStack(alignment: .leading, spacing: 40) {
                 Cabecera(titular: t, state: state, since: link.since)
@@ -20,7 +20,8 @@ struct EstadoView: View {
             .padding(.horizontal, 40)
             .padding(.top, 28)
             .padding(.bottom, 56)
-            .frame(maxWidth: 1240, alignment: .leading)
+            // The whole width, sidebar shown or hidden: no empty band on the right. Prose keeps
+            // its own reading width (620).
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .scrollIndicators(.automatic)
@@ -293,37 +294,47 @@ private struct Datos: View {
     let status: WireStatus
 
     var body: some View {
-        HStack(alignment: .top, spacing: 40) {
-            VStack(alignment: .leading, spacing: 12) {
-                Text(status.gateway.map { "Este Mac en \($0.name)" } ?? "Este Mac y el agente")
-                    .font(Tipo.h2).foregroundStyle(Color.hueso).accessibilityAddTraits(.isHeader)
-                VStack(spacing: 0) {
-                    if let g = status.gateway {
-                        Fila(clave: "Dirección", valor: g.address, seleccionable: true)
-                        Fila(clave: "Nombre en el gateway", valor: g.client_name)
-                        Fila(clave: "Versión del gateway", valor: g.version)
-                    }
-                    Fila(clave: "Cómo se autenticó esta app", valor: Textos.autenticacion(status.peer_check))
-                    Fila(clave: "Arranque del agente", valor: Textos.arranque(status.boot_mode))
-                }
-            }
-            .frame(minWidth: 380, maxWidth: .infinity, alignment: .leading)
-            .accessibilityElement(children: .contain)
-
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Desde que arrancó el agente").font(Tipo.h2).foregroundStyle(Color.hueso)
-                    .accessibilityAddTraits(.isHeader)
-                HStack(spacing: 0) {
-                    Cifra(valor: status.sessions, texto: status.sessions == 1 ? "sesión con el gateway" : "sesiones con el gateway")
-                    Rectangle().fill(Color.veta).frame(width: 1)
-                    Cifra(valor: status.turns_completed, texto: status.turns_completed == 1 ? "turno completado" : "turnos completados")
-                }
-                .fixedSize(horizontal: false, vertical: true)
-                .background(RoundedRectangle(cornerRadius: Medida.radioBloque).fill(Color.piedra))
-            }
-            .frame(width: 400)
-            .accessibilityElement(children: .contain)
+        // Side by side when the detail is wide enough; stacked in a narrow one (a 940 window with
+        // the sidebar shown leaves 700 pt), so nothing is cut off.
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .top, spacing: 40) { tabla; cifras }
+            VStack(alignment: .leading, spacing: 40) { tabla; cifras }
         }
+    }
+
+    private var tabla: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(status.gateway.map { "Este Mac en \($0.name)" } ?? "Este Mac y el agente")
+                .font(Tipo.h2).foregroundStyle(Color.hueso).accessibilityAddTraits(.isHeader)
+            VStack(spacing: 0) {
+                if let g = status.gateway {
+                    Fila(clave: "Dirección", valor: g.address, seleccionable: true)
+                    Fila(clave: "Nombre en el gateway", valor: g.client_name)
+                    Fila(clave: "Versión del gateway", valor: g.version)
+                }
+                Fila(clave: "Cómo se autenticó esta app", valor: Textos.autenticacion(status.peer_check))
+                Fila(clave: "Arranque del agente", valor: Textos.arranque(status.boot_mode))
+            }
+        }
+        // Ideal 380: ViewThatFits stacks below a fixed 820, not whenever a long value is unwrapped.
+        .frame(minWidth: 380, idealWidth: 380, maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var cifras: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Desde que arrancó el agente").font(Tipo.h2).foregroundStyle(Color.hueso)
+                .accessibilityAddTraits(.isHeader)
+            HStack(spacing: 0) {
+                Cifra(valor: status.sessions, texto: status.sessions == 1 ? "sesión con el gateway" : "sesiones con el gateway")
+                Rectangle().fill(Color.veta).frame(width: 1)
+                Cifra(valor: status.turns_completed, texto: status.turns_completed == 1 ? "turno completado" : "turnos completados")
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .background(RoundedRectangle(cornerRadius: Medida.radioBloque).fill(Color.piedra))
+        }
+        .frame(width: 400)
+        .accessibilityElement(children: .contain)
     }
 }
 

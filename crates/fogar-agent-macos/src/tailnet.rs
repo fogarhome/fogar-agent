@@ -154,20 +154,20 @@ mod tests {
 
     #[test]
     fn keeps_online_peers_of_this_user_ipv4_first() {
-        let json = br#"{"BackendState":"Running","Self":{"UserID":7,"TailscaleIPs":["100.89.15.7"]},
+        let json = br#"{"BackendState":"Running","Self":{"UserID":7,"TailscaleIPs":["100.64.0.2"]},
           "Peer":{
-            "a":{"UserID":7,"HostName":"green-house","TailscaleIPs":["100.109.57.116","fd7a:115c:a1e0::2e3b:3976"],"Online":true},
-            "b":{"UserID":7,"TailscaleIPs":["100.126.18.95"],"Online":false},
-            "c":{"UserID":7,"TailscaleIPs":["fd7a:115c:a1e0::7e3b:b136"],"Online":true},
+            "a":{"UserID":7,"HostName":"green-house","TailscaleIPs":["100.64.0.10","fd7a:115c:a1e0::10"],"Online":true},
+            "b":{"UserID":7,"TailscaleIPs":["100.64.0.11"],"Online":false},
+            "c":{"UserID":7,"TailscaleIPs":["fd7a:115c:a1e0::12"],"Online":true},
             "d":{"UserID":7,"TailscaleIPs":["8.8.8.8","192.168.1.19"],"Online":true},
-            "e":{"UserID":7,"TailscaleIPs":["100.109.57.116"],"Online":true},
+            "e":{"UserID":7,"TailscaleIPs":["100.64.0.10"],"Online":true},
             "f":{"UserID":7,"Online":true},
             "g":{"UserID":8,"HostName":"green-house","TailscaleIPs":["100.100.1.1"],"Online":true},
             "h":{"TailscaleIPs":["100.100.1.2"],"Online":true}
           }}"#;
         assert_eq!(
             parse_status(json).unwrap(),
-            ips(&["100.109.57.116", "fd7a:115c:a1e0::7e3b:b136"])
+            ips(&["100.64.0.10", "fd7a:115c:a1e0::12"])
         );
     }
 
@@ -231,10 +231,10 @@ mod tests {
         let cli = stand_in(
             "ok",
             r#"[ "$TAILSCALE_BE_CLI" = 1 ] && [ -z "$HOME" ] && [ "$1 $2" = "status --json" ] || exit 3
-echo '{"BackendState":"Running","Self":{"UserID":1},"Peer":{"a":{"UserID":1,"TailscaleIPs":["100.109.57.116"],"Online":true}}}'"#,
+echo '{"BackendState":"Running","Self":{"UserID":1},"Peer":{"a":{"UserID":1,"TailscaleIPs":["100.64.0.10"],"Online":true}}}'"#,
         );
         let t = MacTailnet::with_cli(&cli);
-        assert_eq!(t.peers().await, Ok(ips(&["100.109.57.116"])));
+        assert_eq!(t.peers().await, Ok(ips(&["100.64.0.10"])));
     }
 
     #[tokio::test]

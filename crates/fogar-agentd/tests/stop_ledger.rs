@@ -222,6 +222,10 @@ fn rate_limit_never_swallows_parked_and_reports_suppressed_lines() {
             panic!("no `link not_paired` line: {all:#?}");
         };
         let parked = l.contains("link not_paired");
+        if parked {
+            // The revocation names its close, like the backoff lines do.
+            assert!(l.contains("(last close 1008 -> Repair)"), "{l}");
+        }
         all.push((Instant::now(), l));
         // Before the fix this line never came once the flaps had used up the burst.
         if parked {

@@ -469,8 +469,8 @@ async fn revoked_then_repaired() {
 async fn discover_finds_gateways_on_tailnet_peers() {
     // A gateway on this machine and one on a tailnet peer; another peer runs no gateway.
     let mut b = unpaired();
-    b.http_addrs = vec!["127.0.0.1:8004", "100.109.57.116:8004"];
-    b.tailnet = FakeTailnet::with_peers(&["100.126.18.95", "100.109.57.116"]);
+    b.http_addrs = vec!["127.0.0.1:8004", "100.64.0.10:8004"];
+    b.tailnet = FakeTailnet::with_peers(&["100.64.0.11", "100.64.0.10"]);
     let rig = b.start();
     let mut c = client(&rig).await;
     let r = c.request(IpcRequest::Discover).await;
@@ -478,10 +478,7 @@ async fn discover_finds_gateways_on_tailnet_peers() {
         panic!("{r:?}")
     };
     let addrs: Vec<&str> = found.iter().map(|g| g.address.as_str()).collect();
-    assert_eq!(
-        addrs,
-        ["http://127.0.0.1:8004", "http://100.109.57.116:8004"]
-    );
+    assert_eq!(addrs, ["http://127.0.0.1:8004", "http://100.64.0.10:8004"]);
     assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
 }
 
@@ -490,8 +487,8 @@ async fn discover_asks_the_tailnet_only_for_the_signed_app() {
     // A uid-only peer (another local app) cannot make the agent run the tailnet client.
     let mut b = unpaired();
     b.signed_peer = false;
-    b.http_addrs = vec!["127.0.0.1:8004", "100.109.57.116:8004"];
-    b.tailnet = FakeTailnet::with_peers(&["100.109.57.116"]);
+    b.http_addrs = vec!["127.0.0.1:8004", "100.64.0.10:8004"];
+    b.tailnet = FakeTailnet::with_peers(&["100.64.0.10"]);
     let calls = b.tailnet.calls.clone();
     let rig = b.start();
     let mut c = client(&rig).await;
