@@ -3,6 +3,7 @@
 
 mod common;
 use common::*;
+use fogar_proto::CloseAction;
 use fogar_testkit::{MockConfig, gateway::Ctl};
 use std::time::Duration;
 
@@ -117,6 +118,20 @@ async fn push_during_a_turn_waits_for_it_instead_of_replacing_it() {
 
 #[tokio::test(start_paused = true)]
 async fn conversation_taken_mid_answer_stops_playback_and_parks() {
+    closed_mid_answer(
+        4102,
+        "conversation opened elsewhere",
+        CloseAction::ConversationTaken,
+    )
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn agent_withdrawn_mid_answer_stops_playback_and_parks() {
+    closed_mid_answer(4020, "agent not permitted", CloseAction::AgentRefused).await;
+}
+
+async fn closed_mid_answer(code: u16, reason: &str, parked: CloseAction) {
     let mock = MockConfig {
         tts_frames: 400,
         frame_interval: Duration::from_millis(20),
@@ -129,16 +144,11 @@ async fn conversation_taken_mid_answer_stops_playback_and_parks() {
         rig.health.snapshot().stats.tts_frames_played >= 10
     })
     .await;
-    // M19: turn_end{closed} first, then 4102. The turn is gone before the link drops, so only
-    // `closed` itself can stop the buffered tail.
-    assert_eq!(rig.link.close_all(4102, "conversation opened elsewhere"), 1);
+    // M19: turn_end{closed} first, then the close. The turn is gone before the link drops, so
+    // only `closed` itself can stop the buffered tail.
+    assert_eq!(rig.link.close_all(code, reason), 1);
     eventually(Duration::from_secs(10), || {
-        matches!(
-            rig.health.snapshot().link,
-            fogar_core::LinkState::Parked {
-                reason: fogar_proto::CloseAction::ConversationTaken
-            }
-        )
+        rig.health.snapshot().link == fogar_core::LinkState::Parked { reason: parked }
     })
     .await;
     assert!(rig.speaker.snapshot().stops >= 1, "the tail is not played");

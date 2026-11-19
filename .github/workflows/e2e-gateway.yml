@@ -25,8 +25,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_TOOLCHAIN: "1.97.0"
-  # The newest gateway development line ("latest"). Switch to main once v3 lands there.
-  GATEWAY_LATEST: claude/hopeful-pasteur-phx8ad
+  # The newest gateway development line ("latest").
+  GATEWAY_LATEST: main
   UV_PYTHON: "3.12"
 
 jobs:

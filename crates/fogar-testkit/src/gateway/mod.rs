@@ -18,11 +18,11 @@
 //! (`FOGAR_GATEWAY_DIR`) has a different `docs/client-protocol.md`: review the diff, update the
 //! mock, then bump both constants.
 
-/// fogar-gateway commit (branch `claude/hopeful-pasteur-phx8ad`, M19 / "v3") whose
-/// `docs/client-protocol.md` this mock was last checked against.
-pub const SPEC_GATEWAY_COMMIT: &str = "832e1de429819ea2ac83f746cb482ba99d77d3bb";
+/// fogar-gateway commit (main, release 3.0.1) whose `docs/client-protocol.md` this mock was last
+/// checked against.
+pub const SPEC_GATEWAY_COMMIT: &str = "d09ce82b9350eb42f6d14c087b00ec0c0104bc6b";
 /// `git hash-object docs/client-protocol.md` at [`SPEC_GATEWAY_COMMIT`].
-pub const SPEC_BLOB: &str = "5505f4ec56b52ad76894816bbf31f8fef83b9dd0";
+pub const SPEC_BLOB: &str = "2477564d47201206057e139a5b4aece5e3401b94";
 
 mod driver;
 mod http;

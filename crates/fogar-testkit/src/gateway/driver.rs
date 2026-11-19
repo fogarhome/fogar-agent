@@ -252,9 +252,11 @@ impl Conn {
     async fn ctl<T: ServerTransport>(&mut self, t: &mut T, cmd: Ctl) -> Step {
         match cmd {
             Ctl::Close { code, reason } => {
-                // M19 ends the open turn with `closed` before these closes (spec §13).
+                // M19 ends the open turn with `closed` before these mid-session closes (spec §13):
+                // revoked, agent withdrawn, conversation taken, unreadable client config.
                 if self.cfg.m19
-                    && matches!(code, 4102 | 4200)
+                    && (matches!(code, 4020 | 4102 | 4200)
+                        || (code == 1011 && reason == "session setup failed"))
                     && matches!(self.cancel_turn(t, TurnEndReason::Closed).await, Step::Stop)
                 {
                     return Step::Stop;
