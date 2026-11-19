@@ -11,6 +11,8 @@ pub struct Config {
     pub client_name: String,
     /// Deadline for probing one address (`/.well-known`, both paths; spec §0: 1–2 s).
     pub probe_timeout: Duration,
+    /// Deadline for asking the tailnet for its peers during discovery.
+    pub tailnet_timeout: Duration,
     /// Deadline for `POST /pair` (a 5xx or no answer leaves the code open: retry it).
     pub pair_timeout: Duration,
     /// Answer `Pair`/`Unpair` from a peer the IPC adapter only checked by OS user (IPC-4).
@@ -55,6 +57,9 @@ impl Default for Config {
             // GUESSED: the composition root should pass the device name.
             client_name: "Fogar Desktop".into(),
             probe_timeout: Duration::from_millis(1500),
+            // The Tailscale CLI answers in ~0.1 s; discovery as a whole must stay well under the
+            // app's 10 s `discover` timeout (tailnet_timeout + probe_timeout).
+            tailnet_timeout: Duration::from_secs(2),
             pair_timeout: Duration::from_secs(10),
             pair_from_uid_only_peers: false,
             agent: None,

@@ -3,16 +3,18 @@
 #![allow(dead_code)]
 
 use fogar_core::{
-    Agent, AgentPorts, Config, HealthProbe, LinkState, LinkView, NoHttp, NoIpc, PairingRecord,
-    crashloop::BootMode,
+    Agent, AgentPorts, Config, HealthProbe, LinkState, LinkView, NoHttp, NoIpc, NoTailnet,
+    PairingRecord, crashloop::BootMode,
 };
 use fogar_ports::{
     gateway::{GatewayAddr, GatewayLink},
+    gateway_http::{GatewayHttp, HttpCall, HttpError, HttpReply},
     secrets::{SecretKey, SecretStore},
 };
 use fogar_testkit::{
-    FakeGatewayHttp, FakeGatewayLink, FakeIpc, FakeMic, FakeSpeaker, FakeSystemProbe, HttpRoutes,
-    MemorySecretStore, MockConfig, SeededRandom, TestClock, silence_chunks, tone_chunks,
+    FakeGatewayHttp, FakeGatewayLink, FakeIpc, FakeMic, FakeSpeaker, FakeSystemProbe, FakeTailnet,
+    HttpRoutes, MemorySecretStore, MockConfig, SeededRandom, TestClock, silence_chunks,
+    tone_chunks,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -68,6 +70,38 @@ pub(crate) struct RigBuilder<L: GatewayLink> {
     /// IPC peers are verified as the same signer (else uid only).
     pub(crate) signed_peer: bool,
     pub(crate) routes: HttpRoutes,
+    /// Addresses where a gateway answers `routes` (all share them).
+    pub(crate) http_addrs: Vec<&'static str>,
+    pub(crate) tailnet: FakeTailnet,
+}
+
+/// Several `FakeGatewayHttp`s, one per address (discovery may find more than one gateway).
+/// An unknown address goes to the first one: it applies the cleartext policy, then answers
+/// `Unreachable`. `http_addrs` must not be empty.
+#[derive(Debug)]
+pub(crate) struct MultiHttp(Vec<FakeGatewayHttp>);
+
+impl MultiHttp {
+    fn pick(&self, addr: &GatewayAddr) -> &FakeGatewayHttp {
+        self.0
+            .iter()
+            .find(|h| h.addr() == *addr)
+            .unwrap_or(&self.0[0])
+    }
+}
+
+impl GatewayHttp for MultiHttp {
+    async fn get(&self, addr: &GatewayAddr, call: HttpCall) -> Result<HttpReply, HttpError> {
+        self.pick(addr).get(addr, call).await
+    }
+    async fn post_json(
+        &self,
+        addr: &GatewayAddr,
+        call: HttpCall,
+        body: secrecy::zeroize::Zeroizing<Vec<u8>>,
+    ) -> Result<HttpReply, HttpError> {
+        self.pick(addr).post_json(addr, call, body).await
+    }
 }
 
 impl RigBuilder<FakeGatewayLink> {
@@ -88,6 +122,8 @@ impl<L: GatewayLink + Clone> RigBuilder<L> {
             with_ipc: false,
             signed_peer: true,
             routes: HttpRoutes::fogar("green-house"),
+            http_addrs: vec![GW_ADDR],
+            tailnet: FakeTailnet::unsupported(),
         }
     }
 
@@ -105,7 +141,15 @@ impl<L: GatewayLink + Clone> RigBuilder<L> {
             clock: Arc::new(clock),
             link: self.link.clone(),
             ipc: ipc.clone(),
-            http: FakeGatewayHttp::at(self.routes.clone(), GatewayAddr::parse(GW_ADDR).unwrap()),
+            http: MultiHttp(
+                self.http_addrs
+                    .iter()
+                    .map(|a| {
+                        FakeGatewayHttp::at(self.routes.clone(), GatewayAddr::parse(a).unwrap())
+                    })
+                    .collect(),
+            ),
+            tailnet: self.tailnet,
             secrets: self.secrets.clone(),
             random: Arc::new(SeededRandom::new(7)),
             audio_in: Arc::new(self.mic.clone()),
@@ -137,6 +181,7 @@ pub(crate) fn start_no_ipc<L: GatewayLink + Clone>(
         link: b.link.clone(),
         ipc: None,
         http: NoHttp,
+        tailnet: NoTailnet,
         secrets: b.secrets.clone(),
         random: Arc::new(SeededRandom::new(7)),
         audio_in: Arc::new(b.mic.clone()),

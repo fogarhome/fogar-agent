@@ -18,6 +18,7 @@ use fogar_ports::{
     ipc::{
         IPC_VERSION, IpcConn, IpcError, IpcRequest, IpcResponse, IpcServer, PeerCheck, StatusReport,
     },
+    tailnet::TailnetPeers,
 };
 use std::{future::Future, sync::Arc, time::Duration};
 use tokio::task::JoinSet;
@@ -36,12 +37,12 @@ pub(crate) struct Limits {
     pub(crate) pair_from_uid_only_peers: bool,
 }
 
-pub(crate) async fn run<C: Clock, S: IpcServer, H: GatewayHttp>(
+pub(crate) async fn run<C: Clock, S: IpcServer, H: GatewayHttp, T: TailnetPeers>(
     server: S,
     clock: Arc<C>,
     health: HealthProbe,
     limits: Limits,
-    pairing: Pairing<C, H>,
+    pairing: Pairing<C, H, T>,
     ingress: CancellationToken,
 ) {
     let mut conns = JoinSet::new();
@@ -82,12 +83,12 @@ pub(crate) async fn run<C: Clock, S: IpcServer, H: GatewayHttp>(
     conns.shutdown().await;
 }
 
-struct Conn<K, C, H> {
+struct Conn<K, C, H, T> {
     conn: K,
     clock: Arc<C>,
     health: HealthProbe,
     limits: Limits,
-    pairing: Pairing<C, H>,
+    pairing: Pairing<C, H, T>,
     peer_check: PeerCheck,
     cancel: CancellationToken,
 }
@@ -105,7 +106,7 @@ fn report(health: &HealthProbe, v: &LinkView, peer_check: PeerCheck) -> StatusRe
     )
 }
 
-impl<K: IpcConn, C: Clock, H: GatewayHttp> Conn<K, C, H> {
+impl<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers> Conn<K, C, H, T> {
     /// `false` = the write failed or missed `write_timeout`: close the connection.
     async fn send(&mut self, resp: IpcResponse) -> bool {
         matches!(
@@ -146,7 +147,7 @@ async fn recv_within<C: Clock, K: IpcConn>(
     }
 }
 
-async fn serve<K: IpcConn, C: Clock, H: GatewayHttp>(mut c: Conn<K, C, H>) {
+async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Conn<K, C, H, T>) {
     let mut view = c.health.view.clone();
     let mut subscribed = false;
     // A peer that said another version is told ours, then refused (it must not guess).
@@ -200,7 +201,7 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp>(mut c: Conn<K, C, H>) {
                 last_pushed = Some(rep.clone());
                 IpcResponse::Event(rep)
             }
-            IpcRequest::Discover => match op(&c.cancel, c.pairing.discover()).await {
+            IpcRequest::Discover => match op(&c.cancel, c.pairing.discover(c.may_pair())).await {
                 Some(found) => IpcResponse::Discovered(found),
                 None => return,
             },

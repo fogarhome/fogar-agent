@@ -112,6 +112,7 @@ fn start_agent() -> (Agent<TokioClock>, Arc<CountingStore>, FakeIpc) {
         link: WsGatewayLink::new(WsConfig::default()),
         ipc: Some(ipc.clone()),
         http: HttpGateway::new(HttpConfig::default()),
+        tailnet: fogar_core::NoTailnet,
         secrets: secrets.clone(),
         random: Arc::new(SeededRandom::new(11)),
         audio_in: Arc::new(FakeMic::minimal()),

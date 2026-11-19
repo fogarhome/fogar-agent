@@ -120,7 +120,7 @@ pub enum IpcRequest {
     /// the write deadline closes it (a client that stops reading cannot hold a slot), and
     /// subscribers share the bounded connection slots (`IPC_MAX_CONNS`).
     Subscribe,
-    /// Look for gateways (saved address, this Mac, later the tailnet). Answered with `Discovered`.
+    /// Look for gateways (saved address, this Mac, the tailnet peers). Answered with `Discovered`.
     Discover,
     /// Redeem a pairing code at a gateway. Answered with `Paired` or `PairFailed`. `code` is
     /// `None` when what was typed is not 6 digits: the core answers `BadCode` without calling

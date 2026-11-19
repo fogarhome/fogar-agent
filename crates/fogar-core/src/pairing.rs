@@ -12,16 +12,20 @@
 use crate::{config::Config, time::deadline};
 use fogar_ports::{
     clock::Clock,
-    gateway::GatewayAddr,
+    gateway::{DEFAULT_GATEWAY_PORT, GatewayAddr},
     gateway_http::{GatewayHttp, HttpCall, HttpError},
     ipc::{GatewayCandidate, GatewayInfo, PairCode, PairFailure},
     secrets::{ExposeSecret, SecretError, SecretKey, SecretStore, SecretString},
+    tailnet::{MAX_TAILNET_PEERS, TailnetPeers},
 };
 use fogar_proto::pairing::{ClientType, PairRequest, PairResponse, WellKnown};
 use secrecy::zeroize::Zeroizing;
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, sync::Arc};
-use tokio::sync::{Semaphore, watch};
+use std::{borrow::Cow, net::SocketAddr, sync::Arc};
+use tokio::{
+    sync::{Semaphore, watch},
+    task::JoinSet,
+};
 
 /// `service` values of a Fogar gateway (before and after the jota -> fogar rename).
 const FOGAR_SERVICES: [&str; 2] = ["fogar-gateway", "jota-gateway"];
@@ -36,10 +40,13 @@ const RECORD_VERSION: u8 = 1;
 /// Longest gateway-supplied label we keep (names, versions, ids).
 const MAX_LABEL_CHARS: usize = 128;
 
-/// Gateway-supplied text shown in the UI and stored in the record: no control or bidi
-/// characters (UI spoofing), at most `MAX_LABEL_CHARS`.
+/// Gateway-supplied text shown in the UI and stored in the record: no control, bidi or
+/// invisible format characters (UI spoofing), at most `MAX_LABEL_CHARS`.
 fn label(s: String) -> String {
-    let bidi = |c: char| matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    let bidi = |c: char| {
+        matches!(c, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+    };
     if s.chars().count() <= MAX_LABEL_CHARS && !s.chars().any(|c| c.is_control() || bidi(c)) {
         return s;
     }
@@ -192,9 +199,11 @@ enum Probe {
 }
 
 /// Pairing operations of the IPC service. Cheap to clone (all shared).
-pub(crate) struct Pairing<C, H> {
+pub(crate) struct Pairing<C, H, T> {
     pub(crate) clock: Arc<C>,
     pub(crate) http: Arc<H>,
+    /// Where discovery looks after the saved address and this machine.
+    pub(crate) tailnet: Arc<T>,
     pub(crate) secrets: Arc<dyn SecretStore>,
     pub(crate) cfg: Arc<Config>,
     /// Bumped after every record write/delete; the link restarts on it.
@@ -205,11 +214,12 @@ pub(crate) struct Pairing<C, H> {
     pub(crate) lock: Arc<Semaphore>,
 }
 
-impl<C, H> Clone for Pairing<C, H> {
+impl<C, H, T> Clone for Pairing<C, H, T> {
     fn clone(&self) -> Self {
         Self {
             clock: self.clock.clone(),
             http: self.http.clone(),
+            tailnet: self.tailnet.clone(),
             secrets: self.secrets.clone(),
             cfg: self.cfg.clone(),
             changed: self.changed.clone(),
@@ -219,7 +229,7 @@ impl<C, H> Clone for Pairing<C, H> {
     }
 }
 
-impl<C: Clock, H: GatewayHttp> Pairing<C, H> {
+impl<C: Clock, H: GatewayHttp, T: TailnetPeers> Pairing<C, H, T> {
     /// `/.well-known/fogar-gateway`, then the pre-rename path; the whole probe of one address
     /// is bounded by `probe_timeout`.
     async fn probe(&self, addr: &GatewayAddr) -> Probe {
@@ -254,29 +264,60 @@ impl<C: Clock, H: GatewayHttp> Pairing<C, H> {
             .unwrap_or(Probe::Unreachable)
     }
 
-    /// Saved address, then this machine; the first Fogar that answers (spec §0 steps 1–2; the
-    /// tailnet step arrives with the integration PR, manual entry is the UI's).
-    pub(crate) async fn discover(&self) -> Vec<GatewayCandidate> {
+    /// Saved address, this machine, then one address per tailnet peer (spec §0 steps 1–3;
+    /// manual entry is the UI's). The tailnet is asked only for a `SameSigner` app
+    /// (`with_tailnet`): only it may pair, and it keeps uid-only peers from making the agent run
+    /// a child process. Every address is probed at once (at most `MAX_TAILNET_PEERS + 2`
+    /// probes, see `queues`); the first two start before the tailnet answers, so the whole call
+    /// takes at most `tailnet_timeout + probe_timeout`. Every Fogar that answers is returned,
+    /// in that order.
+    pub(crate) async fn discover(&self, with_tailnet: bool) -> Vec<GatewayCandidate> {
         let saved = load_record(&*self.secrets)
             .ok()
             .flatten()
             .map(|r| r.address.clone());
         let local = GatewayAddr::parse(LOCAL_GATEWAY).ok();
-        let mut tried: Vec<GatewayAddr> = Vec::with_capacity(2);
+        // Dropped with this future (agent shutdown): aborts every probe still running.
+        let mut probes = JoinSet::new();
+        let mut addrs: Vec<GatewayAddr> = Vec::with_capacity(MAX_TAILNET_PEERS + 2);
+        let mut start = |addr: GatewayAddr, probes: &mut JoinSet<_>| {
+            if addrs.contains(&addr) {
+                return;
+            }
+            let (i, me, a) = (addrs.len(), self.clone(), addr.clone());
+            addrs.push(addr);
+            probes.spawn(async move {
+                let probe = me.probe(&a).await;
+                (i, a, probe)
+            });
+        };
         for addr in saved.into_iter().chain(local) {
-            if tried.contains(&addr) {
-                continue;
-            }
-            if let Probe::Fogar(wk) = self.probe(&addr).await {
-                return vec![GatewayCandidate::new(
-                    addr.to_string(),
-                    label(wk.name),
-                    label(wk.version),
-                )];
-            }
-            tried.push(addr);
+            start(addr, &mut probes);
         }
-        Vec::new()
+        if with_tailnet && self.tailnet.capabilities().is_available() {
+            let peers = deadline(&*self.clock, self.cfg.tailnet_timeout, self.tailnet.peers())
+                .await
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            // The adapter promises the cap; the core does not rely on it.
+            for ip in peers.into_iter().take(MAX_TAILNET_PEERS) {
+                let addr = SocketAddr::new(ip, DEFAULT_GATEWAY_PORT).to_string();
+                if let Ok(addr) = GatewayAddr::parse(&addr) {
+                    start(addr, &mut probes);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        while let Some(r) = probes.join_next().await {
+            if let Ok((i, addr, Probe::Fogar(wk))) = r {
+                found.push((
+                    i,
+                    GatewayCandidate::new(addr.to_string(), label(wk.name), label(wk.version)),
+                ));
+            }
+        }
+        found.sort_by_key(|(i, _)| *i);
+        found.into_iter().map(|(_, c)| c).collect()
     }
 
     pub(crate) async fn pair(
@@ -436,6 +477,10 @@ mod tests {
     fn gateway_labels_are_cleaned_and_capped() {
         assert_eq!(label("green-house".into()), "green-house");
         assert_eq!(label("a\u{202E}b\nc\u{0}".into()), "abc");
+        assert_eq!(
+            label("green\u{200B}-house\u{FEFF}\u{2060}".into()),
+            "green-house"
+        );
         assert_eq!(label("ñ".repeat(500)).chars().count(), MAX_LABEL_CHARS);
     }
 
