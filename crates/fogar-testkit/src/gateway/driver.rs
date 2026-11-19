@@ -90,6 +90,8 @@ pub struct GatewayLog {
     pub audio_bytes: u64,
     pub turns_started: u32,
     pub turns_cancelled: u32,
+    /// Pushes dropped because another push was open (3.0.1 §10).
+    pub pushes_dropped: u32,
     pub tts_frames_sent: u64,
     pub closes_sent: Vec<(u16, String)>,
     pub client_closes: u32,
@@ -126,6 +128,7 @@ pub(crate) trait ServerTransport: Send {
 }
 
 struct Streaming {
+    push: bool,
     turn_id: String,
     seq: u16,
     left: u32,
@@ -139,7 +142,7 @@ struct Conn {
     output_audio: bool,
     turn_n: u32,
     streaming: Option<Streaming>,
-    /// Pushes queued behind the streaming turn: M19 never replaces a turn with a push (§10).
+    /// Pushes queued behind the user's streaming turn: M19 never replaces a turn with a push (§10).
     pending_pushes: u32,
     utterance_audio: u64,
     last_client: Instant,
@@ -252,9 +255,11 @@ impl Conn {
     async fn ctl<T: ServerTransport>(&mut self, t: &mut T, cmd: Ctl) -> Step {
         match cmd {
             Ctl::Close { code, reason } => {
-                // M19 ends the open turn with `closed` before these closes (spec §13).
+                // M19 ends the open turn with `closed` before these mid-session closes (spec §13):
+                // revoked, agent withdrawn, conversation taken, unreadable client config.
                 if self.cfg.m19
-                    && matches!(code, 4102 | 4200)
+                    && (matches!(code, 4020 | 4102 | 4200)
+                        || (code == 1011 && reason == "session setup failed"))
                     && matches!(self.cancel_turn(t, TurnEndReason::Closed).await, Step::Stop)
                 {
                     return Step::Stop;
@@ -263,6 +268,12 @@ impl Conn {
                 Step::Stop
             }
             Ctl::Abort => Step::Stop,
+            // 3.0.1 §10: never two pushes open at once. Another conversation's push is dropped
+            // (the same conversation's folds in; the mock has no conversations).
+            Ctl::Push if self.streaming.as_ref().is_some_and(|s| s.push) => {
+                self.log.lock().unwrap().pushes_dropped += 1;
+                Step::Continue
+            }
             Ctl::Push if self.streaming.is_some() => {
                 self.pending_pushes += 1;
                 Step::Continue
@@ -470,7 +481,9 @@ impl Conn {
         if self.pending_pushes == 0 {
             return Step::Continue;
         }
-        self.pending_pushes -= 1;
+        // Only one opens; the rest now find a push open and are dropped (3.0.1 §10).
+        self.log.lock().unwrap().pushes_dropped += self.pending_pushes - 1;
+        self.pending_pushes = 0;
         self.start_turn(t, TurnOrigin::Push).await
     }
 
@@ -511,6 +524,7 @@ impl Conn {
             0
         };
         self.streaming = Some(Streaming {
+            push: origin == TurnOrigin::Push,
             turn_id,
             seq,
             left: frames,

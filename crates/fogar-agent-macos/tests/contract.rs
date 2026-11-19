@@ -50,6 +50,7 @@ fogar_testkit::secret_store_contract!(test_keychain());
 fogar_testkit::audio_source_contract!(MacAudioSource);
 fogar_testkit::audio_sink_contract!(MacAudioSink);
 fogar_testkit::power_policy_contract!(MacPowerPolicy);
+fogar_testkit::tailnet_contract!(MacTailnet::default());
 fogar_testkit::ipc_server_contract!({
     let server = MacIpcServer::bind(&scratch_dir("ipc")).unwrap();
     let path = server.path().to_path_buf();

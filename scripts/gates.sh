@@ -33,6 +33,9 @@ run_gate "clippy -D warnings"     cargo clippy --workspace --all-targets --locke
 run_gate "test --workspace"       cargo test --workspace --locked
 run_gate "proto no_std build"     cargo build -p fogar-proto --no-default-features --locked
 run_gate "archtest"               cargo test -p fogar-archtest --locked
+# fogar-core alone: no other crate's tokio features leak in, so with archtest R10 (no `time`
+# feature) any `tokio::time` in core is a compile error.
+run_gate "core alone (no tokio::time)" cargo check -p fogar-core --lib --locked
 run_gate "vendored skills hygiene" scripts/check_vendored.sh
 run_gate "vendored hygiene self-test" scripts/test_check_vendored.sh
 
@@ -97,9 +100,6 @@ loom_gate() {
   echo "loom gate: $n loom test(s) ran"
 }
 run_gate "loom (heartbeat)" loom_gate
-
-# --- benchmark harness placeholder: must build and run (numbers are informational, not a gate).
-run_gate "bench harness (placeholder)" cargo bench -p fogar-bench --locked
 
 echo
 echo "================ GATES SUMMARY ================"

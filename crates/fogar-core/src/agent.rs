@@ -34,6 +34,7 @@ use fogar_ports::{
     random::Random,
     secrets::SecretStore,
     system_probe::{ProbeCaps, SystemProbe},
+    tailnet::{TailnetError, TailnetPeers},
 };
 use std::{future::Future, sync::Arc, time::Duration};
 use tokio::sync::{Semaphore, mpsc, watch};
@@ -41,13 +42,15 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 /// Everything the engine needs from the outside world, built by the composition root.
 #[allow(missing_debug_implementations)] // holds trait objects without Debug
-pub struct AgentPorts<C, L, I, H = NoHttp> {
+pub struct AgentPorts<C, L, I, H = NoHttp, T = NoTailnet> {
     pub clock: Arc<C>,
     pub link: L,
     /// `None` = no local UI socket on this platform/build.
     pub ipc: Option<I>,
     /// Discovery and pairing (`/.well-known`, `POST /pair`); used by the IPC service only.
     pub http: H,
+    /// Tailnet peers for discovery; `NoTailnet` where there is no adapter.
+    pub tailnet: T,
     pub secrets: Arc<dyn SecretStore>,
     pub random: Arc<dyn Random>,
     pub audio_in: Arc<dyn AudioSource>,
@@ -133,11 +136,12 @@ pub struct Agent<C> {
 
 impl<C: Clock> Agent<C> {
     /// Spawns the services on the current tokio runtime. Must be called inside a runtime.
-    pub fn start<L, I, H>(ports: AgentPorts<C, L, I, H>, cfg: Config, boot: BootMode) -> Self
+    pub fn start<L, I, H, T>(ports: AgentPorts<C, L, I, H, T>, cfg: Config, boot: BootMode) -> Self
     where
         L: GatewayLink,
         I: IpcServer,
         H: GatewayHttp,
+        T: TailnetPeers,
     {
         let cfg = Arc::new(cfg);
         let stats = Arc::new(Stats::default());
@@ -148,6 +152,8 @@ impl<C: Clock> Agent<C> {
         });
         // Pairing generation (`queues`: watch, coalescing): IPC pair/unpair -> link.
         let (pairing_tx, pairing_rx) = watch::channel(());
+        // IPC reconnect -> parked link (`queues`: watch, coalescing).
+        let (reconnect_tx, reconnect_rx) = watch::channel(());
         let (out_tx, out_rx) = mpsc::channel::<Frame>(queues::OUTBOUND);
         let (in_tx, in_rx) = mpsc::channel::<Inbound>(queues::INBOUND);
         let health = HealthProbe {
@@ -192,6 +198,8 @@ impl<C: Clock> Agent<C> {
             budget: queues::ByteBudget::new(queues::INBOUND_BYTES),
             pairing: pairing_rx,
             _pairing_keep: pairing_tx.clone(),
+            reconnect: reconnect_rx,
+            _reconnect_keep: reconnect_tx.clone(),
         };
         io.spawn(link.run(out_rx, in_tx, egress.clone()));
 
@@ -199,9 +207,11 @@ impl<C: Clock> Agent<C> {
             let pairing = Pairing {
                 clock: ports.clock.clone(),
                 http: Arc::new(ports.http),
+                tailnet: Arc::new(ports.tailnet),
                 secrets: ports.secrets,
                 cfg: cfg.clone(),
                 changed: pairing_tx,
+                reconnect: reconnect_tx,
                 lock: Arc::new(Semaphore::new(queues::PAIRING)),
             };
             edge.spawn(crate::ipc::run(
@@ -338,6 +348,19 @@ impl IpcServer for NoIpc {
     }
     async fn accept(&self) -> Result<(PeerIdentity, NoConn), IpcError> {
         std::future::pending().await
+    }
+}
+
+/// For platforms without a tailnet adapter: discovery skips the tailnet step.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoTailnet;
+
+impl TailnetPeers for NoTailnet {
+    fn capabilities(&self) -> fogar_ports::Support {
+        fogar_ports::Support::Unsupported
+    }
+    async fn peers(&self) -> Result<Vec<std::net::IpAddr>, TailnetError> {
+        Err(TailnetError::Unavailable)
     }
 }
 

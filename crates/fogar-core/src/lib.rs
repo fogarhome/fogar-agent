@@ -24,7 +24,7 @@ mod ipc;
 mod link;
 mod time;
 
-pub use agent::{Agent, AgentPorts, HealthProbe, NoHttp, NoIpc, ShutdownReport};
+pub use agent::{Agent, AgentPorts, HealthProbe, NoHttp, NoIpc, NoTailnet, ShutdownReport};
 pub use config::Config;
 pub use link::LinkView;
 pub use pairing::PairingRecord;

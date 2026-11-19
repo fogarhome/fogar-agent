@@ -2,7 +2,9 @@
 //! subscription, discovery and pairing. Connections live in a JoinSet drained in the same loop
 //! and aborted on shutdown.
 //!
-//! Authorization (IPC-4): `Pair`/`Unpair` change where the user's voice goes, so they are
+//! Authorization (IPC-4): `Pair`/`Unpair` change where the user's voice goes and `Reconnect`
+//! makes the agent spend the stored key to take the conversation back from another session (any
+//! same-user process could otherwise drive the 4102 ping-pong spec §13 forbids), so they are
 //! answered only for a `PeerCheck::SameSigner` peer, unless the composition root opted in to
 //! `UidOnly` peers at compile time (`Config::pair_from_uid_only_peers`). The rest is read-only.
 
@@ -16,6 +18,7 @@ use fogar_ports::{
     ipc::{
         IPC_VERSION, IpcConn, IpcError, IpcRequest, IpcResponse, IpcServer, PeerCheck, StatusReport,
     },
+    tailnet::TailnetPeers,
 };
 use std::{future::Future, sync::Arc, time::Duration};
 use tokio::task::JoinSet;
@@ -34,12 +37,12 @@ pub(crate) struct Limits {
     pub(crate) pair_from_uid_only_peers: bool,
 }
 
-pub(crate) async fn run<C: Clock, S: IpcServer, H: GatewayHttp>(
+pub(crate) async fn run<C: Clock, S: IpcServer, H: GatewayHttp, T: TailnetPeers>(
     server: S,
     clock: Arc<C>,
     health: HealthProbe,
     limits: Limits,
-    pairing: Pairing<C, H>,
+    pairing: Pairing<C, H, T>,
     ingress: CancellationToken,
 ) {
     let mut conns = JoinSet::new();
@@ -80,12 +83,12 @@ pub(crate) async fn run<C: Clock, S: IpcServer, H: GatewayHttp>(
     conns.shutdown().await;
 }
 
-struct Conn<K, C, H> {
+struct Conn<K, C, H, T> {
     conn: K,
     clock: Arc<C>,
     health: HealthProbe,
     limits: Limits,
-    pairing: Pairing<C, H>,
+    pairing: Pairing<C, H, T>,
     peer_check: PeerCheck,
     cancel: CancellationToken,
 }
@@ -103,7 +106,7 @@ fn report(health: &HealthProbe, v: &LinkView, peer_check: PeerCheck) -> StatusRe
     )
 }
 
-impl<K: IpcConn, C: Clock, H: GatewayHttp> Conn<K, C, H> {
+impl<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers> Conn<K, C, H, T> {
     /// `false` = the write failed or missed `write_timeout`: close the connection.
     async fn send(&mut self, resp: IpcResponse) -> bool {
         matches!(
@@ -144,7 +147,7 @@ async fn recv_within<C: Clock, K: IpcConn>(
     }
 }
 
-async fn serve<K: IpcConn, C: Clock, H: GatewayHttp>(mut c: Conn<K, C, H>) {
+async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Conn<K, C, H, T>) {
     let mut view = c.health.view.clone();
     let mut subscribed = false;
     // A peer that said another version is told ours, then refused (it must not guess).
@@ -198,13 +201,17 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp>(mut c: Conn<K, C, H>) {
                 last_pushed = Some(rep.clone());
                 IpcResponse::Event(rep)
             }
-            IpcRequest::Discover => match op(&c.cancel, c.pairing.discover()).await {
+            IpcRequest::Discover => match op(&c.cancel, c.pairing.discover(c.may_pair())).await {
                 Some(found) => IpcResponse::Discovered(found),
                 None => return,
             },
-            IpcRequest::Pair { .. } | IpcRequest::Unpair if !c.may_pair() => IpcResponse::Refused {
-                reason: "pairing needs the signed Fogar app",
-            },
+            IpcRequest::Pair { .. } | IpcRequest::Unpair | IpcRequest::Reconnect
+                if !c.may_pair() =>
+            {
+                IpcResponse::Refused {
+                    reason: "needs the signed Fogar app",
+                }
+            }
             IpcRequest::Pair { address, code } => {
                 match op(&c.cancel, c.pairing.pair(&address, code.as_ref())).await {
                     Some(Ok(info)) => IpcResponse::Paired(info),
@@ -218,6 +225,15 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp>(mut c: Conn<K, C, H>) {
                     reason: "could not delete the pairing",
                 },
                 None => return,
+            },
+            // Checked against the published state: the link only listens while parked for such a
+            // reason, and discards a request it saw before parking.
+            IpcRequest::Reconnect if view.borrow().state.user_may_reconnect() => {
+                c.pairing.reconnect.send_replace(());
+                IpcResponse::Reconnecting
+            }
+            IpcRequest::Reconnect => IpcResponse::Refused {
+                reason: "nothing to reconnect",
             },
             _ => IpcResponse::Refused {
                 reason: "unsupported request",

@@ -11,7 +11,9 @@ description = "macOS adapters: Keychain secret store and Unix-socket IPC with a 
 [target.'cfg(target_os = "macos")'.dependencies]
 fogar-ports = { workspace = true }
 fogar-host = { workspace = true }
-tokio = { workspace = true, features = ["net", "io-util", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "sync", "time", "process"] }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
 zeroize = { workspace = true, features = ["alloc"] }
 security-framework = { workspace = true }
 core-foundation = { workspace = true }

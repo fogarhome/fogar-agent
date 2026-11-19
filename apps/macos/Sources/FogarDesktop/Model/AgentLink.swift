@@ -28,7 +28,8 @@ enum AgentState: Equatable {
 enum CommandError: Error, Equatable {
     case agentNotRunning
     case versionMismatch(agent: UInt32)
-    /// `refused`: on pair/unpair, the agent did not verify this app's signer (uid_only).
+    /// `refused`: on pair/unpair/reconnect, the agent did not verify this app's signer (uid_only);
+    /// on reconnect also «nothing to reconnect» (the link left the pause meanwhile).
     case refused
     case noAnswer
     case unexpected
@@ -44,6 +45,12 @@ final class AgentLink {
     private(set) var state: AgentState = .looking
     /// When the current state began (for «desde hace…» and the log in later slices).
     private(set) var since = Date()
+    /// The agent went from paired to `not_paired` without this app asking (gateway revocation).
+    // shortcut: only seen while the app runs; an app opened after the revocation cannot tell it from
+    // «never paired». Upgrade with the close code in `WireStatus` (contract PR: fogar-ports/testkit).
+    private(set) var accesoRetirado = false
+    /// Set before this app's own `unpair` goes out: its `not_paired` event can beat the answer.
+    @ObservationIgnored private var desemparejando = false
 
     @ObservationIgnored let socketPath: String
     @ObservationIgnored private var loop: Task<Void, Never>?
@@ -130,8 +137,20 @@ final class AgentLink {
 
     private func set(_ new: AgentState) {
         guard new != state else { return }
+        accesoRetirado = Self.retirado(antes: state, despues: new, desemparejando: desemparejando, yaRetirado: accesoRetirado)
+        if new.status?.phase == .notPaired { desemparejando = false }
         if new.phaseKey != state.phaseKey { since = Date() }
         state = new
+    }
+
+    /// Whether the notice «se retiró el acceso» holds after `antes` → `despues`.
+    static func retirado(antes: AgentState, despues: AgentState, desemparejando: Bool, yaRetirado: Bool) -> Bool {
+        guard let fase = despues.status?.phase else { return yaRetirado } // agent silent: keep what we knew
+        guard fase == .notPaired else { return false }
+        // Paired before = a phase with a gateway (a Keychain error at boot shows `reconnecting`
+        // with none, then `not_paired`: never paired, nothing was withdrawn).
+        if let previa = antes.status, previa.phase != .notPaired, previa.gateway != nil { return !desemparejando }
+        return yaRetirado
     }
 
     // MARK: Commands
@@ -158,7 +177,24 @@ final class AgentLink {
     }
 
     func unpair() async throws(CommandError) {
-        guard case .unpaired = try await command(.unpair, timeout: .seconds(5)) else { throw .unexpected }
+        desemparejando = true
+        do throws(CommandError) {
+            guard case .unpaired = try await command(.unpair, timeout: .seconds(5)) else { throw CommandError.unexpected }
+        } catch {
+            // Only when the agent surely did nothing: after `noAnswer` it may still unpair, and its
+            // `not_paired` must not read as a revocation (the next `not_paired` clears the flag).
+            switch error {
+            case .agentNotRunning, .refused, .versionMismatch: desemparejando = false
+            case .noAnswer, .unexpected: break
+            }
+            throw error
+        }
+    }
+
+    /// One new attempt from a link parked by the gateway (`parked_conversation_taken`,
+    /// `parked_agent_refused`); how it goes arrives as live status.
+    func reconnect() async throws(CommandError) {
+        guard case .reconnecting = try await command(.reconnect, timeout: .seconds(5)) else { throw .unexpected }
     }
 
     private func command(_ request: WireRequest, timeout: Duration) async throws(CommandError) -> WireResponse {

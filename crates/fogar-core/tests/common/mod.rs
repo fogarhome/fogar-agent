@@ -3,17 +3,18 @@
 #![allow(dead_code)]
 
 use fogar_core::{
-    Agent, AgentPorts, Config, HealthProbe, LinkState, LinkView, NoHttp, NoIpc, PairingRecord,
-    crashloop::BootMode,
+    Agent, AgentPorts, Config, HealthProbe, LinkState, LinkView, NoHttp, NoIpc, NoTailnet,
+    PairingRecord, crashloop::BootMode,
 };
 use fogar_ports::{
     gateway::{GatewayAddr, GatewayLink},
-    ipc::{IpcCaps, IpcError, IpcServer, PeerIdentity},
+    gateway_http::{GatewayHttp, HttpCall, HttpError, HttpReply},
     secrets::{SecretKey, SecretStore},
 };
 use fogar_testkit::{
-    FakeGatewayHttp, FakeGatewayLink, FakeIpc, FakeMic, FakeSpeaker, FakeSystemProbe, HttpRoutes,
-    MemorySecretStore, MockConfig, SeededRandom, TestClock, silence_chunks, tone_chunks,
+    FakeGatewayHttp, FakeGatewayLink, FakeIpc, FakeMic, FakeSpeaker, FakeSystemProbe, FakeTailnet,
+    HttpRoutes, MemorySecretStore, MockConfig, SeededRandom, TestClock, silence_chunks,
+    tone_chunks,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -59,29 +60,6 @@ pub(crate) fn paired_store(key: &str) -> MemorySecretStore {
     s
 }
 
-/// `FakeIpc` whose peers the "adapter" verified as the same signer (`signed`) or by uid only.
-#[derive(Debug, Clone)]
-pub(crate) struct TestIpc {
-    pub(crate) inner: FakeIpc,
-    pub(crate) signed: bool,
-}
-
-impl IpcServer for TestIpc {
-    type Conn = <FakeIpc as IpcServer>::Conn;
-    fn capabilities(&self) -> IpcCaps {
-        self.inner.capabilities()
-    }
-    async fn accept(&self) -> Result<(PeerIdentity, Self::Conn), IpcError> {
-        let (peer, conn) = self.inner.accept().await?;
-        let peer = if self.signed {
-            PeerIdentity::verified_signer(peer.uid, "com.fogar.desktop".into())
-        } else {
-            peer
-        };
-        Ok((peer, conn))
-    }
-}
-
 pub(crate) struct RigBuilder<L: GatewayLink> {
     pub(crate) cfg: Config,
     pub(crate) link: L,
@@ -92,6 +70,38 @@ pub(crate) struct RigBuilder<L: GatewayLink> {
     /// IPC peers are verified as the same signer (else uid only).
     pub(crate) signed_peer: bool,
     pub(crate) routes: HttpRoutes,
+    /// Addresses where a gateway answers `routes` (all share them).
+    pub(crate) http_addrs: Vec<&'static str>,
+    pub(crate) tailnet: FakeTailnet,
+}
+
+/// Several `FakeGatewayHttp`s, one per address (discovery may find more than one gateway).
+/// An unknown address goes to the first one: it applies the cleartext policy, then answers
+/// `Unreachable`. `http_addrs` must not be empty.
+#[derive(Debug)]
+pub(crate) struct MultiHttp(Vec<FakeGatewayHttp>);
+
+impl MultiHttp {
+    fn pick(&self, addr: &GatewayAddr) -> &FakeGatewayHttp {
+        self.0
+            .iter()
+            .find(|h| h.addr() == *addr)
+            .unwrap_or(&self.0[0])
+    }
+}
+
+impl GatewayHttp for MultiHttp {
+    async fn get(&self, addr: &GatewayAddr, call: HttpCall) -> Result<HttpReply, HttpError> {
+        self.pick(addr).get(addr, call).await
+    }
+    async fn post_json(
+        &self,
+        addr: &GatewayAddr,
+        call: HttpCall,
+        body: secrecy::zeroize::Zeroizing<Vec<u8>>,
+    ) -> Result<HttpReply, HttpError> {
+        self.pick(addr).post_json(addr, call, body).await
+    }
 }
 
 impl RigBuilder<FakeGatewayLink> {
@@ -112,20 +122,34 @@ impl<L: GatewayLink + Clone> RigBuilder<L> {
             with_ipc: false,
             signed_peer: true,
             routes: HttpRoutes::fogar("green-house"),
+            http_addrs: vec![GW_ADDR],
+            tailnet: FakeTailnet::unsupported(),
         }
     }
 
     pub(crate) fn start(self) -> Rig<L> {
         let clock = TestClock::new();
-        let ipc = self.with_ipc.then(FakeIpc::new);
+        let signed = self.signed_peer;
+        let ipc = self.with_ipc.then(|| {
+            if signed {
+                FakeIpc::signed()
+            } else {
+                FakeIpc::new()
+            }
+        });
         let ports = AgentPorts {
             clock: Arc::new(clock),
             link: self.link.clone(),
-            ipc: ipc.clone().map(|inner| TestIpc {
-                inner,
-                signed: self.signed_peer,
-            }),
-            http: FakeGatewayHttp::at(self.routes.clone(), GatewayAddr::parse(GW_ADDR).unwrap()),
+            ipc: ipc.clone(),
+            http: MultiHttp(
+                self.http_addrs
+                    .iter()
+                    .map(|a| {
+                        FakeGatewayHttp::at(self.routes.clone(), GatewayAddr::parse(a).unwrap())
+                    })
+                    .collect(),
+            ),
+            tailnet: self.tailnet,
             secrets: self.secrets.clone(),
             random: Arc::new(SeededRandom::new(7)),
             audio_in: Arc::new(self.mic.clone()),
@@ -157,6 +181,7 @@ pub(crate) fn start_no_ipc<L: GatewayLink + Clone>(
         link: b.link.clone(),
         ipc: None,
         http: NoHttp,
+        tailnet: NoTailnet,
         secrets: b.secrets.clone(),
         random: Arc::new(SeededRandom::new(7)),
         audio_in: Arc::new(b.mic.clone()),

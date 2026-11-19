@@ -289,6 +289,7 @@ async fn serve(
         link: WsGatewayLink::new(WsConfig::default()),
         ipc: p.ipc,
         http: HttpGateway::new(HttpConfig::default()),
+        tailnet: p.tailnet,
         secrets: p.secrets,
         random: Arc::new(PrngRandom::new()),
         audio_in: p.audio_in,
@@ -299,6 +300,9 @@ async fn serve(
     let watchdog = Watchdog::spawn(agent.heartbeat(), clock.epoch_std(), state_dir.clone());
     let mut health = agent.health();
     let mut last = String::new();
+    // The close at the previous state change: `not_paired` names its close only when it is new
+    // (a revocation), never a stale one before an Unpair.
+    let mut prev_close = None;
     let mut limiter = status_log::LogLimiter::new(STATUS_LOG_WINDOW, STATUS_LOG_BURST);
     // Round-2 review F3: armed when a line is first suppressed; reports the count one window
     // later even if no further line is ever printed. Unarmed it costs no wakeups.
@@ -314,6 +318,7 @@ async fn serve(
             () = stop.recv() => break,
             v = health.wait_link(|v| v.state.label() != last) => {
                 last = v.state.label().to_owned();
+                let fresh = v.last_close != std::mem::replace(&mut prev_close, v.last_close);
                 let important = status_log::always_log(&v.state);
                 match limiter.check(std::time::Instant::now(), important) {
                     status_log::Verdict::Suppress => {
@@ -329,7 +334,8 @@ async fn serve(
                     status_log::Verdict::Print(None) => {}
                 }
                 match v.last_close {
-                    Some((code, action)) if matches!(v.state, LinkState::Backoff { .. } | LinkState::Parked { .. }) => {
+                    Some((code, action)) if matches!(v.state, LinkState::Backoff { .. } | LinkState::Parked { .. })
+                        || (fresh && v.state == LinkState::NotPaired) => {
                         eprintln!("fogar-agentd: link {last} (last close {code} -> {action:?})");
                     }
                     _ => eprintln!("fogar-agentd: link {last}"),

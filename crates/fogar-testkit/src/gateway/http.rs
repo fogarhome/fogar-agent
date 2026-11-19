@@ -15,7 +15,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     task::JoinHandle,
 };
 
@@ -237,37 +237,8 @@ impl MockHttpServer {
         };
         let r = routes.clone();
         let task = tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                let r = r.clone();
-                tokio::spawn(async move {
-                    let Some(req) = read_request(&mut sock).await else {
-                        return;
-                    };
-                    let rep = r.answer(req);
-                    if let Some(d) = rep.delay {
-                        tokio::time::sleep(d).await;
-                    }
-                    if rep.endless {
-                        let _ = sock
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100000000\r\n\r\n")
-                            .await;
-                        let chunk = vec![b' '; 4096];
-                        while sock.write_all(&chunk).await.is_ok() {}
-                        return;
-                    }
-                    let mut head = format!(
-                        "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-                        rep.status,
-                        rep.body.len()
-                    );
-                    if let Some(l) = rep.location {
-                        head.push_str(&format!("Location: {l}\r\n"));
-                    }
-                    head.push_str("\r\n");
-                    let _ = sock.write_all(head.as_bytes()).await;
-                    let _ = sock.write_all(&rep.body).await;
-                    let _ = sock.shutdown().await;
-                });
+            while let Ok((sock, _)) = listener.accept().await {
+                tokio::spawn(serve_http(sock, r.clone()));
             }
         });
         Ok(Self {
@@ -288,7 +259,38 @@ impl MockHttpServer {
     }
 }
 
-async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<SeenRequest> {
+/// Answers one request on `sock` from `routes` (`Connection: close`).
+pub(crate) async fn serve_http(mut sock: TcpStream, routes: HttpRoutes) {
+    let Some(req) = read_request(&mut sock).await else {
+        return;
+    };
+    let rep = routes.answer(req);
+    if let Some(d) = rep.delay {
+        tokio::time::sleep(d).await;
+    }
+    if rep.endless {
+        let _ = sock
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100000000\r\n\r\n")
+            .await;
+        let chunk = vec![b' '; 4096];
+        while sock.write_all(&chunk).await.is_ok() {}
+        return;
+    }
+    let mut head = format!(
+        "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        rep.status,
+        rep.body.len()
+    );
+    if let Some(l) = rep.location {
+        head.push_str(&format!("Location: {l}\r\n"));
+    }
+    head.push_str("\r\n");
+    let _ = sock.write_all(head.as_bytes()).await;
+    let _ = sock.write_all(&rep.body).await;
+    let _ = sock.shutdown().await;
+}
+
+async fn read_request(sock: &mut TcpStream) -> Option<SeenRequest> {
     let mut buf = Vec::new();
     let head_end = loop {
         if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {

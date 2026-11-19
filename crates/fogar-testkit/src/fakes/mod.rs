@@ -11,5 +11,5 @@ pub use audio::{
 };
 pub use clock::TestClock;
 pub use ipc::{FakeIpc, FakeIpcClient};
-pub use misc::{FakePowerPolicy, MemorySecretStore, SeededRandom};
+pub use misc::{FakePowerPolicy, FakeTailnet, MemorySecretStore, SeededRandom};
 pub use probe::FakeSystemProbe;

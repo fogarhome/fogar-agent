@@ -31,7 +31,7 @@ retried after reconnect may duplicate; no desktop `client_type`.
 
 ## Amendment (2026-11-15): gateway M19 ("v3") compatibility
 The gateway's M19 (conversations, OpenClaw routing; branch `claude/hopeful-pasteur-phx8ad`, not yet
-released) changes the client protocol. The agent speaks BOTH generations until every gateway is on
+released at the time; released as 3.0.0 on gateway main, E2E pinned to 3.0.1 since 2026-11-19) changes the client protocol. The agent speaks BOTH generations until every gateway is on
 M19:
 - Closes: M19 gives each application reason its own 4xxx code and the code is the contract
   (`fogar_proto::close::classify_close`): 4010/4200 re-pair, 4020/4021 agent refused, 4102
