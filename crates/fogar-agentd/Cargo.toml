@@ -35,7 +35,7 @@ fogar-agent-macos = { workspace = true }
 [dev-dependencies]
 fogar-testkit = { workspace = true }
 fogar-proto = { workspace = true, features = ["std"] }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net", "io-util", "process"] }
 tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }
 futures-util = { workspace = true, features = ["sink", "std"] }
 
