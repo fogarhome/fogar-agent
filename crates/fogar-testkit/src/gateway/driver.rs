@@ -4,8 +4,8 @@ use fogar_proto::{
     ClientMsg, Handshake, OutputMode, decode_client, encode_tts_frame,
     limits::HANDSHAKE_MAX_CHARS,
     server::{
-        Capabilities, ErrorMsg, Ready, ServerMsg, Status, Token, Transcription, TurnEnd,
-        TurnEndReason, TurnOrigin, TurnStart,
+        Capabilities, ErrorMsg, ProgressPhase, Ready, ServerMsg, Status, Token, Transcription,
+        TurnEnd, TurnEndReason, TurnOrigin, TurnProgress, TurnStart,
     },
 };
 use std::{
@@ -43,6 +43,15 @@ pub struct MockConfig {
     /// Keep per-message records (`client_msgs`, `sends`, `closes_sent`). Turn it off for soaks:
     /// the log would otherwise be the only thing growing.
     pub record: bool,
+    /// `turn_progress` sent after each `turn_start`, in order, when the session asked for
+    /// `status` (3.0.1 §5).
+    pub progress: Vec<(ProgressPhase, Option<String>)>,
+    /// Send a `transcription_partial` (the transcript) every this many audio frames while the
+    /// client records; `None` = only the one before the final (silence, as green-house does).
+    pub partial_every_frames: Option<u64>,
+    /// `false` plays a gateway without voice: `status transcriber/tts unavailable` before
+    /// `ready` and `live_capabilities` all false (3.0.1 §3). Text still works.
+    pub voice: bool,
 }
 
 impl Default for MockConfig {
@@ -59,6 +68,13 @@ impl Default for MockConfig {
             handshake_timeout: Duration::from_secs(5),
             m19: true,
             record: true,
+            progress: vec![
+                (ProgressPhase::Preparing, None),
+                (ProgressPhase::Tool, Some("ha_call_service".into())),
+                (ProgressPhase::Thinking, None),
+            ],
+            partial_every_frames: None,
+            voice: true,
         }
     }
 }
@@ -140,11 +156,13 @@ struct Conn {
     log: SharedLog,
     output_text: bool,
     output_audio: bool,
+    output_status: bool,
     turn_n: u32,
     streaming: Option<Streaming>,
     /// Pushes queued behind the user's streaming turn: M19 never replaces a turn with a push (§10).
     pending_pushes: u32,
     utterance_audio: u64,
+    utterance_frames: u64,
     last_client: Instant,
 }
 
@@ -175,10 +193,12 @@ pub(crate) async fn run_conn<T: ServerTransport>(
         log: log.clone(),
         output_text: false,
         output_audio: false,
+        output_status: false,
         turn_n: 0,
         streaming: None,
         pending_pushes: 0,
         utterance_audio: 0,
+        utterance_frames: 0,
         last_client: Instant::now(),
     };
     // Phase 1: handshake.
@@ -309,6 +329,7 @@ impl Conn {
         }
         self.output_text = hs.output_mode.contains(&OutputMode::Text);
         self.output_audio = hs.output_mode.contains(&OutputMode::Audio);
+        self.output_status = hs.output_mode.contains(&OutputMode::Status);
         {
             let mut l = self.log.lock().unwrap();
             l.handshakes_ok += 1;
@@ -332,6 +353,24 @@ impl Conn {
                 return false;
             }
         }
+        if !self.cfg.voice {
+            for service in ["transcriber", "tts"] {
+                let st = ServerMsg::Status(Status {
+                    service: service.into(),
+                    state: "unavailable".into(),
+                    code: None,
+                    message: None,
+                });
+                if matches!(self.send(t, &st).await, Step::Stop) {
+                    return false;
+                }
+            }
+        }
+        let live = Capabilities {
+            barge_in: self.cfg.voice,
+            tts: self.cfg.voice,
+            transcriber: self.cfg.voice,
+        };
         let caps = Capabilities {
             barge_in: true,
             tts: true,
@@ -343,7 +382,7 @@ impl Conn {
             input_mode: Some(hs.input_mode),
             output_mode: hs.output_mode.clone(),
             requested_capabilities: caps,
-            live_capabilities: caps,
+            live_capabilities: live,
         });
         matches!(self.send(t, &ready).await, Step::Continue)
     }
@@ -381,12 +420,21 @@ impl Conn {
                 Step::Stop
             }
             Some(ClientIn::Binary(b)) => {
-                let mut l = self.log.lock().unwrap();
-                l.audio_frames += 1;
-                l.audio_bytes += b.len() as u64;
-                drop(l);
+                {
+                    let mut l = self.log.lock().unwrap();
+                    l.audio_frames += 1;
+                    l.audio_bytes += b.len() as u64;
+                }
                 self.utterance_audio += b.len() as u64;
-                Step::Continue
+                self.utterance_frames += 1;
+                match self.cfg.partial_every_frames {
+                    Some(n) if n > 0 && self.utterance_frames % n == 0 => {
+                        let text = self.cfg.transcript.clone();
+                        self.send(t, &ServerMsg::TranscriptionPartial(Transcription { text }))
+                            .await
+                    }
+                    _ => Step::Continue,
+                }
             }
             Some(ClientIn::Text(s)) => match decode_client(&s) {
                 Ok(msg) => self.on_msg(t, msg).await,
@@ -432,6 +480,7 @@ impl Conn {
                     String::new()
                 };
                 self.utterance_audio = 0;
+                self.utterance_frames = 0;
                 let partial = ServerMsg::TranscriptionPartial(Transcription { text: text.clone() });
                 if matches!(self.send(t, &partial).await, Step::Stop) {
                     return Step::Stop;
@@ -500,6 +549,18 @@ impl Conn {
         });
         if matches!(self.send(t, &start).await, Step::Stop) {
             return Step::Stop;
+        }
+        if self.output_status {
+            for (phase, tool) in self.cfg.progress.clone() {
+                let p = ServerMsg::TurnProgress(TurnProgress {
+                    turn_id: turn_id.clone(),
+                    phase,
+                    tool,
+                });
+                if matches!(self.send(t, &p).await, Step::Stop) {
+                    return Step::Stop;
+                }
+            }
         }
         if self.output_text {
             let reply = self.cfg.reply_text.clone();

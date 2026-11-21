@@ -819,9 +819,11 @@ pub mod gateway_link {
 pub mod ipc_server {
     //! `$make` evaluates (inside the runtime) to `(server, connect)` where `connect().await`
     //! yields a client speaking the adapter's wire format through [`IpcTestClient`].
+    use fogar_ports::audio::MicPermission;
     use fogar_ports::ipc::{
-        GatewayInfo, IpcConn, IpcRequest, IpcResponse, IpcServer, LinkPhase, PairCode, PairFailure,
-        PeerCheck, StatusReport,
+        CaptureGesture, CaptureThen, ConversationView, GatewayInfo, IpcConn, IpcRequest,
+        IpcResponse, IpcServer, LinkPhase, PairCode, PairFailure, PeerCheck, StatusReport,
+        TurnView, UserText,
     };
     use std::{future::Future, time::Duration};
 
@@ -897,12 +899,106 @@ pub mod ipc_server {
                 }
                 IpcRequest::Unpair => IpcResponse::Unpaired,
                 IpcRequest::Reconnect => IpcResponse::Reconnecting,
+                IpcRequest::SubscribeConversation => {
+                    conn.send(IpcResponse::ConversationSubscribed)
+                        .await
+                        .expect("send");
+                    conn.send(IpcResponse::Conversation(big_view()))
+                        .await
+                        .expect("push a near-limit view");
+                    continue;
+                }
+                IpcRequest::SendText { text } => {
+                    assert_eq!(text.0, USER_TEXT, "user text must cross the wire intact");
+                    IpcResponse::TextAccepted
+                }
+                IpcRequest::CaptureStart {
+                    gesture: CaptureGesture::Hold,
+                } => IpcResponse::CaptureStarted,
+                IpcRequest::CaptureEnd {
+                    then: CaptureThen::Review,
+                } => IpcResponse::CaptureEnded,
+                IpcRequest::CancelTurn => IpcResponse::TurnCancelSent,
+                IpcRequest::TurnVisible { turn_id } if turn_id == "t-9" => {
+                    IpcResponse::TurnVisibleNoted
+                }
+                IpcRequest::RequestMicPermission => {
+                    IpcResponse::MicPermission(MicPermission::NotDetermined)
+                }
                 _ => IpcResponse::Refused {
                     reason: "unsupported request",
                 },
             };
             conn.send(resp).await.expect("send");
         }
+    }
+
+    const USER_TEXT: &str = "¿Qué tal? \"comillas\" \\ y salto\nde línea";
+
+    /// A view whose frame is close to `MAX_FRAME_BYTES` but fits untouched.
+    fn big_view() -> ConversationView {
+        let mut t = TurnView::default();
+        t.turn_id = "t-9".into();
+        t.mine = USER_TEXT.into();
+        t.reply = "x".repeat(60 * 1024);
+        let mut v = ConversationView::default();
+        v.turns = vec![t];
+        v.live = "pon".into();
+        v
+    }
+
+    /// IPC v4: every conversation request and answer crosses the adapter intact, including a
+    /// pushed view near the frame limit and the user's text with characters that need escaping.
+    pub async fn conversation_crosses_intact<S, F, Fut, K>(server: S, connect: F)
+    where
+        S: IpcServer,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = K>,
+        K: IpcTestClient,
+    {
+        let client = async {
+            let mut c = connect().await;
+            assert_eq!(
+                c.request(IpcRequest::SubscribeConversation).await,
+                Some(IpcResponse::ConversationSubscribed)
+            );
+            assert_eq!(c.next().await, Some(IpcResponse::Conversation(big_view())));
+            for (req, want) in [
+                (
+                    IpcRequest::SendText {
+                        text: UserText(USER_TEXT.into()),
+                    },
+                    IpcResponse::TextAccepted,
+                ),
+                (
+                    IpcRequest::CaptureStart {
+                        gesture: CaptureGesture::Hold,
+                    },
+                    IpcResponse::CaptureStarted,
+                ),
+                (
+                    IpcRequest::CaptureEnd {
+                        then: CaptureThen::Review,
+                    },
+                    IpcResponse::CaptureEnded,
+                ),
+                (IpcRequest::CancelTurn, IpcResponse::TurnCancelSent),
+                (
+                    IpcRequest::TurnVisible {
+                        turn_id: "t-9".into(),
+                    },
+                    IpcResponse::TurnVisibleNoted,
+                ),
+                (
+                    IpcRequest::RequestMicPermission,
+                    IpcResponse::MicPermission(MicPermission::NotDetermined),
+                ),
+            ] {
+                assert_eq!(c.request(req).await, Some(want));
+            }
+            drop(c);
+        };
+        bounded(async { tokio::join!(serve_one(&server, 0), client) }).await;
     }
 
     async fn bounded<F: Future>(f: F) {
@@ -1112,6 +1208,13 @@ pub mod ipc_server {
                     $crate::run_async(async {
                         let (server, connect) = $make;
                         c::unsolicited_send_reaches_client(server, connect).await
+                    })
+                }
+                #[test]
+                fn conversation_crosses_intact() {
+                    $crate::run_async(async {
+                        let (server, connect) = $make;
+                        c::conversation_crosses_intact(server, connect).await
                     })
                 }
                 #[test]
