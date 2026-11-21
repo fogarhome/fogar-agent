@@ -99,8 +99,10 @@ pub struct TurnMachine {
     suppressed_seq: Option<u16>,
     /// `send`s we stopped waiting for (cancel, local timeout, a newer text) whose `turn_start`
     /// may still arrive. Sends are never matched to their turn otherwise, so such a late
-    /// `turn_start` would play in full and show as a phantom turn. GUESSED gateway behaviour:
-    /// one `turn_start` per `send`, in order, at most `ABANDONED_SEND_TTL` late. Saturating.
+    /// `turn_start` would play in full and show as a phantom turn. CERTAIN (3.0.1 §5): while the
+    /// session is open every accepted `send` gets exactly one `turn_start`/`turn_end` pair, even
+    /// if cancelled or replaced before it starts. GUESSED: at most `ABANDONED_SEND_TTL` late.
+    /// Saturating.
     abandoned: u8,
     /// When `abandoned` was last bumped; the count expires `ABANDONED_SEND_TTL` after it.
     abandoned_at: Mono,
