@@ -33,7 +33,7 @@ impl AudioFormat {
 }
 
 /// Microphone permission as the OS reports it. Querying it must never prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum MicPermission {
     Granted,
@@ -41,6 +41,7 @@ pub enum MicPermission {
     NotDetermined,
     Restricted,
     /// The platform has no permission model (Linux) or the adapter cannot tell.
+    #[default]
     Unknown,
 }
 
