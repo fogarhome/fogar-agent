@@ -144,3 +144,31 @@ fn a_gateway_without_voice_says_so_before_ready() {
         assert!(!r.live_capabilities.transcriber && !r.live_capabilities.tts);
     });
 }
+
+#[test]
+fn without_voice_only_what_was_asked_is_reported_and_audio_is_discarded() {
+    fogar_testkit::run_async(async {
+        let mut cfg = MockConfig::default();
+        cfg.voice = false;
+        cfg.status_before_ready = false;
+        cfg.partial_every_frames = Some(1);
+        let mut frames: Vec<Frame> = (0..5).map(|_| Frame::Binary(vec![0; 1280])).collect();
+        frames.push(Frame::Text(r#"{"type":"end"}"#.into()));
+        frames.push(send("hola"));
+        // audio in, text out: transcriber unavailable only; no transcript; the turn is text only.
+        let got = session(cfg.clone(), r#"["text"]"#, &frames, is_end).await;
+        let unavailable: Vec<_> = got
+            .iter()
+            .filter_map(|m| match m {
+                ServerMsg::Status(s) if s.state == "unavailable" => Some(s.service.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(unavailable, ["transcriber"]);
+        assert!(!got.iter().any(|m| matches!(
+            m,
+            ServerMsg::TranscriptionPartial(_) | ServerMsg::Transcription(_)
+        )));
+        assert!(got.iter().any(is_end), "text still works");
+    });
+}

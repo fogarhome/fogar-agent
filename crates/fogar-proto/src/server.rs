@@ -710,7 +710,8 @@ pub struct PipelineEvent {
     pub stage: String,
     #[serde(default)]
     pub turn: Option<u64>,
-    /// CERTAIN (3.0.1 §15): ms since the session's (or turn's) reference point.
+    /// CERTAIN (3.0.1 §15): ms since the session's PREVIOUS stage, whatever it was (not since
+    /// the turn's start). To measure a span, add the stages that make it up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u64>,
 }

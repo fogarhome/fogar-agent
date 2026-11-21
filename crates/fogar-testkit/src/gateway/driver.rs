@@ -1,7 +1,7 @@
 //! Transport-independent server side of protocol v1 (one connection).
 
 use fogar_proto::{
-    ClientMsg, Handshake, OutputMode, decode_client, encode_tts_frame,
+    ClientMsg, Handshake, InputMode, OutputMode, decode_client, encode_tts_frame,
     limits::HANDSHAKE_MAX_CHARS,
     server::{
         Capabilities, ErrorMsg, ProgressPhase, Ready, ServerMsg, Status, Token, Transcription,
@@ -354,7 +354,12 @@ impl Conn {
             }
         }
         if !self.cfg.voice {
-            for service in ["transcriber", "tts"] {
+            // Only for what the session asked for (3.0.1 §1): a text-only session gets neither.
+            let services = [
+                ("transcriber", hs.input_mode == InputMode::Audio),
+                ("tts", self.output_audio),
+            ];
+            for (service, _) in services.into_iter().filter(|(_, asked)| *asked) {
                 let st = ServerMsg::Status(Status {
                     service: service.into(),
                     state: "unavailable".into(),
@@ -425,6 +430,9 @@ impl Conn {
                     l.audio_frames += 1;
                     l.audio_bytes += b.len() as u64;
                 }
+                if !self.cfg.voice {
+                    return Step::Continue; // voice off: the audio is discarded (3.0.1 §1)
+                }
                 self.utterance_audio += b.len() as u64;
                 self.utterance_frames += 1;
                 match self.cfg.partial_every_frames {
@@ -473,6 +481,7 @@ impl Conn {
         }
         match msg {
             ClientMsg::Keepalive => Step::Continue,
+            ClientMsg::End if !self.cfg.voice => Step::Continue,
             ClientMsg::End => {
                 let text = if self.utterance_audio > 0 {
                     self.cfg.transcript.clone()
@@ -579,7 +588,7 @@ impl Conn {
                 }
             }
         }
-        let frames = if self.output_audio {
+        let frames = if self.output_audio && self.cfg.voice {
             self.cfg.tts_frames
         } else {
             0

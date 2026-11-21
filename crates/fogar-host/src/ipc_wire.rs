@@ -655,9 +655,10 @@ fn mic_to_wire(m: MicPermission) -> WireMic {
     match m {
         MicPermission::Granted => WireMic::Granted,
         MicPermission::Denied => WireMic::Denied,
-        MicPermission::NotDetermined => WireMic::NotDetermined,
         MicPermission::Restricted => WireMic::Restricted,
-        _ => WireMic::Unknown,
+        MicPermission::Unknown => WireMic::Unknown,
+        // NotDetermined and any future state: fail closed (the UI offers to ask).
+        _ => WireMic::NotDetermined,
     }
 }
 
@@ -786,10 +787,11 @@ fn turn_from_wire(t: WireTurn) -> TurnView {
 fn conversation_to_wire(c: ConversationView) -> WireConversation {
     WireConversation {
         activity: match c.activity {
-            UserActivity::Recording => WireActivity::Recording,
+            UserActivity::Idle => WireActivity::Idle,
             UserActivity::Transcribing => WireActivity::Transcribing,
             UserActivity::AwaitingReply => WireActivity::AwaitingReply,
-            _ => WireActivity::Idle,
+            // Recording and any future activity: say the microphone may be on.
+            _ => WireActivity::Recording,
         },
         live: c.live,
         draft: c.draft,
