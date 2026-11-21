@@ -136,7 +136,9 @@ pub enum IpcRequest {
     /// admin fixed it). Answered with `Reconnecting` (one new attempt; progress arrives as status
     /// `Event`s), or `Refused` when the link is not parked for such a reason.
     Reconnect,
-    // ---- conversation (v4). SameSigner only, like Pair: they carry or reveal user content. ----
+    // ---- conversation (v4). Strictly `PeerCheck::SameSigner`: they carry or reveal user
+    // content and can open the microphone. NOT `may_pair()`: the development uid-only opt-in
+    // for pairing never extends to these. ----
     /// From now on the agent pushes `IpcResponse::Conversation` (latest view only). Answered
     /// with `ConversationSubscribed` + one `Conversation`. Only a subscribed connection may
     /// start a take or confirm a turn as visible.
@@ -144,7 +146,9 @@ pub enum IpcRequest {
     /// Typed (or reviewed) text. Answered with `TextAccepted` or `TextRefused`.
     SendText { text: UserText },
     /// The person pressed the microphone button. The core's single consent point decides.
-    /// Answered with `CaptureStarted` or `CaptureRefused`.
+    /// Answered with `CaptureStarted` or `CaptureRefused`. The take belongs to the connection
+    /// that opened it: if that connection closes or stops being subscribed (including being
+    /// dropped for missing a push deadline), the take ends with `Discard`.
     CaptureStart { gesture: CaptureGesture },
     /// The person ended the take. Answered with `CaptureEnded`.
     CaptureEnd { then: CaptureThen },

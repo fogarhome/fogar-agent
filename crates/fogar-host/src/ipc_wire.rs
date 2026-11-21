@@ -870,15 +870,18 @@ fn encode_conversation(mut c: WireConversation) -> Result<Vec<u8>, IpcError> {
             halve(longest);
             continue;
         }
-        match c.turns.is_empty() {
-            // Only ids and codes left: drop the last turn rather than fail the push forever.
-            false => c.turns.clear(),
-            true => {
-                return Err(IpcError::TooLarge {
-                    len: body.len(),
-                    max: MAX_FRAME_BYTES,
-                });
-            }
+        // Only gateway-controlled ids and codes left (unbounded up to the gateway's 1 MiB frame):
+        // drop them rather than fail the push forever. A turn whose id is dropped stays muted:
+        // the UI cannot confirm it (fails safe).
+        if !c.turns.is_empty() {
+            c.turns.clear();
+        } else if c.awaiting_visible.is_some() {
+            c.awaiting_visible = None;
+        } else {
+            return Err(IpcError::TooLarge {
+                len: body.len(),
+                max: MAX_FRAME_BYTES,
+            });
         }
     }
 }
@@ -1259,6 +1262,23 @@ mod tests {
                 assert!(!back.turns.is_empty(), "the newest turn survives");
             }
         }
+        // Gateway-controlled ids (a 70 KB turn_id, conversation or error code) never block a
+        // push either.
+        let huge_id = "\u{1}".repeat(70 * 1024);
+        let mut ids = conversation();
+        ids.awaiting_visible = Some(huge_id.clone());
+        ids.turns[0].turn_id = huge_id.clone();
+        ids.turns[0].conversation = Some(huge_id.clone());
+        ids.turns[1].error_code = Some(huge_id);
+        let body = encode_response(IpcResponse::Conversation(ids)).unwrap();
+        assert!(body.len() <= MAX_FRAME_BYTES);
+        let IpcResponse::Conversation(back) = decode_response(&body).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            back.awaiting_visible, None,
+            "an id the UI could not echo is dropped"
+        );
         // A view that fits is sent untouched.
         let small = conversation();
         let IpcResponse::Conversation(back) =

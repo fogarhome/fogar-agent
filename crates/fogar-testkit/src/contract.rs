@@ -355,6 +355,11 @@ pub mod audio_source {
             ),
             (true, Ok((cap, stream))) => {
                 assert!(may_open(perm), "opened with permission {perm:?}");
+                assert!(
+                    perm == MicPermission::Granted
+                        || !a.capabilities().permission_query.is_available(),
+                    "opened with Unknown on an adapter that has a permission model"
+                );
                 assert_eq!(cap.format().channels, 1, "the port delivers mono");
                 assert_eq!(stream.capacity(), 8);
                 drop(cap);

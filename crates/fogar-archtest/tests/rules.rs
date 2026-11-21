@@ -747,6 +747,11 @@ fn r13_only_the_capture_gate_asks_for_the_permission() {
         bad.is_empty(),
         "permission requested outside capture.rs: {bad:#?}"
     );
+    // Nor at boot from the composition root or the portable adapters (no allowed file there).
+    for krate in ["fogar-agentd", "fogar-host"] {
+        let bad = single_owner_violations(&rust_sources(krate), &["request_mic_permission"], &[]);
+        assert!(bad.is_empty(), "{krate} asks for the permission: {bad:#?}");
+    }
 }
 
 #[test]
