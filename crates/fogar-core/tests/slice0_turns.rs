@@ -22,7 +22,7 @@ async fn utterance_becomes_a_turn_and_audio_is_played() {
         !log.handshake_had_type_field,
         "handshake must not carry `type`"
     );
-    assert_eq!(log.last_output_mode, ["audio", "text"]);
+    assert_eq!(log.last_output_mode, ["audio", "text", "status"]);
     assert_eq!(log.count("end"), 1);
     assert_eq!(log.sends, ["pon la serie"]);
     assert!(

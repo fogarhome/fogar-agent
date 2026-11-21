@@ -139,7 +139,7 @@ async fn mic_to_gateway_to_player_over_a_real_websocket() {
         !log.handshake_had_type_field,
         "the handshake is the only client JSON without `type`"
     );
-    assert_eq!(log.last_output_mode, ["audio", "text"]);
+    assert_eq!(log.last_output_mode, ["audio", "text", "status"]);
     assert_eq!(
         log.client_msgs
             .iter()

@@ -102,7 +102,7 @@ impl<C: Clock> Engine<C> {
     async fn on_inbound(&self, st: &mut State, ev: Inbound) {
         let now = self.clock.now();
         match ev {
-            Inbound::SessionUp => st.turns.link_up(),
+            Inbound::SessionUp(_caps) => st.turns.link_up(),
             Inbound::SessionDown => {
                 let fx = st.turns.link_down();
                 self.apply(st, fx, now).await;
