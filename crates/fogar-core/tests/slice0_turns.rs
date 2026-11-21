@@ -1,4 +1,5 @@
-//! Slice-0 acceptance with fakes in paused time: utterance -> turn -> playback, barge-in, push.
+//! Turn acceptance with fakes in paused time: typed text -> turn -> playback, a new text over a
+//! streaming answer, push. (S2 3a: no microphone; the VAD path is gone until 3b.)
 #![allow(clippy::disallowed_methods)] // the harness drives tokio's paused clock directly
 
 mod common;
@@ -8,10 +9,12 @@ use fogar_testkit::{MockConfig, gateway::Ctl};
 use std::time::Duration;
 
 #[tokio::test(start_paused = true)]
-async fn utterance_becomes_a_turn_and_audio_is_played() {
-    let mut rig = RigBuilder::fake(MockConfig::default()).start();
+async fn text_becomes_a_turn_and_audio_is_played() {
+    let mut b = RigBuilder::fake(MockConfig::default());
+    b.with_ipc = true;
+    let mut rig = b.start();
     wait_ready(&mut rig.health).await;
-    speak(&rig.mic, 10).await;
+    say(&rig, "pon la serie").await;
     eventually(Duration::from_secs(30), || {
         rig.health.snapshot().stats.turns_completed == 1
     })
@@ -23,13 +26,10 @@ async fn utterance_becomes_a_turn_and_audio_is_played() {
         "handshake must not carry `type`"
     );
     assert_eq!(log.last_output_mode, ["audio", "text", "status"]);
-    assert_eq!(log.count("end"), 1);
+    assert_eq!(log.count("end"), 0);
     assert_eq!(log.sends, ["pon la serie"]);
-    assert!(
-        log.audio_frames >= 10,
-        "utterance audio streamed as f32le binary frames"
-    );
-    assert_eq!(log.audio_bytes, log.audio_frames * 320 * 4);
+    assert_eq!(log.audio_frames, 0, "no microphone, no upload");
+    assert_eq!(rig.mic.opens(), 0);
     let sp = rig.speaker.snapshot();
     assert_eq!(sp.accepted, 5 * 480, "every TTS sample reached the player");
     assert_eq!(
@@ -51,22 +51,24 @@ async fn utterance_becomes_a_turn_and_audio_is_played() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn barge_in_cancels_the_streaming_turn() {
+async fn new_text_replaces_the_streaming_turn() {
     let mock = MockConfig {
         tts_frames: 400,
         frame_interval: Duration::from_millis(20),
         ..MockConfig::default()
     };
-    let mut rig = RigBuilder::fake(mock).start();
+    let mut b = RigBuilder::fake(mock);
+    b.with_ipc = true;
+    let mut rig = b.start();
     wait_ready(&mut rig.health).await;
-    speak(&rig.mic, 10).await;
+    say(&rig, "pon la serie").await;
     eventually(Duration::from_secs(30), || {
         rig.health.snapshot().stats.tts_frames_played >= 10
     })
     .await;
     rig.speaker.drain();
-    // The user talks over the answer.
-    speak(&rig.mic, 10).await;
+    // The person types again over the answer.
+    say(&rig, "mejor la otra").await;
     eventually(Duration::from_secs(60), || {
         rig.health.snapshot().stats.turns_started >= 2
     })
@@ -74,16 +76,21 @@ async fn barge_in_cancels_the_streaming_turn() {
     let s = rig.health.snapshot().stats;
     assert_eq!(s.barge_ins, 1);
     let log = rig.link.log();
-    assert_eq!(log.count("cancel"), 1, "barge-in sends `cancel`");
-    assert_eq!(log.turns_cancelled, 1);
+    assert_eq!(
+        log.count("cancel"),
+        0,
+        "a new `send` replaces the turn: no `cancel`"
+    );
+    assert_eq!(log.turns_cancelled, 1, "the gateway ended it as replaced");
     assert!(
         rig.speaker.snapshot().stops >= 1,
         "playback flushed immediately"
     );
     assert!(
         log.tts_frames_sent < 400,
-        "server stopped streaming the cancelled turn"
+        "server stopped streaming the replaced turn"
     );
+    assert_eq!(rig.mic.opens(), 0);
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
 
@@ -108,9 +115,11 @@ async fn push_during_a_turn_waits_for_it_instead_of_replacing_it() {
         frame_interval: Duration::from_millis(20),
         ..MockConfig::default()
     };
-    let mut rig = RigBuilder::fake(mock).start();
+    let mut b = RigBuilder::fake(mock);
+    b.with_ipc = true;
+    let mut rig = b.start();
     wait_ready(&mut rig.health).await;
-    speak(&rig.mic, 10).await;
+    say(&rig, "pon la serie").await;
     eventually(Duration::from_secs(30), || {
         rig.health.snapshot().stats.tts_frames_played >= 1
     })
@@ -202,10 +211,12 @@ async fn closed_mid_answer(code: u16, reason: &str, action: CloseAction) {
 async fn minimal_platform_without_audio_still_connects_and_shuts_down() {
     let mut b = RigBuilder::fake(MockConfig::default());
     b.mic = fogar_testkit::FakeMic::minimal();
+    let rig_mic = b.mic.clone();
     b.speaker = fogar_testkit::FakeSpeaker::minimal();
     let (agent, mut h) = start_no_ipc(b);
     wait_ready(&mut h).await;
     tokio::time::sleep(Duration::from_secs(600)).await;
     assert_eq!(h.snapshot().stats.mic_chunks, 0);
+    assert_eq!(rig_mic.opens(), 0);
     assert!(agent.shutdown(Duration::from_secs(5)).await.clean);
 }

@@ -4,12 +4,14 @@
 //!
 //! | Queue | Producer -> consumer | Capacity | When full |
 //! |---|---|---|---|
-//! | mic chunks (`EventStream<AudioChunk>`) | audio adapter -> engine | `MIC_CHUNKS` (~1 s of 20 ms chunks) | adapter drops NEWEST, counts (`EventStream::dropped`); never blocks the audio thread |
-//! | uplink audio (`out` channel, `Frame::Binary`) | engine -> link session | shares `OUTBOUND` | shed NEWEST, count `uplink_audio_shed` (`try_send`); the gateway would close a slow client anyway |
+//! | mic chunks (`EventStream<AudioChunk>`) | audio adapter -> capture gate | `MIC_CHUNKS` (~1 s of 20 ms chunks) | adapter drops NEWEST, counts (`EventStream::dropped`); never blocks the audio thread. No producer in S2 sub-PR 3a (the mic is never opened; 3b adds the gate) |
+//! | uplink audio (`out` channel, `Frame::Binary`) | engine -> link session | shares `OUTBOUND` | shed NEWEST, count `uplink_audio_shed` (`try_send`); the gateway would close a slow client anyway. No producer in 3a |
 //! | uplink control (`out` channel, `Frame::Text`) | engine -> link session | shares `OUTBOUND` | must-deliver while connected: `reserve()` with `write_timeout`; on deadline count `uplink_control_dropped` and return the turn machine to Idle (the session itself is kept) |
 //! | inbound JSON events | link session -> engine | `INBOUND` messages AND `INBOUND_BYTES` bytes | must-deliver: byte charge + `reserve()` with `inbound_deadline` (< gateway `CLIENT_SEND_TIMEOUT_S` = 10 s); on deadline the session ends as `EngineStalled` and reconnects |
 //! | inbound TTS audio | link session -> engine | shares `INBOUND` and `INBOUND_BYTES` | shed NEWEST, count `inbound_audio_shed` (`try_send` / `try_charge`); the session never waits on audio |
 //! | playback buffer | engine -> audio sink adapter | adapter-owned, bounded | `ActivePlayback::write` accepts what fits; engine counts the rest in `tts_samples_dropped` |
+//! | engine commands (typed text, cancel) | IPC connections -> engine | `ENGINE_COMMANDS` | the IPC answers "busy" at once (`try_send`, never waits) and counts `engine_commands_busy`; each command carries a `oneshot` the IPC awaits under `write_timeout`, and a command whose reply was abandoned is skipped, not executed late |
+//! | conversation view | engine -> each conversation-subscribed connection | `watch` (1) | coalesce: latest view wins, never a backlog; each push runs under `write_timeout` and a miss closes the connection; the view itself is bounded (`CONVERSATION_MAX_TURNS`, `CONVERSATION_MAX_TEXT_BYTES`) |
 //! | link state / health | many -> readers | `watch` (1) | coalesce: latest value wins |
 //! | IPC connections | IPC adapter -> service | `IPC_MAX_CONNS` concurrent (subscribers included) | further accepts wait (the accept branch is disabled while full); a connection idle for `Config::ipc_idle_timeout` (30 s) is closed, so silent clients cannot hold the slots; a SUBSCRIBED connection is exempt from the idle close but each push runs under `write_timeout` and a miss closes it |
 //! | status subscription | link view -> each subscribed connection | `watch` (1) | coalesce: latest value wins, a push is skipped when the status did not change; never a backlog |
@@ -37,6 +39,9 @@ pub const MIC_CHUNKS: NonZeroUsize = nz(50);
 pub const OUTBOUND: usize = 64;
 /// Link session -> engine.
 pub const INBOUND: usize = 128;
+/// IPC -> engine commands. With `IPC_MAX_CONNS` connections answering one request at a time it
+/// fills only while the engine is stalled (abandoned commands wait to be skipped).
+pub const ENGINE_COMMANDS: usize = 8;
 /// Concurrent local UI connections.
 pub const IPC_MAX_CONNS: usize = 4;
 /// Pairing operations in flight (one: the gateway's code is one-use).

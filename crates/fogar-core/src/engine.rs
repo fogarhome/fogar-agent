@@ -1,29 +1,48 @@
-//! The engine task: microphone -> VAD -> turn machine -> uplink; inbound events -> turn machine ->
-//! playback. Single task, single owner of all turn state (no locks). Every await is either a
-//! cancel-safe `select!` branch or bounded by a deadline.
+//! The engine task: IPC commands (typed text, cancel) -> turn machine -> uplink; inbound events
+//! -> turn machine + conversation view -> playback. Single task, single owner of all turn and
+//! conversation state (no locks). Every await is either a cancel-safe `select!` branch or
+//! bounded by a deadline.
+//!
+//! S2 Decision 1: the microphone is never opened at start; there is no capture path at all until
+//! the consent gate (`capture.rs`, sub-PR 3b). The engine only reads the permission STATUS
+//! (`mic_permission`, which never prompts) for the view.
 
 use crate::{
     config::Config,
+    conversation,
     link::Inbound,
     stats::Stats,
     time::{deadline, sleep_until_opt},
-    turn::{ClientCmd, Effects, TurnMachine},
-    vad::{EnergyVad, VadEvent},
+    turn::{ClientCmd, Effects, TurnMachine, UserPhase},
 };
 use fogar_ports::{
-    audio::{ActiveCapture, ActivePlayback, AudioChunk, AudioFormat, AudioSink, AudioSource},
-    clock::{Clock, Mono},
-    events::EventStream,
+    audio::{ActivePlayback, AudioFormat, AudioSink, AudioSource},
+    clock::Clock,
     gateway::Frame,
+    ipc::{ConversationView, TextRefusal, TurnOutcome, UserActivity},
 };
-use fogar_proto::{
-    ClientMsg, audio::TTS_RATE_HZ, encode_client, encode_upload_f32le, parse_tts_frame,
-};
+use fogar_proto::{ClientMsg, audio::TTS_RATE_HZ, encode_client, parse_tts_frame};
 use std::{borrow::Cow, sync::Arc};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-type Capture = (Box<dyn ActiveCapture>, EventStream<AudioChunk>);
+/// IPC -> engine (`queues::ENGINE_COMMANDS`). Each carries the reply channel; the IPC side waits
+/// for it under `write_timeout` and drops it on expiry, and the engine then skips the command
+/// (`is_closed`) instead of acting on a request the UI was told failed.
+pub(crate) enum Command {
+    SendText(String, oneshot::Sender<Result<(), TextRefusal>>),
+    Cancel(oneshot::Sender<()>),
+}
+
+/// Redacting `Debug`: the text is the user's.
+impl std::fmt::Debug for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Command::SendText(t, _) => write!(f, "SendText(<redacted {} bytes>)", t.len()),
+            Command::Cancel(_) => f.write_str("Cancel"),
+        }
+    }
+}
 
 pub(crate) struct Engine<C> {
     pub(crate) clock: Arc<C>,
@@ -33,25 +52,35 @@ pub(crate) struct Engine<C> {
     pub(crate) audio_out: Arc<dyn AudioSink>,
     pub(crate) out_tx: mpsc::Sender<Frame>,
     pub(crate) in_rx: mpsc::Receiver<Inbound>,
+    pub(crate) cmd_rx: mpsc::Receiver<Command>,
+    pub(crate) conv: watch::Sender<ConversationView>,
 }
 
 struct State {
     turns: TurnMachine,
-    vad: EnergyVad,
     playback: Option<Box<dyn ActivePlayback>>,
     /// Reused for TTS sample conversion: no allocation per frame after warm-up.
     pcm: Vec<i16>,
 }
 
+impl State {
+    fn playing(&self) -> bool {
+        self.playback
+            .as_ref()
+            .is_some_and(|p| p.queued_samples() > 0)
+    }
+}
+
 impl<C: Clock> Engine<C> {
     pub(crate) async fn run(mut self, ingress: CancellationToken) {
-        let mut capture = self.open_capture();
         let mut st = State {
             turns: TurnMachine::new(self.cfg.turn),
-            vad: EnergyVad::new(self.cfg.vad),
             playback: None,
             pcm: Vec::with_capacity(fogar_proto::audio::TTS_MAX_FRAME_HINT_BYTES / 2),
         };
+        self.refresh_mic();
+        // No IPC (or it stopped): the closed channel must not turn the branch into a hot loop.
+        let mut cmds_open = true;
         loop {
             let wake_at = st.turns.next_deadline();
             tokio::select! {
@@ -61,14 +90,14 @@ impl<C: Clock> Engine<C> {
                     None => break,
                     Some(ev) => self.on_inbound(&mut st, ev).await,
                 },
-                chunk = next_chunk(&mut capture), if capture.is_some() => match chunk {
-                    Some(c) => self.on_chunk(&mut st, &c).await,
-                    // Adapter stopped (device lost). S2 adds rebuild-with-backoff.
-                    None => capture = None,
+                cmd = self.cmd_rx.recv(), if cmds_open => match cmd {
+                    None => cmds_open = false,
+                    Some(cmd) => self.on_command(&mut st, cmd).await,
                 },
                 () = sleep_until_opt(&*self.clock, wake_at), if wake_at.is_some() => {
                     if st.turns.on_tick(self.clock.now()) {
                         Stats::inc(&self.stats.user_waits_timed_out);
+                        self.publish(&st, |v| conversation::wait_ended(v, TurnOutcome::Timeout));
                     }
                 }
             }
@@ -76,45 +105,89 @@ impl<C: Clock> Engine<C> {
         if let Some(pb) = st.playback.as_mut() {
             pb.stop();
         }
-        // Dropping the capture stops the device; dropping playback closes the output.
+        // Dropping playback closes the output.
     }
 
-    // TODO(S2, review sec#8, HARD requirement): route every capture start through ONE consent
-    // choke point (local consent state, never a gateway message) before real capture ships;
-    // see docs/ROADMAP.md "Requirements carried from the slice-0 review".
-    fn open_capture(&self) -> Option<Capture> {
-        if !self.audio_in.capabilities().capture.is_available() {
-            return None;
-        }
-        match self.audio_in.open(crate::queues::MIC_CHUNKS) {
-            Ok((cap, stream)) => {
-                let f = cap.format();
-                if f != AudioFormat::mono(self.cfg.upload_rate_hz) {
-                    // v1 accepts only f32le 16 kHz mono; resampling arrives with S2.
-                    return None;
+    /// Applies `f` to the view and publishes it if anything changed (activity follows the turn
+    /// machine). The view lives inside the `watch`: no copy per token.
+    fn publish(&self, st: &State, f: impl FnOnce(&mut ConversationView) -> bool) {
+        let activity = match st.turns.phase() {
+            UserPhase::AwaitTurn { .. } => UserActivity::AwaitingReply,
+            UserPhase::Offline | UserPhase::Idle => UserActivity::Idle,
+        };
+        self.conv
+            .send_if_modified(|v| f(v) | conversation::set_activity(v, activity));
+    }
+
+    /// The permission STATUS only (the port guarantees it never prompts).
+    fn refresh_mic(&self) {
+        let m = self.audio_in.mic_permission();
+        self.conv.send_if_modified(|v| conversation::set_mic(v, m));
+    }
+
+    async fn on_command(&self, st: &mut State, cmd: Command) {
+        match cmd {
+            Command::SendText(text, reply) => {
+                // The IPC gave up (and counted it as busy): never act on it late.
+                if reply.is_closed() {
+                    return;
                 }
-                Some((cap, stream))
+                let playing = st.playing();
+                let Some(fx) = st.turns.send_text(text, playing, self.clock.now()) else {
+                    let _ = reply.send(Err(TextRefusal::NotReady));
+                    return;
+                };
+                let _ = reply.send(Ok(()));
+                if let Some(ClientCmd::Send(t)) = &fx.send {
+                    self.publish(st, |v| conversation::sent(v, t));
+                }
+                Stats::inc(&self.stats.texts_sent);
+                self.apply(st, fx).await;
             }
-            Err(_) => None,
+            Command::Cancel(reply) => {
+                // The IPC gave up (and counted it as busy): never act on it late.
+                if reply.is_closed() {
+                    return;
+                }
+                let _ = reply.send(());
+                let playing = st.playing();
+                let fx = st.turns.cancel(playing);
+                if fx.send.is_some() {
+                    Stats::inc(&self.stats.cancels_sent);
+                }
+                // A wait with no turn yet ends here; a streaming turn ends with its turn_end.
+                self.publish(st, |v| conversation::wait_ended(v, TurnOutcome::Cancelled));
+                self.apply(st, fx).await;
+            }
         }
     }
 
     async fn on_inbound(&self, st: &mut State, ev: Inbound) {
-        let now = self.clock.now();
         match ev {
-            Inbound::SessionUp(_caps) => st.turns.link_up(),
+            Inbound::SessionUp(caps) => {
+                st.turns.link_up();
+                self.refresh_mic();
+                self.publish(st, |v| conversation::link_up(v, caps));
+            }
             Inbound::SessionDown => {
                 let fx = st.turns.link_down();
-                self.apply(st, fx, now).await;
+                self.publish(st, conversation::link_down);
+                self.apply(st, fx).await;
                 // Release the output device while offline (energy).
                 st.playback = None;
             }
             Inbound::Server(msg, _charge) => {
-                let fx = st.turns.on_server(&msg, now);
+                let fx = st.turns.on_server(&msg);
                 if fx.turn_started {
                     Stats::inc(&self.stats.turns_started);
                 }
-                self.apply(st, fx, now).await;
+                let origin = st
+                    .turns
+                    .turn()
+                    .filter(|_| fx.turn_started)
+                    .map(|t| t.origin);
+                self.publish(st, |v| conversation::on_server(v, &msg, origin));
+                self.apply(st, fx).await;
             }
             Inbound::Audio(buf, _charge) => {
                 let Ok(frame) = parse_tts_frame(&buf) else {
@@ -138,6 +211,11 @@ impl<C: Clock> Engine<C> {
                             (st.pcm.len() - accepted.min(st.pcm.len())) as u64,
                         );
                         Stats::inc(&self.stats.tts_frames_played);
+                        if let Some(t) = st.turns.turn() {
+                            let id = t.turn_id.as_str();
+                            self.conv
+                                .send_if_modified(|v| conversation::audio_played(v, id));
+                        }
                     }
                     None => Stats::add(&self.stats.tts_samples_dropped, st.pcm.len() as u64),
                 }
@@ -145,36 +223,7 @@ impl<C: Clock> Engine<C> {
         }
     }
 
-    async fn on_chunk(&self, st: &mut State, chunk: &AudioChunk) {
-        Stats::inc(&self.stats.mic_chunks);
-        let now = self.clock.now();
-        match st.vad.process(&chunk.samples) {
-            VadEvent::Silence => {}
-            VadEvent::SpeechStart => {
-                if st.turns.phase() == crate::turn::UserPhase::Offline {
-                    return;
-                }
-                Stats::inc(&self.stats.utterances);
-                let playing = st.playback.as_ref().is_some_and(|p| p.queued_samples() > 0);
-                let fx = st.turns.speech_start(playing);
-                self.apply(st, fx, now).await;
-                if st.turns.is_listening() {
-                    self.send_audio(&chunk.samples);
-                }
-            }
-            VadEvent::Speech => {
-                if st.turns.is_listening() {
-                    self.send_audio(&chunk.samples);
-                }
-            }
-            VadEvent::SpeechEnd => {
-                let fx = st.turns.speech_end(now);
-                self.apply(st, fx, now).await;
-            }
-        }
-    }
-
-    async fn apply(&self, st: &mut State, fx: Effects, _now: Mono) {
+    async fn apply(&self, st: &mut State, fx: Effects) {
         if fx.stop_playback
             && let Some(pb) = st.playback.as_mut()
         {
@@ -189,14 +238,17 @@ impl<C: Clock> Engine<C> {
         if let Some(cmd) = fx.send
             && !self.send_control(&cmd).await
         {
+            let was_waiting = matches!(st.turns.phase(), UserPhase::AwaitTurn { .. });
             st.turns.uplink_failed();
+            if was_waiting {
+                self.publish(st, |v| conversation::wait_ended(v, TurnOutcome::Error));
+            }
         }
     }
 
     /// Must-deliver while connected: wait for queue space up to `write_timeout`.
     async fn send_control(&self, cmd: &ClientCmd) -> bool {
         let msg = match cmd {
-            ClientCmd::End => ClientMsg::End,
             ClientCmd::Cancel => ClientMsg::Cancel,
             ClientCmd::Send(text) => ClientMsg::Send {
                 text: Cow::Borrowed(text),
@@ -220,26 +272,5 @@ impl<C: Clock> Engine<C> {
                 false
             }
         }
-    }
-
-    /// Best effort: shed the newest chunk when the uplink queue is full.
-    fn send_audio(&self, samples: &[f32]) {
-        let mut buf = Vec::with_capacity(samples.len() * 4);
-        encode_upload_f32le(samples, &mut buf);
-        match self.out_tx.try_send(Frame::Binary(buf)) {
-            Ok(()) => Stats::hwm(
-                &self.stats.out_queue_hwm,
-                self.out_tx.max_capacity() - self.out_tx.capacity(),
-            ),
-            Err(mpsc::error::TrySendError::Full(_)) => Stats::inc(&self.stats.uplink_audio_shed),
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
-        }
-    }
-}
-
-async fn next_chunk(c: &mut Option<Capture>) -> Option<AudioChunk> {
-    match c {
-        Some((_, stream)) => stream.next().await,
-        None => std::future::pending().await,
     }
 }

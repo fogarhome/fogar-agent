@@ -1,6 +1,7 @@
-//! THE slice-0 end-to-end test: fake microphone -> energy VAD -> core turn machine -> REAL
+//! THE end-to-end test: typed text over the in-memory IPC -> core turn machine -> REAL
 //! WebSocket (fogar-host, tokio-tungstenite) -> protocol-v1 mock gateway (fogar-testkit) ->
 //! TTS frames 0xA1 + turn_seq + PCM16 -> fake player. Real time, loopback, a few seconds total.
+//! (S2 3a: no microphone at start; the voice path returns with the capture gate in 3b.)
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use fogar_core::{
@@ -10,12 +11,13 @@ use fogar_core::{
 use fogar_host::{TokioClock, WsConfig, WsGatewayLink};
 use fogar_ports::{
     gateway::GatewayAddr,
+    ipc::{IpcRequest, IpcResponse, UserText},
     secrets::{SecretKey, SecretStore as _},
 };
 use fogar_proto::CloseAction;
 use fogar_testkit::{
-    FakeMic, FakeSpeaker, MemorySecretStore, MockConfig, MockGateway, SeededRandom, gateway::Ctl,
-    silence_chunks, tone_chunks,
+    FakeIpc, FakeMic, FakeSpeaker, MemorySecretStore, MockConfig, MockGateway, SeededRandom,
+    gateway::Ctl,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -27,6 +29,7 @@ struct E2e {
     health: HealthProbe,
     mic: FakeMic,
     speaker: FakeSpeaker,
+    ipc: FakeIpc,
 }
 
 /// A store paired with the gateway at `addr`.
@@ -46,7 +49,6 @@ fn paired(addr: GatewayAddr, key: &str) -> MemorySecretStore {
 
 fn fast_config() -> Config {
     let mut c = Config::default();
-    c.vad.hangover_chunks = 10;
     c.backoff.base = Duration::from_millis(20);
     c.backoff.cap = Duration::from_millis(200);
     c.backoff.floor = Duration::from_millis(5);
@@ -58,10 +60,11 @@ async fn start(mock: MockConfig, cfg: Config, key: &str) -> E2e {
     let baseline = alive_tasks();
     let mic = FakeMic::healthy();
     let speaker = FakeSpeaker::healthy();
-    let ports: AgentPorts<TokioClock, WsGatewayLink, NoIpc> = AgentPorts {
+    let ipc = FakeIpc::signed();
+    let ports: AgentPorts<TokioClock, WsGatewayLink, FakeIpc> = AgentPorts {
         clock: Arc::new(TokioClock::new()),
         link: WsGatewayLink::new(WsConfig::default()),
-        ipc: None,
+        ipc: Some(ipc.clone()),
         http: NoHttp,
         tailnet: fogar_core::NoTailnet,
         secrets: Arc::new(paired(gw.addr(), key)),
@@ -79,6 +82,7 @@ async fn start(mock: MockConfig, cfg: Config, key: &str) -> E2e {
         health,
         mic,
         speaker,
+        ipc,
     }
 }
 
@@ -103,12 +107,15 @@ async fn ready(h: &mut HealthProbe, session: u64) {
     .await;
 }
 
-/// Pushes a scripted utterance at 4x real time (the VAD only counts chunks).
-async fn speak(mic: &FakeMic) {
-    for c in tone_chunks(12, 0.3).into_iter().chain(silence_chunks(12)) {
-        mic.push(c);
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+/// The person types `text` in the signed app (one IPC connection per request).
+async fn say(ipc: &FakeIpc, text: &str) {
+    let mut c = ipc.client().await;
+    let r = c
+        .request(IpcRequest::SendText {
+            text: UserText(text.to_owned()),
+        })
+        .await;
+    assert_eq!(r, Some(IpcResponse::TextAccepted));
 }
 
 fn alive_tasks() -> usize {
@@ -118,7 +125,7 @@ fn alive_tasks() -> usize {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mic_to_gateway_to_player_over_a_real_websocket() {
+async fn text_to_gateway_to_player_over_a_real_websocket() {
     let mut e = start(
         MockConfig::default(),
         fast_config(),
@@ -127,7 +134,7 @@ async fn mic_to_gateway_to_player_over_a_real_websocket() {
     .await;
     ready(&mut e.health, 1).await;
     assert!(alive_tasks() > e.baseline);
-    speak(&e.mic).await;
+    say(&e.ipc, "pon la serie").await;
     eventually(Duration::from_secs(10), || {
         e.health.snapshot().stats.turns_completed == 1
     })
@@ -145,15 +152,15 @@ async fn mic_to_gateway_to_player_over_a_real_websocket() {
             .iter()
             .filter(|m| *m != "keepalive")
             .collect::<Vec<_>>(),
-        ["end", "send"]
+        ["send"]
     );
     assert_eq!(
         log.sends,
         ["pon la serie"],
-        "the final transcription is sent back as the turn text"
+        "the typed text is the turn text"
     );
-    assert!(log.audio_frames >= 12);
-    assert_eq!(log.audio_bytes % 4, 0, "f32le upload");
+    assert_eq!(log.audio_frames, 0, "no microphone, no upload");
+    assert_eq!(e.mic.opens(), 0);
     assert_eq!(log.tts_frames_sent, 5);
 
     let played = e.speaker.played_samples();
@@ -185,7 +192,7 @@ async fn mic_to_gateway_to_player_over_a_real_websocket() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn barge_in_over_websocket() {
+async fn new_text_replaces_the_turn_over_websocket() {
     let mock = MockConfig {
         tts_frames: 500,
         frame_interval: Duration::from_millis(10),
@@ -193,18 +200,18 @@ async fn barge_in_over_websocket() {
     };
     let mut e = start(mock, fast_config(), &MockConfig::default().client_key).await;
     ready(&mut e.health, 1).await;
-    speak(&e.mic).await;
+    say(&e.ipc, "pon la serie").await;
     eventually(Duration::from_secs(10), || {
         e.health.snapshot().stats.tts_frames_played >= 5
     })
     .await;
-    speak(&e.mic).await; // user talks over the answer
+    say(&e.ipc, "mejor la otra").await; // typed over the answer
     eventually(Duration::from_secs(10), || {
         e.health.snapshot().stats.turns_started >= 2
     })
     .await;
     let log = e.gw.log();
-    assert_eq!(log.count("cancel"), 1);
+    assert_eq!(log.count("cancel"), 0, "`send` replaces the turn by itself");
     assert!(log.turns_cancelled >= 1);
     assert_eq!(e.health.snapshot().stats.barge_ins, 1);
     assert!(e.speaker.snapshot().stops >= 1);

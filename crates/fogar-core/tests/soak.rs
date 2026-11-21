@@ -37,13 +37,14 @@ async fn run_soak(hours: u32, planted_leak: bool) -> Outcome {
         ..MockConfig::default()
     });
     b.speaker = FakeSpeaker::healthy().without_recording();
+    b.with_ipc = true;
     let mut rig = b.start();
     wait_ready(&mut rig.health).await;
 
     let mut samples: Vec<Sample> = Vec::with_capacity(80);
     for hour in 0..hours {
         for _half in 0..2 {
-            speak(&rig.mic, 10).await;
+            say(&rig, "pon la serie").await;
             tokio::time::sleep(Duration::from_secs(29 * 60)).await;
             rig.speaker.drain();
         }
