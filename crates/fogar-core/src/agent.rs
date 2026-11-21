@@ -8,7 +8,7 @@
 //! | `io` | link supervisor | `egress` |
 //! | `ops` | liveness heartbeat | `ops` |
 //!
-//! Shutdown: (1) cancel `ingress` -> engine stops capture/playback, IPC stops; wait `data`+`edge`
+//! Shutdown: (1) cancel `ingress` -> engine stops playback, IPC stops; wait `data`+`edge`
 //! (budget/4). (2) cancel `egress` -> the session sends a close frame (bounded by
 //! `close_timeout`) and the supervisor stops; wait `io` (the rest minus budget/4, so >= budget/2).
 //! (3) cancel `ops`; wait (budget/4). Each wait has its own deadline; the report says what overran.
@@ -30,7 +30,10 @@ use fogar_ports::{
     clock::Clock,
     gateway::{Frame, GatewayAddr, GatewayLink},
     gateway_http::{GatewayHttp, HttpCall, HttpError, HttpReply},
-    ipc::{IpcCaps, IpcConn, IpcError, IpcRequest, IpcResponse, IpcServer, PeerIdentity},
+    ipc::{
+        ConversationView, IpcCaps, IpcConn, IpcError, IpcRequest, IpcResponse, IpcServer,
+        PeerIdentity,
+    },
     random::Random,
     secrets::SecretStore,
     system_probe::{ProbeCaps, SystemProbe},
@@ -64,6 +67,8 @@ pub struct HealthProbe {
     pub(crate) stats: Arc<Stats>,
     pub(crate) view: watch::Receiver<LinkView>,
     pub(crate) boot_mode: &'static str,
+    /// The conversation view the engine publishes (also the voice state for `StatusReport`).
+    pub(crate) conversation: watch::Receiver<ConversationView>,
     probe_caps: Option<ProbeCaps>,
     out_tx: mpsc::WeakSender<Frame>,
     in_tx: mpsc::WeakSender<Inbound>,
@@ -80,6 +85,11 @@ impl HealthProbe {
             out_queue_len: queue_len(&self.out_tx),
             in_queue_len: queue_len(&self.in_tx),
         }
+    }
+
+    /// Latest conversation view (for the composition root and tests).
+    pub fn conversation(&self) -> ConversationView {
+        self.conversation.borrow().clone()
     }
 
     pub fn probe_caps(&self) -> Option<ProbeCaps> {
@@ -156,10 +166,13 @@ impl<C: Clock> Agent<C> {
         let (reconnect_tx, reconnect_rx) = watch::channel(());
         let (out_tx, out_rx) = mpsc::channel::<Frame>(queues::OUTBOUND);
         let (in_tx, in_rx) = mpsc::channel::<Inbound>(queues::INBOUND);
+        let (cmd_tx, cmd_rx) = mpsc::channel(queues::ENGINE_COMMANDS);
+        let (conv_tx, conv_rx) = watch::channel(ConversationView::default());
         let health = HealthProbe {
             stats: stats.clone(),
             view: view_rx,
             boot_mode: boot.label(),
+            conversation: conv_rx,
             probe_caps: ports.probe.as_ref().map(|p| p.capabilities()),
             out_tx: out_tx.downgrade(),
             in_tx: in_tx.downgrade(),
@@ -184,6 +197,8 @@ impl<C: Clock> Agent<C> {
             audio_out: ports.audio_out,
             out_tx,
             in_rx,
+            cmd_rx,
+            conv: conv_tx,
         };
         data.spawn(engine.run(ingress.clone()));
 
@@ -224,6 +239,7 @@ impl<C: Clock> Agent<C> {
                     pair_from_uid_only_peers: cfg.pair_from_uid_only_peers,
                 },
                 pairing,
+                cmd_tx,
                 ingress.clone(),
             ));
         }
