@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1b446b1336e19cebbd5a1508032fd5f7aa1e48cf50016f0df21e5a08c17b5099 # shrinks to m = TurnProgress(TurnProgress { turn_id: "", phase: Preparing, tool: Some("") })

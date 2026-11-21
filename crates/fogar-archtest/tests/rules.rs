@@ -16,6 +16,11 @@
 //!  R10 fogar-core's own build never enables tokio's `time` feature, so `tokio::time` does not
 //!     exist for it; gates.sh compiles fogar-core alone, where any use is a compile error
 //!     (production code only: test-only code in `src/` gets `time` from the dev-dependencies)
+//!  R11 only `capture.rs` (and the hand-over in `agent.rs`) names the microphone port in
+//!     fogar-core: the single consent point of spec S2
+//!  R12 only `playback.rs` (and `agent.rs`) names the speaker port: nothing sounds unseen
+//!  R13 only `capture.rs` asks the OS for the microphone permission
+//!     (R11/R12 tolerate today's `engine.rs` until the owner file exists, then tighten alone)
 //!
 //! Every checker has a self-test (`selftest_*`) that plants the violation in a temporary
 //! fixture and asserts the rule fires (review code#4: a rule that cannot fail proves nothing).
@@ -654,6 +659,148 @@ fn r8_no_unsafe_in_inner_crates() {
             }
         }
     }
+}
+
+/// fogar-core's sources with paths relative to its `src/` (so `x/capture.rs` is not `capture.rs`).
+fn core_sources() -> Vec<(PathBuf, String)> {
+    let base = root().join("crates/fogar-core/src");
+    rust_sources("fogar-core")
+        .into_iter()
+        .map(|(p, t)| (p.strip_prefix(&base).unwrap().to_path_buf(), t))
+        .collect()
+}
+
+/// R11–R13 checker: files of `sources` (paths relative to fogar-core/src) that name one of
+/// `idents` outside `allowed` (relative paths, e.g. `capture.rs` = `src/capture.rs` only).
+/// Token-based: comments and strings do not count.
+fn single_owner_violations(
+    sources: &[(PathBuf, String)],
+    idents: &[&str],
+    allowed: &[&str],
+) -> Vec<String> {
+    let mut bad = Vec::new();
+    for (p, text) in sources {
+        if allowed.iter().any(|a| p == Path::new(a)) {
+            continue;
+        }
+        for (tok, line) in tokens(text) {
+            if let Tok::Ident(id) = tok
+                && idents.contains(&id.as_str())
+            {
+                bad.push(format!("{}:{line}: `{id}`", p.display()));
+            }
+        }
+    }
+    bad
+}
+
+/// `extra` while `owner` does not exist yet in fogar-core/src: the rule tightens by itself the
+/// moment the S2 core PR adds the owner file (then `extra` must no longer name the port).
+fn owners(
+    sources: &[(PathBuf, String)],
+    owner: &'static str,
+    extra: &'static str,
+) -> Vec<&'static str> {
+    let exists = sources.iter().any(|(p, _)| p == Path::new(owner));
+    let mut v = vec!["agent.rs", owner];
+    if !exists {
+        v.push(extra);
+    }
+    v
+}
+
+/// R11: single consent point (spec S2, sec#8 of the slice-0 review). Only `capture.rs` holds the
+/// microphone port; `agent.rs` only hands it over.
+#[test]
+fn r11_only_the_capture_gate_holds_the_microphone() {
+    let src = core_sources();
+    let allowed = owners(&src, "capture.rs", "engine.rs");
+    let bad = single_owner_violations(&src, &["AudioSource", "audio_in"], &allowed);
+    assert!(
+        bad.is_empty(),
+        "the microphone port outside {allowed:?}: {bad:#?}"
+    );
+}
+
+/// R12: single output point (spec S2): nothing sounds unless `playback.rs` lets it.
+#[test]
+fn r12_only_the_playback_gate_holds_the_speaker() {
+    let src = core_sources();
+    let allowed = owners(&src, "playback.rs", "engine.rs");
+    let bad = single_owner_violations(&src, &["AudioSink", "audio_out"], &allowed);
+    assert!(
+        bad.is_empty(),
+        "the speaker port outside {allowed:?}: {bad:#?}"
+    );
+}
+
+/// R13: the OS permission prompt is asked for only by the capture gate (which does it only on
+/// an explicit `RequestMicPermission` from the person).
+#[test]
+fn r13_only_the_capture_gate_asks_for_the_permission() {
+    let bad = single_owner_violations(
+        &core_sources(),
+        &["request_mic_permission"],
+        &["capture.rs"],
+    );
+    assert!(
+        bad.is_empty(),
+        "permission requested outside capture.rs: {bad:#?}"
+    );
+    // Nor at boot from the composition root or the portable adapters (no allowed file there).
+    for krate in ["fogar-agentd", "fogar-host"] {
+        let bad = single_owner_violations(&rust_sources(krate), &["request_mic_permission"], &[]);
+        assert!(bad.is_empty(), "{krate} asks for the permission: {bad:#?}");
+    }
+}
+
+#[test]
+fn selftest_single_owner_rules_fire() {
+    let src = |name: &str, text: &str| (PathBuf::from(name), text.to_owned());
+    let planted = [
+        src("agent.rs", "pub audio_in: Arc<dyn AudioSource>,"),
+        src(
+            "capture.rs",
+            "self.audio_in.open(n); src.request_mic_permission()",
+        ),
+        src(
+            "turn.rs",
+            "// AudioSource in a comment\nlet s = \"audio_in\";",
+        ),
+        src(
+            "link.rs",
+            "fn sneak(a: &dyn AudioSource) { a.request_mic_permission(); }",
+        ),
+    ];
+    let bad = single_owner_violations(
+        &planted,
+        &["AudioSource", "audio_in"],
+        &["agent.rs", "capture.rs"],
+    );
+    assert_eq!(bad.len(), 1, "{bad:#?}");
+    assert!(bad[0].contains("link.rs:1: `AudioSource`"));
+    let bad = single_owner_violations(&planted, &["request_mic_permission"], &["capture.rs"]);
+    assert_eq!(bad.len(), 1, "{bad:#?}");
+    // Self-tightening: engine.rs is tolerated only until capture.rs exists.
+    let before = [src("engine.rs", "")];
+    assert_eq!(
+        owners(&before, "capture.rs", "engine.rs"),
+        ["agent.rs", "capture.rs", "engine.rs"]
+    );
+    assert_eq!(
+        owners(&planted, "capture.rs", "engine.rs"),
+        ["agent.rs", "capture.rs"]
+    );
+    // A `capture.rs` elsewhere is not the consent point, and does not tighten the rule either.
+    let nested = [src("link/capture.rs", "fn f(a: &dyn AudioSource) {}")];
+    assert_eq!(
+        single_owner_violations(&nested, &["AudioSource"], &["agent.rs", "capture.rs"]).len(),
+        1
+    );
+    assert_eq!(
+        owners(&nested, "capture.rs", "engine.rs"),
+        ["agent.rs", "capture.rs", "engine.rs"]
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

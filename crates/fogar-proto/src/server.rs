@@ -40,6 +40,9 @@ pub enum ServerMsg {
     Error(ErrorMsg),
     /// GUESSED beyond `stage`/`turn`
     PipelineEvent(PipelineEvent),
+    /// CERTAIN (3.0.1 §5, #254). Only with `status` in `output_mode`. The turn's current state;
+    /// a `token` makes it stale.
+    TurnProgress(TurnProgress),
     /// Any future or unknown message type. Must never break the session.
     #[serde(other)]
     Unknown,
@@ -430,6 +433,61 @@ pub enum TurnOrigin {
     Push,
 }
 
+/// CERTAIN (3.0.1 §5). Unknown phases are a generic «working» (the list may grow).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProgressPhase {
+    Preparing,
+    Thinking,
+    Tool,
+    /// Any phase this client does not know, or a missing/odd `phase`.
+    Working,
+}
+
+impl FromJsonStr for ProgressPhase {
+    fn from_json_str<E: de::Error>(s: &str) -> Option<Self> {
+        Some(
+            ProgressPhase::deserialize(StrDeserializer::<E>::new(s))
+                .unwrap_or(ProgressPhase::Working),
+        )
+    }
+}
+
+fn lenient_phase<'de, D: Deserializer<'de>>(d: D) -> Result<ProgressPhase, D::Error> {
+    Ok(d.deserialize_any(Lenient::<ProgressPhase>(PhantomData))?
+        .unwrap_or(ProgressPhase::Working))
+}
+
+/// CERTAIN (3.0.1 §5). `tool` is a tool NAME only (never arguments or results); `None` outside
+/// `phase: tool` or when the gateway withheld a non-identifier name. A name that breaks the
+/// gateway's own rule (`[A-Za-z0-9_.:-]`, at most 128 chars) is dropped to `None` («una
+/// herramienta»), so it can never carry text or grow the UI's view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnProgress {
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub turn_id: String,
+    #[serde(default = "working", deserialize_with = "lenient_phase")]
+    pub phase: ProgressPhase,
+    #[serde(default, deserialize_with = "lenient_tool")]
+    pub tool: Option<String>,
+}
+
+/// Longest tool name the gateway sends (3.0.1 §5).
+pub const TOOL_NAME_MAX: usize = 128;
+
+fn working() -> ProgressPhase {
+    ProgressPhase::Working
+}
+
+fn lenient_tool<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(lenient_opt_string(d)?.filter(|t| {
+        !t.is_empty()
+            && t.len() <= TOOL_NAME_MAX
+            && t.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+    }))
+}
+
 /// CERTAIN
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Token {
@@ -652,4 +710,8 @@ pub struct PipelineEvent {
     pub stage: String,
     #[serde(default)]
     pub turn: Option<u64>,
+    /// CERTAIN (3.0.1 §15): ms since the session's PREVIOUS stage, whatever it was (not since
+    /// the turn's start). To measure a span, add the stages that make it up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
 }

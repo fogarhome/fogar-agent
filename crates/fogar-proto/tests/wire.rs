@@ -5,8 +5,8 @@ use fogar_proto::{
     ClientMsg, Handshake, InputMode, OutputMode, ServerMsg, decode_client, decode_server,
     encode_client, encode_handshake, encode_tts_frame, parse_tts_frame,
     server::{
-        Capabilities, ErrorMsg, Interrupted, PipelineEvent, Ready, Status, Token, Transcription,
-        TurnEnd, TurnErrorReason, TurnStart,
+        Capabilities, ErrorMsg, Interrupted, PipelineEvent, ProgressPhase, Ready, Status, Token,
+        Transcription, TurnEnd, TurnErrorReason, TurnProgress, TurnStart,
     },
 };
 use proptest::prelude::*;
@@ -207,8 +207,35 @@ fn arb_server_msg() -> impl Strategy<Value = ServerMsg> {
                     turn_id
                 })
             ),
-        (arb_text(), proptest::option::of(any::<u64>()))
-            .prop_map(|(stage, turn)| { ServerMsg::PipelineEvent(PipelineEvent { stage, turn }) }),
+        (
+            arb_text(),
+            proptest::option::of(any::<u64>()),
+            proptest::option::of(any::<u64>())
+        )
+            .prop_map(|(stage, turn, elapsed_ms)| {
+                ServerMsg::PipelineEvent(PipelineEvent {
+                    stage,
+                    turn,
+                    elapsed_ms,
+                })
+            }),
+        (
+            arb_text(),
+            prop_oneof![
+                Just(ProgressPhase::Preparing),
+                Just(ProgressPhase::Thinking),
+                Just(ProgressPhase::Tool),
+                Just(ProgressPhase::Working)
+            ],
+            proptest::option::of("[A-Za-z0-9_.:-]{1,128}")
+        )
+            .prop_map(
+                |(turn_id, phase, tool)| ServerMsg::TurnProgress(TurnProgress {
+                    turn_id,
+                    phase,
+                    tool
+                })
+            ),
     ]
 }
 
@@ -376,9 +403,58 @@ fn m19_turn_vectors_decode() {
         decode_server(r#"{"type":"ready","session_id":"c:1","agent":"main","conversation":{"id":"x","agent":"main"}}"#).unwrap(),
         ServerMsg::Ready(_)
     ));
-    assert!(matches!(
+    assert_eq!(
         decode_server(r#"{"type":"turn_progress","turn_id":"t-1","phase":"thinking","tool":null}"#)
             .unwrap(),
-        ServerMsg::Unknown
+        ServerMsg::TurnProgress(TurnProgress {
+            turn_id: "t-1".into(),
+            phase: ProgressPhase::Thinking,
+            tool: None
+        })
+    );
+    // Tolerant: an unknown or odd phase is «working»; a missing tool is None.
+    for (raw, phase) in [
+        (
+            r#"{"type":"turn_progress","turn_id":"t-2","phase":"dreaming"}"#,
+            ProgressPhase::Working,
+        ),
+        (
+            r#"{"type":"turn_progress","turn_id":"t-2","phase":7,"tool":3}"#,
+            ProgressPhase::Working,
+        ),
+        (
+            r#"{"type":"turn_progress","turn_id":"t-2"}"#,
+            ProgressPhase::Working,
+        ),
+        (
+            r#"{"type":"turn_progress","turn_id":"t-2","phase":"tool","tool":"ha_call_service"}"#,
+            ProgressPhase::Tool,
+        ),
+    ] {
+        let ServerMsg::TurnProgress(p) = decode_server(raw).unwrap() else {
+            panic!("{raw}")
+        };
+        assert_eq!(p.phase, phase, "{raw}");
+    }
+    // A tool "name" that is not an identifier (or is too long) never reaches the UI.
+    let long = "a".repeat(129);
+    for bad in ["con espacios", "", "x\"y", long.as_str()] {
+        let raw =
+            serde_json::json!({"type":"turn_progress","turn_id":"t","phase":"tool","tool":bad})
+                .to_string();
+        let ServerMsg::TurnProgress(p) = decode_server(&raw).unwrap() else {
+            panic!("{raw}")
+        };
+        assert_eq!(p.tool, None, "{bad:?}");
+    }
+    assert!(matches!(
+        decode_server(
+            r#"{"type":"pipeline_event","stage":"session_end","elapsed_ms":10008,"turn":0}"#
+        )
+        .unwrap(),
+        ServerMsg::PipelineEvent(PipelineEvent {
+            elapsed_ms: Some(10008),
+            ..
+        })
     ));
 }

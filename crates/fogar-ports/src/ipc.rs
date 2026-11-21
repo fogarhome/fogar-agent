@@ -136,6 +136,29 @@ pub enum IpcRequest {
     /// admin fixed it). Answered with `Reconnecting` (one new attempt; progress arrives as status
     /// `Event`s), or `Refused` when the link is not parked for such a reason.
     Reconnect,
+    // ---- conversation (v4). Strictly `PeerCheck::SameSigner`: they carry or reveal user
+    // content and can open the microphone. NOT `may_pair()`: the development uid-only opt-in
+    // for pairing never extends to these. ----
+    /// From now on the agent pushes `IpcResponse::Conversation` (latest view only). Answered
+    /// with `ConversationSubscribed` + one `Conversation`. Only a subscribed connection may
+    /// start a take or confirm a turn as visible.
+    SubscribeConversation,
+    /// Typed (or reviewed) text. Answered with `TextAccepted` or `TextRefused`.
+    SendText { text: UserText },
+    /// The person pressed the microphone button. The core's single consent point decides.
+    /// Answered with `CaptureStarted` or `CaptureRefused`. The take belongs to the connection
+    /// that opened it: if that connection closes or stops being subscribed (including being
+    /// dropped for missing a push deadline), the take ends with `Discard`.
+    CaptureStart { gesture: CaptureGesture },
+    /// The person ended the take. Answered with `CaptureEnded`.
+    CaptureEnd { then: CaptureThen },
+    /// Cancel button. Answered with `TurnCancelSent`.
+    CancelTurn,
+    /// The UI is showing this turn: its audio may play. Answered with `TurnVisibleNoted`.
+    TurnVisible { turn_id: String },
+    /// The person asked to allow the microphone (may show the system prompt). Answered with
+    /// `MicPermission` once decided.
+    RequestMicPermission,
 }
 
 /// Link state as the UI shows it. Mirrors fogar-core's link states without their internals.
@@ -202,9 +225,17 @@ pub struct StatusReport {
     pub turns_completed: u64,
     pub boot_mode: String,
     pub peer_check: PeerCheck,
+    /// The gateway's transcriber and TTS as last heard (`Unknown` until a session is ready).
+    pub transcriber: ServiceState,
+    pub tts: ServiceState,
 }
 
 impl StatusReport {
+    pub fn with_voice(mut self, transcriber: ServiceState, tts: ServiceState) -> Self {
+        self.transcriber = transcriber;
+        self.tts = tts;
+        self
+    }
     pub fn new(
         link: String,
         phase: LinkPhase,
@@ -222,6 +253,8 @@ impl StatusReport {
             turns_completed,
             boot_mode,
             peer_check,
+            transcriber: ServiceState::Unknown,
+            tts: ServiceState::Unknown,
         }
     }
 }
@@ -290,11 +323,266 @@ pub enum IpcResponse {
     Unpaired,
     /// `Reconnect` accepted: the parked link makes one new attempt.
     Reconnecting,
+    /// `SubscribeConversation` accepted; one `Conversation` follows, then one per change.
+    ConversationSubscribed,
+    /// Pushed WITHOUT a request after `SubscribeConversation`: the latest view (watch, no backlog).
+    Conversation(ConversationView),
+    /// A take is open: the microphone is on.
+    CaptureStarted,
+    CaptureRefused(CaptureRefusal),
+    /// `CaptureEnd` handled (also when no take was open: ending is idempotent). What happens
+    /// to the transcript shows in the next `Conversation`.
+    CaptureEnded,
+    TextAccepted,
+    TextRefused(TextRefusal),
+    /// `CancelTurn` handled: `cancel` sent if a turn or a wait was open, audio stopped.
+    TurnCancelSent,
+    /// `TurnVisible` recorded.
+    TurnVisibleNoted,
+    /// Answer to `RequestMicPermission` (after the system prompt, if one was shown).
+    MicPermission(crate::audio::MicPermission),
 }
 
 /// IPC protocol version spoken by this build. 2 = S1 (subscribe, discover, pair, unpair);
-/// 3 = reconnect.
-pub const IPC_VERSION: u32 = 3;
+/// 3 = reconnect; 4 = conversation (S2).
+pub const IPC_VERSION: u32 = 4;
+
+// ---- conversation (IPC v4, spec S2) ------------------------------------------------------
+//
+// Everything below carries the user's content. The core answers these requests only for a
+// `PeerCheck::SameSigner` peer (like Pair), never logs the text, and every type here prints
+// sizes, not content, in `Debug`.
+
+/// Largest text a UI may send in one `SendText` (UTF-8 bytes; the core validates).
+pub const SEND_TEXT_MAX_BYTES: usize = 8 * 1024;
+/// The view keeps at most this many turns (oldest dropped first).
+pub const CONVERSATION_MAX_TURNS: usize = 20;
+/// ... and at most this much text across them (oldest turns dropped first). The wire codec
+/// still guarantees the encoded frame fits `MAX_FRAME_BYTES` whatever the content.
+pub const CONVERSATION_MAX_TEXT_BYTES: usize = 48 * 1024;
+
+/// Text the person typed or reviewed. Redacted `Debug`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct UserText(pub String);
+
+impl std::fmt::Debug for UserText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "UserText({} B)", self.0.len())
+    }
+}
+
+/// How the person started a take. For logs and metrics only: the core treats both the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CaptureGesture {
+    /// Press and hold; release sends.
+    Hold,
+    /// Click to start; Stop / Send now / Discard ends it.
+    Toggle,
+}
+
+/// What happens to the final transcript when the take ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CaptureThen {
+    /// Sent with `send`.
+    Send,
+    /// Goes to the text box (`ConversationView::draft`); never sent on its own.
+    Review,
+    /// Thrown away.
+    Discard,
+}
+
+/// Why a take did not open. One sentence each in the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CaptureRefusal {
+    /// This connection is not subscribed to the conversation (it must show «Escuchando»).
+    NotSubscribed,
+    /// The OS permission was never asked: offer `RequestMicPermission`.
+    PermissionNotDetermined,
+    /// Denied or restricted in System Settings.
+    PermissionDenied,
+    /// This machine cannot capture (no adapter support or no input device).
+    NoMicrophone,
+    /// The link to the gateway is not ready.
+    NotReady,
+    /// The gateway has no live transcriber.
+    NoTranscriber,
+    /// A take is already open.
+    Busy,
+}
+
+/// Why a `SendText` was not sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TextRefusal {
+    Empty,
+    /// Over `SEND_TEXT_MAX_BYTES`.
+    TooLong,
+    NotReady,
+    /// A take is open: end it first.
+    Recording,
+}
+
+/// A gateway service as the agent last heard about it (`ready.live_capabilities` + `status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ServiceState {
+    #[default]
+    Unknown,
+    Up,
+    Degraded,
+    Down,
+}
+
+/// What the person is doing, as the core sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum UserActivity {
+    #[default]
+    Idle,
+    /// A take is open (microphone on).
+    Recording,
+    /// The take ended; waiting for the final transcript.
+    Transcribing,
+    /// Sent; waiting for the gateway's `turn_start`.
+    AwaitingReply,
+}
+
+/// The last thing worth telling the person about (cleared by their next action).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Notice {
+    /// The transcriber lost the phrase (`phrase_interrupted`): ask to repeat it.
+    PhraseLost,
+    /// The take was cut because nothing was heard; the transcript is in `draft`.
+    SilenceCut,
+    /// The take hit the safety limit; the transcript is in `draft`.
+    SafetyCut,
+}
+
+/// Who opened a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum TurnSource {
+    #[default]
+    Mine,
+    /// Agent-initiated (a reminder): shown as «Fogar te escribió».
+    Push,
+}
+
+/// Mirrors the gateway's `turn_progress` phases; unknown ones are `Working`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProgressKind {
+    Preparing,
+    Thinking,
+    /// `TurnView::tool` names the tool when the gateway gave a name.
+    Tool,
+    Working,
+}
+
+/// How a turn ended (gateway `turn_end.reason`). `Error` comes with `TurnView::error_code`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TurnOutcome {
+    Done,
+    Cancelled,
+    Interrupted,
+    Replaced,
+    Timeout,
+    Error,
+    Closed,
+}
+
+/// Whether the reply was heard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum TurnAudio {
+    /// No audio (yet, or the turn had none).
+    #[default]
+    None,
+    Played,
+    /// Audio arrived but was not played (nobody confirmed the turn was on screen): text only.
+    Muted,
+}
+
+/// One turn of the conversation. Built by the core; fields are public so it can fill a
+/// `default()` value (the struct is `non_exhaustive`).
+#[derive(Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct TurnView {
+    pub turn_id: String,
+    /// The gateway conversation this turn ran in (a change = a new day); `None` when unknown.
+    pub conversation: Option<String>,
+    pub source: TurnSource,
+    /// What I typed or said (empty for a push).
+    pub mine: String,
+    /// Fogar's reply so far.
+    pub reply: String,
+    /// Current progress while no text is arriving; `None` once tokens flow or the turn ended.
+    pub progress: Option<ProgressKind>,
+    pub tool: Option<String>,
+    /// `None` while the turn is open.
+    pub outcome: Option<TurnOutcome>,
+    /// The gateway's stable code when `outcome` is `Error`.
+    pub error_code: Option<String>,
+    pub audio: TurnAudio,
+}
+
+impl std::fmt::Debug for TurnView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnView")
+            .field("turn_id", &self.turn_id)
+            .field("source", &self.source)
+            .field("mine_bytes", &self.mine.len())
+            .field("reply_bytes", &self.reply.len())
+            .field("progress", &self.progress)
+            .field("outcome", &self.outcome)
+            .field("audio", &self.audio)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The conversation as the UI draws it: a bounded snapshot pushed latest-only (Decision 3 of
+/// spec S2). The UI keeps nothing of its own.
+#[derive(Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct ConversationView {
+    pub activity: UserActivity,
+    /// The live `transcription_partial` while recording.
+    pub live: String,
+    /// The transcript waiting for review in the text box.
+    pub draft: Option<String>,
+    /// Oldest first, at most `CONVERSATION_MAX_TURNS`.
+    pub turns: Vec<TurnView>,
+    /// Audio is playing now.
+    pub speaking: bool,
+    /// A turn whose audio waits for `TurnVisible` before it may play.
+    pub awaiting_visible: Option<String>,
+    pub mic: crate::audio::MicPermission,
+    pub transcriber: ServiceState,
+    pub tts: ServiceState,
+    pub notice: Option<Notice>,
+}
+
+impl std::fmt::Debug for ConversationView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConversationView")
+            .field("activity", &self.activity)
+            .field("live_bytes", &self.live.len())
+            .field("draft_bytes", &self.draft.as_ref().map(String::len))
+            .field("turns", &self.turns)
+            .field("speaking", &self.speaking)
+            .field("awaiting_visible", &self.awaiting_visible)
+            .field("mic", &self.mic)
+            .field("transcriber", &self.transcriber)
+            .field("tts", &self.tts)
+            .field("notice", &self.notice)
+            .finish()
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

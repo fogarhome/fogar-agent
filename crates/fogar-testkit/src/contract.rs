@@ -323,10 +323,29 @@ pub mod audio_source {
         }
     }
 
+    fn may_open(p: MicPermission) -> bool {
+        matches!(p, MicPermission::Granted | MicPermission::Unknown)
+    }
+
+    /// An adapter that can read the permission never answers `Unknown` (that value lets `open`
+    /// touch the device): an unreadable status is `NotDetermined`.
+    pub fn unknown_only_without_a_permission_model(a: &dyn AudioSource) {
+        if a.capabilities().permission_query.is_available() {
+            assert_ne!(
+                a.mic_permission(),
+                MicPermission::Unknown,
+                "permission_query available but mic_permission() is Unknown"
+            );
+        }
+    }
+
     /// Unsupported capture => `open` fails with `Unsupported`; supported => mono format and a
-    /// bounded stream of the requested capacity. Never panics, never prompts.
+    /// bounded stream of the requested capacity. A permission that is not `Granted`/`Unknown`
+    /// (denied, restricted or still undecided) => `PermissionDenied` without opening (no OS
+    /// prompt behind the core's back). `NoDevice` is valid (CI runners have no microphone).
+    /// Never panics, never prompts.
     pub fn open_matches_caps(a: &dyn AudioSource) {
-        let _ = a.mic_permission();
+        let perm = a.mic_permission();
         let r = a.open(NonZeroUsize::new(8).unwrap());
         match (a.capabilities().capture.is_available(), r) {
             (false, Err(AudioError::Unsupported(_))) => {}
@@ -335,15 +354,94 @@ pub mod audio_source {
                 other.map(|_| ())
             ),
             (true, Ok((cap, stream))) => {
+                assert!(may_open(perm), "opened with permission {perm:?}");
+                assert!(
+                    perm == MicPermission::Granted
+                        || !a.capabilities().permission_query.is_available(),
+                    "opened with Unknown on an adapter that has a permission model"
+                );
                 assert_eq!(cap.format().channels, 1, "the port delivers mono");
                 assert_eq!(stream.capacity(), 8);
                 drop(cap);
             }
             (true, Err(AudioError::PermissionDenied)) => {
-                assert_ne!(a.mic_permission(), MicPermission::Granted);
+                assert!(
+                    !may_open(a.mic_permission()),
+                    "Granted but PermissionDenied"
+                );
             }
+            (true, Err(AudioError::NoDevice)) => assert!(may_open(perm)),
             (true, Err(e)) => panic!("open failed: {e}"),
         }
+    }
+
+    /// Dropping the capture closes its stream (the device stops; nothing keeps listening).
+    pub fn drop_stops_capture(a: &dyn AudioSource) {
+        let Ok((cap, mut stream)) = a.open(NonZeroUsize::new(4).unwrap()) else {
+            return;
+        };
+        drop(cap);
+        crate::run_async(async {
+            let end = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while stream.next().await.is_some() {}
+            })
+            .await;
+            assert!(
+                end.is_ok(),
+                "the chunk stream did not end after the capture was dropped"
+            );
+        });
+    }
+
+    /// `permission_request` Unsupported => `Unsupported`. Supported and already decided => the
+    /// current permission arrives promptly, exactly once, without a prompt, then the stream
+    /// ends. An undecided permission is not requested here: it would prompt on a real Mac (the
+    /// fake covers that path in its own tests).
+    pub fn request_matches_caps(a: &dyn AudioSource) {
+        let supported = a.capabilities().permission_request.is_available();
+        let perm = a.mic_permission();
+        if supported && perm == MicPermission::NotDetermined {
+            return;
+        }
+        match (supported, a.request_mic_permission()) {
+            (false, Err(AudioError::Unsupported(_))) => {}
+            (false, other) => panic!(
+                "permission_request Unsupported but request returned {:?}",
+                other.map(|_| ())
+            ),
+            (true, Ok(mut stream)) => crate::run_async(async {
+                let wait = std::time::Duration::from_secs(2);
+                let first = tokio::time::timeout(wait, stream.next()).await;
+                assert_eq!(
+                    first.ok().flatten(),
+                    Some(perm),
+                    "one answer: the current state"
+                );
+                let rest = tokio::time::timeout(wait, stream.next()).await;
+                assert_eq!(
+                    rest.ok(),
+                    Some(None),
+                    "exactly one answer, then the stream ends"
+                );
+            }),
+            (true, Err(e)) => panic!("request failed: {e}"),
+        }
+        assert_eq!(
+            a.mic_permission(),
+            perm,
+            "asking a decided permission changes nothing"
+        );
+    }
+
+    /// Dropping the answer stream before reading it is safe, and asking again still works.
+    pub fn request_can_be_abandoned(a: &dyn AudioSource) {
+        if !a.capabilities().permission_request.is_available()
+            || a.mic_permission() == MicPermission::NotDetermined
+        {
+            return;
+        }
+        drop(a.request_mic_permission());
+        assert!(a.request_mic_permission().is_ok());
     }
 
     #[macro_export]
@@ -360,6 +458,22 @@ pub mod audio_source {
                 #[test]
                 fn open_matches_caps() {
                     c::open_matches_caps(&$make)
+                }
+                #[test]
+                fn drop_stops_capture() {
+                    c::drop_stops_capture(&$make)
+                }
+                #[test]
+                fn unknown_only_without_a_permission_model() {
+                    c::unknown_only_without_a_permission_model(&$make)
+                }
+                #[test]
+                fn request_matches_caps() {
+                    c::request_matches_caps(&$make)
+                }
+                #[test]
+                fn request_can_be_abandoned() {
+                    c::request_can_be_abandoned(&$make)
                 }
             }
         };
@@ -726,9 +840,11 @@ pub mod gateway_link {
 pub mod ipc_server {
     //! `$make` evaluates (inside the runtime) to `(server, connect)` where `connect().await`
     //! yields a client speaking the adapter's wire format through [`IpcTestClient`].
+    use fogar_ports::audio::MicPermission;
     use fogar_ports::ipc::{
-        GatewayInfo, IpcConn, IpcRequest, IpcResponse, IpcServer, LinkPhase, PairCode, PairFailure,
-        PeerCheck, StatusReport,
+        CaptureGesture, CaptureThen, ConversationView, GatewayInfo, IpcConn, IpcRequest,
+        IpcResponse, IpcServer, LinkPhase, PairCode, PairFailure, PeerCheck, StatusReport,
+        TurnView, UserText,
     };
     use std::{future::Future, time::Duration};
 
@@ -804,12 +920,106 @@ pub mod ipc_server {
                 }
                 IpcRequest::Unpair => IpcResponse::Unpaired,
                 IpcRequest::Reconnect => IpcResponse::Reconnecting,
+                IpcRequest::SubscribeConversation => {
+                    conn.send(IpcResponse::ConversationSubscribed)
+                        .await
+                        .expect("send");
+                    conn.send(IpcResponse::Conversation(big_view()))
+                        .await
+                        .expect("push a near-limit view");
+                    continue;
+                }
+                IpcRequest::SendText { text } => {
+                    assert_eq!(text.0, USER_TEXT, "user text must cross the wire intact");
+                    IpcResponse::TextAccepted
+                }
+                IpcRequest::CaptureStart {
+                    gesture: CaptureGesture::Hold,
+                } => IpcResponse::CaptureStarted,
+                IpcRequest::CaptureEnd {
+                    then: CaptureThen::Review,
+                } => IpcResponse::CaptureEnded,
+                IpcRequest::CancelTurn => IpcResponse::TurnCancelSent,
+                IpcRequest::TurnVisible { turn_id } if turn_id == "t-9" => {
+                    IpcResponse::TurnVisibleNoted
+                }
+                IpcRequest::RequestMicPermission => {
+                    IpcResponse::MicPermission(MicPermission::NotDetermined)
+                }
                 _ => IpcResponse::Refused {
                     reason: "unsupported request",
                 },
             };
             conn.send(resp).await.expect("send");
         }
+    }
+
+    const USER_TEXT: &str = "¿Qué tal? \"comillas\" \\ y salto\nde línea";
+
+    /// A view whose frame is close to `MAX_FRAME_BYTES` but fits untouched.
+    fn big_view() -> ConversationView {
+        let mut t = TurnView::default();
+        t.turn_id = "t-9".into();
+        t.mine = USER_TEXT.into();
+        t.reply = "x".repeat(60 * 1024);
+        let mut v = ConversationView::default();
+        v.turns = vec![t];
+        v.live = "pon".into();
+        v
+    }
+
+    /// IPC v4: every conversation request and answer crosses the adapter intact, including a
+    /// pushed view near the frame limit and the user's text with characters that need escaping.
+    pub async fn conversation_crosses_intact<S, F, Fut, K>(server: S, connect: F)
+    where
+        S: IpcServer,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = K>,
+        K: IpcTestClient,
+    {
+        let client = async {
+            let mut c = connect().await;
+            assert_eq!(
+                c.request(IpcRequest::SubscribeConversation).await,
+                Some(IpcResponse::ConversationSubscribed)
+            );
+            assert_eq!(c.next().await, Some(IpcResponse::Conversation(big_view())));
+            for (req, want) in [
+                (
+                    IpcRequest::SendText {
+                        text: UserText(USER_TEXT.into()),
+                    },
+                    IpcResponse::TextAccepted,
+                ),
+                (
+                    IpcRequest::CaptureStart {
+                        gesture: CaptureGesture::Hold,
+                    },
+                    IpcResponse::CaptureStarted,
+                ),
+                (
+                    IpcRequest::CaptureEnd {
+                        then: CaptureThen::Review,
+                    },
+                    IpcResponse::CaptureEnded,
+                ),
+                (IpcRequest::CancelTurn, IpcResponse::TurnCancelSent),
+                (
+                    IpcRequest::TurnVisible {
+                        turn_id: "t-9".into(),
+                    },
+                    IpcResponse::TurnVisibleNoted,
+                ),
+                (
+                    IpcRequest::RequestMicPermission,
+                    IpcResponse::MicPermission(MicPermission::NotDetermined),
+                ),
+            ] {
+                assert_eq!(c.request(req).await, Some(want));
+            }
+            drop(c);
+        };
+        bounded(async { tokio::join!(serve_one(&server, 0), client) }).await;
     }
 
     async fn bounded<F: Future>(f: F) {
@@ -1019,6 +1229,13 @@ pub mod ipc_server {
                     $crate::run_async(async {
                         let (server, connect) = $make;
                         c::unsolicited_send_reaches_client(server, connect).await
+                    })
+                }
+                #[test]
+                fn conversation_crosses_intact() {
+                    $crate::run_async(async {
+                        let (server, connect) = $make;
+                        c::conversation_crosses_intact(server, connect).await
                     })
                 }
                 #[test]

@@ -77,7 +77,8 @@ actor StandIn {
         return WireStatus(
             link: link == "reconnecting" ? "backoff" : link, phase: phase, gateway: gateway,
             sessions: phase == .ready ? 3 : 0, turns_completed: 7,
-            boot_mode: options.boot, peer_check: options.peer)
+            boot_mode: options.boot, peer_check: options.peer,
+            transcriber: phase == .ready ? .up : .unknown, tts: phase == .ready ? .up : .unknown)
     }
 
     func set(link: String) async {
@@ -159,6 +160,10 @@ actor StandIn {
                 await self.set(link: "ready")
             }
             return .reconnecting
+        case .subscribeConversation, .sendText, .captureStart, .captureEnd, .cancelTurn,
+             .turnVisible, .requestMicPermission:
+            // Conversation (IPC v4) arrives in the stand-in with the app's S2 PR.
+            return .refused(WireRefused(reason: "conversation not implemented in the stand-in yet"))
         }
     }
 }

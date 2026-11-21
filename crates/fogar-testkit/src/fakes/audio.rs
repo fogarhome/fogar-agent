@@ -38,19 +38,37 @@ pub fn silence_chunks(n: usize) -> Vec<AudioChunk> {
         .collect()
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct MicState {
     sink: Option<EventSink<AudioChunk>>,
     opens: u32,
+    permission: MicPermission,
+    /// What "the person" answers when the OS prompts.
+    answer: MicPermission,
+    /// `request_mic_permission` calls, and how many of them showed a prompt.
+    requests: u32,
+    prompts: u32,
+}
+
+impl MicState {
+    fn new(permission: MicPermission) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            sink: None,
+            opens: 0,
+            permission,
+            answer: MicPermission::Granted,
+            requests: 0,
+            prompts: 0,
+        }))
+    }
 }
 
 /// Fake microphone. The test pushes chunks as the OS callback would (never blocking; full =>
-/// dropped and counted, exactly the port contract).
+/// dropped and counted, exactly the port contract). Clones share state.
 #[derive(Debug, Clone)]
 pub struct FakeMic {
     caps: AudioSourceCaps,
     format: AudioFormat,
-    permission: MicPermission,
     state: Arc<Mutex<MicState>>,
 }
 
@@ -60,11 +78,11 @@ impl FakeMic {
         let mut caps = AudioSourceCaps::NONE;
         caps.capture = Support::Native;
         caps.permission_query = Support::Native;
+        caps.permission_request = Support::Native;
         Self {
             caps,
             format: AudioFormat::mono(16_000),
-            permission: MicPermission::Granted,
-            state: Arc::default(),
+            state: MicState::new(MicPermission::Granted),
         }
     }
     /// No capture at all (e.g. a headless Linux box).
@@ -72,15 +90,35 @@ impl FakeMic {
         Self {
             caps: AudioSourceCaps::NONE,
             format: AudioFormat::mono(16_000),
-            permission: MicPermission::Unknown,
-            state: Arc::default(),
+            state: MicState::new(MicPermission::Unknown),
         }
     }
     pub fn denied() -> Self {
-        Self {
-            permission: MicPermission::Denied,
-            ..Self::healthy()
-        }
+        Self::healthy().with_permission(MicPermission::Denied)
+    }
+    /// macOS before the first prompt. `request_mic_permission` prompts and the person answers
+    /// `answer` (see [`FakeMic::answering`], default `Granted`).
+    pub fn not_determined() -> Self {
+        Self::healthy().with_permission(MicPermission::NotDetermined)
+    }
+    pub fn with_permission(self, p: MicPermission) -> Self {
+        self.state.lock().unwrap().permission = p;
+        self
+    }
+    /// What the person answers at the next prompt.
+    pub fn answering(self, p: MicPermission) -> Self {
+        self.state.lock().unwrap().answer = p;
+        self
+    }
+    /// The person changes it in System Settings while the agent runs.
+    pub fn set_permission(&self, p: MicPermission) {
+        self.state.lock().unwrap().permission = p;
+    }
+    pub fn permission_requests(&self) -> u32 {
+        self.state.lock().unwrap().requests
+    }
+    pub fn prompts(&self) -> u32 {
+        self.state.lock().unwrap().prompts
     }
     pub fn with_format(mut self, f: AudioFormat) -> Self {
         self.format = f;
@@ -139,7 +177,7 @@ impl AudioSource for FakeMic {
         self.caps
     }
     fn mic_permission(&self) -> MicPermission {
-        self.permission
+        self.state.lock().unwrap().permission
     }
     fn open(
         &self,
@@ -148,11 +186,14 @@ impl AudioSource for FakeMic {
         if !self.caps.capture.is_available() {
             return Err(AudioError::Unsupported("capture"));
         }
-        if self.permission == MicPermission::Denied {
+        let mut st = self.state.lock().unwrap();
+        if !matches!(
+            st.permission,
+            MicPermission::Granted | MicPermission::Unknown
+        ) {
             return Err(AudioError::PermissionDenied);
         }
         let (tx, rx) = event_channel(capacity);
-        let mut st = self.state.lock().unwrap();
         st.sink = Some(tx);
         st.opens += 1;
         Ok((
@@ -162,6 +203,20 @@ impl AudioSource for FakeMic {
             }),
             rx,
         ))
+    }
+    fn request_mic_permission(&self) -> Result<EventStream<MicPermission>, AudioError> {
+        if !self.caps.permission_request.is_available() {
+            return Err(AudioError::Unsupported("permission request"));
+        }
+        let mut st = self.state.lock().unwrap();
+        st.requests += 1;
+        if st.permission == MicPermission::NotDetermined {
+            st.prompts += 1;
+            st.permission = st.answer;
+        }
+        let (tx, rx) = event_channel(NonZeroUsize::MIN);
+        tx.push(st.permission);
+        Ok(rx)
     }
 }
 

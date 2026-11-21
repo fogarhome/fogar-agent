@@ -151,6 +151,19 @@ fn one_mib_frames_cost_at_most_3x_their_size() {
             frame_with_string("error", r#""code":"TURN_ERROR","#, "message", ""),
         ),
         (
+            "turn_progress tool name",
+            frame_with_string(
+                "turn_progress",
+                r#""turn_id":"t-1","phase":"tool","#,
+                "tool",
+                "",
+            ),
+        ),
+        (
+            "turn_progress phase [[],..]",
+            frame_with_array("turn_progress", r#""turn_id":"t-1","#, "phase", "[],", ""),
+        ),
+        (
             "unknown type",
             frame_with_array("from_the_future", "", "payload", r#"{"a":[1,{}]},"#, ""),
         ),
@@ -177,6 +190,7 @@ fn one_mib_frames_cost_at_most_3x_their_size() {
             ServerMsg::Status(_) => ty == "status",
             ServerMsg::Error(_) => ty == "error",
             ServerMsg::PipelineEvent(_) => ty == "pipeline_event",
+            ServerMsg::TurnProgress(_) => ty == "turn_progress",
             ServerMsg::Unknown => ty == "from_the_future",
         };
         assert!(ok, "{what}: decoded as {msg:?}");

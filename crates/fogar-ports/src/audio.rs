@@ -33,14 +33,19 @@ impl AudioFormat {
 }
 
 /// Microphone permission as the OS reports it. Querying it must never prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum MicPermission {
     Granted,
     Denied,
+    /// Also the default: "not known yet" fails closed (`open` refuses it).
+    #[default]
     NotDetermined,
     Restricted,
-    /// The platform has no permission model (Linux) or the adapter cannot tell.
+    /// ONLY for a platform with no permission model (Linux), where `open` may proceed. An
+    /// adapter on a platform that has one (`permission_query` available) maps any status it
+    /// cannot read to `NotDetermined`, never to `Unknown`: `Unknown` lets `open` touch the
+    /// device, which on macOS would make the OS prompt behind the core's consent point.
     Unknown,
 }
 
@@ -79,12 +84,15 @@ impl fmt::Debug for AudioChunk {
 pub struct AudioSourceCaps {
     pub capture: Support,
     pub permission_query: Support,
+    /// The adapter can ask the OS for the microphone permission (macOS TCC prompt).
+    pub permission_request: Support,
 }
 
 impl AudioSourceCaps {
     pub const NONE: Self = Self {
         capture: Support::Unsupported,
         permission_query: Support::Unsupported,
+        permission_request: Support::Unsupported,
     };
 }
 
@@ -101,11 +109,27 @@ pub trait AudioSource: Send + Sync + 'static {
     fn mic_permission(&self) -> MicPermission;
     /// Starts capture. Chunks arrive on the returned bounded stream (`capacity` chunks). When the
     /// core lags, the adapter drops the newest chunk and counts it (`EventStream::dropped`).
-    /// Errors: `Unsupported` if `capture` is Unsupported, `PermissionDenied`, `NoDevice`, ...
+    /// Errors: `Unsupported` if `capture` is Unsupported, `NoDevice`, ... and `PermissionDenied`
+    /// whenever `mic_permission()` is `Denied`, `Restricted` or `NotDetermined`, WITHOUT touching
+    /// the device: opening the device with an undecided permission would make the OS prompt on
+    /// its own, bypassing the core's single consent point (spec S2). Only `Granted`, and
+    /// `Unknown` on an adapter whose `permission_query` is Unsupported (no permission model),
+    /// may open. The adapter never prompts from its constructor, `capabilities()`,
+    /// `mic_permission()` or anything but `request_mic_permission`.
     fn open(
         &self,
         capacity: NonZeroUsize,
     ) -> Result<(Box<dyn ActiveCapture>, EventStream<AudioChunk>), AudioError>;
+    /// Asks the OS for the microphone permission (may show the system prompt). Never blocks:
+    /// exactly one `MicPermission` arrives on the returned stream, after which the adapter drops
+    /// its end (the stream then yields `None`). When the permission is already decided it is
+    /// delivered at once without prompting. Dropping the stream before the answer is safe.
+    /// Only the core's capture gate (`fogar-core/src/capture.rs`) calls it, and only on the
+    /// person's explicit `RequestMicPermission` (archtest R13; no other crate may call it).
+    /// Errors: `Unsupported` when `permission_request` is Unsupported.
+    fn request_mic_permission(&self) -> Result<EventStream<MicPermission>, AudioError> {
+        Err(AudioError::Unsupported("permission request"))
+    }
 }
 
 const _: Option<&dyn AudioSource> = None;

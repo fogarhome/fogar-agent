@@ -19,6 +19,159 @@ public struct WireCandidate: Codable, Sendable, Equatable, Hashable {
 	}
 }
 
+public enum WireThen: String, Codable, Sendable, Equatable, Hashable {
+	case send
+	case review
+	case discard
+}
+
+public struct WireCaptureEnd: Codable, Sendable, Equatable, Hashable {
+	public let then: WireThen
+
+	public init(then: WireThen) {
+		self.then = then
+	}
+}
+
+public enum WireCaptureRefusal: String, Codable, Sendable, Equatable, Hashable {
+	case notSubscribed = "not_subscribed"
+	case permissionNotDetermined = "permission_not_determined"
+	case permissionDenied = "permission_denied"
+	case noMicrophone = "no_microphone"
+	case notReady = "not_ready"
+	case noTranscriber = "no_transcriber"
+	case busy
+}
+
+public struct WireCaptureRefused: Codable, Sendable, Equatable, Hashable {
+	public let reason: WireCaptureRefusal
+
+	public init(reason: WireCaptureRefusal) {
+		self.reason = reason
+	}
+}
+
+public enum WireGesture: String, Codable, Sendable, Equatable, Hashable {
+	case hold
+	case toggle
+}
+
+public struct WireCaptureStart: Codable, Sendable, Equatable, Hashable {
+	public let gesture: WireGesture
+
+	public init(gesture: WireGesture) {
+		self.gesture = gesture
+	}
+}
+
+public enum WireActivity: String, Codable, Sendable, Equatable, Hashable {
+	case idle
+	case recording
+	case transcribing
+	case awaitingReply = "awaiting_reply"
+}
+
+public enum WireSource: String, Codable, Sendable, Equatable, Hashable {
+	case mine
+	case push
+}
+
+public enum WireProgress: String, Codable, Sendable, Equatable, Hashable {
+	case preparing
+	case thinking
+	case tool
+	case working
+}
+
+public enum WireOutcome: String, Codable, Sendable, Equatable, Hashable {
+	case done
+	case cancelled
+	case interrupted
+	case replaced
+	case timeout
+	case error
+	case closed
+}
+
+public enum WireAudio: String, Codable, Sendable, Equatable, Hashable {
+	case none
+	case played
+	case muted
+}
+
+public struct WireTurn: Codable, Sendable, Equatable, Hashable {
+	public let turn_id: String
+	public let conversation: String?
+	public let source: WireSource
+	public let mine: String
+	public let reply: String
+	public let progress: WireProgress?
+	public let tool: String?
+	public let outcome: WireOutcome?
+	public let error_code: String?
+	public let audio: WireAudio
+
+	public init(turn_id: String, conversation: String?, source: WireSource, mine: String, reply: String, progress: WireProgress?, tool: String?, outcome: WireOutcome?, error_code: String?, audio: WireAudio) {
+		self.turn_id = turn_id
+		self.conversation = conversation
+		self.source = source
+		self.mine = mine
+		self.reply = reply
+		self.progress = progress
+		self.tool = tool
+		self.outcome = outcome
+		self.error_code = error_code
+		self.audio = audio
+	}
+}
+
+public enum WireMic: String, Codable, Sendable, Equatable, Hashable {
+	case granted
+	case denied
+	case notDetermined = "not_determined"
+	case restricted
+	case unknown
+}
+
+public enum WireService: String, Codable, Sendable, Equatable, Hashable {
+	case unknown
+	case up
+	case degraded
+	case down
+}
+
+public enum WireNotice: String, Codable, Sendable, Equatable, Hashable {
+	case phraseLost = "phrase_lost"
+	case silenceCut = "silence_cut"
+	case safetyCut = "safety_cut"
+}
+
+public struct WireConversation: Codable, Sendable, Equatable, Hashable {
+	public let activity: WireActivity
+	public let live: String
+	public let draft: String?
+	public let turns: [WireTurn]
+	public let speaking: Bool
+	public let awaiting_visible: String?
+	public let mic: WireMic
+	public let transcriber: WireService
+	public let tts: WireService
+	public let notice: WireNotice?
+
+	public init(activity: WireActivity, live: String, draft: String?, turns: [WireTurn], speaking: Bool, awaiting_visible: String?, mic: WireMic, transcriber: WireService, tts: WireService, notice: WireNotice?) {
+		self.activity = activity
+		self.live = live
+		self.draft = draft
+		self.turns = turns
+		self.speaking = speaking
+		self.awaiting_visible = awaiting_visible
+		self.mic = mic
+		self.transcriber = transcriber
+		self.tts = tts
+		self.notice = notice
+	}
+}
+
 public struct WireDiscovered: Codable, Sendable, Equatable, Hashable {
 	public let gateways: [WireCandidate]
 
@@ -46,6 +199,14 @@ public struct WireHello: Codable, Sendable, Equatable, Hashable {
 
 	public init(version: UInt32) {
 		self.version = version
+	}
+}
+
+public struct WireMicPermission: Codable, Sendable, Equatable, Hashable {
+	public let state: WireMic
+
+	public init(state: WireMic) {
+		self.state = state
 	}
 }
 
@@ -87,6 +248,14 @@ public struct WireRefused: Codable, Sendable, Equatable, Hashable {
 	}
 }
 
+public struct WireSendText: Codable, Sendable, Equatable, Hashable {
+	public let text: String
+
+	public init(text: String) {
+		self.text = text
+	}
+}
+
 public enum WirePhase: String, Codable, Sendable, Equatable, Hashable {
 	case notPaired = "not_paired"
 	case connecting
@@ -109,8 +278,10 @@ public struct WireStatus: Codable, Sendable, Equatable, Hashable {
 	public let turns_completed: Int
 	public let boot_mode: String
 	public let peer_check: WirePeerCheck
+	public let transcriber: WireService
+	public let tts: WireService
 
-	public init(link: String, phase: WirePhase, gateway: WireGateway?, sessions: Int, turns_completed: Int, boot_mode: String, peer_check: WirePeerCheck) {
+	public init(link: String, phase: WirePhase, gateway: WireGateway?, sessions: Int, turns_completed: Int, boot_mode: String, peer_check: WirePeerCheck, transcriber: WireService, tts: WireService) {
 		self.link = link
 		self.phase = phase
 		self.gateway = gateway
@@ -118,6 +289,31 @@ public struct WireStatus: Codable, Sendable, Equatable, Hashable {
 		self.turns_completed = turns_completed
 		self.boot_mode = boot_mode
 		self.peer_check = peer_check
+		self.transcriber = transcriber
+		self.tts = tts
+	}
+}
+
+public enum WireTextRefusal: String, Codable, Sendable, Equatable, Hashable {
+	case empty
+	case tooLong = "too_long"
+	case notReady = "not_ready"
+	case recording
+}
+
+public struct WireTextRefused: Codable, Sendable, Equatable, Hashable {
+	public let reason: WireTextRefusal
+
+	public init(reason: WireTextRefusal) {
+		self.reason = reason
+	}
+}
+
+public struct WireTurnVisible: Codable, Sendable, Equatable, Hashable {
+	public let turn_id: String
+
+	public init(turn_id: String) {
+		self.turn_id = turn_id
 	}
 }
 
@@ -129,6 +325,13 @@ public enum WireRequest: Codable, Sendable, Equatable, Hashable {
 	case pair(WirePair)
 	case unpair
 	case reconnect
+	case subscribeConversation
+	case sendText(WireSendText)
+	case captureStart(WireCaptureStart)
+	case captureEnd(WireCaptureEnd)
+	case cancelTurn
+	case turnVisible(WireTurnVisible)
+	case requestMicPermission
 
 	enum CodingKeys: String, CodingKey, Codable {
 		case hello,
@@ -137,7 +340,14 @@ public enum WireRequest: Codable, Sendable, Equatable, Hashable {
 			discover,
 			pair,
 			unpair,
-			reconnect
+			reconnect,
+			subscribeConversation = "subscribe_conversation",
+			sendText = "send_text",
+			captureStart = "capture_start",
+			captureEnd = "capture_end",
+			cancelTurn = "cancel_turn",
+			turnVisible = "turn_visible",
+			requestMicPermission = "request_mic_permission"
 	}
 
 	private enum ContainerCodingKeys: String, CodingKey {
@@ -173,6 +383,35 @@ public enum WireRequest: Codable, Sendable, Equatable, Hashable {
 			case .reconnect:
 				self = .reconnect
 				return
+			case .subscribeConversation:
+				self = .subscribeConversation
+				return
+			case .sendText:
+				if let content = try? container.decode(WireSendText.self, forKey: .data) {
+					self = .sendText(content)
+					return
+				}
+			case .captureStart:
+				if let content = try? container.decode(WireCaptureStart.self, forKey: .data) {
+					self = .captureStart(content)
+					return
+				}
+			case .captureEnd:
+				if let content = try? container.decode(WireCaptureEnd.self, forKey: .data) {
+					self = .captureEnd(content)
+					return
+				}
+			case .cancelTurn:
+				self = .cancelTurn
+				return
+			case .turnVisible:
+				if let content = try? container.decode(WireTurnVisible.self, forKey: .data) {
+					self = .turnVisible(content)
+					return
+				}
+			case .requestMicPermission:
+				self = .requestMicPermission
+				return
 			}
 		}
 		throw DecodingError.typeMismatch(WireRequest.self, DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Wrong type for WireRequest"))
@@ -197,6 +436,24 @@ public enum WireRequest: Codable, Sendable, Equatable, Hashable {
 			try container.encode(CodingKeys.unpair, forKey: .type)
 		case .reconnect:
 			try container.encode(CodingKeys.reconnect, forKey: .type)
+		case .subscribeConversation:
+			try container.encode(CodingKeys.subscribeConversation, forKey: .type)
+		case .sendText(let content):
+			try container.encode(CodingKeys.sendText, forKey: .type)
+			try container.encode(content, forKey: .data)
+		case .captureStart(let content):
+			try container.encode(CodingKeys.captureStart, forKey: .type)
+			try container.encode(content, forKey: .data)
+		case .captureEnd(let content):
+			try container.encode(CodingKeys.captureEnd, forKey: .type)
+			try container.encode(content, forKey: .data)
+		case .cancelTurn:
+			try container.encode(CodingKeys.cancelTurn, forKey: .type)
+		case .turnVisible(let content):
+			try container.encode(CodingKeys.turnVisible, forKey: .type)
+			try container.encode(content, forKey: .data)
+		case .requestMicPermission:
+			try container.encode(CodingKeys.requestMicPermission, forKey: .type)
 		}
 	}
 }
@@ -212,6 +469,16 @@ public enum WireResponse: Codable, Sendable, Equatable, Hashable {
 	case pairFailed(WirePairFailed)
 	case unpaired
 	case reconnecting
+	case conversationSubscribed
+	case conversation(WireConversation)
+	case captureStarted
+	case captureRefused(WireCaptureRefused)
+	case captureEnded
+	case textAccepted
+	case textRefused(WireTextRefused)
+	case turnCancelSent
+	case turnVisibleNoted
+	case micPermission(WireMicPermission)
 
 	enum CodingKeys: String, CodingKey, Codable {
 		case hello,
@@ -223,7 +490,17 @@ public enum WireResponse: Codable, Sendable, Equatable, Hashable {
 			paired,
 			pairFailed = "pair_failed",
 			unpaired,
-			reconnecting
+			reconnecting,
+			conversationSubscribed = "conversation_subscribed",
+			conversation,
+			captureStarted = "capture_started",
+			captureRefused = "capture_refused",
+			captureEnded = "capture_ended",
+			textAccepted = "text_accepted",
+			textRefused = "text_refused",
+			turnCancelSent = "turn_cancel_sent",
+			turnVisibleNoted = "turn_visible_noted",
+			micPermission = "mic_permission"
 	}
 
 	private enum ContainerCodingKeys: String, CodingKey {
@@ -278,6 +555,44 @@ public enum WireResponse: Codable, Sendable, Equatable, Hashable {
 			case .reconnecting:
 				self = .reconnecting
 				return
+			case .conversationSubscribed:
+				self = .conversationSubscribed
+				return
+			case .conversation:
+				if let content = try? container.decode(WireConversation.self, forKey: .data) {
+					self = .conversation(content)
+					return
+				}
+			case .captureStarted:
+				self = .captureStarted
+				return
+			case .captureRefused:
+				if let content = try? container.decode(WireCaptureRefused.self, forKey: .data) {
+					self = .captureRefused(content)
+					return
+				}
+			case .captureEnded:
+				self = .captureEnded
+				return
+			case .textAccepted:
+				self = .textAccepted
+				return
+			case .textRefused:
+				if let content = try? container.decode(WireTextRefused.self, forKey: .data) {
+					self = .textRefused(content)
+					return
+				}
+			case .turnCancelSent:
+				self = .turnCancelSent
+				return
+			case .turnVisibleNoted:
+				self = .turnVisibleNoted
+				return
+			case .micPermission:
+				if let content = try? container.decode(WireMicPermission.self, forKey: .data) {
+					self = .micPermission(content)
+					return
+				}
 			}
 		}
 		throw DecodingError.typeMismatch(WireResponse.self, DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Wrong type for WireResponse"))
@@ -313,6 +628,30 @@ public enum WireResponse: Codable, Sendable, Equatable, Hashable {
 			try container.encode(CodingKeys.unpaired, forKey: .type)
 		case .reconnecting:
 			try container.encode(CodingKeys.reconnecting, forKey: .type)
+		case .conversationSubscribed:
+			try container.encode(CodingKeys.conversationSubscribed, forKey: .type)
+		case .conversation(let content):
+			try container.encode(CodingKeys.conversation, forKey: .type)
+			try container.encode(content, forKey: .data)
+		case .captureStarted:
+			try container.encode(CodingKeys.captureStarted, forKey: .type)
+		case .captureRefused(let content):
+			try container.encode(CodingKeys.captureRefused, forKey: .type)
+			try container.encode(content, forKey: .data)
+		case .captureEnded:
+			try container.encode(CodingKeys.captureEnded, forKey: .type)
+		case .textAccepted:
+			try container.encode(CodingKeys.textAccepted, forKey: .type)
+		case .textRefused(let content):
+			try container.encode(CodingKeys.textRefused, forKey: .type)
+			try container.encode(content, forKey: .data)
+		case .turnCancelSent:
+			try container.encode(CodingKeys.turnCancelSent, forKey: .type)
+		case .turnVisibleNoted:
+			try container.encode(CodingKeys.turnVisibleNoted, forKey: .type)
+		case .micPermission(let content):
+			try container.encode(CodingKeys.micPermission, forKey: .type)
+			try container.encode(content, forKey: .data)
 		}
 	}
 }

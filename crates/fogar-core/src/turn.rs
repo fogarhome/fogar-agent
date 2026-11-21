@@ -273,6 +273,7 @@ impl TurnMachine {
             | ServerMsg::Status(_)
             | ServerMsg::Token(_)
             | ServerMsg::PipelineEvent(_)
+            | ServerMsg::TurnProgress(_)
             | ServerMsg::Unknown => {}
         }
         fx

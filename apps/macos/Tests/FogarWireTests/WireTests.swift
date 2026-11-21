@@ -6,7 +6,7 @@ import Testing
 /// app must parse and produce. If Rust changes it, IPC_VERSION bumps and these fail.
 @Suite struct GoldenJSON {
     @Test func eventDecodes() throws {
-        let json = #"{"type":"event","data":{"link":"ready","phase":"ready","gateway":{"address":"http://green-house:8004","name":"green-house","version":"1.29.0","client_name":"Mac de Sito"},"sessions":3,"turns_completed":7,"boot_mode":"normal","peer_check":"same_signer"}}"#
+        let json = #"{"type":"event","data":{"link":"ready","phase":"ready","gateway":{"address":"http://green-house:8004","name":"green-house","version":"1.29.0","client_name":"Mac de Sito"},"sessions":3,"turns_completed":7,"boot_mode":"normal","peer_check":"same_signer","transcriber":"up","tts":"down"}}"#
         guard case .event(let s) = try WireCodec.decodeResponse(Data(json.utf8)) else {
             Issue.record("not an event"); return
         }
@@ -29,11 +29,33 @@ import Testing
     }
 
     @Test func notPairedStatusHasNullGateway() throws {
-        let json = #"{"type":"status","data":{"link":"not_paired","phase":"not_paired","gateway":null,"sessions":0,"turns_completed":0,"boot_mode":"safe","peer_check":"uid_only"}}"#
+        let json = #"{"type":"status","data":{"link":"not_paired","phase":"not_paired","gateway":null,"sessions":0,"turns_completed":0,"boot_mode":"safe","peer_check":"uid_only","transcriber":"unknown","tts":"unknown"}}"#
         guard case .status(let s) = try WireCodec.decodeResponse(Data(json.utf8)) else {
             Issue.record("not a status"); return
         }
         #expect(s.gateway == nil && s.peer_check == .uidOnly && s.boot_mode == "safe")
+    }
+
+    /// IPC v4: the conversation view and the v4 answers.
+    @Test func conversationDecodes() throws {
+        let json = #"{"type":"conversation","data":{"activity":"recording","live":"pon la","draft":"borrador","turns":[{"turn_id":"t-3","conversation":"0b9d","source":"mine","mine":"¿qué tiempo hace?","reply":"Soleado.","progress":"tool","tool":"ha_call_service","outcome":null,"error_code":null,"audio":"none"},{"turn_id":"t-4","conversation":null,"source":"push","mine":"","reply":"Recuerda la cita.","progress":null,"tool":null,"outcome":"error","error_code":"TURN_ERROR","audio":"muted"}],"speaking":true,"awaiting_visible":"t-4","mic":"granted","transcriber":"degraded","tts":"up","notice":"silence_cut"}}"#
+        guard case .conversation(let c) = try WireCodec.decodeResponse(Data(json.utf8)) else {
+            Issue.record("not a conversation"); return
+        }
+        #expect(c.activity == .recording && c.live == "pon la" && c.draft == "borrador")
+        #expect(c.turns.count == 2 && c.turns[0].tool == "ha_call_service" && c.turns[0].progress == .tool)
+        #expect(c.turns[1].source == .push && c.turns[1].outcome == .error && c.turns[1].audio == .muted)
+        #expect(c.awaiting_visible == "t-4" && c.mic == .granted && c.notice == .silenceCut)
+        guard case .captureRefused(let r) = try WireCodec.decodeResponse(
+            Data(#"{"type":"capture_refused","data":{"reason":"permission_not_determined"}}"#.utf8)) else {
+            Issue.record("not capture_refused"); return
+        }
+        #expect(r.reason == .permissionNotDetermined)
+        guard case .micPermission(let m) = try WireCodec.decodeResponse(
+            Data(#"{"type":"mic_permission","data":{"state":"not_determined"}}"#.utf8)) else {
+            Issue.record("not mic_permission"); return
+        }
+        #expect(m.state == .notDetermined)
     }
 
     /// Requests are compared as JSON objects: JSONEncoder's key order is not stable.
@@ -44,6 +66,13 @@ import Testing
         (.subscribe, #"{"type":"subscribe"}"#),
         (.discover, #"{"type":"discover"}"#),
         (.unpair, #"{"type":"unpair"}"#),
+        (.subscribeConversation, #"{"type":"subscribe_conversation"}"#),
+        (.sendText(WireSendText(text: "hola \"Fogar\"\n")), #"{"type":"send_text","data":{"text":"hola \"Fogar\"\n"}}"#),
+        (.captureStart(WireCaptureStart(gesture: .hold)), #"{"type":"capture_start","data":{"gesture":"hold"}}"#),
+        (.captureEnd(WireCaptureEnd(then: .review)), #"{"type":"capture_end","data":{"then":"review"}}"#),
+        (.cancelTurn, #"{"type":"cancel_turn"}"#),
+        (.turnVisible(WireTurnVisible(turn_id: "t-4")), #"{"type":"turn_visible","data":{"turn_id":"t-4"}}"#),
+        (.requestMicPermission, #"{"type":"request_mic_permission"}"#),
     ])
     func requestsMatchRust(request: WireRequest, golden: String) throws {
         let ours = try JSONSerialization.jsonObject(with: WireCodec.encode(request)) as? NSDictionary

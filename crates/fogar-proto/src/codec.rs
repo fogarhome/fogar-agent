@@ -90,6 +90,7 @@ pub fn decode_server(text: &str) -> Result<ServerMsg, DecodeError> {
         "status" => ServerMsg::Status(body(text)?),
         "error" => ServerMsg::Error(body(text)?),
         "pipeline_event" => ServerMsg::PipelineEvent(body(text)?),
+        "turn_progress" => ServerMsg::TurnProgress(body(text)?),
         _ => ServerMsg::Unknown,
     })
 }
