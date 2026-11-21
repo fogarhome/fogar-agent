@@ -54,7 +54,7 @@ nonisolated final class FakeAgent: @unchecked Sendable {
 
 nonisolated let ready = WireStatus(link: "ready", phase: .ready,
                        gateway: WireGateway(address: "http://green-house:8004", name: "green-house", version: "1.29.0", client_name: "Mac"),
-                       sessions: 1, turns_completed: 2, boot_mode: "normal", peer_check: .sameSigner)
+                       sessions: 1, turns_completed: 2, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown)
 
 func answers(version: UInt32 = ipcVersion, pair: WireResponse = .unpaired) -> @Sendable (WireRequest) -> [WireResponse] {
     { req in
@@ -66,6 +66,9 @@ func answers(version: UInt32 = ipcVersion, pair: WireResponse = .unpaired) -> @S
         case .unpair: [.unpaired]
         case .reconnect: [.event(ready), .reconnecting]
         case .status: [.status(ready)]
+        case .subscribeConversation, .sendText, .captureStart, .captureEnd, .cancelTurn,
+             .turnVisible, .requestMicPermission:
+            [.refused(WireRefused(reason: "not in these tests"))]
         }
     }
 }
@@ -181,7 +184,7 @@ extension AgentLinkOverASocket {
     @Test func everyPhaseHasAHeadline() {
         for phase: WirePhase in [.notPaired, .connecting, .ready, .reconnecting, .parked, .stopping] {
             let s = WireStatus(link: phase.rawValue, phase: phase, gateway: ready.gateway, sessions: 0,
-                               turns_completed: 0, boot_mode: "normal", peer_check: .uidOnly)
+                               turns_completed: 0, boot_mode: "normal", peer_check: .uidOnly, transcriber: .unknown, tts: .unknown)
             #expect(!Textos.titular(.live(s)).titulo.isEmpty)
         }
         #expect(Textos.titular(.versionMismatch(agent: 1)).titulo == "Actualiza el agente de Fogar")
@@ -191,7 +194,7 @@ extension AgentLinkOverASocket {
     @Test func pausesWithReconnectSayReconectar() {
         for link in ["parked_conversation_taken", "parked_agent_refused"] {
             let s = WireStatus(link: link, phase: .parked, gateway: ready.gateway, sessions: 0,
-                               turns_completed: 0, boot_mode: "normal", peer_check: .sameSigner)
+                               turns_completed: 0, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown)
             let sub = Textos.titular(.live(s)).sub
             #expect(sub.contains("Reconectar"))
             #expect(!sub.contains("einicia"))
@@ -200,7 +203,7 @@ extension AgentLinkOverASocket {
 }
 
 nonisolated let notPaired = WireStatus(link: "not_paired", phase: .notPaired, gateway: nil, sessions: 1,
-                                       turns_completed: 2, boot_mode: "normal", peer_check: .sameSigner)
+                                       turns_completed: 2, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown)
 
 /// Revocation (gateway 4200/4010): the agent goes from paired to `not_paired` by itself.
 @Suite struct AccesoRetirado {
@@ -217,7 +220,7 @@ nonisolated let notPaired = WireStatus(link: "not_paired", phase: .notPaired, ga
         #expect(!AgentLink.retirado(antes: .notRunning, despues: .live(notPaired), desemparejando: false, yaRetirado: false))
         // Keychain error at boot: `reconnecting` with no gateway, then `not_paired`.
         let sinClave = WireStatus(link: "backoff", phase: .reconnecting, gateway: nil, sessions: 0,
-                                  turns_completed: 0, boot_mode: "normal", peer_check: .sameSigner)
+                                  turns_completed: 0, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown)
         #expect(!AgentLink.retirado(antes: .live(sinClave), despues: .live(notPaired), desemparejando: false, yaRetirado: false))
     }
 
