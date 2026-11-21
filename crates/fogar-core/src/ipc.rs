@@ -239,9 +239,13 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
                 if r.is_err() {
                     return;
                 }
-                let latest = conv.borrow_and_update().clone();
-                if conv_subscribed && !c.send(IpcResponse::Conversation(latest)).await {
-                    return;
+                if conv_subscribed {
+                    let latest = conv.borrow_and_update().clone();
+                    if !c.send(IpcResponse::Conversation(latest)).await {
+                        return;
+                    }
+                } else {
+                    conv.borrow_and_update(); // status only: mark seen, no copy of the view
                 }
                 if subscribed {
                     let rep = report(&c.health, &view.borrow(), c.peer_check);

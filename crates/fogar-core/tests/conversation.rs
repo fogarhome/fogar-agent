@@ -5,6 +5,7 @@
 
 mod common;
 use common::*;
+use fogar_ports::audio::MicPermission;
 use fogar_ports::ipc::{
     CaptureGesture, ConversationView, IpcRequest, IpcResponse, ProgressKind, SEND_TEXT_MAX_BYTES,
     ServiceState, TextRefusal, TurnAudio, TurnOutcome, TurnSource, UserActivity, UserText,
@@ -69,6 +70,11 @@ async fn typed_text_shows_as_a_turn_with_reply_then_done() {
     wait_ready(&mut rig.health).await;
     let (mut sub, first) = subscribe(&rig).await;
     assert!(first.turns.is_empty());
+    assert_eq!(
+        first.mic,
+        MicPermission::Granted,
+        "permission status reaches the view"
+    );
     assert_eq!(
         (first.transcriber, first.tts),
         (ServiceState::Up, ServiceState::Up)
