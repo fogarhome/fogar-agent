@@ -192,6 +192,20 @@ pub fn wait_ended(v: &mut ConversationView, o: TurnOutcome) -> bool {
     }
 }
 
+/// Ends every open turn that has a gateway id (a cut turn whose `turn_end` will never come).
+pub fn end_open(v: &mut ConversationView, o: TurnOutcome) -> bool {
+    let mut changed = false;
+    for t in v
+        .turns
+        .iter_mut()
+        .filter(|t| t.outcome.is_none() && !t.turn_id.is_empty())
+    {
+        end(t, o);
+        changed = true;
+    }
+    changed
+}
+
 /// TTS audio of this turn reached the speaker.
 pub fn audio_played(v: &mut ConversationView, turn_id: &str) -> bool {
     match open_turn(v, turn_id) {
@@ -201,13 +215,20 @@ pub fn audio_played(v: &mut ConversationView, turn_id: &str) -> bool {
 }
 
 /// A gateway event. `origin` is the turn machine's verdict for a `turn_start` (M19 `origin`,
-/// or inferred on older gateways).
+/// or inferred on older gateways); `None` = the machine ignored it (the late answer to a send
+/// we abandoned), so it is not shown either.
 pub fn on_server(v: &mut ConversationView, msg: &ServerMsg, origin: Option<Origin>) -> bool {
     match msg {
         ServerMsg::TurnStart(ts) => {
+            let Some(origin) = origin else {
+                return false;
+            };
+            // One active turn (the machine's rule, JGW-286): an open turn left without its
+            // turn_end was replaced by this one.
+            end_open(v, TurnOutcome::Replaced);
             let id = bounded(&ts.turn_id).to_owned();
             let conversation = ts.conversation.as_deref().map(|c| bounded(c).to_owned());
-            let mine = origin != Some(Origin::Push);
+            let mine = origin == Origin::User;
             match pending(v).filter(|_| mine) {
                 Some(t) => {
                     t.turn_id = id;
@@ -228,22 +249,23 @@ pub fn on_server(v: &mut ConversationView, msg: &ServerMsg, origin: Option<Origi
             }
             true
         }
-        ServerMsg::Token(tok) => match open_turn(v, &tok.turn_id) {
-            Some(t) => {
-                t.reply.push_str(&tok.text);
-                t.progress = None;
-                t.tool = None;
-                trim(v);
-                true
+        ServerMsg::Token(tok) => {
+            let before = (v.turns.len(), text_bytes(v));
+            match open_turn(v, &tok.turn_id) {
+                Some(t) => {
+                    t.reply.push_str(&tok.text);
+                    let stale = t.progress.take().is_some() | t.tool.take().is_some();
+                    trim(v);
+                    // A token cut off whole at the cap changes nothing: no push.
+                    stale || before != (v.turns.len(), text_bytes(v))
+                }
+                None => false,
             }
-            None => false,
-        },
+        }
         ServerMsg::TurnProgress(p) => match open_turn(v, &p.turn_id) {
+            // fogar-proto already dropped names over 128 chars or outside `[A-Za-z0-9_.:-]`.
             Some(t) => {
-                t.progress = Some(progress(p.phase));
-                // fogar-proto already dropped names over 128 chars or outside `[A-Za-z0-9_.:-]`.
-                t.tool = p.tool.clone();
-                true
+                set(&mut t.progress, Some(progress(p.phase))) | set(&mut t.tool, p.tool.clone())
             }
             None => false,
         },
@@ -255,11 +277,19 @@ pub fn on_server(v: &mut ConversationView, msg: &ServerMsg, origin: Option<Origi
             None => false,
         },
         ServerMsg::Error(e) => {
-            let t = match e.turn_id.as_deref() {
-                Some(id) if !id.is_empty() => open_turn(v, id),
-                // A TURN_ERROR before `turn_start` means our `send` failed.
-                _ if e.is_turn_error() => pending(v),
-                _ => None,
+            // Same rule as `TurnMachine::on_error`: an error naming an open turn is about that
+            // turn; a TURN_ERROR naming none (no id, or one we never saw start) means our
+            // `send` failed.
+            let named = e
+                .turn_id
+                .as_deref()
+                .is_some_and(|id| open_turn(v, id).is_some());
+            let t = if named {
+                e.turn_id.as_deref().and_then(|id| open_turn(v, id))
+            } else if e.is_turn_error() {
+                pending(v)
+            } else {
+                None
             };
             match t {
                 Some(t) => {
@@ -575,5 +605,84 @@ mod tests {
         let d = format!("{v:?}");
         assert!(!d.contains("4321") && !d.contains("9876"), "{d}");
         assert!(d.contains("mine_bytes") && d.contains("reply_bytes"), "{d}");
+    }
+
+    /// Review M1: a turn_start the machine ignored (origin `None`) is not shown and does not take
+    /// my waiting text, whichever way the send was abandoned.
+    #[test]
+    fn ignored_turn_start_is_never_shown() {
+        // (a) cancel / (b) timeout: my entry ended locally; the late turn is a no-op.
+        for o in [TurnOutcome::Cancelled, TurnOutcome::Timeout] {
+            let mut v = ConversationView::default();
+            sent(&mut v, "x");
+            wait_ended(&mut v, o);
+            assert!(!on_server(&mut v, &start("t-1", None), None));
+            assert!(!on_server(&mut v, &token("t-1", "fantasma"), None));
+            assert_eq!(v.turns.len(), 1);
+            assert_eq!(
+                (v.turns[0].outcome, v.turns[0].reply.as_str()),
+                (Some(o), "")
+            );
+        }
+        // (c) two quick texts: t-1 (ignored) must not land in text 2's entry.
+        let mut v = ConversationView::default();
+        sent(&mut v, "uno");
+        sent(&mut v, "dos");
+        assert!(!on_server(&mut v, &start("t-1", None), None));
+        assert_eq!(v.turns[1].turn_id, "", "still waiting");
+        on_server(&mut v, &start("t-2", None), USER);
+        assert_eq!((v.turns.len(), v.turns[1].turn_id.as_str()), (2, "t-2"));
+    }
+
+    /// Review M3: one active turn; a turn left without turn_end is replaced.
+    #[test]
+    fn a_new_turn_start_replaces_open_turns() {
+        let mut v = ConversationView::default();
+        on_server(&mut v, &start("t-1", None), PUSH);
+        sent(&mut v, "hola");
+        on_server(&mut v, &start("t-2", None), USER);
+        assert_eq!(v.turns[0].outcome, Some(TurnOutcome::Replaced));
+        assert_eq!(
+            (v.turns[1].turn_id.as_str(), v.turns[1].outcome),
+            ("t-2", None)
+        );
+        // A cut turn whose cancel never went out is closed by the engine.
+        assert!(end_open(&mut v, TurnOutcome::Interrupted));
+        assert_eq!(v.turns[1].outcome, Some(TurnOutcome::Interrupted));
+        assert!(!end_open(&mut v, TurnOutcome::Interrupted));
+    }
+
+    /// Review L4: a TURN_ERROR naming a turn that never started fails my waiting text.
+    #[test]
+    fn turn_error_with_an_unknown_id_fails_the_waiting_text() {
+        let mut v = ConversationView::default();
+        sent(&mut v, "hola");
+        assert!(on_server(
+            &mut v,
+            &err("TURN_ERROR", "orchestrator_error", Some("t-7")),
+            None
+        ));
+        assert_eq!(v.turns[0].outcome, Some(TurnOutcome::Error));
+        assert_eq!(v.turns[0].error_code.as_deref(), Some("orchestrator_error"));
+    }
+
+    /// Review L5: updates that leave the view identical report no change (no push).
+    #[test]
+    fn no_op_updates_report_no_change() {
+        let mut v = ConversationView::default();
+        on_server(&mut v, &start("t-1", None), PUSH);
+        let p = ServerMsg::TurnProgress(TurnProgress {
+            turn_id: "t-1".into(),
+            phase: ProgressPhase::Thinking,
+            tool: None,
+        });
+        assert!(on_server(&mut v, &p, None));
+        assert!(!on_server(&mut v, &p, None), "same progress again");
+        let big = "x".repeat(CONVERSATION_MAX_TEXT_BYTES);
+        assert!(on_server(&mut v, &token("t-1", &big), None));
+        assert!(
+            !on_server(&mut v, &token("t-1", "y"), None),
+            "cut off whole at the cap"
+        );
     }
 }

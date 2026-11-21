@@ -68,6 +68,9 @@ pub struct Effects {
     pub turn_started: bool,
     pub turn_completed: bool,
     pub barge_in: bool,
+    /// A streaming turn was cut locally (new text or cancel). If the control message then fails
+    /// to go out, no `turn_end` will close it: the engine ends its view entry itself.
+    pub turn_cut: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +78,10 @@ pub struct TurnTimeouts {
     /// Max wait for `turn_start` after `send` (the server's own turn timeout is 120 s).
     pub turn_start: Duration,
 }
+
+/// How long an abandoned `send` may still produce its `turn_start` (the gateway's own turn
+/// timeout, 120 s). GUESSED: no later `turn_start` belongs to it.
+pub const ABANDONED_SEND_TTL: Duration = Duration::from_secs(120);
 
 impl Default for TurnTimeouts {
     fn default() -> Self {
@@ -90,6 +97,13 @@ pub struct TurnMachine {
     turn: Option<ActiveTurn>,
     /// Seq cut locally (new text or cancel): its late frames are dropped.
     suppressed_seq: Option<u16>,
+    /// `send`s we stopped waiting for (cancel, local timeout, a newer text) whose `turn_start`
+    /// may still arrive. Sends are never matched to their turn otherwise, so such a late
+    /// `turn_start` would play in full and show as a phantom turn. GUESSED gateway behaviour:
+    /// one `turn_start` per `send`, in order, at most `ABANDONED_SEND_TTL` late. Saturating.
+    abandoned: u8,
+    /// When `abandoned` was last bumped; the count expires `ABANDONED_SEND_TTL` after it.
+    abandoned_at: Mono,
     timeouts: TurnTimeouts,
 }
 
@@ -99,6 +113,8 @@ impl TurnMachine {
             phase: UserPhase::Offline,
             turn: None,
             suppressed_seq: None,
+            abandoned: 0,
+            abandoned_at: Mono::ZERO,
             timeouts,
         }
     }
@@ -116,6 +132,7 @@ impl TurnMachine {
         self.phase = UserPhase::Idle;
         self.turn = None;
         self.suppressed_seq = None;
+        self.abandoned = 0;
     }
 
     /// The session ended. Turn ids restart on the next connection, so nothing carries over.
@@ -124,6 +141,7 @@ impl TurnMachine {
         self.phase = UserPhase::Offline;
         self.turn = None;
         self.suppressed_seq = None;
+        self.abandoned = 0;
         Effects {
             stop_playback: had_audio,
             ..Effects::default()
@@ -138,15 +156,24 @@ impl TurnMachine {
         if self.phase == UserPhase::Offline {
             return None;
         }
+        if matches!(self.phase, UserPhase::AwaitTurn { .. }) {
+            // The earlier send's turn_start may still come (then replaced by this one).
+            self.abandon(now);
+        }
         let mut fx = self.cut(playing);
         fx.send = Some(ClientCmd::Send(text));
         self.phase = UserPhase::AwaitTurn { since: now };
         Some(fx)
     }
 
+    fn abandon(&mut self, now: Mono) {
+        self.abandoned = self.abandoned.saturating_add(1);
+        self.abandoned_at = now;
+    }
+
     /// The cancel button: `cancel` goes out if a turn streams or our `send` still waits for its
     /// `turn_start`; playback stops either way.
-    pub fn cancel(&mut self, playing: bool) -> Effects {
+    pub fn cancel(&mut self, playing: bool, now: Mono) -> Effects {
         let waiting = matches!(self.phase, UserPhase::AwaitTurn { .. });
         let streaming = self.turn.is_some();
         let mut fx = self.cut(playing);
@@ -155,6 +182,7 @@ impl TurnMachine {
         }
         if waiting {
             self.phase = UserPhase::Idle;
+            self.abandon(now);
         }
         fx
     }
@@ -166,6 +194,7 @@ impl TurnMachine {
             self.suppressed_seq = Some(t.turn_seq);
             fx.stop_playback = true;
             fx.barge_in = true;
+            fx.turn_cut = true;
         } else if playing {
             // The turn already ended; only its ~2 s playback tail is left.
             fx.stop_playback = true;
@@ -189,20 +218,36 @@ impl TurnMachine {
         }
     }
 
-    /// Returns true if a user-side wait timed out (and was abandoned).
-    pub fn on_tick(&mut self, now: Mono) -> bool {
+    /// `Some` if the user-side wait timed out: it is abandoned and `cancel` goes out so the
+    /// gateway (whose own limit is 120 s) does not answer it later.
+    pub fn on_tick(&mut self, now: Mono) -> Option<Effects> {
         match self.next_deadline() {
             Some(d) if now >= d => {
                 self.phase = UserPhase::Idle;
-                true
+                self.abandon(now);
+                Some(Effects {
+                    send: Some(ClientCmd::Cancel),
+                    ..Effects::default()
+                })
             }
-            _ => false,
+            _ => None,
         }
     }
 
-    pub fn on_server(&mut self, msg: &ServerMsg) -> Effects {
+    pub fn on_server(&mut self, msg: &ServerMsg, now: Mono) -> Effects {
         let mut fx = Effects::default();
+        if self.abandoned > 0 && now >= self.abandoned_at.saturating_add(ABANDONED_SEND_TTL) {
+            self.abandoned = 0;
+        }
         match msg {
+            ServerMsg::TurnStart(ts)
+                if self.abandoned > 0 && ts.origin != Some(TurnOrigin::Push) =>
+            {
+                // The late answer to a send we abandoned: never played, never shown, and a live
+                // wait for a newer send stays open. Its turn_end matches nothing.
+                self.abandoned -= 1;
+                self.suppressed_seq = Some(ts.turn_seq);
+            }
             ServerMsg::TurnStart(ts) => {
                 let awaiting = matches!(self.phase, UserPhase::AwaitTurn { .. });
                 // M19 says who started the turn; older gateways do not, so infer it from
@@ -259,10 +304,14 @@ impl TurnMachine {
     }
 
     fn on_error(&mut self, e: &ErrorMsg) {
-        // A TURN_ERROR before turn_start means our send failed (e.g. orchestrator_unavailable):
-        // stop waiting. Once a turn started, its turn_end still follows (spec §7).
+        // A TURN_ERROR that names no turn we are playing means our send failed (e.g.
+        // orchestrator_unavailable): stop waiting. One naming the playing turn is about that
+        // turn, whose turn_end still follows (spec §7). Same rule as `conversation::on_server`.
+        let names_playing = e.turn_id.as_deref().is_some_and(|id| {
+            !id.is_empty() && self.turn.as_ref().is_some_and(|t| t.turn_id == id)
+        });
         if e.is_turn_error()
-            && self.turn.is_none()
+            && !names_playing
             && let UserPhase::AwaitTurn { .. } = self.phase
         {
             self.phase = UserPhase::Idle;
@@ -323,7 +372,7 @@ mod tests {
         ] {
             let mut m = online();
             if streaming {
-                m.on_server(&ts("t-1", 7, Some(TurnOrigin::Push)));
+                m.on_server(&ts("t-1", 7, Some(TurnOrigin::Push)), T0);
             }
             let fx = m.send_text("hola".into(), playing, T0).expect(name);
             assert_eq!(
@@ -346,12 +395,12 @@ mod tests {
     fn my_text_opens_a_user_turn() {
         let mut m = online();
         m.send_text("pon la serie".into(), false, T0);
-        let fx = m.on_server(&ts("t-1", 1, None));
+        let fx = m.on_server(&ts("t-1", 1, None), T0);
         assert!(fx.turn_started);
         assert_eq!(m.turn().map(|t| t.origin), Some(Origin::User), "we waited");
         assert_eq!(m.phase(), UserPhase::Idle);
         assert!(m.accept_audio(1) && !m.accept_audio(2));
-        assert!(m.on_server(&te("t-1", None)).turn_completed);
+        assert!(m.on_server(&te("t-1", None), T0).turn_completed);
         assert!(!m.accept_audio(1));
     }
 
@@ -369,9 +418,9 @@ mod tests {
                 m.send_text("x".into(), false, T0);
             }
             if streaming {
-                m.on_server(&ts("t-1", 3, Some(TurnOrigin::Push)));
+                m.on_server(&ts("t-1", 3, Some(TurnOrigin::Push)), T0);
             }
-            let fx = m.cancel(playing);
+            let fx = m.cancel(playing, T0);
             let want = sends.then_some(ClientCmd::Cancel);
             assert_eq!(fx.send, want, "{name}");
             assert_eq!(fx.stop_playback, stop, "{name}");
@@ -380,21 +429,21 @@ mod tests {
             assert!(!m.accept_audio(3), "{name}");
         }
         let mut off = TurnMachine::new(TurnTimeouts::default());
-        assert_eq!(off.cancel(false), Effects::default());
+        assert_eq!(off.cancel(false, T0), Effects::default());
     }
 
     #[test]
     fn cancelled_turn_end_is_not_ours_and_interrupted_stops() {
         let mut m = online();
-        m.on_server(&ts("t-1", 7, None));
+        m.on_server(&ts("t-1", 7, None), T0);
         assert_eq!(m.turn().map(|t| t.origin), Some(Origin::Push));
-        m.cancel(true);
+        m.cancel(true, T0);
         let end = te("t-1", Some(TurnEndReason::Cancelled));
-        assert!(!m.on_server(&end).turn_completed);
+        assert!(!m.on_server(&end, T0).turn_completed);
         let i = ServerMsg::Interrupted(Interrupted {
             turn_id: Some("t-1".into()),
         });
-        assert!(m.on_server(&i).stop_playback);
+        assert!(m.on_server(&i, T0).stop_playback);
     }
 
     /// Gateway M19: no `interrupted` message; the turn_end carries the reason.
@@ -403,25 +452,25 @@ mod tests {
         let mut m = online();
         // Waiting for our answer, but the server says this turn is a push: trust it.
         m.send_text("hola".into(), false, T0);
-        m.on_server(&ts("t-1", 1, Some(TurnOrigin::Push)));
+        m.on_server(&ts("t-1", 1, Some(TurnOrigin::Push)), T0);
         assert_eq!(m.turn().map(|t| t.origin), Some(Origin::Push));
         assert!(matches!(m.phase(), UserPhase::AwaitTurn { .. }));
-        let fx = m.on_server(&te("t-1", Some(TurnEndReason::Interrupted)));
+        let fx = m.on_server(&te("t-1", Some(TurnEndReason::Interrupted)), T0);
         assert!(fx.turn_completed && fx.stop_playback);
-        m.on_server(&ts("t-2", 2, Some(TurnOrigin::User)));
+        m.on_server(&ts("t-2", 2, Some(TurnOrigin::User)), T0);
         assert_eq!(m.turn().map(|t| t.origin), Some(Origin::User));
         let replaced = te("t-2", Some(TurnEndReason::Replaced));
-        assert!(m.on_server(&replaced).stop_playback);
-        m.on_server(&ts("t-3", 3, Some(TurnOrigin::User)));
-        let fx = m.on_server(&te("t-3", Some(TurnEndReason::Done)));
+        assert!(m.on_server(&replaced, T0).stop_playback);
+        m.on_server(&ts("t-3", 3, Some(TurnOrigin::User)), T0);
+        let fx = m.on_server(&te("t-3", Some(TurnEndReason::Done)), T0);
         assert!(
             fx.turn_completed && !fx.stop_playback,
             "a finished turn plays to the end"
         );
         // `closed` precedes a 4102/4200 close: the tail must not play on a dead session.
-        m.on_server(&ts("t-4", 4, Some(TurnOrigin::User)));
+        m.on_server(&ts("t-4", 4, Some(TurnOrigin::User)), T0);
         let closed = te("t-4", Some(TurnEndReason::Closed));
-        assert!(m.on_server(&closed).stop_playback);
+        assert!(m.on_server(&closed, T0).stop_playback);
     }
 
     #[test]
@@ -429,8 +478,8 @@ mod tests {
         let mut m = online();
         m.send_text("x".into(), false, T0);
         let d = m.next_deadline().unwrap();
-        assert!(!m.on_tick(Mono(Duration::from_secs(1))));
-        assert!(m.on_tick(d));
+        assert!(m.on_tick(Mono(Duration::from_secs(1))).is_none());
+        assert_eq!(m.on_tick(d).and_then(|fx| fx.send), Some(ClientCmd::Cancel));
         assert_eq!(m.phase(), UserPhase::Idle);
         m.send_text("x".into(), false, T0);
         let err = ServerMsg::Error(ErrorMsg {
@@ -439,7 +488,7 @@ mod tests {
             fatal: false,
             turn_id: None,
         });
-        m.on_server(&err);
+        m.on_server(&err, T0);
         assert_eq!(m.phase(), UserPhase::Idle);
         m.send_text("x".into(), false, T0);
         m.uplink_failed();
@@ -449,9 +498,129 @@ mod tests {
     #[test]
     fn link_down_resets_everything() {
         let mut m = online();
-        m.on_server(&ts("t-1", 1, None));
+        m.on_server(&ts("t-1", 1, None), T0);
         assert!(m.link_down().stop_playback);
         assert_eq!(m.phase(), UserPhase::Offline);
         assert!(!m.accept_audio(1));
+    }
+
+    fn at(s: u64) -> Mono {
+        Mono(Duration::from_secs(s))
+    }
+
+    /// Review M1 (a): cancel while waiting, then the gateway's racing turn_start arrives.
+    #[test]
+    fn late_turn_start_after_cancel_is_ignored() {
+        for origin in [None, Some(TurnOrigin::User)] {
+            let mut m = online();
+            m.send_text("x".into(), false, T0);
+            assert_eq!(m.cancel(false, T0).send, Some(ClientCmd::Cancel));
+            let fx = m.on_server(&ts("t-1", 1, origin), at(1));
+            assert!(!fx.turn_started, "{origin:?}");
+            assert!(
+                m.turn().is_none() && !m.accept_audio(1),
+                "{origin:?}: never played"
+            );
+            assert!(
+                !m.on_server(&te("t-1", Some(TurnEndReason::Cancelled)), at(1))
+                    .turn_completed
+            );
+            // Consumed: the next answer is ours again.
+            m.send_text("y".into(), false, at(2));
+            assert!(m.on_server(&ts("t-2", 2, origin), at(2)).turn_started);
+            assert!(m.accept_audio(2));
+        }
+    }
+
+    /// Review M1 (b): local timeout sends `cancel`; a turn_start after it is not played.
+    #[test]
+    fn late_turn_start_after_timeout_is_ignored_and_expires() {
+        let mut m = online();
+        m.send_text("x".into(), false, T0);
+        let d = m.next_deadline().unwrap();
+        assert_eq!(m.on_tick(d).and_then(|fx| fx.send), Some(ClientCmd::Cancel));
+        assert!(!m.on_server(&ts("t-1", 1, None), at(60)).turn_started);
+        assert!(!m.accept_audio(1));
+        // An abandoned send expires after ABANDONED_SEND_TTL: a later push-less turn plays.
+        let mut m = online();
+        m.send_text("x".into(), false, T0);
+        m.on_tick(m.next_deadline().unwrap());
+        let late = d.saturating_add(ABANDONED_SEND_TTL);
+        assert!(m.on_server(&ts("t-1", 1, None), late).turn_started);
+        // Pushes are never taken for a late answer.
+        let mut m = online();
+        m.send_text("x".into(), false, T0);
+        m.cancel(false, T0);
+        assert!(
+            m.on_server(&ts("t-1", 1, Some(TurnOrigin::Push)), at(1))
+                .turn_started
+        );
+    }
+
+    /// Review M1 (c): two quick texts; t-1 answers the first and must not end the second's wait.
+    #[test]
+    fn two_quick_texts_pair_with_their_own_turns() {
+        let mut m = online();
+        m.send_text("uno".into(), false, T0);
+        m.send_text("dos".into(), false, T0);
+        let fx = m.on_server(&ts("t-1", 1, Some(TurnOrigin::User)), T0);
+        assert!(!fx.turn_started && !m.accept_audio(1));
+        assert!(
+            matches!(m.phase(), UserPhase::AwaitTurn { .. }),
+            "still waiting for dos"
+        );
+        assert!(
+            m.on_server(&ts("t-2", 2, Some(TurnOrigin::User)), T0)
+                .turn_started
+        );
+        assert_eq!(m.phase(), UserPhase::Idle);
+        assert!(m.accept_audio(2));
+    }
+
+    #[test]
+    fn abandoned_count_is_cleared_by_the_link() {
+        let mut m = online();
+        m.send_text("x".into(), false, T0);
+        m.cancel(false, T0);
+        m.link_down();
+        m.link_up();
+        m.send_text("y".into(), false, T0);
+        assert!(m.on_server(&ts("t-1", 1, None), T0).turn_started);
+    }
+
+    /// Review L4: a TURN_ERROR naming a turn we never saw start still ends the wait; one naming
+    /// the playing turn does not.
+    #[test]
+    fn turn_error_rule() {
+        let err = |id: Option<&str>| {
+            ServerMsg::Error(ErrorMsg {
+                code: "TURN_ERROR".into(),
+                message: "orchestrator_error".into(),
+                fatal: false,
+                turn_id: id.map(Into::into),
+            })
+        };
+        let mut m = online();
+        m.on_server(&ts("t-1", 1, Some(TurnOrigin::Push)), T0);
+        m.send_text("x".into(), false, T0);
+        m.on_server(&ts("t-2", 2, Some(TurnOrigin::Push)), T0);
+        m.on_server(&err(Some("t-2")), T0);
+        assert!(
+            matches!(m.phase(), UserPhase::AwaitTurn { .. }),
+            "about the playing push"
+        );
+        m.on_server(&err(Some("t-9")), T0);
+        assert_eq!(
+            m.phase(),
+            UserPhase::Idle,
+            "names no turn we play: our send failed"
+        );
+        m.send_text("y".into(), false, T0);
+        m.on_server(&err(None), T0);
+        assert_eq!(
+            m.phase(),
+            UserPhase::Idle,
+            "no id, even with a turn playing"
+        );
     }
 }

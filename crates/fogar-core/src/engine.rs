@@ -95,9 +95,10 @@ impl<C: Clock> Engine<C> {
                     Some(cmd) => self.on_command(&mut st, cmd).await,
                 },
                 () = sleep_until_opt(&*self.clock, wake_at), if wake_at.is_some() => {
-                    if st.turns.on_tick(self.clock.now()) {
+                    if let Some(fx) = st.turns.on_tick(self.clock.now()) {
                         Stats::inc(&self.stats.user_waits_timed_out);
                         self.publish(&st, |v| conversation::wait_ended(v, TurnOutcome::Timeout));
+                        self.apply(&mut st, fx).await;
                     }
                 }
             }
@@ -151,7 +152,7 @@ impl<C: Clock> Engine<C> {
                 }
                 let _ = reply.send(());
                 let playing = st.playing();
-                let fx = st.turns.cancel(playing);
+                let fx = st.turns.cancel(playing, self.clock.now());
                 if fx.send.is_some() {
                     Stats::inc(&self.stats.cancels_sent);
                 }
@@ -177,16 +178,26 @@ impl<C: Clock> Engine<C> {
                 st.playback = None;
             }
             Inbound::Server(msg, _charge) => {
-                let fx = st.turns.on_server(&msg);
+                let was_waiting = matches!(st.turns.phase(), UserPhase::AwaitTurn { .. });
+                let fx = st.turns.on_server(&msg, self.clock.now());
                 if fx.turn_started {
                     Stats::inc(&self.stats.turns_started);
                 }
+                // `None` for a turn_start the machine ignored (late answer to an abandoned send).
                 let origin = st
                     .turns
                     .turn()
                     .filter(|_| fx.turn_started)
                     .map(|t| t.origin);
                 self.publish(st, |v| conversation::on_server(v, &msg, origin));
+                if was_waiting
+                    && !fx.turn_started
+                    && !matches!(st.turns.phase(), UserPhase::AwaitTurn { .. })
+                {
+                    // The machine gave up the wait (a TURN_ERROR): the view's entry follows,
+                    // whatever the error named, so the two never disagree.
+                    self.publish(st, |v| conversation::wait_ended(v, TurnOutcome::Error));
+                }
                 self.apply(st, fx).await;
             }
             Inbound::Audio(buf, _charge) => {
@@ -235,6 +246,7 @@ impl<C: Clock> Engine<C> {
         if fx.turn_completed {
             Stats::inc(&self.stats.turns_completed);
         }
+        let turn_cut = fx.turn_cut;
         if let Some(cmd) = fx.send
             && !self.send_control(&cmd).await
         {
@@ -242,6 +254,10 @@ impl<C: Clock> Engine<C> {
             st.turns.uplink_failed();
             if was_waiting {
                 self.publish(st, |v| conversation::wait_ended(v, TurnOutcome::Error));
+            }
+            if turn_cut {
+                // No `turn_end` will come for the turn we cut: close its entry here.
+                self.publish(st, |v| conversation::end_open(v, TurnOutcome::Interrupted));
             }
         }
     }
