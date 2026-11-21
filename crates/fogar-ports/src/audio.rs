@@ -79,12 +79,15 @@ impl fmt::Debug for AudioChunk {
 pub struct AudioSourceCaps {
     pub capture: Support,
     pub permission_query: Support,
+    /// The adapter can ask the OS for the microphone permission (macOS TCC prompt).
+    pub permission_request: Support,
 }
 
 impl AudioSourceCaps {
     pub const NONE: Self = Self {
         capture: Support::Unsupported,
         permission_query: Support::Unsupported,
+        permission_request: Support::Unsupported,
     };
 }
 
@@ -101,11 +104,24 @@ pub trait AudioSource: Send + Sync + 'static {
     fn mic_permission(&self) -> MicPermission;
     /// Starts capture. Chunks arrive on the returned bounded stream (`capacity` chunks). When the
     /// core lags, the adapter drops the newest chunk and counts it (`EventStream::dropped`).
-    /// Errors: `Unsupported` if `capture` is Unsupported, `PermissionDenied`, `NoDevice`, ...
+    /// Errors: `Unsupported` if `capture` is Unsupported, `NoDevice`, ... and `PermissionDenied`
+    /// whenever `mic_permission()` is `Denied`, `Restricted` or `NotDetermined`, WITHOUT touching
+    /// the device: opening the device with an undecided permission would make the OS prompt on
+    /// its own, bypassing the core's single consent point (spec S2). Only `Granted` and
+    /// `Unknown` (no permission model) may open.
     fn open(
         &self,
         capacity: NonZeroUsize,
     ) -> Result<(Box<dyn ActiveCapture>, EventStream<AudioChunk>), AudioError>;
+    /// Asks the OS for the microphone permission (may show the system prompt). Never blocks:
+    /// exactly one `MicPermission` arrives on the returned stream, after which the adapter drops
+    /// its end (the stream then yields `None`). When the permission is already decided it is
+    /// delivered at once without prompting. Dropping the stream before the answer is safe.
+    /// Only the core's IPC handler calls it, on an explicit order from the user (archtest).
+    /// Errors: `Unsupported` when `permission_request` is Unsupported.
+    fn request_mic_permission(&self) -> Result<EventStream<MicPermission>, AudioError> {
+        Err(AudioError::Unsupported("permission request"))
+    }
 }
 
 const _: Option<&dyn AudioSource> = None;

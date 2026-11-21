@@ -42,6 +42,50 @@ mod denied {
     fogar_testkit::audio_source_contract!(FakeMic::denied());
 }
 
+mod not_determined {
+    use fogar_testkit::*;
+    fogar_testkit::audio_source_contract!(FakeMic::not_determined());
+}
+
+/// The prompt path the generic contract cannot exercise on a real Mac.
+mod fake_mic_prompt {
+    use fogar_ports::audio::{AudioError, AudioSource, MicPermission};
+    use fogar_testkit::FakeMic;
+    use std::num::NonZeroUsize;
+
+    fn ask(mic: &FakeMic) -> Option<MicPermission> {
+        mic.request_mic_permission().unwrap().try_next()
+    }
+
+    #[test]
+    fn undecided_never_opens_and_one_prompt_decides_it() {
+        for answer in [MicPermission::Granted, MicPermission::Denied] {
+            let mic = FakeMic::not_determined().answering(answer);
+            assert!(matches!(
+                mic.open(NonZeroUsize::MIN),
+                Err(AudioError::PermissionDenied)
+            ));
+            assert_eq!(mic.opens(), 0);
+            assert_eq!(ask(&mic), Some(answer));
+            assert_eq!(mic.mic_permission(), answer);
+            assert_eq!(ask(&mic), Some(answer), "asking again does not prompt");
+            assert_eq!((mic.permission_requests(), mic.prompts()), (2, 1));
+            assert_eq!(
+                mic.open(NonZeroUsize::MIN).is_ok(),
+                answer == MicPermission::Granted
+            );
+        }
+    }
+
+    #[test]
+    fn minimal_cannot_request() {
+        assert!(matches!(
+            FakeMic::minimal().request_mic_permission(),
+            Err(AudioError::Unsupported(_))
+        ));
+    }
+}
+
 /// The fake's routes behave the same over the real-socket HTTP mock (so adapter contract
 /// failures are the adapter's, not the mock's).
 mod mock_http_server_matches_the_fake {
