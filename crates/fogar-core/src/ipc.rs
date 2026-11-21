@@ -220,6 +220,13 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
         let req = tokio::select! {
             biased;
             () = c.cancel.cancelled() => return,
+            // Requests BEFORE pushes (review M2): a dense token stream must never starve a
+            // CancelTurn/SendText on a subscribed connection.
+            r = recv_within(&*c.clock, &mut c.conn, (!subscribed && !conv_subscribed).then_some(c.limits.idle_timeout)) => match r {
+                Some(Ok(Some(req))) => req,
+                // Idle, peer gone or a bad frame: close the connection (dropping it).
+                None | Some(Ok(None) | Err(_)) => return,
+            },
             r = view.changed(), if subscribed => {
                 if r.is_err() {
                     return;
@@ -239,15 +246,19 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
                 if r.is_err() {
                     return;
                 }
-                if conv_subscribed {
-                    let latest = conv.borrow_and_update().clone();
-                    if !c.send(IpcResponse::Conversation(latest)).await {
-                        return;
-                    }
-                } else {
-                    conv.borrow_and_update(); // status only: mark seen, no copy of the view
+                let (latest, voice) = {
+                    let v = conv.borrow_and_update();
+                    // Status only: mark seen, no copy of the view.
+                    (conv_subscribed.then(|| v.clone()), (v.transcriber, v.tts))
+                };
+                if let Some(latest) = latest
+                    && !c.send(IpcResponse::Conversation(latest)).await
+                {
+                    return;
                 }
-                if subscribed {
+                // Only a voice change rebuilds the status report (tokens alone never do).
+                let pushed_voice = last_pushed.as_ref().map(|r| (r.transcriber, r.tts));
+                if subscribed && pushed_voice != Some(voice) {
                     let rep = report(&c.health, &view.borrow(), c.peer_check);
                     if last_pushed.as_ref() != Some(&rep) {
                         if !c.send(IpcResponse::Event(rep.clone())).await {
@@ -258,11 +269,6 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
                 }
                 continue;
             }
-            r = recv_within(&*c.clock, &mut c.conn, (!subscribed && !conv_subscribed).then_some(c.limits.idle_timeout)) => match r {
-                Some(Ok(Some(req))) => req,
-                // Idle, peer gone or a bad frame: close the connection (dropping it).
-                None | Some(Ok(None) | Err(_)) => return,
-            },
         };
         let resp = match req {
             IpcRequest::Hello { version } => {
@@ -309,6 +315,9 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
                 conv_subscribed = true;
                 IpcResponse::Conversation(conv.borrow_and_update().clone())
             }
+            // `TextAccepted` / `TurnCancelSent` mean "accepted by the agent", NOT "delivered to
+            // the gateway": the conversation view carries the real outcome (an uplink failure
+            // ends the turn there as `Error` / `Interrupted`).
             IpcRequest::SendText { text } => match check_text(&text.0) {
                 Err(r) => IpcResponse::TextRefused(r),
                 Ok(()) => match c.ask(|tx| Command::SendText(text.0, tx)).await {

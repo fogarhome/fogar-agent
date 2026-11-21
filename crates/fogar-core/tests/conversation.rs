@@ -5,13 +5,14 @@
 
 mod common;
 use common::*;
-use fogar_ports::audio::MicPermission;
 use fogar_ports::ipc::{
-    CaptureGesture, ConversationView, IpcRequest, IpcResponse, ProgressKind, SEND_TEXT_MAX_BYTES,
-    ServiceState, TextRefusal, TurnAudio, TurnOutcome, TurnSource, UserActivity, UserText,
+    CaptureGesture, CaptureThen, ConversationView, IpcRequest, IpcResponse, ProgressKind,
+    SEND_TEXT_MAX_BYTES, ServiceState, TextRefusal, TurnAudio, TurnOutcome, TurnSource,
+    UserActivity, UserText,
 };
+use fogar_ports::{audio::MicPermission, gateway::GatewayLink};
 use fogar_proto::{OutputMode, server::ProgressPhase};
-use fogar_testkit::{FakeIpcClient, MemorySecretStore, MockConfig};
+use fogar_testkit::{FakeIpcClient, MemorySecretStore, MockConfig, gateway::Ctl};
 use std::{sync::Arc, time::Duration};
 
 fn text(t: &str) -> IpcRequest {
@@ -21,7 +22,7 @@ fn text(t: &str) -> IpcRequest {
 }
 
 /// A connection subscribed to the conversation (its first view returned).
-async fn subscribe(rig: &Rig) -> (FakeIpcClient, ConversationView) {
+async fn subscribe<L: GatewayLink>(rig: &Rig<L>) -> (FakeIpcClient, ConversationView) {
     let mut c = rig.ipc.as_ref().unwrap().client().await;
     assert_eq!(
         c.request(IpcRequest::SubscribeConversation).await,
@@ -216,6 +217,12 @@ async fn uid_only_peers_are_refused_even_with_the_pairing_opt_in() {
         IpcRequest::CaptureStart {
             gesture: CaptureGesture::Hold,
         },
+        IpcRequest::CaptureEnd {
+            then: CaptureThen::Send,
+        },
+        IpcRequest::TurnVisible {
+            turn_id: "t-1".into(),
+        },
         IpcRequest::RequestMicPermission,
     ] {
         assert_eq!(
@@ -346,4 +353,133 @@ async fn text_is_refused_while_the_link_is_not_ready() {
 
 fn rig_idle() -> Duration {
     test_config().ipc_idle_timeout
+}
+
+/// Extra server frames injected into the mock session (a dense token stream).
+mod flood {
+    use fogar_ports::gateway::{
+        Frame, GatewayAddr, GatewayLink, LinkError, LinkEvent, LinkSession,
+    };
+    use fogar_testkit::FakeGatewayLink;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
+
+    #[derive(Clone)]
+    pub(super) struct FloodLink {
+        pub(super) inner: FakeGatewayLink,
+        pub(super) rx: Arc<Mutex<Option<mpsc::Receiver<String>>>>,
+    }
+    pub(super) struct FloodSess {
+        inner: <FakeGatewayLink as GatewayLink>::Session,
+        rx: Option<mpsc::Receiver<String>>,
+    }
+    impl LinkSession for FloodSess {
+        fn max_frame(&self) -> usize {
+            self.inner.max_frame()
+        }
+        async fn send(&mut self, f: Frame) -> Result<(), LinkError> {
+            self.inner.send(f).await
+        }
+        async fn recv(&mut self) -> Option<LinkEvent> {
+            match self.rx.as_mut() {
+                Some(rx) => tokio::select! {
+                    biased;
+                    Some(t) = rx.recv() => Some(LinkEvent::Frame(Frame::Text(t))),
+                    ev = self.inner.recv() => ev,
+                },
+                None => self.inner.recv().await,
+            }
+        }
+        async fn close(&mut self, c: u16, r: &str) -> Result<(), LinkError> {
+            self.inner.close(c, r).await
+        }
+    }
+    impl GatewayLink for FloodLink {
+        type Session = FloodSess;
+        async fn connect(&self, addr: &GatewayAddr) -> Result<FloodSess, LinkError> {
+            let inner = self.inner.connect(addr).await?;
+            let rx = self.rx.lock().ok().and_then(|mut g| g.take());
+            Ok(FloodSess { inner, rx })
+        }
+    }
+}
+
+/// Review M2: pushes must not starve requests. The SAME subscribed connection gets a dense
+/// token stream and still has its `CancelTurn` answered within one `write_timeout`.
+#[tokio::test(start_paused = true)]
+async fn requests_are_read_under_a_dense_push_stream() {
+    let mock = paced(100_000);
+    let inner = fogar_testkit::FakeGatewayLink::new(mock.clone());
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(20_000);
+    let link = flood::FloodLink {
+        inner: inner.clone(),
+        rx: Arc::new(std::sync::Mutex::new(Some(rx))),
+    };
+    let mut b = RigBuilder::with_link(link, &mock.client_key);
+    b.with_ipc = true;
+    let write_timeout = b.cfg.write_timeout;
+    let mut rig = b.start();
+    wait_ready(&mut rig.health).await;
+    let (mut sub, _) = subscribe(&rig).await;
+    assert_eq!(inner.control(Ctl::Push), 1);
+    until(&mut sub, |v| {
+        v.turns.last().is_some_and(|t| t.turn_id == "t-1")
+    })
+    .await;
+    // Frames already waiting in the transport: the stream never pauses.
+    for _ in 0..20_000 {
+        let tok = r#"{"type":"token","turn_id":"t-1","text":"x"}"#.to_owned();
+        tx.try_send(tok).unwrap();
+    }
+    // Let the stream get going, then press cancel on the subscribed connection.
+    let mut pushes = 0;
+    while pushes < 50 {
+        if let Some(IpcResponse::Conversation(_)) = sub.next().await {
+            pushes += 1;
+        }
+    }
+    let t0 = tokio::time::Instant::now();
+    let mut r = sub.request(IpcRequest::CancelTurn).await;
+    let mut waited_pushes = 0u32;
+    while matches!(r, Some(IpcResponse::Conversation(_))) {
+        waited_pushes += 1;
+        assert!(waited_pushes < 100_000, "CancelTurn never read");
+        r = sub.next().await;
+    }
+    assert_eq!(r, Some(IpcResponse::TurnCancelSent));
+    assert!(
+        t0.elapsed() <= write_timeout,
+        "answered after {:?}",
+        t0.elapsed()
+    );
+    drop(tx);
+    assert_eq!(rig.mic.opens(), 0);
+    assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
+}
+
+/// A uid-only status subscriber never sees the conversation, even while a turn streams.
+#[tokio::test(start_paused = true)]
+async fn uid_only_status_subscriber_never_gets_the_conversation() {
+    let mut b = rig_with(paced(50));
+    b.signed_peer = false;
+    let mut rig = b.start();
+    wait_ready(&mut rig.health).await;
+    let mut c = rig.ipc.as_ref().unwrap().client().await;
+    assert_eq!(
+        c.request(IpcRequest::Subscribe).await,
+        Some(IpcResponse::Subscribed)
+    );
+    assert!(matches!(c.next().await, Some(IpcResponse::Event(_))));
+    assert_eq!(rig.link.control(Ctl::Push), 1);
+    eventually(Duration::from_secs(30), || {
+        rig.health.snapshot().stats.tts_frames_played == 50
+    })
+    .await;
+    let drain = async {
+        while let Some(m) = c.next().await {
+            assert!(matches!(m, IpcResponse::Event(_)), "{m:?}");
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(5), drain).await;
+    assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
