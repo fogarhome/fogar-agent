@@ -1,5 +1,10 @@
 //! The mock gateway's S2 behaviour: `turn_progress` only with `status`, live partials while
 //! recording, and a gateway without voice.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::field_reassign_with_default
+)]
 
 use fogar_ports::gateway::{Frame, GatewayLink, LinkEvent, LinkSession};
 use fogar_proto::{ServerMsg, decode_server, server::ProgressPhase};

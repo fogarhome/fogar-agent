@@ -54,7 +54,7 @@ mod fake_mic_prompt {
     use std::num::NonZeroUsize;
 
     fn ask(mic: &FakeMic) -> Option<MicPermission> {
-        mic.request_mic_permission().unwrap().try_next()
+        mic.request_mic_permission().ok()?.try_next()
     }
 
     #[test]

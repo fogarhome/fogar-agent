@@ -661,8 +661,18 @@ fn r8_no_unsafe_in_inner_crates() {
     }
 }
 
-/// R11–R13 checker: files of `sources` (fogar-core/src) that name one of `idents` outside
-/// `allowed` (file names). Token-based: comments and strings do not count.
+/// fogar-core's sources with paths relative to its `src/` (so `x/capture.rs` is not `capture.rs`).
+fn core_sources() -> Vec<(PathBuf, String)> {
+    let base = root().join("crates/fogar-core/src");
+    rust_sources("fogar-core")
+        .into_iter()
+        .map(|(p, t)| (p.strip_prefix(&base).unwrap().to_path_buf(), t))
+        .collect()
+}
+
+/// R11–R13 checker: files of `sources` (paths relative to fogar-core/src) that name one of
+/// `idents` outside `allowed` (relative paths, e.g. `capture.rs` = `src/capture.rs` only).
+/// Token-based: comments and strings do not count.
 fn single_owner_violations(
     sources: &[(PathBuf, String)],
     idents: &[&str],
@@ -670,8 +680,7 @@ fn single_owner_violations(
 ) -> Vec<String> {
     let mut bad = Vec::new();
     for (p, text) in sources {
-        let file = p.file_name().and_then(|f| f.to_str()).unwrap_or_default();
-        if allowed.contains(&file) {
+        if allowed.iter().any(|a| p == Path::new(a)) {
             continue;
         }
         for (tok, line) in tokens(text) {
@@ -692,9 +701,7 @@ fn owners(
     owner: &'static str,
     extra: &'static str,
 ) -> Vec<&'static str> {
-    let exists = sources
-        .iter()
-        .any(|(p, _)| p.file_name().is_some_and(|f| f == owner));
+    let exists = sources.iter().any(|(p, _)| p == Path::new(owner));
     let mut v = vec!["agent.rs", owner];
     if !exists {
         v.push(extra);
@@ -706,7 +713,7 @@ fn owners(
 /// microphone port; `agent.rs` only hands it over.
 #[test]
 fn r11_only_the_capture_gate_holds_the_microphone() {
-    let src = rust_sources("fogar-core");
+    let src = core_sources();
     let allowed = owners(&src, "capture.rs", "engine.rs");
     let bad = single_owner_violations(&src, &["AudioSource", "audio_in"], &allowed);
     assert!(
@@ -718,7 +725,7 @@ fn r11_only_the_capture_gate_holds_the_microphone() {
 /// R12: single output point (spec S2): nothing sounds unless `playback.rs` lets it.
 #[test]
 fn r12_only_the_playback_gate_holds_the_speaker() {
-    let src = rust_sources("fogar-core");
+    let src = core_sources();
     let allowed = owners(&src, "playback.rs", "engine.rs");
     let bad = single_owner_violations(&src, &["AudioSink", "audio_out"], &allowed);
     assert!(
@@ -732,7 +739,7 @@ fn r12_only_the_playback_gate_holds_the_speaker() {
 #[test]
 fn r13_only_the_capture_gate_asks_for_the_permission() {
     let bad = single_owner_violations(
-        &rust_sources("fogar-core"),
+        &core_sources(),
         &["request_mic_permission"],
         &["capture.rs"],
     );
@@ -744,7 +751,7 @@ fn r13_only_the_capture_gate_asks_for_the_permission() {
 
 #[test]
 fn selftest_single_owner_rules_fire() {
-    let src = |name: &str, text: &str| (PathBuf::from(format!("src/{name}")), text.to_owned());
+    let src = |name: &str, text: &str| (PathBuf::from(name), text.to_owned());
     let planted = [
         src("agent.rs", "pub audio_in: Arc<dyn AudioSource>,"),
         src(
@@ -778,6 +785,16 @@ fn selftest_single_owner_rules_fire() {
     assert_eq!(
         owners(&planted, "capture.rs", "engine.rs"),
         ["agent.rs", "capture.rs"]
+    );
+    // A `capture.rs` elsewhere is not the consent point, and does not tighten the rule either.
+    let nested = [src("link/capture.rs", "fn f(a: &dyn AudioSource) {}")];
+    assert_eq!(
+        single_owner_violations(&nested, &["AudioSource"], &["agent.rs", "capture.rs"]).len(),
+        1
+    );
+    assert_eq!(
+        owners(&nested, "capture.rs", "engine.rs"),
+        ["agent.rs", "capture.rs", "engine.rs"]
     );
 }
 

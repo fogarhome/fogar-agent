@@ -428,7 +428,7 @@ impl Conn {
                 self.utterance_audio += b.len() as u64;
                 self.utterance_frames += 1;
                 match self.cfg.partial_every_frames {
-                    Some(n) if n > 0 && self.utterance_frames % n == 0 => {
+                    Some(n) if n > 0 && self.utterance_frames.is_multiple_of(n) => {
                         let text = self.cfg.transcript.clone();
                         self.send(t, &ServerMsg::TranscriptionPartial(Transcription { text }))
                             .await

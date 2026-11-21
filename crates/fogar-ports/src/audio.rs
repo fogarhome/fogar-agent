@@ -40,7 +40,10 @@ pub enum MicPermission {
     Denied,
     NotDetermined,
     Restricted,
-    /// The platform has no permission model (Linux) or the adapter cannot tell.
+    /// ONLY for a platform with no permission model (Linux), where `open` may proceed. An
+    /// adapter on a platform that has one (`permission_query` available) maps any status it
+    /// cannot read to `NotDetermined`, never to `Unknown`: `Unknown` lets `open` touch the
+    /// device, which on macOS would make the OS prompt behind the core's consent point.
     #[default]
     Unknown,
 }

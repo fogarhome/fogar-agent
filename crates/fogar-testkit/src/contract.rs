@@ -327,6 +327,18 @@ pub mod audio_source {
         matches!(p, MicPermission::Granted | MicPermission::Unknown)
     }
 
+    /// An adapter that can read the permission never answers `Unknown` (that value lets `open`
+    /// touch the device): an unreadable status is `NotDetermined`.
+    pub fn unknown_only_without_a_permission_model(a: &dyn AudioSource) {
+        if a.capabilities().permission_query.is_available() {
+            assert_ne!(
+                a.mic_permission(),
+                MicPermission::Unknown,
+                "permission_query available but mic_permission() is Unknown"
+            );
+        }
+    }
+
     /// Unsupported capture => `open` fails with `Unsupported`; supported => mono format and a
     /// bounded stream of the requested capacity. A permission that is not `Granted`/`Unknown`
     /// (denied, restricted or still undecided) => `PermissionDenied` without opening (no OS
@@ -445,6 +457,10 @@ pub mod audio_source {
                 #[test]
                 fn drop_stops_capture() {
                     c::drop_stops_capture(&$make)
+                }
+                #[test]
+                fn unknown_only_without_a_permission_model() {
+                    c::unknown_only_without_a_permission_model(&$make)
                 }
                 #[test]
                 fn request_matches_caps() {
