@@ -60,6 +60,14 @@ rustls-platform-verifier = { version = "0.7.1", default-features = false }
 security-framework = { version = "3.7.0", default-features = false }
 core-foundation = { version = "0.10.1", default-features = false }
 libc = { version = "0.2.191", default-features = false }
+# S2 audio (fogar-agent-macos target table only). Verified on crates.io 2026-11-22 (cargo info):
+# cpal 0.18.2 (pinned exactly: API churn between minors; 0.19 renames play/start), rtrb 0.4.1 (SPSC
+# ring for the CoreAudio callback), objc2 0.6.5 + block2 0.6.2 (AVCaptureDevice permission; both
+# already in the tree through cpal's objc2-* bindings).
+cpal = { version = "=0.18.2", default-features = false }
+rtrb = { version = "0.4.1", default-features = false }
+objc2 = { version = "0.6.5", default-features = false }
+block2 = { version = "0.6.2", default-features = false }
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 loom = { version = "0.7.3" }
 

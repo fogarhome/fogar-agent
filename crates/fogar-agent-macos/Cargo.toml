@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "macOS adapters: Keychain secret store and Unix-socket IPC with a same-signer peer check (S1); probe/power partial, audio stubs. Compiles to an empty crate on other hosts."
+description = "macOS adapters: Keychain secret store and Unix-socket IPC with a same-signer peer check (S1); cpal/CoreAudio audio and AVCaptureDevice mic permission (S2); probe/power partial. Compiles to an empty crate on other hosts."
 
 # Apple binding crates only under this target table (deny.toml wrappers).
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -18,6 +18,10 @@ zeroize = { workspace = true, features = ["alloc"] }
 security-framework = { workspace = true }
 core-foundation = { workspace = true }
 libc = { workspace = true }
+cpal = { workspace = true }
+rtrb = { workspace = true }
+objc2 = { workspace = true, features = ["std"] }
+block2 = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 fogar-testkit = { workspace = true }
