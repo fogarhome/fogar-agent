@@ -2,10 +2,13 @@ import AppKit
 import SwiftUI
 
 /// Fogar Desktop: the main window (sidebar + sections), Settings (⌘,) and the menu bar quick view.
-/// One `AgentLink` for all of them: one subscription to the agent, no polling.
+/// One `AgentLink` for all of them: one subscription to the agent, no polling. One
+/// `ConversationLink` too, alive as long as the app (the menu bar icon): closing the window does
+/// not end the conversation, and my own turns are still confirmed visible (the icon says «hablando»).
 @main
 struct FogarDesktopApp: App {
     @State private var link: AgentLink
+    @State private var conversacion: Conversacion
     @State private var nav = Navegacion()
     @AppStorage("apariencia") private var apariencia = Apariencia.sistema
 
@@ -14,12 +17,16 @@ struct FogarDesktopApp: App {
         let l = AgentLink()
         l.start()
         _link = State(initialValue: l)
+        let c = ConversationLink()
+        c.start()
+        _conversacion = State(initialValue: Conversacion(link: c))
     }
 
     var body: some Scene {
         Window("Fogar", id: "main") {
             RootView()
                 .environment(link)
+                .environment(conversacion)
                 .environment(nav)
         }
         .defaultSize(width: 1100, height: 740)
@@ -36,23 +43,27 @@ struct FogarDesktopApp: App {
         MenuBarExtra {
             MenuBarView()
                 .environment(link)
+                .environment(conversacion)
                 .environment(nav)
         } label: {
             // The label lives as long as the app: it applies the appearance to every window,
             // the menu bar panel included (preferredColorScheme does not reach that panel).
-            MenuBarIcono(state: link.state, retirado: link.accesoRetirado)
+            MenuBarIcono(modo: IconoModo(link.state, conversacion), titular: Textos.titular(link.state, retirado: link.accesoRetirado).titulo)
                 .onChange(of: apariencia, initial: true) { _, a in NSApp.appearance = a.nsAppearance }
+                // The agent came back: the conversation connects at once, not at its next backoff.
+                .onChange(of: link.state.status != nil) { _, vivo in if vivo { conversacion.link.retryNow() } }
         }
         .menuBarExtraStyle(.window)
     }
 }
 
 enum Seccion: String, CaseIterable, Identifiable {
-    case estado, emparejar, ajustes
+    case conversacion, estado, emparejar, ajustes
     var id: Self { self }
 
     var titulo: String {
         switch self {
+        case .conversacion: "Conversación"
         case .estado: "Estado"
         case .emparejar: "Emparejar"
         case .ajustes: "Ajustes"
@@ -61,6 +72,7 @@ enum Seccion: String, CaseIterable, Identifiable {
 
     var icono: String {
         switch self {
+        case .conversacion: "bubble.left.and.bubble.right"
         case .estado: "point.3.connected.trianglepath.dotted"
         case .emparejar: "link"
         case .ajustes: "gearshape"
@@ -69,9 +81,10 @@ enum Seccion: String, CaseIterable, Identifiable {
 
     var atajo: KeyEquivalent {
         switch self {
-        case .estado: "1"
-        case .emparejar: "2"
-        case .ajustes: "3"
+        case .conversacion: "1"
+        case .estado: "2"
+        case .emparejar: "3"
+        case .ajustes: "4"
         }
     }
 }

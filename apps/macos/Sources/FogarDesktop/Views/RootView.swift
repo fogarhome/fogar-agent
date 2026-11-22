@@ -5,21 +5,26 @@ import SwiftUI
 struct RootView: View {
     @Environment(AgentLink.self) private var link
     @Environment(Navegacion.self) private var nav
+    @State private var columnas = NavigationSplitViewVisibility.all
 
     var body: some View {
         @Bindable var nav = nav
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnas) {
             BarraLateral(seleccion: $nav.seccion)
                 .navigationSplitViewColumnWidth(min: 200, ideal: 232, max: 280)
         } detail: {
             ZStack {
                 Color.noche.ignoresSafeArea()
                 switch nav.seccion {
+                case .conversacion: ConversacionView()
                 case .estado: EstadoView()
                 case .emparejar: EmparejarView()
                 case .ajustes: AjustesView(enVentana: true)
                 }
             }
+            // Adaptive layout: the detail takes every point the split view gives it, so hiding the
+            // sidebar widens the section instead of leaving an empty band on the right.
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .modifier(BarraSinFondo())
         }
         .frame(minWidth: 940, minHeight: 620)
@@ -136,6 +141,7 @@ private struct Pie: View {
         case .versionMismatch: "Agente de otra versión"
         case .refused: "Agente rechaza la app"
         case .noLiveStatus, .unintelligible: "Agente desactualizado"
+        case .noVerificado: "Agente sin verificar"
         }
     }
 }

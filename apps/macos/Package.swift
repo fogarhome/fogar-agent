@@ -20,8 +20,11 @@ let package = Package(
             exclude: ["Info.plist"],
             swiftSettings: [.defaultIsolation(MainActor.self)]
         ),
-        .executableTarget(name: "fogar-standin", dependencies: ["FogarWire"]),
+        // The stand-in agent's conversation rules (IPC v4), pure so they can be tested.
+        .target(name: "FogarStandinKit", dependencies: ["FogarWire"]),
+        .executableTarget(name: "fogar-standin", dependencies: ["FogarWire", "FogarStandinKit"]),
         .testTarget(name: "FogarWireTests", dependencies: ["FogarWire"]),
+        .testTarget(name: "FogarStandinTests", dependencies: ["FogarStandinKit", "FogarWire"]),
         .testTarget(
             name: "FogarDesktopTests",
             dependencies: ["FogarDesktop"],

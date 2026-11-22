@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import Testing
 @testable import FogarWire
 
@@ -133,5 +134,96 @@ import Testing
         await #expect(throws: LinkError.unavailable) {
             _ = try await FramedConnection.connect(path: path)
         }
+    }
+}
+
+/// A private directory (0700) for a test socket, removed by the caller.
+private func directorioPrivado(_ modo: mode_t = 0o700) throws -> String {
+    let dir = NSTemporaryDirectory() + "fogar-w-\(UUID().uuidString.prefix(8))"
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: false)
+    _ = chmod(dir, modo)
+    return dir
+}
+
+/// Binds a Unix socket at `path` (no listen: enough for the path checks).
+private func socketEn(_ path: String) -> Int32 {
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let bytes = Array(path.utf8)
+    withUnsafeMutableBytes(of: &addr.sun_path) { dst in
+        for (i, b) in bytes.enumerated() where i < dst.count - 1 { dst[i] = b }
+    }
+    _ = withUnsafePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+    }
+    return fd
+}
+
+/// The app only talks to a socket of ours in a private directory of ours (ADR-0002 mirrored).
+@Suite struct RutaDelSocket {
+    @Test func socketPropioEnDirectorioPrivado() throws {
+        let dir = try directorioPrivado()
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let fd = socketEn(dir + "/a.sock")
+        defer { _ = close(fd) }
+        #expect(PeerCheck.rutaPropia(dir + "/a.sock"))
+    }
+
+    @Test func directorioAbiertoNo() throws {
+        let dir = try directorioPrivado(0o755)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let fd = socketEn(dir + "/a.sock")
+        defer { _ = close(fd) }
+        #expect(!PeerCheck.rutaPropia(dir + "/a.sock"))
+    }
+
+    @Test func directorioEnlazadoNo() throws {
+        let dir = try directorioPrivado()
+        let enlace = dir + "-enlace"
+        defer { try? FileManager.default.removeItem(atPath: dir); _ = unlink(enlace) }
+        let fd = socketEn(dir + "/a.sock")
+        defer { _ = close(fd) }
+        #expect(symlink(dir, enlace) == 0)
+        #expect(!PeerCheck.rutaPropia(enlace + "/a.sock"))
+    }
+
+    @Test func unFicheroQueNoEsSocketNo() throws {
+        let dir = try directorioPrivado()
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        #expect(FileManager.default.createFile(atPath: dir + "/a.sock", contents: Data("x".utf8)))
+        #expect(!PeerCheck.rutaPropia(dir + "/a.sock"))
+        // A socket of another user cannot be made in a test without root: follow-up.
+    }
+}
+
+/// The app's own socket transport (`Enchufe`): frames split across reads and joined in one.
+@Suite(.serialized) struct TramasPorElEnchufe {
+    @Test func trozosYJuntas() async throws {
+        let dir = try directorioPrivado()
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let path = dir + "/a.sock"
+        let uno = try frame(Data(#"{"type":"subscribed"}"#.utf8))
+        let dos = try frame(Data(#"{"type":"unpaired"}"#.utf8))
+        let params = NWParameters.tcp
+        params.requiredLocalEndpoint = .unix(path: path)
+        let l = try NWListener(using: params)
+        defer { l.cancel() }
+        l.newConnectionHandler = { conn in
+            conn.start(queue: .global())
+            // The first frame in two writes, 100 ms apart; then two frames in one write.
+            conn.send(content: uno.prefix(3), completion: .contentProcessed { _ in
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
+                    conn.send(content: uno.dropFirst(3) + dos + dos, completion: .contentProcessed { _ in })
+                }
+            })
+        }
+        l.start(queue: .global())
+        try await Task.sleep(for: .milliseconds(200))
+        let c = try await FramedConnection.connect(path: path, verificacion: .rutaYUsuario)
+        defer { c.cancel() }
+        #expect(try WireCodec.decodeResponse(await c.receive()) == .subscribed)
+        #expect(try WireCodec.decodeResponse(await c.receive()) == .unpaired)
+        #expect(try WireCodec.decodeResponse(await c.receive()) == .unpaired)
     }
 }

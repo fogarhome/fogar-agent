@@ -10,12 +10,19 @@ nonisolated final class FakeAgent: @unchecked Sendable {
     private let lock = NSLock()
     private var _accepted = 0
     var accepted: Int { lock.withLock { _accepted } }
-    let path = NSTemporaryDirectory() + "fogar-t-\(UUID().uuidString.prefix(8)).sock"
+    /// A private directory (0700, ours), like the agent's `run/`: the app refuses any other.
+    let dir = NSTemporaryDirectory() + "fogar-t-\(UUID().uuidString.prefix(8))"
+    var path: String { dir + "/a.sock" }
     private var listener: NWListener?
 
     /// `dropAfterSubscribe`: close each subscribed connection this long after its first event
-    /// (an agent restart, as the app sees it).
-    init(dropAfterSubscribe: Duration? = nil, _ respond: @escaping @Sendable (WireRequest) -> [WireResponse]) throws {
+    /// (an agent restart, as the app sees it). `pausa`: wait this long before answering a request
+    /// (the connection's later requests wait behind it, like the core's).
+    init(dropAfterSubscribe: Duration? = nil, pausa: (@Sendable (WireRequest) -> Duration?)? = nil,
+         cerrarTras: (@Sendable (WireRequest) -> Bool)? = nil,
+         _ respond: @escaping @Sendable (WireRequest) -> [WireResponse]) throws {
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
         unlink(path)
         let params = NWParameters.tcp
         params.requiredLocalEndpoint = .unix(path: path)
@@ -28,7 +35,13 @@ nonisolated final class FakeAgent: @unchecked Sendable {
                     try await c.start()
                     while true {
                         let req = try WireCodec.decodeRequest(try await c.receive())
+                        if let d = pausa?(req) { try await Task.sleep(for: d) }
                         for r in respond(req) { try await c.send(WireCodec.encode(r)) }
+                        if cerrarTras?(req) == true {
+                            try await Task.sleep(for: .milliseconds(400))
+                            c.cancel()
+                            return
+                        }
                         if case .subscribe = req, let raw = Self.rawAfterSubscribe { try await c.send(Data(raw.utf8)) }
                         if case .subscribe = req, let d = dropAfterSubscribe {
                             try await Task.sleep(for: d)
@@ -49,6 +62,7 @@ nonisolated final class FakeAgent: @unchecked Sendable {
     deinit {
         listener?.cancel()
         unlink(path)
+        try? FileManager.default.removeItem(atPath: dir)
     }
 }
 
@@ -86,7 +100,7 @@ func waitFor(_ link: AgentLink, _ ok: (AgentState) -> Bool) async -> Bool {
     @Test func subscribesAndShowsTheLiveStatus() async throws {
         let agent = try FakeAgent(answers())
         try await Task.sleep(for: .milliseconds(200))
-        let link = AgentLink(socketPath: agent.path)
+        let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
         link.start()
         defer { link.stop() }
         #expect(await waitFor(link) { $0 == .live(ready) })
@@ -102,7 +116,7 @@ func waitFor(_ link: AgentLink, _ ok: (AgentState) -> Bool) async -> Bool {
     @Test func versionMismatchNamesTheAgentVersion() async throws {
         let agent = try FakeAgent(answers(version: ipcVersion + 1))
         try await Task.sleep(for: .milliseconds(200))
-        let link = AgentLink(socketPath: agent.path)
+        let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
         link.start()
         defer { link.stop() }
         #expect(await waitFor(link) { $0 == .versionMismatch(agent: ipcVersion + 1) })
@@ -112,7 +126,7 @@ func waitFor(_ link: AgentLink, _ ok: (AgentState) -> Bool) async -> Bool {
     @Test func commandsSkipEventsAndMapFailures() async throws {
         let agent = try FakeAgent(answers(pair: .pairFailed(WirePairFailed(reason: .invalidCode))))
         try await Task.sleep(for: .milliseconds(200))
-        let link = AgentLink(socketPath: agent.path)
+        let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
         #expect(try await link.discover().isEmpty)
         #expect(try await link.pair(address: "green-house", code: "111111") == .failed(.invalidCode))
         try await link.unpair()
@@ -122,7 +136,7 @@ func waitFor(_ link: AgentLink, _ ok: (AgentState) -> Bool) async -> Bool {
     @Test func refusedPairIsTheSignerSentence() async throws {
         let agent = try FakeAgent(answers(pair: .refused(WireRefused(reason: "peer not allowed"))))
         try await Task.sleep(for: .milliseconds(200))
-        let link = AgentLink(socketPath: agent.path)
+        let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
         await #expect(throws: CommandError.refused) { _ = try await link.pair(address: "x", code: "482913") }
     }
 }
@@ -136,7 +150,7 @@ extension AgentLinkOverASocket {
             return [.refused(WireRefused(reason: "not implemented yet"))]
         }
         try await Task.sleep(for: .milliseconds(200))
-        let link = AgentLink(socketPath: agent.path)
+        let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
         link.start()
         defer { link.stop() }
         #expect(await waitFor(link) { $0 == .noLiveStatus })
@@ -148,7 +162,7 @@ extension AgentLinkOverASocket {
     @Test func reconnectsAfterTheAgentDropsTheLink() async throws {
         let agent = try FakeAgent(dropAfterSubscribe: .milliseconds(300), answers())
         try await Task.sleep(for: .milliseconds(200))
-        let link = AgentLink(socketPath: agent.path)
+        let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
         link.start()
         defer { link.stop() }
         #expect(await waitFor(link) { $0 == .live(ready) })
@@ -165,7 +179,7 @@ extension AgentLinkOverASocket {
             return [.subscribed]
         }
         try await Task.sleep(for: .milliseconds(200))
-        let link = AgentLink(socketPath: agent.path)
+        let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
         link.start()
         defer { link.stop() }
         #expect(await waitFor(link) { $0 == .unintelligible })
@@ -246,7 +260,7 @@ extension AgentLinkOverASocket {
             }
         }
         try await Task.sleep(for: .milliseconds(200))
-        let link = AgentLink(socketPath: agent.path)
+        let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
         link.start()
         defer { link.stop() }
         #expect(await waitFor(link) { $0 == .live(notPaired) })
