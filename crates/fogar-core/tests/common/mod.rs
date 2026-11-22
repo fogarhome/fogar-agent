@@ -1,5 +1,5 @@
 //! Test rig: the agent wired to in-memory fakes (paused-time friendly).
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(dead_code)]
 
 use fogar_core::{
@@ -9,12 +9,12 @@ use fogar_core::{
 use fogar_ports::{
     gateway::{GatewayAddr, GatewayLink},
     gateway_http::{GatewayHttp, HttpCall, HttpError, HttpReply},
+    ipc::{IpcRequest, IpcResponse, UserText},
     secrets::{SecretKey, SecretStore},
 };
 use fogar_testkit::{
     FakeGatewayHttp, FakeGatewayLink, FakeIpc, FakeMic, FakeSpeaker, FakeSystemProbe, FakeTailnet,
-    HttpRoutes, MemorySecretStore, MockConfig, SeededRandom, TestClock, silence_chunks,
-    tone_chunks,
+    HttpRoutes, MemorySecretStore, MockConfig, SeededRandom, TestClock,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -35,9 +35,7 @@ pub(crate) struct Rig<L: GatewayLink = FakeGatewayLink> {
 pub(crate) const GW_ADDR: &str = "127.0.0.1:8004";
 
 pub(crate) fn test_config() -> Config {
-    let mut c = Config::default();
-    c.vad.hangover_chunks = 10;
-    c
+    Config::default()
 }
 
 /// A pairing record for `GW_ADDR` with `key`.
@@ -225,16 +223,21 @@ pub(crate) async fn eventually(d: Duration, mut cond: impl FnMut() -> bool) {
     .await
 }
 
-/// Feeds one scripted utterance at real-time pace: `voiced` tone chunks, then enough silence
-/// to end it (hangover 10).
-pub(crate) async fn speak(mic: &FakeMic, voiced: usize) {
-    for c in tone_chunks(voiced, 0.3)
-        .into_iter()
-        .chain(silence_chunks(14))
-    {
-        mic.push(c);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+/// The person types `text` in the app: a fresh signed IPC connection sends it (the rig needs
+/// `with_ipc`; it stays open only for this request, so the idle close never matters).
+pub(crate) async fn say<L: GatewayLink>(rig: &Rig<L>, text: &str) {
+    let mut c = rig
+        .ipc
+        .as_ref()
+        .expect("rig built without ipc")
+        .client()
+        .await;
+    let r = c
+        .request(IpcRequest::SendText {
+            text: UserText(text.to_owned()),
+        })
+        .await;
+    assert_eq!(r, Some(IpcResponse::TextAccepted));
 }
 
 pub(crate) fn alive_tasks() -> usize {

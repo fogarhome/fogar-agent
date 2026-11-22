@@ -21,7 +21,7 @@ async fn graceful_shutdown_returns_to_the_task_baseline() {
     let mut rig = b.start();
     wait_ready(&mut rig.health).await;
     assert!(alive_tasks() > baseline);
-    assert!(rig.mic.is_open());
+    assert_eq!(rig.mic.opens(), 0, "S2 Decision 1: no microphone at start");
 
     let ipc = rig.ipc.clone().unwrap();
     let mut client = ipc.client().await;
@@ -48,7 +48,7 @@ async fn graceful_shutdown_returns_to_the_task_baseline() {
     );
 
     // Shut down in the middle of a streaming turn.
-    speak(&rig.mic, 10).await;
+    say(&rig, "pon la serie").await;
     eventually(Duration::from_secs(30), || {
         rig.health.snapshot().stats.tts_frames_played > 3
     })
@@ -63,7 +63,7 @@ async fn graceful_shutdown_returns_to_the_task_baseline() {
     assert_eq!(report.tasks_left, 0);
     assert!(t0.elapsed() < Duration::from_secs(5));
     assert_eq!(health.wait_link(|_| true).await.state, LinkState::Stopped);
-    assert!(!mic.is_open(), "capture released");
+    assert_eq!(mic.opens(), 0, "the microphone was never opened");
     assert_eq!(speaker.snapshot().open_now, 0, "output device released");
     assert_eq!(
         link.log().client_closes,

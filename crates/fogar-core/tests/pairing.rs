@@ -109,7 +109,10 @@ async fn pairing_happy_path_persists_then_connects() {
     assert_eq!(body["code"], "482913");
     assert_eq!(body["client_type"], "app");
     assert_eq!(body["name"], rig_cfg_name());
-    assert_eq!(body["output_mode"], serde_json::json!(["audio", "text"]));
+    assert_eq!(
+        body["output_mode"],
+        serde_json::json!(["audio", "text", "status"])
+    );
 
     // The link restarts on the new record and the subscriber sees it.
     ready_promptly(&mut rig.health).await;

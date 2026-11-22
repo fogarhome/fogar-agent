@@ -22,7 +22,8 @@ pub struct Config {
     /// Requested agent; `None` = gateway fallback cascade (spec §2).
     pub agent: Option<String>,
     pub input_mode: InputMode,
-    /// We never request `status` (one `pipeline_event` per STT partial; spec §7).
+    /// `status` is requested for `turn_progress` and the voice services' `status` (S2); it also
+    /// brings one `pipeline_event` per STT partial (spec §7), which the engine ignores.
     pub output_mode: Vec<OutputMode>,
     pub connect_timeout: Duration,
     /// Handshake sent -> `ready` received (the gateway's own handshake limit is 5 s).
@@ -64,7 +65,7 @@ impl Default for Config {
             pair_from_uid_only_peers: false,
             agent: None,
             input_mode: InputMode::Audio,
-            output_mode: vec![OutputMode::Audio, OutputMode::Text],
+            output_mode: vec![OutputMode::Audio, OutputMode::Text, OutputMode::Status],
             connect_timeout: Duration::from_secs(10),
             ready_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(5),

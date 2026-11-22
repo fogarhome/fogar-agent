@@ -6,22 +6,32 @@
 //! makes the agent spend the stored key to take the conversation back from another session (any
 //! same-user process could otherwise drive the 4102 ping-pong spec §13 forbids), so they are
 //! answered only for a `PeerCheck::SameSigner` peer, unless the composition root opted in to
-//! `UidOnly` peers at compile time (`Config::pair_from_uid_only_peers`). The rest is read-only.
+//! `UidOnly` peers at compile time (`Config::pair_from_uid_only_peers`).
+//!
+//! The conversation requests (IPC v4) carry or reveal the user's content, so they are answered
+//! ONLY for a `PeerCheck::SameSigner` peer: the development opt-in above never extends to them.
+//! Typed text is validated here (empty, too long), then handed to the engine through the
+//! bounded command queue (`queues::ENGINE_COMMANDS`: full => "busy" at once). Text is never
+//! logged; counters only. The rest is read-only.
 
 use crate::{
-    agent::HealthProbe, link::LinkView, pairing::Pairing, queues::IPC_MAX_CONNS, stats::Stats,
-    time::deadline,
+    agent::HealthProbe, engine::Command, link::LinkView, pairing::Pairing, queues::IPC_MAX_CONNS,
+    stats::Stats, time::deadline,
 };
 use fogar_ports::{
     clock::Clock,
     gateway_http::GatewayHttp,
     ipc::{
-        IPC_VERSION, IpcConn, IpcError, IpcRequest, IpcResponse, IpcServer, PeerCheck, StatusReport,
+        IPC_VERSION, IpcConn, IpcError, IpcRequest, IpcResponse, IpcServer, PeerCheck,
+        SEND_TEXT_MAX_BYTES, StatusReport, TextRefusal,
     },
     tailnet::TailnetPeers,
 };
 use std::{future::Future, sync::Arc, time::Duration};
-use tokio::task::JoinSet;
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinSet,
+};
 use tokio_util::sync::CancellationToken;
 
 /// Per-connection limits.
@@ -43,6 +53,7 @@ pub(crate) async fn run<C: Clock, S: IpcServer, H: GatewayHttp, T: TailnetPeers>
     health: HealthProbe,
     limits: Limits,
     pairing: Pairing<C, H, T>,
+    cmds: mpsc::Sender<Command>,
     ingress: CancellationToken,
 ) {
     let mut conns = JoinSet::new();
@@ -65,6 +76,7 @@ pub(crate) async fn run<C: Clock, S: IpcServer, H: GatewayHttp, T: TailnetPeers>
                         health: health.clone(),
                         limits,
                         pairing: pairing.clone(),
+                        cmds: cmds.clone(),
                         peer_check,
                         cancel: ingress.child_token(),
                     }));
@@ -89,12 +101,17 @@ struct Conn<K, C, H, T> {
     health: HealthProbe,
     limits: Limits,
     pairing: Pairing<C, H, T>,
+    cmds: mpsc::Sender<Command>,
     peer_check: PeerCheck,
     cancel: CancellationToken,
 }
 
 fn report(health: &HealthProbe, v: &LinkView, peer_check: PeerCheck) -> StatusReport {
     let s = health.stats.snapshot();
+    let (transcriber, tts) = {
+        let c = health.conversation.borrow();
+        (c.transcriber, c.tts)
+    };
     StatusReport::new(
         v.state.label().to_owned(),
         v.state.phase(),
@@ -104,6 +121,7 @@ fn report(health: &HealthProbe, v: &LinkView, peer_check: PeerCheck) -> StatusRe
         health.boot_mode.to_owned(),
         peer_check,
     )
+    .with_voice(transcriber, tts)
 }
 
 impl<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers> Conn<K, C, H, T> {
@@ -122,6 +140,49 @@ impl<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers> Conn<K, C, H, T> {
 
     fn may_pair(&self) -> bool {
         self.peer_check == PeerCheck::SameSigner || self.limits.pair_from_uid_only_peers
+    }
+
+    /// `&mut`: the future must stay `Send` without requiring `K: Sync`.
+    async fn ask<R>(&mut self, make: impl FnOnce(oneshot::Sender<R>) -> Command) -> Option<R> {
+        let timeout = self.limits.write_timeout;
+        ask(&*self.clock, &self.cmds, timeout, &self.health.stats, make).await
+    }
+}
+
+/// Hands a command to the engine and waits for its answer under `timeout`. `None` = busy: the
+/// queue was full (never waited on) or the engine did not answer in time (the dropped reply
+/// makes the engine skip the command).
+async fn ask<C: Clock, R>(
+    clock: &C,
+    cmds: &mpsc::Sender<Command>,
+    timeout: Duration,
+    stats: &Stats,
+    make: impl FnOnce(oneshot::Sender<R>) -> Command,
+) -> Option<R> {
+    let (tx, rx) = oneshot::channel();
+    let answer = match cmds.try_send(make(tx)) {
+        Ok(()) => deadline(clock, timeout, rx).await.and_then(Result::ok),
+        Err(_) => None,
+    };
+    if answer.is_none() {
+        Stats::inc(&stats.engine_commands_busy);
+    }
+    answer
+}
+
+/// The engine could not take the command now (full queue or no answer in time).
+const BUSY: IpcResponse = IpcResponse::Refused {
+    reason: "engine busy",
+};
+
+/// Local checks of a typed text before it reaches the engine (which adds `NotReady`).
+fn check_text(text: &str) -> Result<(), TextRefusal> {
+    if text.len() > SEND_TEXT_MAX_BYTES {
+        Err(TextRefusal::TooLong)
+    } else if text.trim().is_empty() {
+        Err(TextRefusal::Empty)
+    } else {
+        Ok(())
     }
 }
 
@@ -149,7 +210,9 @@ async fn recv_within<C: Clock, K: IpcConn>(
 
 async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Conn<K, C, H, T>) {
     let mut view = c.health.view.clone();
+    let mut conv = c.health.conversation.clone();
     let mut subscribed = false;
+    let mut conv_subscribed = false;
     // A peer that said another version is told ours, then refused (it must not guess).
     let mut version_ok = true;
     let mut last_pushed: Option<StatusReport> = None;
@@ -157,6 +220,13 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
         let req = tokio::select! {
             biased;
             () = c.cancel.cancelled() => return,
+            // Requests BEFORE pushes (review M2): a dense token stream must never starve a
+            // CancelTurn/SendText on a subscribed connection.
+            r = recv_within(&*c.clock, &mut c.conn, (!subscribed && !conv_subscribed).then_some(c.limits.idle_timeout)) => match r {
+                Some(Ok(Some(req))) => req,
+                // Idle, peer gone or a bad frame: close the connection (dropping it).
+                None | Some(Ok(None) | Err(_)) => return,
+            },
             r = view.changed(), if subscribed => {
                 if r.is_err() {
                     return;
@@ -171,17 +241,41 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
                 last_pushed = Some(rep);
                 continue;
             }
-            r = recv_within(&*c.clock, &mut c.conn, (!subscribed).then_some(c.limits.idle_timeout)) => match r {
-                Some(Ok(Some(req))) => req,
-                // Idle, peer gone or a bad frame: close the connection (dropping it).
-                None | Some(Ok(None) | Err(_)) => return,
-            },
+            // The conversation, and the voice state inside the status report.
+            r = conv.changed(), if subscribed || conv_subscribed => {
+                if r.is_err() {
+                    return;
+                }
+                let (latest, voice) = {
+                    let v = conv.borrow_and_update();
+                    // Status only: mark seen, no copy of the view.
+                    (conv_subscribed.then(|| v.clone()), (v.transcriber, v.tts))
+                };
+                if let Some(latest) = latest
+                    && !c.send(IpcResponse::Conversation(latest)).await
+                {
+                    return;
+                }
+                // Only a voice change rebuilds the status report (tokens alone never do).
+                let pushed_voice = last_pushed.as_ref().map(|r| (r.transcriber, r.tts));
+                if subscribed && pushed_voice != Some(voice) {
+                    let rep = report(&c.health, &view.borrow(), c.peer_check);
+                    if last_pushed.as_ref() != Some(&rep) {
+                        if !c.send(IpcResponse::Event(rep.clone())).await {
+                            return;
+                        }
+                        last_pushed = Some(rep);
+                    }
+                }
+                continue;
+            }
         };
         let resp = match req {
             IpcRequest::Hello { version } => {
                 version_ok &= version == IPC_VERSION;
                 // A peer speaking another version gets no more pushes either.
                 subscribed &= version_ok;
+                conv_subscribed &= version_ok;
                 IpcResponse::Hello {
                     version: IPC_VERSION,
                 }
@@ -201,6 +295,41 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
                 last_pushed = Some(rep.clone());
                 IpcResponse::Event(rep)
             }
+            IpcRequest::SubscribeConversation
+            | IpcRequest::SendText { .. }
+            | IpcRequest::CancelTurn
+            | IpcRequest::CaptureStart { .. }
+            | IpcRequest::CaptureEnd { .. }
+            | IpcRequest::TurnVisible { .. }
+            | IpcRequest::RequestMicPermission
+                if c.peer_check != PeerCheck::SameSigner =>
+            {
+                IpcResponse::Refused {
+                    reason: "needs the signed Fogar app",
+                }
+            }
+            IpcRequest::SubscribeConversation => {
+                if !c.send(IpcResponse::ConversationSubscribed).await {
+                    return;
+                }
+                conv_subscribed = true;
+                IpcResponse::Conversation(conv.borrow_and_update().clone())
+            }
+            // `TextAccepted` / `TurnCancelSent` mean "accepted by the agent", NOT "delivered to
+            // the gateway": the conversation view carries the real outcome (an uplink failure
+            // ends the turn there as `Error` / `Interrupted`).
+            IpcRequest::SendText { text } => match check_text(&text.0) {
+                Err(r) => IpcResponse::TextRefused(r),
+                Ok(()) => match c.ask(|tx| Command::SendText(text.0, tx)).await {
+                    Some(Ok(())) => IpcResponse::TextAccepted,
+                    Some(Err(r)) => IpcResponse::TextRefused(r),
+                    None => BUSY,
+                },
+            },
+            IpcRequest::CancelTurn => match c.ask(Command::Cancel).await {
+                Some(()) => IpcResponse::TurnCancelSent,
+                None => BUSY,
+            },
             IpcRequest::Discover => match op(&c.cancel, c.pairing.discover(c.may_pair())).await {
                 Some(found) => IpcResponse::Discovered(found),
                 None => return,
@@ -235,6 +364,8 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
             IpcRequest::Reconnect => IpcResponse::Refused {
                 reason: "nothing to reconnect",
             },
+            // CaptureStart/CaptureEnd/TurnVisible/RequestMicPermission arrive with S2 3b/3c;
+            // until then nothing here touches the microphone.
             _ => IpcResponse::Refused {
                 reason: "unsupported request",
             },
@@ -242,5 +373,56 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
         if !c.send(resp).await {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::disallowed_methods)]
+    use super::*;
+    use crate::queues::ENGINE_COMMANDS;
+    use fogar_testkit::TestClock;
+
+    /// `queues`: a full engine queue is answered "busy" at once, without waiting.
+    #[tokio::test(start_paused = true)]
+    async fn full_command_queue_is_busy_at_once() {
+        let (tx, mut rx) = mpsc::channel(ENGINE_COMMANDS);
+        let (clock, stats) = (TestClock::new(), Stats::default());
+        let mut parked = Vec::new();
+        for _ in 0..ENGINE_COMMANDS {
+            let (r, keep) = oneshot::channel::<()>();
+            tx.try_send(Command::Cancel(r)).unwrap();
+            parked.push(keep);
+        }
+        let t0 = tokio::time::Instant::now();
+        let got = ask(&clock, &tx, Duration::from_secs(5), &stats, Command::Cancel).await;
+        assert_eq!((got, t0.elapsed()), (None, Duration::ZERO));
+        assert_eq!(stats.snapshot().engine_commands_busy, 1);
+        // Room again, but nobody answers: busy after the deadline, and the reply is abandoned
+        // so the engine skips the command instead of running it late.
+        drop(rx.recv().await);
+        let got = ask(&clock, &tx, Duration::from_secs(5), &stats, Command::Cancel).await;
+        assert_eq!(got, None);
+        assert_eq!(t0.elapsed(), Duration::from_secs(5));
+        let mut last = None;
+        while let Ok(c) = rx.try_recv() {
+            last = Some(c);
+        }
+        assert!(matches!(last, Some(Command::Cancel(r)) if r.is_closed()));
+    }
+
+    #[test]
+    fn typed_text_checks() {
+        let max = "a".repeat(SEND_TEXT_MAX_BYTES);
+        for (text, want) in [
+            ("hola", Ok(())),
+            ("", Err(TextRefusal::Empty)),
+            (" \n\t ", Err(TextRefusal::Empty)),
+            (max.as_str(), Ok(())),
+        ] {
+            assert_eq!(check_text(text), want, "{text:?}");
+        }
+        let over = format!("{max}a");
+        assert_eq!(check_text(&over), Err(TextRefusal::TooLong));
     }
 }

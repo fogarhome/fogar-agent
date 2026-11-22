@@ -11,6 +11,7 @@
 pub mod agent;
 pub mod backoff;
 pub mod config;
+pub mod conversation;
 pub mod crashloop;
 pub mod heartbeat;
 pub mod pairing;

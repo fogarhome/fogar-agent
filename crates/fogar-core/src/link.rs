@@ -23,7 +23,7 @@ use fogar_ports::{
 };
 use fogar_proto::{
     ClientMsg, CloseAction, Handshake, ServerMsg, classify_close, close::CLOSE_ABNORMAL,
-    close::CLOSE_NORMAL, decode_server, encode_client, encode_handshake,
+    close::CLOSE_NORMAL, decode_server, encode_client, encode_handshake, server::Capabilities,
 };
 use std::{borrow::Cow, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, watch};
@@ -32,7 +32,8 @@ use tokio_util::sync::CancellationToken;
 /// Session -> engine events. Frames carry the [`Charge`] of their bytes against
 /// `queues::INBOUND_BYTES`; it is released when the engine drops the message.
 pub(crate) enum Inbound {
-    SessionUp,
+    /// The session reached `ready`; carries its `live_capabilities` (voice services up).
+    SessionUp(Capabilities),
     SessionDown,
     Server(ServerMsg, Charge),
     /// Raw binary frame (0xA1 + turn_seq + PCM16); the engine parses it zero-copy.
@@ -43,7 +44,7 @@ pub(crate) enum Inbound {
 impl std::fmt::Debug for Inbound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Inbound::SessionUp => f.write_str("SessionUp"),
+            Inbound::SessionUp(c) => f.debug_tuple("SessionUp").field(c).finish(),
             Inbound::SessionDown => f.write_str("SessionDown"),
             Inbound::Server(m, _) => f.debug_tuple("Server").field(m).finish(),
             Inbound::Audio(b, _) => write!(f, "Audio(<{} bytes>)", b.len()),
@@ -353,17 +354,17 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
         while out_rx.try_recv().is_ok() {
             Stats::inc(&self.stats.stale_outbound_discarded);
         }
-        match self.await_ready(&mut sess, in_tx, egress).await {
-            Ok(()) => {}
+        let caps = match self.await_ready(&mut sess, in_tx, egress).await {
+            Ok(caps) => caps,
             Err(o) => return (o, false),
-        }
+        };
         Stats::inc(&self.stats.sessions_started);
         let session = self
             .stats
             .sessions_started
             .load(std::sync::atomic::Ordering::Relaxed);
         self.set_state(LinkState::Ready { session });
-        if !self.forward(in_tx, Inbound::SessionUp, egress).await {
+        if !self.forward(in_tx, Inbound::SessionUp(caps), egress).await {
             self.close_quietly(&mut sess, CLOSE_NORMAL).await;
             return (self.not_delivered(in_tx, egress), true);
         }
@@ -376,7 +377,7 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
         sess: &mut L::Session,
         in_tx: &mpsc::Sender<Inbound>,
         egress: &CancellationToken,
-    ) -> Result<(), Outcome> {
+    ) -> Result<Capabilities, Outcome> {
         let clock = &*self.clock;
         let ready_by = clock.now().saturating_add(self.cfg.ready_timeout);
         let mut pairing = self.pairing.clone();
@@ -395,7 +396,7 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                     None => return Err(Outcome::Closed { code: CLOSE_ABNORMAL, reason: String::new() }),
                     Some(LinkEvent::Closed { code, reason }) => return Err(Outcome::Closed { code, reason }),
                     Some(LinkEvent::Frame(Frame::Text(t))) => match decode_server(&t) {
-                        Ok(ServerMsg::Ready(_)) => return Ok(()),
+                        Ok(ServerMsg::Ready(r)) => return Ok(r.live_capabilities),
                         Ok(msg @ ServerMsg::Status(_)) => {
                             let delivered = match self.charge(t.len(), egress).await {
                                 Some(charge) => self.forward(in_tx, Inbound::Server(msg, charge), egress).await,
@@ -830,7 +831,7 @@ mod budget_tests {
         // semaphore hands permits to the queued waiter as they come free).
         assert_eq!(r.budget.in_use(), INBOUND_BYTES);
         assert_eq!(r.in_rx.len(), 1 + 4, "the 5th waits for room");
-        assert!(matches!(r.in_rx.recv().await, Some(Inbound::SessionUp)));
+        assert!(matches!(r.in_rx.recv().await, Some(Inbound::SessionUp(_))));
         let first = r.in_rx.recv().await;
         assert!(matches!(first, Some(Inbound::Server(..))));
         settle(&r).await;
