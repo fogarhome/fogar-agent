@@ -10,6 +10,8 @@ struct FogarDesktopApp: App {
     @State private var link: AgentLink
     @State private var conversacion: Conversacion
     @State private var nav = Navegacion()
+    /// The agent's LaunchAgent (registered once at first launch; S2 PR 6).
+    @State private var servicio = ServicioAgente()
     @AppStorage("apariencia") private var apariencia = Apariencia.sistema
 
     init() {
@@ -28,6 +30,7 @@ struct FogarDesktopApp: App {
                 .environment(link)
                 .environment(conversacion)
                 .environment(nav)
+                .environment(servicio)
         }
         .defaultSize(width: 1100, height: 740)
         .windowStyle(.hiddenTitleBar)
@@ -37,6 +40,7 @@ struct FogarDesktopApp: App {
             AjustesView(enVentana: false)
                 .environment(link)
                 .environment(nav)
+                .environment(servicio)
         }
         .windowResizability(.contentSize)
 
@@ -52,6 +56,8 @@ struct FogarDesktopApp: App {
                 .onChange(of: apariencia, initial: true) { _, a in NSApp.appearance = a.nsAppearance }
                 // The agent came back: the conversation connects at once, not at its next backoff.
                 .onChange(of: link.state.status != nil) { _, vivo in if vivo { conversacion.link.retryNow() } }
+                // First launch: register the agent with launchd; then keep its state current.
+                .task { await servicio.arrancar() }
         }
         .menuBarExtraStyle(.window)
     }

@@ -229,3 +229,31 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
   audits still owed for cpal, coreaudio-rs, objc2-core-audio(-types), objc2-audio-toolbox, rtrb,
   mach2, dispatch2.
 - UNVERIFIED (M2): xruns at start, cost with mic open, TCC prompt/revoke, device loss, AirPods.
+
+## S2 — PR 6: integration and minimal packaging, the part without the Mac (2026-11-22)
+- Fogar Desktop.app (release) carries fogar-agentd in Contents/MacOS and the LaunchAgent plist
+  com.fogar.agent.plist in Contents/Library/LaunchAgents (BundleProgram, RunAtLoad, KeepAlive
+  SuccessfulExit=false, ThrottleInterval 30, ProcessType Standard [to measure vs Background],
+  AssociatedBundleIdentifiers com.fogar.desktop). Debug builds carry no agent.
+- Agent Info.plist (com.fogar.agent + NSMicrophoneUsageDescription) linked into __TEXT,__info_plist
+  by build-app.sh (cargo rustc link-arg: no build.rs). App Info.plist gains
+  NSMicrophoneUsageDescription; both sign with com.apple.security.device.audio-input (spike step 0).
+- build-app.sh: signs the agent first (identifier com.fogar.agent, hardened runtime, entitlements
+  file), then the app, same identity, no --deep; then checks identifier, same Team, runtime flag,
+  no get-task-allow/disable-library-validation/allow-dyld-environment-variables, embedded plist,
+  BundleProgram/Label. Contents/MacOS must be exactly {FogarDesktop, fogar-agentd} (release).
+- App: ServicioAgente (SMAppService.agent, off the main thread): registers once at first launch,
+  re-reads the state on every activation, Ajustes → Agente shows active / waiting for approval
+  (opens Login Items) / not registered (register) / not found / not in this build; unregister.
+- PeerCheck: requirement builder split out (anchor injectable for tests only). CI signs a tiny C
+  test server four ways with a temporary self-signed certificate (scripts/ci-signed-agents.sh) and
+  SignedAgentTests runs the real check: com.fogar.agent + runtime accepted; other identifier,
+  no runtime, get-task-allow, other Team, Apple anchor all refused.
+- Rust: MacIpcServer's run/ is set to exactly 0700 (also a narrower mode or special bits), test on
+  macOS; fogar-agentd: an explicit --state-dir other than the default uses its own Keychain service
+  com.fogar.agent.dir-<FNV-1a 64 of the path> (instance.rs), default unchanged; tests.
+- Audio wiring: platform_macos already built MacAudioSource/MacAudioSink (#22); the engine still
+  opens no microphone until 3b (not forced here).
+- NOT here: E2E against the real gateway with fake STT/TTS (needs 3b/3c), anything verified on the
+  M2 (registration, approval, launchd start, TCC prompt to the app's name, same-signer connection
+  with the Personal Team, Keychain without a dialog: GUESSED).

@@ -2,8 +2,9 @@ import FogarWire
 import ServiceManagement
 import SwiftUI
 
-/// Ajustes: only what is real today. Unpair (the agent forgets the key), appearance, open at login
-/// (SMAppService, the system's own login item), and what this build is. Shown as a section of the
+/// Ajustes: only what is real today. Unpair (the agent forgets the key), the agent's registration
+/// with launchd (SMAppService.agent), appearance, open at login (SMAppService, the system's own
+/// login item), and what this build is. Shown as a section of the
 /// window and as the Settings scene (⌘,).
 struct AjustesView: View {
     let enVentana: Bool
@@ -14,6 +15,7 @@ struct AjustesView: View {
             VStack(alignment: .leading, spacing: 36) {
                 if enVentana { Text("Ajustes").titularFogar() }
                 Emparejamiento(enVentana: enVentana)
+                AgenteBloque()
                 AparienciaBloque()
                 InicioSesion()
                 AcercaDe(socket: link.socketPath)
@@ -102,6 +104,52 @@ private struct Emparejamiento: View {
         Task {
             defer { trabajando = false }
             do { try await link.unpair() } catch { self.error = Textos.fallo(error) }
+        }
+    }
+}
+
+/// The agent inside this app, as launchd runs it: active, waiting for the person's approval in
+/// Login Items, or not registered; with the one action that fits each.
+private struct AgenteBloque: View {
+    @Environment(ServicioAgente.self) private var servicio
+
+    var body: some View {
+        Bloque(titulo: "Agente") {
+            if let estado = servicio.estado {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    EstadoIcono(tono: estado == .activo ? .ok : (estado == .noIncluido ? .off : .warn), tam: 12)
+                    Text(Textos.servicioAgente(estado))
+                        .font(Tipo.cuerpo).foregroundStyle(Color.hueso)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .accessibilityElement(children: .combine)
+                acciones(estado)
+            } else {
+                Text("Mirando si el agente está registrado…").font(Tipo.cuerpo).suave()
+            }
+            if let error = servicio.error {
+                Text(error).meta().fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    @ViewBuilder private func acciones(_ estado: EstadoServicio) -> some View {
+        switch estado {
+        case .activo:
+            Button("Quitar el registro") { Task { await servicio.quitar() } }
+                .buttonStyle(Pildora(ocupado: servicio.trabajando))
+                .disabled(servicio.trabajando)
+            Text("Sin registro, el agente deja de arrancar solo y la app no podrá hablar con él.")
+                .meta().fixedSize(horizontal: false, vertical: true)
+        case .pendienteAprobacion:
+            Button("Abrir Ítems de inicio") { servicio.abrirItemsDeInicio() }
+                .buttonStyle(Pildora())
+        case .desactivado, .noEncontrado:
+            Button("Registrar el agente") { Task { await servicio.registrar() } }
+                .buttonStyle(Pildora(ocupado: servicio.trabajando))
+                .disabled(servicio.trabajando)
+        case .noIncluido:
+            EmptyView()
         }
     }
 }

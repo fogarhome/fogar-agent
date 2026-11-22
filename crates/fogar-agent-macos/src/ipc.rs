@@ -101,7 +101,10 @@ fn euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// Creates (or validates) a private directory: owned by us, mode 0700, not a symlink.
+/// Creates (or validates) a private directory: owned by us, mode exactly 0700, not a symlink.
+/// Exactly: the app accepts the socket only in a directory whose permission bits are `0700`
+/// (`PeerCheck.rutaPropia`), so a narrower mode left by the umask (`0500`) or a special bit is
+/// corrected too, not only group/other access.
 pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -114,7 +117,7 @@ pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
             "not a private directory we own",
         ));
     }
-    if md.permissions().mode() & 0o077 != 0 {
+    if md.permissions().mode() & 0o7777 != 0o700 {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
@@ -622,6 +625,37 @@ impl MacIpcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S2 PR 6 (review of #23): the run directory ends up with mode exactly 0700 whatever it was
+    /// before (looser, narrower, with a special bit) and whatever the umask, because the app
+    /// refuses any other mode; a symlink is refused, never followed.
+    #[test]
+    fn run_dir_is_exactly_0700() {
+        let base = std::env::temp_dir().join(format!("fogar-rundir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let run = base.join("state/run");
+        let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777;
+        ensure_private_dir(&run).unwrap();
+        assert_eq!(mode(&run), 0o700);
+        for before in [0o755, 0o500, 0o1700, 0o2700, 0o711] {
+            std::fs::set_permissions(&run, std::fs::Permissions::from_mode(before)).unwrap();
+            ensure_private_dir(&run).unwrap();
+            assert_eq!(mode(&run), 0o700, "from {before:o}");
+        }
+        // The socket bound there keeps the directory at 0700 too.
+        let server = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async { MacIpcServer::bind(&run) })
+            .unwrap();
+        assert_eq!(mode(&run), 0o700);
+        drop(server);
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&run, &link).unwrap();
+        assert!(ensure_private_dir(&link).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn requirement_inputs_are_validated() {
