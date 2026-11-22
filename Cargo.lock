@@ -277,6 +277,7 @@ dependencies = [
  "cpal",
  "fogar-host",
  "fogar-ports",
+ "fogar-testalloc",
  "fogar-testkit",
  "libc",
  "objc2",

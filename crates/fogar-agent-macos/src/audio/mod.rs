@@ -1,16 +1,16 @@
 //! macOS audio adapters (S2 §D): `MacAudioSource` (microphone + TCC permission) and
 //! `MacAudioSink` (speaker), on cpal 0.18.2 / CoreAudio with `rtrb` rings between the real-time
-//! callbacks and our own threads. Verified on the macOS CI runner (contract suites; the runner has
-//! no microphone, so `NoDevice`/`PermissionDenied` are valid outcomes); behaviour, xruns, energy
-//! and TCC still need the M2 (see the PR notes).
+//! callbacks and our own threads. What CI proves: on the macOS runner the contract suites pass,
+//! but the microphone path ends in `PermissionDenied`/`NoDevice` there, so capture itself is NOT
+//! exercised by CI; only playback runs against a real (virtual) output. Capture, xruns, energy
+//! and TCC need the M2 (see the PR notes). The OS-free parts (`crate::rt`) are unit-tested on
+//! every host.
 //!
-//! - `dsp`: OS-free RT writer/reader, counters and the resampler (unit-tested, no `unsafe`).
 //! - `permission`: `AVCaptureDevice` authorization status/request (the only `unsafe` here).
-//! - `capture` / `playback`: one owned thread per open device, which builds, runs and drops the
-//!   cpal stream; dropping the handle joins it.
+//! - `capture` / `playback`: one owned thread per open device (`rt::worker`), which builds,
+//!   runs and drops the cpal stream; dropping the handle stops it within a deadline.
 
 mod capture;
-mod dsp;
 mod permission;
 mod playback;
 
@@ -34,16 +34,22 @@ pub struct AudioCounters {
     pub input_overrun_frames: u64,
     /// 20 ms chunks dropped because the core's stream was full.
     pub chunks_dropped: u64,
-    /// Output callbacks that ran dry in the middle of queued audio (audible gaps).
+    /// Short gaps in playback (ring ran dry and audio resumed within 250 ms): audible xruns.
     pub output_underruns: u64,
     /// Errors reported by the audio device (cpal error callback, any kind).
     pub device_errors: u64,
-    /// Captures the adapter ended on its own (device lost, stream invalidated, stalled).
+    /// Captures the adapter ended on its own (device lost, stalled, permission revoked).
     pub captures_aborted: u64,
+    /// Resampled output samples the ring had no room for (expected 0).
+    pub output_samples_dropped: u64,
+    /// `open` refused at once because an earlier timed-out open is still inside CoreAudio.
+    pub opens_refused_in_flight: u64,
+    /// Audio threads detached because they did not stop within 1 s of their handle's drop.
+    pub threads_detached: u64,
 }
 
 pub fn audio_counters() -> AudioCounters {
-    let c = &dsp::COUNTERS;
+    let c = &crate::rt::dsp::COUNTERS;
     AudioCounters {
         input_callbacks: c.input_callbacks.load(Ordering::Relaxed),
         input_overrun_frames: c.input_overrun_frames.load(Ordering::Relaxed),
@@ -51,6 +57,9 @@ pub fn audio_counters() -> AudioCounters {
         output_underruns: c.output_underruns.load(Ordering::Relaxed),
         device_errors: c.device_errors.load(Ordering::Relaxed),
         captures_aborted: c.captures_aborted.load(Ordering::Relaxed),
+        output_samples_dropped: c.output_samples_dropped.load(Ordering::Relaxed),
+        opens_refused_in_flight: c.opens_refused_in_flight.load(Ordering::Relaxed),
+        threads_detached: c.threads_detached.load(Ordering::Relaxed),
     }
 }
 
@@ -84,7 +93,7 @@ impl AudioSource for MacAudioSource {
 
     fn request_mic_permission(&self) -> Result<EventStream<MicPermission>, AudioError> {
         let (sink, stream) = event_channel(NonZeroUsize::MIN);
-        permission::request(sink);
+        permission::request(sink)?;
         Ok(stream)
     }
 }

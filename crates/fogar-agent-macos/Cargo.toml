@@ -26,6 +26,9 @@ block2 = { workspace = true, features = ["std"] }
 [dev-dependencies]
 fogar-testkit = { workspace = true }
 fogar-ports = { workspace = true }
+# The OS-free audio parts (src/rt) are unit-tested on every host.
+rtrb = { workspace = true }
+fogar-testalloc = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]

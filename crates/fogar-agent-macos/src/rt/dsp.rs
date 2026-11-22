@@ -1,33 +1,40 @@
-//! Portable, OS-free audio plumbing for the macOS adapter (no CoreAudio, no `unsafe`): the
-//! real-time writer/reader that live inside the cpal callbacks, and a small streaming resampler.
+//! OS-free audio plumbing for the macOS adapter (no CoreAudio, no `unsafe`): the real-time
+//! writer/reader that live inside the cpal callbacks, the process-wide counters and a small
+//! streaming resampler. Compiled and unit-tested on every host.
 //!
 //! Real-time rules (fogar-realtime-audio §2) for [`InputWriter`] and [`OutputReader`]: no
 //! allocation or deallocation, no locks, no logging, no syscalls, no `Waker::wake`. They only
-//! convert samples, move them through a preallocated `rtrb` SPSC ring and bump `Relaxed` counters
-//! (the barge-in watermark uses `Acquire`/`Release`). Tests below prove the no-alloc part with a
-//! counting allocator.
+//! convert samples, move them through a preallocated `rtrb` SPSC ring and bump atomics (`Relaxed`
+//! counters; the barge-in watermark and the consumed total use `Acquire`/`Release`).
 
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-/// Process-wide audio counters (one microphone, one speaker per agent). Read with
-/// [`super::audio_counters`]; never reset.
-#[derive(Debug, Default)]
+/// Process-wide audio counters (one microphone, one speaker per agent), never reset. Read through
+/// `fogar_agent_macos::audio_counters()`.
+#[derive(Debug)]
 pub(crate) struct Counters {
-    /// Callbacks seen on the input (also the capture heartbeat).
+    /// Callbacks seen on any input stream.
     pub(crate) input_callbacks: AtomicU64,
     /// Device frames lost because the capture ring was full (input overrun).
     pub(crate) input_overrun_frames: AtomicU64,
     /// 20 ms chunks dropped because the core's stream was full.
     pub(crate) chunks_dropped: AtomicU64,
-    /// Output callbacks that ran dry in the middle of queued audio (audible gap, xrun).
+    /// Gaps in playback: the ring ran dry and audio resumed shortly after (an xrun the listener
+    /// hears), not the normal silence at the end of an utterance.
     pub(crate) output_underruns: AtomicU64,
-    /// Device errors reported by cpal (any kind, including xruns it reports itself).
+    /// Resampled output samples the ring had no room for (should stay 0: `write` sizes itself).
+    pub(crate) output_samples_dropped: AtomicU64,
+    /// Errors reported by the audio device (cpal error callback, any kind).
     pub(crate) device_errors: AtomicU64,
-    /// Captures ended by the adapter itself (device lost, stream invalidated, stalled callbacks).
+    /// Captures the adapter ended on its own (device lost, stalled, permission revoked).
     pub(crate) captures_aborted: AtomicU64,
+    /// `open` refused at once because an earlier, timed-out open is still inside CoreAudio.
+    pub(crate) opens_refused_in_flight: AtomicU64,
+    /// Audio threads left running after `drop` because they did not stop within the deadline.
+    pub(crate) threads_detached: AtomicU64,
 }
 
 pub(crate) static COUNTERS: Counters = Counters {
@@ -35,8 +42,11 @@ pub(crate) static COUNTERS: Counters = Counters {
     input_overrun_frames: AtomicU64::new(0),
     chunks_dropped: AtomicU64::new(0),
     output_underruns: AtomicU64::new(0),
+    output_samples_dropped: AtomicU64::new(0),
     device_errors: AtomicU64::new(0),
     captures_aborted: AtomicU64::new(0),
+    opens_refused_in_flight: AtomicU64::new(0),
+    threads_detached: AtomicU64::new(0),
 };
 
 /// Sample formats the CoreAudio input/output hands to cpal on macOS (0.18.2: F32 or I16).
@@ -61,7 +71,7 @@ impl Sample for i16 {
         f32::from(self) / 32_768.0
     }
     fn from_f32(v: f32) -> Self {
-        // `as` saturates on f32 -> i16; the clamp keeps +1.0 from wrapping to the far side.
+        // `as` saturates on f32 -> i16; the clamp keeps the scale symmetric.
         (v.clamp(-1.0, 1.0) * 32_767.0) as i16
     }
     const SILENCE: Self = 0;
@@ -69,26 +79,28 @@ impl Sample for i16 {
 
 /// Moved into the cpal input callback: downmix interleaved frames to mono and push them into the
 /// SPSC ring. When the ring is full the newest frames are dropped and counted (never block,
-/// never overwrite).
+/// never overwrite). `heartbeat` counts this capture's callbacks (stall detection per capture).
 pub(crate) struct InputWriter {
     prod: rtrb::Producer<f32>,
     channels: usize,
     inv: f32,
+    heartbeat: Arc<AtomicU64>,
 }
 
 impl InputWriter {
-    /// `channels` must be >= 1 (checked by the caller before the stream is built).
-    pub(crate) fn new(prod: rtrb::Producer<f32>, channels: u16) -> Self {
+    pub(crate) fn new(prod: rtrb::Producer<f32>, channels: u16, heartbeat: Arc<AtomicU64>) -> Self {
         let channels = usize::from(channels.max(1));
         Self {
             prod,
             channels,
             inv: 1.0 / channels as f32,
+            heartbeat,
         }
     }
 
     /// Real-time safe.
     pub(crate) fn write<S: Sample>(&mut self, data: &[S]) {
+        self.heartbeat.fetch_add(1, Ordering::Relaxed);
         COUNTERS.input_callbacks.fetch_add(1, Ordering::Relaxed);
         let frames = data.len() / self.channels;
         let n = frames.min(self.prod.slots());
@@ -117,9 +129,14 @@ pub(crate) struct PlaybackShared {
     pub(crate) consumed: AtomicU64,
     /// Barge-in watermark: the callback discards everything pushed before this total.
     pub(crate) discard_until: AtomicU64,
+    /// Output callbacks run (stall detection on the core side).
+    pub(crate) callbacks: AtomicU64,
     /// The device reported a fatal error (gone, invalidated): playback accepts nothing more.
     pub(crate) failed: AtomicBool,
 }
+
+/// Silence (in device frames) after which resumed audio is a new utterance, not a gap.
+const GAP_FRAMES_MAX: u64 = 12_000; // 250 ms at 48 kHz
 
 /// Moved into the cpal output callback: pop mono samples, copy them to every channel, fill the
 /// rest with silence. Real-time safe.
@@ -128,6 +145,8 @@ pub(crate) struct OutputReader {
     channels: usize,
     shared: Arc<PlaybackShared>,
     consumed: u64,
+    /// Silent frames written since the ring ran dry in the middle of audio (`None`: not dry).
+    starved: Option<u64>,
 }
 
 impl OutputReader {
@@ -141,11 +160,13 @@ impl OutputReader {
             channels: usize::from(channels.max(1)),
             shared,
             consumed: 0,
+            starved: None,
         }
     }
 
     pub(crate) fn fill<S: Sample>(&mut self, out: &mut [S]) {
-        // Barge-in: drop what was queued before `stop()`.
+        self.shared.callbacks.fetch_add(1, Ordering::Relaxed);
+        // Barge-in: drop what was queued before `stop()`; a stop is never a gap.
         let target = self.shared.discard_until.load(Ordering::Acquire);
         if self.consumed < target {
             let skip = usize::try_from(target - self.consumed)
@@ -155,9 +176,16 @@ impl OutputReader {
                 chunk.commit_all();
                 self.consumed += skip as u64;
             }
+            self.starved = None;
         }
         let frames = out.len() / self.channels;
         let avail = frames.min(self.cons.slots());
+        if avail > 0
+            && let Some(silent) = self.starved.take()
+            && silent <= GAP_FRAMES_MAX
+        {
+            COUNTERS.output_underruns.fetch_add(1, Ordering::Relaxed);
+        }
         let mut frames_out = out.chunks_exact_mut(self.channels);
         if let Ok(chunk) = self.cons.read_chunk(avail) {
             let (a, b) = chunk.as_slices();
@@ -170,11 +198,15 @@ impl OutputReader {
         for frame in frames_out {
             frame.fill(S::SILENCE);
         }
-        // Trailing samples of a partial frame (should not happen) are silenced too.
         let whole = frames * self.channels;
         out[whole..].fill(S::SILENCE);
-        if avail > 0 && avail < frames {
-            COUNTERS.output_underruns.fetch_add(1, Ordering::Relaxed);
+        let silent = (frames - avail) as u64;
+        if silent > 0 {
+            self.starved = match self.starved {
+                Some(s) => Some(s.saturating_add(silent)),
+                None if avail > 0 => Some(silent), // ran dry inside this callback
+                None => None,                      // idle: nothing was playing
+            };
         }
         self.shared.consumed.store(self.consumed, Ordering::Release);
     }
@@ -194,10 +226,11 @@ const MAX_TABLE: usize = 1 << 18;
 
 /// Streaming band-limited resampler with a fixed rational ratio `out/in = up/down`: a
 /// Blackman-windowed sinc evaluated on a precomputed polyphase table (no FFT, no extra crates).
-/// The low-pass sits at 90 % of the lower Nyquist, so 48 kHz -> 16 kHz does not alias. Its group
-/// delay is `taps/2` input samples (2 ms at 48 kHz -> 16 kHz). Allocates only in `new`, as long
-/// as callers feed at most `max_block` samples per call into an `out` with
-/// [`Resampler::max_output`] spare capacity.
+/// The low-pass sits at 90 % of the lower Nyquist, so 48 kHz -> 16 kHz does not alias. Each
+/// output is centred `taps/2 - 1` input samples after the newest input it needs, which is the
+/// group delay: 95 samples (about 2 ms) for 48 -> 16 kHz, 31 samples (about 1.3 ms) for
+/// 24 -> 48 kHz. Allocates only in `new`, as long as callers feed at most `max_block` samples per
+/// call into an `out` with [`Resampler::max_output`] spare capacity.
 pub(crate) struct Resampler {
     up: usize,
     down: usize,
@@ -317,50 +350,20 @@ impl Resampler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::alloc::{GlobalAlloc, Layout, System};
-
-    /// Counts allocations and frees made by the CURRENT thread only (tests run in parallel).
-    struct Counting;
-    thread_local! {
-        // const-initialised, no destructor: touching it never allocates (safe inside `alloc`).
-        static ALLOCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    }
-    fn bump() {
-        let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
-    }
-    // SAFETY: forwards every call unchanged to the system allocator; only adds a counter.
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            bump();
-            // SAFETY: same layout contract as the caller's.
-            unsafe { System.alloc(l) }
-        }
-        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-            bump();
-            // SAFETY: `p` came from `System.alloc` with this layout.
-            unsafe { System.dealloc(p, l) }
-        }
-    }
-    #[global_allocator]
-    static A: Counting = Counting;
-
-    fn allocs_during(mut f: impl FnMut()) -> u64 {
-        let before = ALLOCS.with(|c| c.get());
-        f();
-        ALLOCS.with(|c| c.get()) - before
-    }
+    use crate::rt::test_support::assert_no_alloc;
 
     #[test]
     fn input_writer_downmixes_counts_overrun_and_never_allocates() {
         let (prod, mut cons) = rtrb::RingBuffer::<f32>::new(4800);
-        let mut w = InputWriter::new(prod, 2);
+        let beat = Arc::new(AtomicU64::new(0));
+        let mut w = InputWriter::new(prod, 2, beat.clone());
         let block: Vec<f32> = [0.5f32, -0.25].repeat(1024);
         let before = COUNTERS.input_overrun_frames.load(Ordering::Relaxed);
-        let n = allocs_during(|| w.write(&block));
-        assert_eq!(n, 0, "the RT input path allocated");
+        assert_no_alloc("InputWriter::write", || w.write(&block));
         for _ in 0..10 {
             w.write(&block);
         }
+        assert!(beat.load(Ordering::Relaxed) >= 11, "per-capture heartbeat");
         assert!(COUNTERS.input_overrun_frames.load(Ordering::Relaxed) > before);
         assert_eq!(cons.slots(), 4800);
         let c = cons.read_chunk(4800).unwrap();
@@ -368,7 +371,7 @@ mod tests {
         assert!(a.iter().chain(b).all(|&x| (x - 0.125).abs() < 1e-6));
         c.commit_all();
         let (prod, mut cons) = rtrb::RingBuffer::<f32>::new(8);
-        let mut w = InputWriter::new(prod, 1);
+        let mut w = InputWriter::new(prod, 1, beat);
         w.write(&[i16::MIN, 0, 16_384]);
         assert_eq!(cons.pop().unwrap(), -1.0);
         assert_eq!(cons.pop().unwrap(), 0.0);
@@ -384,23 +387,77 @@ mod tests {
             prod.push(i as f32 / 10.0).unwrap();
         }
         let mut out = [9.0f32; 8];
-        let n = allocs_during(|| {
-            out = [9.0; 8];
-            r.fill(&mut out);
-        });
-        assert_eq!(n, 0, "the RT output path allocated");
-        let played = shared.consumed.load(Ordering::Acquire);
-        assert!(played >= 4);
-        // Barge-in: everything pushed so far is discarded, rest is silence.
-        shared.discard_until.store(10, Ordering::Release);
+        r.fill(&mut out);
+        assert_eq!(out, [0.0, 0.0, 0.1, 0.1, 0.2, 0.2, 0.3, 0.3]);
+        assert_eq!(shared.consumed.load(Ordering::Acquire), 4);
+        assert_no_alloc("OutputReader::fill", || r.fill(&mut out));
+        assert!(shared.callbacks.load(Ordering::Relaxed) >= 1);
+        // Barge-in: everything pushed so far is discarded, the rest is silence.
+        let pushed = 10;
+        shared.discard_until.store(pushed, Ordering::Release);
         let mut out = [9i16; 6];
         r.fill(&mut out);
         assert_eq!(out, [0; 6]);
-        assert_eq!(shared.consumed.load(Ordering::Acquire), 10);
+        assert_eq!(shared.consumed.load(Ordering::Acquire), pushed);
         prod.push(1.0).unwrap();
         let mut out = [9i16; 4];
         r.fill(&mut out);
         assert_eq!(out, [32_767, 32_767, 0, 0]);
+    }
+
+    /// Only a short silence between two stretches of audio is an underrun; the end of an
+    /// utterance, an idle device, a barge-in or a new utterance after a pause are not.
+    #[test]
+    fn underruns_count_only_real_gaps() {
+        let (mut prod, cons) = rtrb::RingBuffer::<f32>::new(64_000);
+        let shared = Arc::new(PlaybackShared::default());
+        let mut r = OutputReader::new(cons, 1, shared.clone());
+        let n = || COUNTERS.output_underruns.load(Ordering::Relaxed);
+        let mut out = [0f32; 480];
+        // Idle device, then audio starts: no gap.
+        let base = n();
+        r.fill(&mut out);
+        for _ in 0..480 {
+            prod.push(0.1).unwrap();
+        }
+        r.fill(&mut out);
+        // Ring runs dry mid-callback, audio resumes 10 ms later: one gap.
+        for _ in 0..100 {
+            prod.push(0.1).unwrap();
+        }
+        r.fill(&mut out);
+        r.fill(&mut out);
+        for _ in 0..480 {
+            prod.push(0.1).unwrap();
+        }
+        r.fill(&mut out);
+        let after_gap = n();
+        assert!(after_gap > base, "a short gap is counted");
+        // Utterance ends, long pause (> 250 ms), next utterance: not a gap. Other tests may
+        // bump the global counter concurrently, so only this reader's events are asserted
+        // through its own state.
+        for _ in 0..100 {
+            prod.push(0.1).unwrap();
+        }
+        r.fill(&mut out);
+        for _ in 0..40 {
+            r.fill(&mut out);
+        }
+        assert!(r.starved.is_some_and(|s| s > GAP_FRAMES_MAX));
+        for _ in 0..480 {
+            prod.push(0.1).unwrap();
+        }
+        r.fill(&mut out);
+        assert!(r.starved.is_none());
+        // A barge-in clears the starving state.
+        for _ in 0..100 {
+            prod.push(0.1).unwrap();
+        }
+        r.fill(&mut out);
+        assert!(r.starved.is_some());
+        shared.discard_until.store(u64::MAX, Ordering::Release);
+        r.fill(&mut out);
+        assert!(r.starved.is_none());
     }
 
     fn tone(rate: u32, hz: f64, n: usize) -> Vec<f32> {
@@ -416,7 +473,7 @@ mod tests {
     }
 
     fn run(in_hz: u32, out_hz: u32, input: &[f32], block: usize) -> Vec<f32> {
-        let mut r = Resampler::new(in_hz, out_hz, block).unwrap();
+        let mut r = Resampler::new(in_hz, out_hz, 1_024).unwrap();
         let mut out = Vec::with_capacity(r.max_output(input.len()) + 8);
         for piece in input.chunks(block) {
             r.process(piece, &mut out);
@@ -425,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn resampler_ratio_passband_and_stopband() {
+    fn resampler_ratio_and_passband() {
         for &(i, o) in &[
             (48_000u32, 16_000u32),
             (44_100, 16_000),
@@ -449,10 +506,41 @@ mod tests {
                 rms(mid)
             );
         }
-        // 12 kHz at 48 kHz is above the 8 kHz Nyquist of 16 kHz: it must not alias back.
-        let out = run(48_000, 16_000, &tone(48_000, 12_000.0, 48_000), 960);
-        let mid = &out[4_000..12_000];
-        assert!(rms(mid) < 0.005, "aliasing: rms {}", rms(mid));
+    }
+
+    /// 48 -> 16 kHz: speech band kept, everything at or above the new Nyquist (8 kHz) removed,
+    /// swept finely around the edge where aliasing would fold back into the speech band.
+    #[test]
+    fn resampler_sweep_around_the_8_khz_edge() {
+        let gain = |hz: f64| {
+            let out = run(48_000, 16_000, &tone(48_000, hz, 48_000), 960);
+            rms(&out[4_000..12_000]) / 0.3536
+        };
+        for hz in [300.0, 1_000.0, 3_400.0, 5_000.0, 6_000.0] {
+            let g = gain(hz);
+            assert!((g - 1.0).abs() < 0.02, "{hz} Hz passband gain {g}");
+        }
+        for hz in [
+            8_000.0, 8_100.0, 8_200.0, 8_400.0, 9_000.0, 12_000.0, 20_000.0,
+        ] {
+            let g = gain(hz);
+            assert!(g < 0.01, "{hz} Hz must be stopped (-40 dB), gain {g}");
+        }
+    }
+
+    /// The output does not depend on how the input is cut into calls.
+    #[test]
+    fn resampler_output_is_block_invariant() {
+        let input = tone(48_000, 1_234.0, 9_600);
+        let whole = run(48_000, 16_000, &input, input.len());
+        for block in [1, 7, 320, 441, 960, 1_024, 5_000] {
+            assert_eq!(run(48_000, 16_000, &input, block), whole, "block {block}");
+        }
+        let input = tone(24_000, 700.0, 4_800);
+        let whole = run(24_000, 44_100, &input, input.len());
+        for block in [1, 13, 480, 2_000] {
+            assert_eq!(run(24_000, 44_100, &input, block), whole, "block {block}");
+        }
     }
 
     #[test]
@@ -461,11 +549,10 @@ mod tests {
         let input = tone(48_000, 440.0, 960);
         let mut out = Vec::with_capacity(r.max_output(960) * 4);
         r.process(&input, &mut out);
-        let n = allocs_during(|| {
+        assert_no_alloc("Resampler::process", || {
             out.clear();
             r.process(&input, &mut out);
         });
-        assert_eq!(n, 0);
         assert!(r.pending_input() > 0);
         r.reset();
         assert_eq!(r.pending_input(), 0);

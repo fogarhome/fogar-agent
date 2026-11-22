@@ -196,8 +196,13 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
   when NotDetermined; open() refuses anything but Granted before touching the device).
 - Own windowed-sinc resampler (audio/dsp.rs) instead of rubato; RT writer/reader proven
   alloc-free by a per-thread counting allocator. Counters: fogar_agent_macos::audio_counters().
-- macOS CI: unit tests + audio contract suites green (runner has an output device; mic path ends
-  in PermissionDenied/NoDevice as the contract allows).
+- macOS CI: unit tests + audio contract suites green, but the mic path ends in
+  PermissionDenied/NoDevice there: capture is NOT executed in CI. Playback runs against the
+  runner's output. The OS-free parts (src/rt: ring writer/reader, resampler, capture loop, device
+  thread lifecycle) are table-tested on every host.
+- Review round 1 (2026-11-22): abandoned-open guard (no mic start after a timeout, reopen refused
+  while in flight), per-capture heartbeat with 6 s first-callback grace, permission re-read every
+  1 s, dead output reports 0 queued, deadline joins, usage-description check before requestAccess.
 - BLOCKED on the architecture owner: deny.toml wrappers for cpal + objc2-core-audio*, vet
   imports/exemptions, geiger-darwin baseline (owner files, ADR-0007). Recipe in the PR.
 - UNVERIFIED (M2): xruns at start, cost with mic open, TCC prompt/revoke, device loss, AirPods.
