@@ -13,10 +13,9 @@
 //!
 //! A dead output (fatal device error, or no callback for 2 s after a 6 s start grace) accepts
 //! nothing and reports nothing queued, so the core does not wait on audio that will never play.
-//! The port has no health method yet (follow-up in the contract). Caveat: a stall does not empty
-//! the ring (only the RT side can pop it), so if the callbacks come back, what was queued before
-//! the stall plays late unless the core calls `stop()` first; a dead output does not recover by
-//! itself either (follow-up in fogar-core: drop and reopen).
+//! `is_alive()` reports it (port health, issue #25). Death is latched: a handle that stalled
+//! stays dead even if the callbacks come back (so nothing queued before the stall plays late);
+//! the core drops it and reopens (follow-up in fogar-core, S2 3c).
 
 use super::capture::{is_fatal, map_cpal};
 use crate::rt::{
@@ -55,6 +54,8 @@ pub(crate) struct MacPlayback {
     opened: Instant,
     /// Last callback count seen and when it changed (`None`: no callback yet).
     beat: Cell<(u64, Option<Instant>)>,
+    /// Latched once `dead()` is true: a dead handle stays dead (port contract, issue #25).
+    died: Cell<bool>,
     _worker: worker::Worker,
 }
 
@@ -69,8 +70,20 @@ impl std::fmt::Debug for MacPlayback {
 }
 
 impl MacPlayback {
-    /// The device will not play what is queued: fatal error, or callbacks stopped.
+    /// The device will not play what is queued: fatal error, or callbacks stopped. Latched:
+    /// once dead, this handle stays dead and the core reopens (port `is_alive`, issue #25).
     fn dead(&self) -> bool {
+        if self.died.get() {
+            return true;
+        }
+        let dead = self.probe_dead();
+        if dead {
+            self.died.set(true);
+        }
+        dead
+    }
+
+    fn probe_dead(&self) -> bool {
         if self.shared.failed.load(Ordering::Relaxed) {
             return true;
         }
@@ -157,6 +170,10 @@ impl ActivePlayback for MacPlayback {
         if let Some(r) = self.resampler.as_mut() {
             r.reset();
         }
+    }
+
+    fn is_alive(&self) -> bool {
+        !self.dead()
     }
 
     fn queued_samples(&self) -> usize {
@@ -278,6 +295,7 @@ fn open_device(format: AudioFormat) -> Result<MacPlayback, AudioError> {
         shared,
         opened: Instant::now(),
         beat: Cell::new((0, None)),
+        died: Cell::new(false),
         _worker: w,
     })
 }
@@ -309,9 +327,10 @@ mod tests {
         let mut pb = open_device(AudioFormat::mono(24_000)).expect("no output device");
         assert!(pb.write(&[0; 2_400]) > 0);
         assert!(pb.queued_samples() > 0 || pb.shared.callbacks.load(Ordering::Relaxed) > 0);
+        assert!(pb.is_alive());
         pb.shared.failed.store(true, Ordering::Relaxed);
-        assert_eq!(pb.write(&[0; 2_400]), 0);
-        assert_eq!(pb.queued_samples(), 0);
-        pb.stop();
+        fogar_testkit::contract::audio_sink::dead_playback_is_inert(&mut pb);
+        pb.shared.failed.store(false, Ordering::Relaxed);
+        assert!(!pb.is_alive(), "death is latched");
     }
 }

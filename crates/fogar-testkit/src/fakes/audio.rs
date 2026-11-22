@@ -230,10 +230,17 @@ struct SpeakerState {
     pub stops: u32,
     pub opens: u32,
     pub open_now: u32,
+    /// Playbacks with an id (1-based open count) up to this one are dead (`kill`).
+    killed_upto: u32,
+    /// New playbacks open already dead (`set_open_dead`).
+    open_dead: bool,
 }
 
 /// Fake speaker with a bounded buffer of `capacity` samples. Nothing "plays" by itself: the test
-/// drains the buffer with [`FakeSpeaker::drain`] (no timers in the fake).
+/// drains the buffer with [`FakeSpeaker::drain`] (no timers in the fake). [`FakeSpeaker::kill`]
+/// simulates a fatal output error (issue #25): the open playback reports `is_alive() == false`,
+/// accepts nothing and queues nothing; a playback opened afterwards is alive again, unless
+/// [`FakeSpeaker::set_open_dead`] keeps the device broken.
 #[derive(Debug, Clone)]
 pub struct FakeSpeaker {
     caps: AudioSinkCaps,
@@ -247,6 +254,7 @@ impl FakeSpeaker {
     pub fn healthy() -> Self {
         let mut caps = AudioSinkCaps::NONE;
         caps.playback = Support::Native;
+        caps.health = Support::Native;
         Self {
             caps,
             capacity: 240_000,
@@ -273,6 +281,17 @@ impl FakeSpeaker {
     }
     pub fn drain(&self) {
         self.state.lock().unwrap().queued = 0;
+    }
+    /// Fatal output error: every playback opened so far is dead for good (`is_alive()` false,
+    /// `write` accepts 0, nothing queued). The next `open` returns a live playback.
+    pub fn kill(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.killed_upto = st.opens;
+        st.queued = 0;
+    }
+    /// While `true`, every new playback opens dead (a device that stays broken: reopen backoff).
+    pub fn set_open_dead(&self, dead: bool) {
+        self.state.lock().unwrap().open_dead = dead;
     }
     pub fn snapshot(&self) -> SpeakerSnapshot {
         let st = self.state.lock().unwrap();
@@ -304,6 +323,9 @@ pub struct SpeakerSnapshot {
 
 #[derive(Debug)]
 struct FakePlayback {
+    /// 1-based open count at the time this playback was opened.
+    id: u32,
+    born_dead: bool,
     format: AudioFormat,
     capacity: usize,
     record: bool,
@@ -316,7 +338,11 @@ impl ActivePlayback for FakePlayback {
     }
     fn write(&mut self, pcm: &[i16]) -> usize {
         let mut st = self.state.lock().unwrap();
-        let room = self.capacity.saturating_sub(st.queued);
+        let room = if self.dead(&st) {
+            0
+        } else {
+            self.capacity.saturating_sub(st.queued)
+        };
         let n = pcm.len().min(room);
         st.queued += n;
         st.accepted += n as u64;
@@ -332,7 +358,17 @@ impl ActivePlayback for FakePlayback {
         st.stops += 1;
     }
     fn queued_samples(&self) -> usize {
-        self.state.lock().unwrap().queued
+        let st = self.state.lock().unwrap();
+        if self.dead(&st) { 0 } else { st.queued }
+    }
+    fn is_alive(&self) -> bool {
+        !self.dead(&self.state.lock().unwrap())
+    }
+}
+
+impl FakePlayback {
+    fn dead(&self, st: &SpeakerState) -> bool {
+        self.born_dead || self.id <= st.killed_upto
     }
 }
 
@@ -357,6 +393,8 @@ impl AudioSink for FakeSpeaker {
         st.opens += 1;
         st.open_now += 1;
         Ok(Box::new(FakePlayback {
+            id: st.opens,
+            born_dead: st.open_dead,
             format,
             capacity: self.capacity,
             record: self.record,
