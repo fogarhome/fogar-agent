@@ -257,8 +257,8 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
 - Issue #24 (capture part): open and drop of ActiveCapture run on the blocking pool through the
   gate's own JoinSet (JoinSet::spawn_blocking; tokio::task::spawn_blocking stays banned by
   clippy.toml, which was not touched — the architecture owner should confirm this reading of
-  "no blocking work in core"). One job in flight (queues::CAPTURE_JOBS = 1; a start meanwhile is
-  Busy), core-side OPEN_DEADLINE = OPEN_BLOCK_MAX + 0.5 s (late handle released), failed opens
+  "no blocking work in core"). One open in flight (queues::CAPTURE_JOBS = 1; a start meanwhile
+  is Busy); a start during the previous take's release waits for it (CI caught the race), core-side OPEN_DEADLINE = OPEN_BLOCK_MAX + 0.5 s (late handle released), failed opens
   back off 0.5 s doubling to 8 s; stop waits 0.5 s for the release then detaches. Playback
   open/drop is still synchronous on the runtime (3c).
 - Issue #26: the engine starts the utterance and publishes activity=Recording before it answers

@@ -5,7 +5,7 @@
 //! | Queue | Producer -> consumer | Capacity | When full |
 //! |---|---|---|---|
 //! | mic chunks (`EventStream<AudioChunk>`) | audio adapter -> capture gate | `MIC_CHUNKS` (~1 s of 20 ms chunks) | adapter drops NEWEST, counts (`EventStream::dropped`); never blocks the audio thread. Only open while a take is open (`capture.rs`, the consent gate) |
-//! | capture device jobs (blocking `AudioSource::open` / drop of `ActiveCapture`, issue #24) | capture gate -> tokio blocking pool, one owned `JoinSet` | `CAPTURE_JOBS` in flight | admission control: a `CaptureStart` while one runs is refused `Busy` at once; a release is never refused (at most one more, since a take only opens with the set empty); each job is bounded by the adapter (`OPEN_BLOCK_MAX` / `DROP_BLOCK_MAX`) and an open also by `capture::OPEN_DEADLINE` on the core side (late result released); on stop the gate waits `capture::RELEASE_WAIT_ON_STOP`, then detaches |
+//! | capture device jobs (blocking `AudioSource::open` / drop of `ActiveCapture`, issue #24) | capture gate -> tokio blocking pool, one owned `JoinSet` | `CAPTURE_JOBS` opens in flight, plus the releases | admission control: a `CaptureStart` while an open runs (also a late one past its deadline) is refused `Busy` at once; a release is never refused (one per take); a start arriving while the previous take's release runs waits for it (still under `capture::OPEN_DEADLINE` from the request) so the device is never opened while closing; each job is bounded by the adapter (`OPEN_BLOCK_MAX` / `DROP_BLOCK_MAX`) and an open also by `capture::OPEN_DEADLINE` on the core side (late result released); on stop the gate waits `capture::RELEASE_WAIT_ON_STOP`, then detaches |
 //! | permission request waiters | IPC `RequestMicPermission` -> capture gate | `IPC_MAX_CONNS` on one pending prompt | an extra waiter is answered at once with the current status; each waiter's IPC side gives up after `Config::mic_permission_wait` and gets the current status |
 //! | uplink audio (`out` channel, `Frame::Binary`) | engine -> link session | shares `OUTBOUND` | shed NEWEST, count `uplink_audio_shed` (`try_send`); the gateway would close a slow client anyway. Produced only while a take records |
 //! | uplink control (`out` channel, `Frame::Text`) | engine -> link session | shares `OUTBOUND` | must-deliver while connected: `reserve()` with `write_timeout`; on deadline count `uplink_control_dropped` and return the turn machine to Idle (the session itself is kept) |
@@ -37,7 +37,7 @@ const fn nz(n: usize) -> NonZeroUsize {
 
 /// 50 x 20 ms = 1 s of capture.
 pub const MIC_CHUNKS: NonZeroUsize = nz(50);
-/// Blocking capture device jobs (open or release) in flight at once (`capture.rs`).
+/// Blocking capture opens in flight at once (`capture.rs`); releases are never refused.
 pub const CAPTURE_JOBS: usize = 1;
 /// Engine -> link session.
 pub const OUTBOUND: usize = 64;

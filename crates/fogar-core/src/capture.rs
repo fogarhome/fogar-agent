@@ -216,7 +216,9 @@ enum Take {
         reply: Reply,
         gesture: CaptureGesture,
         since: Mono,
-        job: tokio::task::Id,
+        /// `None` while a previous take's release still runs: the open starts when it ends
+        /// (the device is never opened while it is still closing).
+        job: Option<tokio::task::Id>,
     },
     Open(Box<OpenTake>),
 }
@@ -244,6 +246,10 @@ pub(crate) struct CaptureGate {
     format: AudioFormat,
     /// Blocking open/release jobs (`queues::CAPTURE_JOBS`).
     jobs: JoinSet<Job>,
+    /// Ids of the open jobs in flight (the current one, or a late one past its deadline).
+    opens: Vec<tokio::task::Id>,
+    /// Release jobs in flight.
+    releasing: usize,
     take: Take,
     open_failures: u32,
     retry_at: Option<Mono>,
@@ -275,6 +281,8 @@ impl CaptureGate {
             safety_cut: cfg.capture_safety_cut,
             format: AudioFormat::mono(cfg.upload_rate_hz),
             jobs: JoinSet::new(),
+            opens: Vec::new(),
+            releasing: 0,
             take: Take::Idle,
             open_failures: 0,
             retry_at: None,
@@ -292,7 +300,7 @@ impl CaptureGate {
     }
 
     fn busy(&self) -> bool {
-        !matches!(self.take, Take::Idle) || self.jobs.len() >= queues::CAPTURE_JOBS
+        !matches!(self.take, Take::Idle) || self.opens.len() >= queues::CAPTURE_JOBS
     }
 
     /// The consent point. Decides, and on success starts the device open off the runtime; the
@@ -320,12 +328,8 @@ impl CaptureGate {
             let _ = reply.send(Err(why));
             return;
         }
-        let mic = self.mic.clone();
-        Stats::inc(&self.stats.capture_audio_jobs);
-        let job = self
-            .jobs
-            .spawn_blocking(move || Job::Opened(mic.open(queues::MIC_CHUNKS)))
-            .id();
+        // Right after a take ended its release may still run: open once it is done.
+        let job = (self.releasing == 0).then(|| self.spawn_open());
         self.take = Take::Opening {
             owner,
             reply,
@@ -333,6 +337,17 @@ impl CaptureGate {
             since: now,
             job,
         };
+    }
+
+    fn spawn_open(&mut self) -> tokio::task::Id {
+        let mic = self.mic.clone();
+        Stats::inc(&self.stats.capture_audio_jobs);
+        let id = self
+            .jobs
+            .spawn_blocking(move || Job::Opened(mic.open(queues::MIC_CHUNKS)))
+            .id();
+        self.opens.push(id);
+        id
     }
 
     fn count_refusal(&self, why: CaptureRefusal) {
@@ -435,6 +450,7 @@ impl CaptureGate {
     fn release(&mut self, capture: Box<dyn ActiveCapture>, stream: EventStream<AudioChunk>) {
         drop(stream);
         Stats::inc(&self.stats.capture_audio_jobs);
+        self.releasing += 1;
         self.jobs.spawn_blocking(move || {
             drop(capture);
             Job::Released
@@ -546,13 +562,32 @@ impl CaptureGate {
         j: Result<(tokio::task::Id, Job), tokio::task::JoinError>,
         now: Mono,
     ) -> GateEvent {
-        let (id, result) = match j {
-            Ok((_, Job::Released)) => return GateEvent::Nothing,
-            Ok((id, Job::Opened(r))) => (id, r.map_err(Some)),
-            // A panicking adapter: a failed open if it was the open, nothing otherwise.
-            Err(e) => (e.id(), Err(None)),
+        let id = match &j {
+            Ok((id, _)) => *id,
+            Err(e) => e.id(),
         };
-        let ours = matches!(&self.take, Take::Opening { job, .. } if *job == id);
+        let was_open = self.opens.iter().position(|o| *o == id);
+        let result = match (j, was_open) {
+            (Ok((_, Job::Opened(r))), _) => r.map_err(Some),
+            // A panicking adapter during an open: a failed open.
+            (Err(_), Some(_)) => Err(None),
+            // A release finished (or panicked: the handle is gone either way). A take waiting
+            // for it may open now.
+            (Ok((_, Job::Released)), _) | (Err(_), None) => {
+                self.releasing = self.releasing.saturating_sub(1);
+                if self.releasing == 0 && matches!(self.take, Take::Opening { job: None, .. }) {
+                    let id = self.spawn_open();
+                    if let Take::Opening { job, .. } = &mut self.take {
+                        *job = Some(id);
+                    }
+                }
+                return GateEvent::Nothing;
+            }
+        };
+        if let Some(i) = was_open {
+            self.opens.swap_remove(i);
+        }
+        let ours = matches!(&self.take, Take::Opening { job: Some(job), .. } if *job == id);
         if !ours {
             // A late open nobody waits for: release it at once, never use it.
             if let Ok((capture, stream)) = result {
@@ -591,8 +626,11 @@ impl CaptureGate {
                 why: CaptureRefusal::NoMicrophone,
             };
         }
-        if reply.is_closed() {
-            // The request was given up (and answered "busy") while the device opened.
+        let mut owner = owner;
+        let owner_gone = matches!(owner.try_recv(), Err(oneshot::error::TryRecvError::Closed));
+        if reply.is_closed() || owner_gone {
+            // The request was given up (and answered "busy"), or its connection left, while the
+            // device opened: nobody would hear this take.
             self.release(capture, stream);
             Stats::inc(&self.stats.captures_discarded);
             return GateEvent::Nothing;
@@ -917,6 +955,37 @@ mod tests {
         assert!(mic.is_open(), "the engine closes it");
         g.close(clock.now(), CaptureRefusal::Busy);
         assert!(!mic.is_open() || matches!(g.next(&clock).await, GateEvent::Nothing));
+    }
+
+    /// A new take right after the previous one ended waits for that release instead of being
+    /// refused `Busy` (or opening the device while it still closes).
+    #[tokio::test(start_paused = true)]
+    async fn a_take_right_after_another_waits_for_the_release() {
+        let mic = FakeMic::healthy();
+        let (mut g, _) = gate(Arc::new(mic.clone()));
+        let clock = TestClock::new();
+        let (_o1, _a1) = start(&mut g, &clock).await;
+        let GateEvent::Opened { reply } = g.next(&clock).await else {
+            panic!()
+        };
+        reply.send(Ok(())).unwrap();
+        assert!(g.close(clock.now(), CaptureRefusal::Busy).is_some());
+        let (_o2, mut a2) = start(&mut g, &clock).await;
+        assert!(
+            a2.try_recv().is_err(),
+            "not refused: waiting for the release"
+        );
+        assert_eq!(mic.opens(), 1, "no open while the device closes");
+        assert!(
+            matches!(g.next(&clock).await, GateEvent::Nothing),
+            "released"
+        );
+        match g.next(&clock).await {
+            GateEvent::Opened { reply } => reply.send(Ok(())).unwrap(),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(mic.opens(), 2);
+        assert!(g.is_open() && mic.is_open());
     }
 
     #[tokio::test(start_paused = true)]
