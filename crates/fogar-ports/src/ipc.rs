@@ -152,8 +152,8 @@ pub enum IpcRequest {
     ///
     /// Ordering (issue #26): before it answers `CaptureStarted`, the core publishes the view
     /// with `activity = UserActivity::Recording` (every later `Conversation` push carries it
-    /// until the take ends). The app treats a view with any other activity received after `CaptureStarted` as
-    /// "take closed", so a push of the previous view arriving after the answer would close the
+    /// until the take ends). The app treats a view with any other activity received after
+    /// `CaptureStarted` as "take closed", so a push of the previous view arriving after the answer would close the
     /// take with the microphone still open. This is a core obligation (the IPC adapter only
     /// frames what the core sends, in order); it is tested in fogar-core, not in the
     /// `ipc_server` contract suite.

@@ -302,6 +302,20 @@ mod fake_speaker_dead_output {
     }
 
     #[test]
+    fn an_old_handle_never_touches_the_new_queue() {
+        let spk = FakeSpeaker::healthy();
+        let mut old = spk.open(F).unwrap();
+        spk.kill();
+        let mut new = spk.open(F).unwrap();
+        assert_eq!(new.write(&[1i16; 480]), 480);
+        old.stop();
+        assert_eq!(old.write(&[1i16; 480]), 0);
+        drop(old);
+        assert_eq!(new.queued_samples(), 480);
+        assert_eq!(spk.snapshot().queued, 480);
+    }
+
+    #[test]
     fn a_device_that_stays_broken_opens_dead_until_repaired() {
         let spk = FakeSpeaker::healthy();
         spk.set_open_dead(true);

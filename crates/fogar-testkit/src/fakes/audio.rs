@@ -338,7 +338,7 @@ impl ActivePlayback for FakePlayback {
     }
     fn write(&mut self, pcm: &[i16]) -> usize {
         let mut st = self.state.lock().unwrap();
-        let room = if self.dead(&st) {
+        let room = if !self.owns_queue(&st) {
             0
         } else {
             self.capacity.saturating_sub(st.queued)
@@ -354,12 +354,14 @@ impl ActivePlayback for FakePlayback {
     }
     fn stop(&mut self) {
         let mut st = self.state.lock().unwrap();
-        st.queued = 0;
+        if self.owns_queue(&st) {
+            st.queued = 0;
+        }
         st.stops += 1;
     }
     fn queued_samples(&self) -> usize {
         let st = self.state.lock().unwrap();
-        if self.dead(&st) { 0 } else { st.queued }
+        if self.owns_queue(&st) { st.queued } else { 0 }
     }
     fn is_alive(&self) -> bool {
         !self.dead(&self.state.lock().unwrap())
@@ -370,13 +372,20 @@ impl FakePlayback {
     fn dead(&self, st: &SpeakerState) -> bool {
         self.born_dead || self.id <= st.killed_upto
     }
+    /// The shared queue belongs to the newest live playback only: an older or dead handle never
+    /// reads, writes, stops or clears the queue of the one opened after it.
+    fn owns_queue(&self, st: &SpeakerState) -> bool {
+        self.id == st.opens && !self.dead(st)
+    }
 }
 
 impl Drop for FakePlayback {
     fn drop(&mut self) {
         if let Ok(mut st) = self.state.lock() {
             st.open_now = st.open_now.saturating_sub(1);
-            st.queued = 0;
+            if self.owns_queue(&st) {
+                st.queued = 0;
+            }
         }
     }
 }
@@ -392,6 +401,7 @@ impl AudioSink for FakeSpeaker {
         let mut st = self.state.lock().unwrap();
         st.opens += 1;
         st.open_now += 1;
+        st.queued = 0;
         Ok(Box::new(FakePlayback {
             id: st.opens,
             born_dead: st.open_dead,

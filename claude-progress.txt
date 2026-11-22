@@ -241,3 +241,7 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
 - #26: `CaptureStart` doc states the recording view is published before `CaptureStarted`; core
   obligation, not checkable in testkit (IPC adapter only frames). 3b owes the core test.
 - macOS changes type-checked only on macOS CI (Linux host cannot build them).
+- RISK ACCEPTED (review of #27, M1): the dead-output latch requires 3c before any real voice
+  test (no packaged agent until PR 6). Review fixes: fake queue owned by the newest live handle
+  (M2), compile-time deadline <= port budget asserts in the macOS adapter (B1), health=Native
+  obligation documented on dead_playback_is_inert (B2).

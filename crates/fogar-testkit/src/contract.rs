@@ -507,6 +507,8 @@ pub mod audio_sink {
     /// Issue #25: a playback that reports `!is_alive()` accepts nothing, queues nothing, and
     /// stays dead (no recovery by itself). Precondition: `pb` is dead. Adapters call it from
     /// a test that can break the output; the fake runs it after `FakeSpeaker::kill`.
+    /// OBLIGATION: an adapter that reports `AudioSinkCaps::health = Native` MUST have a test that
+    /// kills a real playback and calls this clause (the macro cannot break a device for it).
     pub fn dead_playback_is_inert(pb: &mut dyn ActivePlayback) {
         assert!(!pb.is_alive(), "precondition: a dead playback");
         assert_eq!(
