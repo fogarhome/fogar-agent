@@ -278,3 +278,52 @@ mod contract_catches_lossy_recv {
         })
     }
 }
+
+/// Issue #25: the dead-output path the generic contract cannot trigger on a real device.
+mod fake_speaker_dead_output {
+    use fogar_ports::audio::{AudioFormat, AudioSink};
+    use fogar_testkit::{FakeSpeaker, contract::audio_sink as c};
+
+    const F: AudioFormat = AudioFormat::mono(24_000);
+
+    #[test]
+    fn killed_playback_is_inert_and_a_reopen_is_alive() {
+        let spk = FakeSpeaker::healthy();
+        let mut pb = spk.open(F).unwrap();
+        assert!(pb.write(&[1i16; 480]) > 0);
+        spk.kill();
+        c::dead_playback_is_inert(pb.as_mut());
+        let mut fresh = spk.open(F).unwrap();
+        assert!(fresh.is_alive());
+        assert_eq!(fresh.write(&[1i16; 480]), 480);
+        assert!(!pb.is_alive(), "the old handle stays dead after a reopen");
+        drop(pb);
+        assert_eq!(spk.snapshot().open_now, 1);
+    }
+
+    #[test]
+    fn an_old_handle_never_touches_the_new_queue() {
+        let spk = FakeSpeaker::healthy();
+        let mut old = spk.open(F).unwrap();
+        spk.kill();
+        let mut new = spk.open(F).unwrap();
+        assert_eq!(new.write(&[1i16; 480]), 480);
+        old.stop();
+        assert_eq!(old.write(&[1i16; 480]), 0);
+        drop(old);
+        assert_eq!(new.queued_samples(), 480);
+        assert_eq!(spk.snapshot().queued, 480);
+    }
+
+    #[test]
+    fn a_device_that_stays_broken_opens_dead_until_repaired() {
+        let spk = FakeSpeaker::healthy();
+        spk.set_open_dead(true);
+        let mut pb = spk.open(F).unwrap();
+        c::dead_playback_is_inert(pb.as_mut());
+        drop(pb);
+        spk.set_open_dead(false);
+        assert!(spk.open(F).unwrap().is_alive());
+        assert_eq!(spk.snapshot().opens, 2);
+    }
+}

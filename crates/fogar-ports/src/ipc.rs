@@ -149,6 +149,14 @@ pub enum IpcRequest {
     /// Answered with `CaptureStarted` or `CaptureRefused`. The take belongs to the connection
     /// that opened it: if that connection closes or stops being subscribed (including being
     /// dropped for missing a push deadline), the take ends with `Discard`.
+    ///
+    /// Ordering (issue #26): before it answers `CaptureStarted`, the core publishes the view
+    /// with `activity = UserActivity::Recording` (every later `Conversation` push carries it
+    /// until the take ends). The app treats a view with any other activity received after
+    /// `CaptureStarted` as "take closed", so a push of the previous view arriving after the answer would close the
+    /// take with the microphone still open. This is a core obligation (the IPC adapter only
+    /// frames what the core sends, in order); it is tested in fogar-core, not in the
+    /// `ipc_server` contract suite.
     CaptureStart { gesture: CaptureGesture },
     /// The person ended the take. Answered with `CaptureEnded`.
     CaptureEnd { then: CaptureThen },

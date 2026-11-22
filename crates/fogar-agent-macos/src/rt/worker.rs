@@ -26,6 +26,9 @@ use std::{
 pub(crate) const OPEN_DEADLINE: Duration = Duration::from_secs(5);
 /// Deadline for the device thread to stop when its handle is dropped.
 pub(crate) const JOIN_DEADLINE: Duration = Duration::from_secs(1);
+// The port promises callers a bounded block (issue #24): never exceed it.
+const _: () = assert!(OPEN_DEADLINE.as_nanos() <= fogar_ports::audio::OPEN_BLOCK_MAX.as_nanos());
+const _: () = assert!(JOIN_DEADLINE.as_nanos() <= fogar_ports::audio::DROP_BLOCK_MAX.as_nanos());
 
 /// One per direction (input, output): abandoned builds still inside the OS.
 #[derive(Debug)]
