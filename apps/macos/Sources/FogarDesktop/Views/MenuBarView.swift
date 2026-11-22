@@ -36,7 +36,7 @@ struct MenuBarView: View {
                         .font(Tipo.texto(14, peso: 550)).foregroundStyle(Color.hueso)
                     Spacer(minLength: 0)
                     if conversacion.cancelable {
-                        Button { Task { await conversacion.cancelar() } } label: { Text("Cancelar") }
+                        Button { conversacion.cancelarAhora() } label: { Text("Cancelar") }
                             .buttonStyle(Pildora(pequena: true))
                     } else if conversacion.grabando {
                         Button { conversacion.descartar() } label: { Text("Descartar") }

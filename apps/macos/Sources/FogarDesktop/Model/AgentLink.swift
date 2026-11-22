@@ -67,11 +67,13 @@ final class AgentLink {
         self.verificacion = verificacion
     }
 
-    /// Release: only the signed agent. Debug builds accept an unsigned server of the same user
-    /// ONLY when `FOGAR_AGENT_UNSIGNED=1` is set explicitly (the stand-in, see the README).
+    /// What `pair`, `unpair`, `reconnect` and the conversation require. Release: the signed agent.
+    /// Debug builds accept an unsigned server of the same user ONLY when `FOGAR_AGENT_UNSIGNED=1`
+    /// is set explicitly (the stand-in, see the README). The read-only status always needs only
+    /// the directory and user checks (`verificacionLectura`).
     static var verificacionPorDefecto: VerificacionPar {
         #if DEBUG
-        if ProcessInfo.processInfo.environment["FOGAR_AGENT_UNSIGNED"] == "1" { return .mismoUsuario }
+        if ProcessInfo.processInfo.environment["FOGAR_AGENT_UNSIGNED"] == "1" { return .rutaYUsuario }
         #endif
         return .agenteFirmado
     }
@@ -106,7 +108,9 @@ final class AgentLink {
         while !Task.isCancelled {
             var permanent = false // retrying soon would not change the answer
             do {
-                let v = verificacion
+                // Status is read-only: the directory and user checks are enough (an S1 agent not yet
+                // signed as `com.fogar.agent` still shows its state).
+                let v = VerificacionPar.rutaYUsuario
                 let c = try await FramedConnection.connect(path: socketPath, verificacion: v)
                 defer { c.cancel() }
                 // Every outside await has a deadline; only the event stream itself is open-ended.
@@ -218,7 +222,11 @@ final class AgentLink {
 
     private func command(_ request: WireRequest, timeout: Duration) async throws(CommandError) -> WireResponse {
         let path = socketPath
-        let v = verificacion
+        // What carries the person's content or changes where it goes needs the signed agent.
+        let v: VerificacionPar = switch request {
+        case .pair, .unpair, .reconnect: verificacion
+        default: .rutaYUsuario
+        }
         do {
             return try await withDeadline(timeout) {
                 let c = try await FramedConnection.connect(path: path, verificacion: v)

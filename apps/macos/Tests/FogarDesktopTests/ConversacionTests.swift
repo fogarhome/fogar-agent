@@ -88,7 +88,7 @@ nonisolated func vista(_ turns: [WireTurn] = [], activity: WireActivity = .idle,
             Issue.record("not a conversation")
             return
         }
-        #expect(v.activity == .idle && v.mic == .unknown && v.transcriber == .unknown && v.notice == nil)
+        #expect(v.activity == .awaitingReply && v.mic == .unknown && v.transcriber == .unknown && v.notice == nil)
         #expect(v.turns[0].source == .push && v.turns[0].progress == .working && v.turns[0].audio == WireAudio.none)
         #expect(v.turns[1].outcome == .error)
     }
@@ -150,7 +150,7 @@ nonisolated func agenteConversacion(_ registro: Registro, inicial: WireConversat
 /// A live conversation over a real socket: the agent, its link and the model.
 @MainActor func conectar(_ agent: FakeAgent) async throws -> (ConversationLink, Conversacion) {
     try await Task.sleep(for: .milliseconds(200))
-    let link = ConversationLink(socketPath: agent.path, verificacion: .mismoUsuario)
+    let link = ConversationLink(socketPath: agent.path, verificacion: .rutaYUsuario)
     let conv = Conversacion(link: link)
     link.start()
     #expect(await esperar { conv.vivo })
@@ -181,11 +181,24 @@ func abierta(_ t: Toma) -> Bool { if case .abierta = t { true } else { false } }
         link.start()
         defer { link.stop() }
         #expect(await esperar { link.enlace == .noDisponible })
+        #expect(registro.pedidos.isEmpty)
+    }
+
+    /// The read-only status needs only the directory and user checks (an S1 agent not yet signed
+    /// still shows its state); pairing needs the signed agent and sends nothing otherwise.
+    @Test func elEstadoSiPeroEmparejarNo() async throws {
+        let registro = Registro()
+        let base = answers()
+        let agent = try FakeAgent { req in registro.anotar(req); return base(req) }
+        try await Task.sleep(for: .milliseconds(200))
         let estado = AgentLink(socketPath: agent.path, verificacion: .agenteFirmado)
         estado.start()
         defer { estado.stop() }
-        #expect(await waitFor(estado) { $0 == .noVerificado })
-        #expect(registro.pedidos.isEmpty)
+        #expect(await waitFor(estado) { $0 == .live(ready) })
+        await #expect(throws: CommandError.notOurAgent) { _ = try await estado.pair(address: "green-house", code: "482913") }
+        await #expect(throws: CommandError.notOurAgent) { try await estado.unpair() }
+        #expect(!registro.pedidos.contains { if case .pair = $0 { true } else { false } })
+        #expect(!registro.pedidos.contains(.unpair))
     }
 
     @Test func soloParaLaAppFirmadaSinBucle() async throws {
@@ -194,7 +207,7 @@ func abierta(_ t: Toma) -> Bool { if case .abierta = t { true } else { false } }
             return [.refused(WireRefused(reason: "needs the signed Fogar app"))]
         }
         try await Task.sleep(for: .milliseconds(200))
-        let link = ConversationLink(socketPath: agent.path, verificacion: .mismoUsuario)
+        let link = ConversationLink(socketPath: agent.path, verificacion: .rutaYUsuario)
         link.start()
         defer { link.stop() }
         #expect(await esperar { link.enlace == .soloAppFirmada })
@@ -388,6 +401,42 @@ func abierta(_ t: Toma) -> Bool { if case .abierta = t { true } else { false } }
         #expect(!registro.pedidos.contains(.turnVisible(WireTurnVisible(turn_id: "p1"))))
         conv.aLaVista = true
         #expect(await esperar { registro.pedidos.contains(.turnVisible(WireTurnVisible(turn_id: "p1"))) })
+    }
+
+    /// A busy agent gets a bounded number of tries; a refusal that will not change gets one.
+    @Test(arguments: [("engine busy", Conversacion.maxIntentosVisible), ("unsupported request", 1)])
+    func turnVisibleRechazadoEsAcotado(motivo: String, maximo: Int) async throws {
+        let registro = Registro()
+        let abierta = vista([turno("t1")])
+        let agent = try FakeAgent { req in
+            registro.anotar(req)
+            switch req {
+            case .hello: return [.hello(WireHello(version: ipcVersion))]
+            case .subscribeConversation: return [.conversationSubscribed, .conversation(abierta)]
+            case .turnVisible: return [.refused(WireRefused(reason: motivo))]
+            case .cancelTurn: return [.turnCancelSent, .conversation(abierta)]
+            default: return [.refused(WireRefused(reason: "x"))]
+            }
+        }
+        let (link, conv) = try await conectar(agent)
+        defer { link.stop() }
+        let visible = WireRequest.turnVisible(WireTurnVisible(turn_id: "t1"))
+        #expect(await esperar { registro.cuantos(visible) >= 1 })
+        // New views keep arriving meanwhile; the backoff is 0.5 s, then 1 s.
+        for _ in 0..<6 {
+            try await Task.sleep(for: .milliseconds(500))
+            await conv.cancelar()
+        }
+        #expect(registro.cuantos(visible) == maximo)
+    }
+
+    @Test func traConfirmar() {
+        #expect(Conversacion.tras(.turnVisibleNoted, intentos: 0) == .anotado)
+        #expect(Conversacion.tras(nil, intentos: 0) == .siguienteVista)
+        #expect(Conversacion.tras(.refused(WireRefused(reason: "engine busy")), intentos: 0) == .reintentar(.milliseconds(500)))
+        #expect(Conversacion.tras(.refused(WireRefused(reason: "engine busy")), intentos: 1) == .reintentar(.seconds(1)))
+        #expect(Conversacion.tras(.refused(WireRefused(reason: "engine busy")), intentos: 2) == .descartar)
+        #expect(Conversacion.tras(.refused(WireRefused(reason: "needs the signed Fogar app")), intentos: 0) == .descartar)
     }
 
     /// A confirmation the agent did not note is retried on the next view, and only once noted.

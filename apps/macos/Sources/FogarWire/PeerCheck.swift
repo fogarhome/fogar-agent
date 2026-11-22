@@ -6,14 +6,15 @@ import Security
 /// peer check, ADR-0002): any same-user process could otherwise bind a socket there and read
 /// what the person types and says.
 public enum VerificacionPar: Sendable, Equatable {
-    /// Release: the run directory is ours (0700, no symlink), the server runs as our user, and its
-    /// code is signed by this app's own Team with the agent's identifier and the hardened runtime.
+    /// The run directory is ours (0700, no symlink), the server runs as our user, and its code is
+    /// signed by this app's own Team with the agent's identifier and the hardened runtime, not
+    /// debuggable. Required for everything that carries the person's content or changes where it
+    /// goes: the conversation, `pair`, `unpair`, `reconnect`.
     case agenteFirmado
-    #if DEBUG
-    /// Debug builds only, for the unsigned stand-in and the tests: the same directory and user
-    /// checks, no code signature. Never compiled into a release build.
-    case mismoUsuario
-    #endif
+    /// Only the directory and user checks. Enough for the read-only status (`hello`, `status`,
+    /// `subscribe`, `discover`), so an agent not yet packaged and signed (S1, until S2 PR 6) still
+    /// shows its state. Debug builds use it for everything only with `FOGAR_AGENT_UNSIGNED=1`.
+    case rutaYUsuario
 }
 
 /// The agent's code-signing identifier (GUESSED: the identifier the agent inside the `.app` is
@@ -38,13 +39,12 @@ public enum PeerCheck {
         var uid: uid_t = 0
         var gid: gid_t = 0
         guard getpeereid(fd, &uid, &gid) == 0, uid == getuid() else { return false }
-        #if DEBUG
-        if verificacion == .mismoUsuario { return true }
-        #endif
-        guard let equipo = equipoPropio(), let token = tokenDelPar(fd) else { return false }
+        if verificacion == .rutaYUsuario { return true }
+        guard let equipo = equipoPropio, let token = tokenDelPar(fd) else { return false }
         let requisito = "anchor apple generic and certificate leaf[subject.OU] = \"\(equipo)\" and identifier \"\(identificadorAgente)\""
             + " and !(entitlement[\"com.apple.security.cs.allow-dyld-environment-variables\"] exists)"
             + " and !(entitlement[\"com.apple.security.cs.disable-library-validation\"] exists)"
+            + " and !(entitlement[\"com.apple.security.get-task-allow\"] exists)"
         return cumple(token: token, requisito: requisito)
     }
 
@@ -60,7 +60,10 @@ public enum PeerCheck {
     }
 
     /// This app's own Team ID (none for an ad-hoc or unsigned build: then nothing is trusted).
-    static func equipoPropio() -> String? {
+    /// Read once: the app's own signature does not change while it runs.
+    static let equipoPropio: String? = leerEquipoPropio()
+
+    private static func leerEquipoPropio() -> String? {
         var yo: SecCode?
         guard SecCodeCopySelf([], &yo) == errSecSuccess, let yo else { return nil }
         var estatico: SecStaticCode?
@@ -84,12 +87,13 @@ public enum PeerCheck {
         var req: SecRequirement?
         guard SecRequirementCreateWithString(requisito as CFString, [], &req) == errSecSuccess, let req else { return false }
         guard SecCodeCheckValidity(guest, [], req) == errSecSuccess else { return false }
-        // Dynamic status: CS_RUNTIME (0x10000).
         var info: CFDictionary?
         let estatico = unsafeBitCast(guest, to: SecStaticCode.self)
         guard SecCodeCopySigningInformation(estatico, SecCSFlags(rawValue: kSecCSDynamicInformation), &info) == errSecSuccess,
               let d = info as? [String: Any],
               let estado = d[kSecCodeInfoStatus as String] as? NSNumber else { return false }
-        return estado.uint32Value & 0x10000 != 0
+        // CS_RUNTIME (0x10000) set, CS_DEBUGGED (0x10000000) not: a debugger attached to the
+        // agent could make it say anything.
+        return estado.uint32Value & 0x10000 != 0 && estado.uint32Value & 0x1000_0000 == 0
     }
 }

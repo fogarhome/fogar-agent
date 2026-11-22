@@ -61,6 +61,12 @@ final class Conversacion {
     /// Turn ids the agent noted as visible (`turn_visible_noted`), bounded; and those in flight.
     @ObservationIgnored private var confirmados: [String] = []
     @ObservationIgnored private var confirmando: Set<String> = []
+    /// Refused for good (`unsupported request`, not the signed app…): never asked again.
+    @ObservationIgnored private var descartados: [String] = []
+    /// Transient refusals (`engine busy`) so far, per turn.
+    @ObservationIgnored private var intentos: [String: Int] = [:]
+    /// At most this many `turn_visible` per turn when the agent is busy, 0.5 s, 1 s, 2 s apart.
+    nonisolated static let maxIntentosVisible = 3
     /// Bumped when the draft lands in the box (the view focuses the field).
     private(set) var borradorNuevo = 0
     /// Every task this model starts (forgotten when done), so none is left without an owner.
@@ -133,7 +139,10 @@ final class Conversacion {
             ultimoBorrador = nil
         }
         // After `capture_started`, any view without `recording` means the take is over (cut by the
-        // agent, or ended): the agent pushes the newest view only, never an older one.
+        // agent, or ended): the agent pushes the newest view only, never an older one. This relies
+        // on the core publishing the `recording` view BEFORE it answers `capture_started` (asked
+        // of S2 3b in the orchestrator's issue on that order); until then a stale `idle` view
+        // right after the answer would end the take here.
         if v.activity != .recording {
             switch toma {
             case .abierta, .cerrando: toma = .ninguna
@@ -147,17 +156,59 @@ final class Conversacion {
     /// bar says «hablando»), a push only while the conversation is in view. A turn counts as
     /// confirmed only once the agent noted it; a failed confirmation is retried on the next view.
     private func confirmar(_ v: WireConversation) {
-        for id in Self.porConfirmar(v, aLaVista: aLaVista, ya: Set(confirmados).union(confirmando)) {
+        let ya = Set(confirmados).union(confirmando).union(descartados)
+        for id in Self.porConfirmar(v, aLaVista: aLaVista, ya: ya) {
             confirmando.insert(id)
             lanzar { [weak self] in
                 guard let self else { return }
                 let r = try? await self.link.pedir(.turnVisible(WireTurnVisible(turn_id: id)))
-                self.confirmando.remove(id)
-                guard case .turnVisibleNoted? = r else { return }
-                self.confirmados.append(id)
-                if self.confirmados.count > 64 { self.confirmados.removeFirst(self.confirmados.count - 64) }
+                switch Self.tras(r, intentos: self.intentos[id, default: 0]) {
+                case .anotado:
+                    self.confirmando.remove(id)
+                    self.anotar(id)
+                case .descartar:
+                    self.confirmando.remove(id)
+                    self.descartar(id)
+                case .reintentar(let espera):
+                    // Still «in flight» while waiting, so new views do not ask again meanwhile.
+                    self.intentos[id, default: 0] += 1
+                    try? await Task.sleep(for: espera)
+                    guard self.confirmando.remove(id) != nil else { return } // reset by a reconnection
+                    if let v = self.link.vista { self.confirmar(v) }
+                case .siguienteVista:
+                    self.confirmando.remove(id) // the connection dropped: the new one starts over
+                }
             }
         }
+    }
+
+    enum TrasConfirmar: Equatable {
+        case anotado, descartar, siguienteVista
+        case reintentar(Duration)
+    }
+
+    /// What to do after a `turn_visible` answer (`nil`: no answer, the connection dropped).
+    static func tras(_ r: WireResponse?, intentos: Int) -> TrasConfirmar {
+        switch r {
+        case .turnVisibleNoted?: return .anotado
+        case nil: return .siguienteVista
+        case .refused(let x)? where x.reason == "engine busy":
+            guard intentos + 1 < maxIntentosVisible else { return .descartar }
+            return .reintentar(.milliseconds(500 << intentos))
+        default: return .descartar // not transient: another answer will not change it
+        }
+    }
+
+    private func anotar(_ id: String) {
+        intentos[id] = nil
+        confirmados.append(id)
+        if confirmados.count > 64 { confirmados.removeFirst(confirmados.count - 64) }
+    }
+
+    private func descartar(_ id: String) {
+        intentos[id] = nil
+        descartados.append(id)
+        if descartados.count > 64 { descartados.removeFirst(descartados.count - 64) }
     }
 
     static func porConfirmar(_ v: WireConversation, aLaVista: Bool, ya: Set<String>) -> [String] {
@@ -179,6 +230,8 @@ final class Conversacion {
         toma = .ninguna
         confirmados.removeAll()
         confirmando.removeAll()
+        descartados.removeAll()
+        intentos.removeAll()
     }
 
     // MARK: Text
@@ -377,6 +430,20 @@ final class Conversacion {
 
     func abrirAjustesMicro() {
         if let url = Self.ajustesMicro { NSWorkspace.shared.open(url) }
+    }
+
+    // MARK: From the views (the task belongs to this model, not to a view that may go away)
+
+    func enviarAhora() { lanzar { [weak self] in await self?.enviar() } }
+    func cancelarAhora() { lanzar { [weak self] in await self?.cancelar() } }
+    func pedirPermisoAhora() { lanzar { [weak self] in await self?.pedirPermiso() } }
+
+    /// After a press: past the threshold, if the press is still held, the take becomes «mantener».
+    func vigilarMantener() {
+        lanzar { [weak self] in
+            try? await Task.sleep(for: .milliseconds(Int(Conversacion.umbralMantener * 1000) + 20))
+            self?.comprobarMantener()
+        }
     }
 
     // MARK: Tasks

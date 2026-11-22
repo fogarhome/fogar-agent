@@ -89,6 +89,14 @@ jobs:
         run: cargo install --locked typeshare-cli --version 1.13.4
       - name: Fogar Desktop tests and Wire.swift check
         run: cd apps/macos && swift test && scripts/gen-wire.sh --check
+      # The unsigned-agent override exists only in debug builds: the release binary must not even
+      # contain its name.
+      - name: Fogar Desktop release has no debug override
+        run: |
+          cd apps/macos
+          swift build -c release --product FogarDesktop
+          bin="$(swift build -c release --show-bin-path)/FogarDesktop"
+          if grep -q FOGAR_AGENT_UNSIGNED "$bin"; then echo "release binary contains FOGAR_AGENT_UNSIGNED"; exit 1; fi
 
   supply-chain:
     # cargo vet + the unsafe-count baseline (scripts/geiger.sh) on both OSes: the macOS adapter and its

@@ -25,15 +25,18 @@ agent treats it as `uid_only`: status works, pair/unpair are refused.
 swift run fogar-standin --phase ready --gateways 2
 scripts/build-app.sh --debug
 FOGAR_AGENT_SOCKET=/tmp/fogar-standin/agent.sock FOGAR_AGENT_UNSIGNED=1 \
-  "build/Fogar Desktop.app/Contents/MacOS/FogarDesktop"
+  "build/Fogar Desktop (debug).app/Contents/MacOS/FogarDesktop"
 ```
 
-The app authenticates the server behind the socket before sending anything (ADR-0002, mirrored):
-the socket and its directory must be the user's (directory 0700, no symlinks), the server must run
-as the same user, and its code must be signed by the app's own Team with the identifier
-`com.fogar.agent` (GUESSED until PR 6 packages the agent) and the hardened runtime. The unsigned
-stand-in passes only in a debug build started with `FOGAR_AGENT_UNSIGNED=1`; a release build has no
-such switch.
+The app authenticates the server behind the socket before sending anything (ADR-0002, mirrored).
+Always: the socket and its directory are the user's (directory 0700, no symlinks) and the server
+runs as the same user. That is enough for the read-only status (`hello`, `status`, `subscribe`,
+`discover`), so an agent not yet packaged and signed still shows its state. The conversation and
+`pair`, `unpair`, `reconnect` also need the agent's code signed by the app's own Team with the
+identifier `com.fogar.agent` (GUESSED until PR 6 packages the agent), the hardened runtime, no
+`get-task-allow` and no debugger attached. The unsigned stand-in passes those only in a debug build
+started with `FOGAR_AGENT_UNSIGNED=1`; a release build has no such switch (CI checks the release
+binary does not even contain the name).
 
 Only debug builds honour `FOGAR_AGENT_SOCKET`. Phases: `not_paired`, `connecting`, `ready`,
 `reconnecting`, `parked_repair`, `parked_agent_refused`, `parked_client_error`, `stopping` (also typed

@@ -193,6 +193,7 @@ final class Enchufe: @unchecked Sendable {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw LinkError.unavailable }
         let e = Enchufe(fd: fd)
+        _ = fcntl(fd, F_SETFD, FD_CLOEXEC) // never inherited by a child process
         var si: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &si, socklen_t(MemoryLayout<Int32>.size))
         // Writes never hang: a stuck agent is a closed connection after 5 s.

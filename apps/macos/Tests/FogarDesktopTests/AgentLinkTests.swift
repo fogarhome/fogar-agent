@@ -100,7 +100,7 @@ func waitFor(_ link: AgentLink, _ ok: (AgentState) -> Bool) async -> Bool {
     @Test func subscribesAndShowsTheLiveStatus() async throws {
         let agent = try FakeAgent(answers())
         try await Task.sleep(for: .milliseconds(200))
-        let link = AgentLink(socketPath: agent.path, verificacion: .mismoUsuario)
+        let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
         link.start()
         defer { link.stop() }
         #expect(await waitFor(link) { $0 == .live(ready) })
@@ -116,7 +116,7 @@ func waitFor(_ link: AgentLink, _ ok: (AgentState) -> Bool) async -> Bool {
     @Test func versionMismatchNamesTheAgentVersion() async throws {
         let agent = try FakeAgent(answers(version: ipcVersion + 1))
         try await Task.sleep(for: .milliseconds(200))
-        let link = AgentLink(socketPath: agent.path, verificacion: .mismoUsuario)
+        let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
         link.start()
         defer { link.stop() }
         #expect(await waitFor(link) { $0 == .versionMismatch(agent: ipcVersion + 1) })
@@ -126,7 +126,7 @@ func waitFor(_ link: AgentLink, _ ok: (AgentState) -> Bool) async -> Bool {
     @Test func commandsSkipEventsAndMapFailures() async throws {
         let agent = try FakeAgent(answers(pair: .pairFailed(WirePairFailed(reason: .invalidCode))))
         try await Task.sleep(for: .milliseconds(200))
-        let link = AgentLink(socketPath: agent.path, verificacion: .mismoUsuario)
+        let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
         #expect(try await link.discover().isEmpty)
         #expect(try await link.pair(address: "green-house", code: "111111") == .failed(.invalidCode))
         try await link.unpair()
@@ -136,7 +136,7 @@ func waitFor(_ link: AgentLink, _ ok: (AgentState) -> Bool) async -> Bool {
     @Test func refusedPairIsTheSignerSentence() async throws {
         let agent = try FakeAgent(answers(pair: .refused(WireRefused(reason: "peer not allowed"))))
         try await Task.sleep(for: .milliseconds(200))
-        let link = AgentLink(socketPath: agent.path, verificacion: .mismoUsuario)
+        let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
         await #expect(throws: CommandError.refused) { _ = try await link.pair(address: "x", code: "482913") }
     }
 }
@@ -150,7 +150,7 @@ extension AgentLinkOverASocket {
             return [.refused(WireRefused(reason: "not implemented yet"))]
         }
         try await Task.sleep(for: .milliseconds(200))
-        let link = AgentLink(socketPath: agent.path, verificacion: .mismoUsuario)
+        let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
         link.start()
         defer { link.stop() }
         #expect(await waitFor(link) { $0 == .noLiveStatus })
@@ -162,7 +162,7 @@ extension AgentLinkOverASocket {
     @Test func reconnectsAfterTheAgentDropsTheLink() async throws {
         let agent = try FakeAgent(dropAfterSubscribe: .milliseconds(300), answers())
         try await Task.sleep(for: .milliseconds(200))
-        let link = AgentLink(socketPath: agent.path, verificacion: .mismoUsuario)
+        let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
         link.start()
         defer { link.stop() }
         #expect(await waitFor(link) { $0 == .live(ready) })
@@ -179,7 +179,7 @@ extension AgentLinkOverASocket {
             return [.subscribed]
         }
         try await Task.sleep(for: .milliseconds(200))
-        let link = AgentLink(socketPath: agent.path, verificacion: .mismoUsuario)
+        let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
         link.start()
         defer { link.stop() }
         #expect(await waitFor(link) { $0 == .unintelligible })
@@ -260,7 +260,7 @@ extension AgentLinkOverASocket {
             }
         }
         try await Task.sleep(for: .milliseconds(200))
-        let link = AgentLink(socketPath: agent.path, verificacion: .mismoUsuario)
+        let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
         link.start()
         defer { link.stop() }
         #expect(await waitFor(link) { $0 == .live(notPaired) })

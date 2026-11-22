@@ -412,27 +412,49 @@ func serve(_ c: FramedConnection, _ agent: StandIn) async {
 }
 
 let options = Options(CommandLine.arguments)
-// Never the real agent's socket: the stand-in unlinks its path before listening.
-if options.socket == AgentSocket.defaultPath { fail("refusing the real agent's socket \(options.socket); use another --socket") }
 let agent = StandIn(options)
-let dir = (options.socket as NSString).deletingLastPathComponent
-do {
-    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true,
-                                            attributes: [.posixPermissions: 0o700])
-    // The app only talks to a socket in a private directory (0700, ours).
-    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
-} catch { fail("cannot create \(dir): \(error)") }
-unlink(options.socket)
+
+/// The stand-in's socket directory: created private (0700) or, if it exists, ours and a real
+/// directory (never a symlink); never the real agent's directory, whatever path leads there.
+func prepararSocket(_ socket: String) -> String {
+    let dir = (socket as NSString).deletingLastPathComponent
+    let uid = getuid()
+    var d = stat()
+    if lstat(dir, &d) != 0 {
+        guard mkdir(dir, 0o700) == 0 else { fail("cannot create \(dir)") }
+        guard lstat(dir, &d) == 0 else { fail("cannot read \(dir)") }
+    }
+    guard d.st_mode & S_IFMT == S_IFDIR, d.st_uid == uid else { fail("\(dir) is not a directory of ours (symlinks refused)") }
+    guard chmod(dir, 0o700) == 0 else { fail("cannot make \(dir) private") }
+    // Canonical path: no route through symlinks into the real agent's directory.
+    guard let real = realpath(dir, nil) else { fail("cannot resolve \(dir)") }
+    let canonico = String(cString: real)
+    free(real)
+    let realAgente = ((AgentSocket.defaultPath as NSString).deletingLastPathComponent as NSString).deletingLastPathComponent
+    if canonico.contains("/com.fogar.agent/") || canonico.hasSuffix("/com.fogar.agent") || canonico.hasPrefix(realAgente) {
+        fail("refusing a path under the real agent's directory (\(canonico)); use another --socket")
+    }
+    let ruta = canonico + "/" + (socket as NSString).lastPathComponent
+    // Remove a previous stand-in's socket only: a socket file of ours, nothing else.
+    var s = stat()
+    if lstat(ruta, &s) == 0 {
+        guard s.st_mode & S_IFMT == S_IFSOCK, s.st_uid == uid else { fail("\(ruta) exists and is not our socket") }
+        unlink(ruta)
+    }
+    return ruta
+}
+
+let rutaSocket = prepararSocket(options.socket)
 
 let parameters = NWParameters.tcp
-parameters.requiredLocalEndpoint = .unix(path: options.socket)
-guard let listener = try? NWListener(using: parameters) else { fail("cannot listen on \(options.socket)") }
+parameters.requiredLocalEndpoint = .unix(path: rutaSocket)
+guard let listener = try? NWListener(using: parameters) else { fail("cannot listen on \(rutaSocket)") }
 listener.newConnectionHandler = { connection in
     Task { await serve(FramedConnection(accepted: connection), agent) }
 }
 listener.stateUpdateHandler = { state in
     switch state {
-    case .ready: print("fogar-standin: listening on \(options.socket) (phase \(options.phase), ipc v\(options.version))")
+    case .ready: print("fogar-standin: listening on \(rutaSocket) (phase \(options.phase), ipc v\(options.version))")
     case .failed(let e): fail("listener failed: \(e)")
     default: break
     }
@@ -444,7 +466,7 @@ signal(SIGINT, SIG_DFL)
 Task.detached {
     while let line = readLine() {
         let word = line.trimmingCharacters(in: .whitespaces)
-        if word == "quit" { unlink(options.socket); exit(0) }
+        if word == "quit" { unlink(rutaSocket); exit(0) }
         if word.isEmpty { continue }
         if await agent.orden(word.split(separator: " ").map(String.init)) { print("conversación -> \(word)"); continue }
         await agent.set(link: word); print("phase -> \(word)")

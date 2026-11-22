@@ -36,7 +36,8 @@ public enum WireCodec {
 extension WireCodec {
     /// Like `decodeResponse`, but a value this app does not know inside a conversation frame never
     /// costs the connection: an unknown enum value in the view reads as its closest known meaning
-    /// (an unknown outcome as `error`, an unknown progress as `working`, an unknown source as
+    /// (an unknown activity as `awaiting_reply`, an unknown outcome as `error`, an unknown progress
+    /// as `working`, an unknown source as
     /// `push`, which only sounds when on screen), and an undecodable answer to a request reads as
     /// `refused`, so the answers' order is kept. A frame of an unknown type still throws.
     public static func decodeResponseTolerante(_ body: Data) throws -> WireResponse {
@@ -100,7 +101,9 @@ struct ConversacionTolerante: Decodable {
         let tts = try c.decode(String.self, forKey: .tts)
         let aviso = try c.decodeIfPresent(String.self, forKey: .notice)
         wire = WireConversation(
-            activity: WireActivity(rawValue: actividad) ?? WireActivity.idle,
+            // An unknown activity is «Fogar is busy» (neutral), never `idle`: an `idle` guess could
+            // hide a take that is still open.
+            activity: WireActivity(rawValue: actividad) ?? WireActivity.awaitingReply,
             live: try c.decode(String.self, forKey: .live),
             draft: try c.decodeIfPresent(String.self, forKey: .draft),
             turns: try c.decode([TurnoTolerante].self, forKey: .turns).map(\.wire),

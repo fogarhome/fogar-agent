@@ -1,7 +1,9 @@
 #!/bin/sh
 # Builds Fogar Desktop into build/Fogar Desktop.app and signs it.
 #   scripts/build-app.sh            release build
-#   scripts/build-app.sh --debug    debug build (honours FOGAR_AGENT_SOCKET, for the stand-in agent)
+#   scripts/build-app.sh --debug    debug build (honours FOGAR_AGENT_SOCKET and FOGAR_AGENT_UNSIGNED,
+#                                   for the stand-in agent): "Fogar Desktop (debug).app", bundle id
+#                                   com.fogar.desktop.debug, so it is never mistaken for the real app
 # Signing: the first "Apple Development" identity in the keychain (free Personal Team), with the
 # hardened runtime the agent's peer check requires; ad hoc ("-") when there is none, in which case
 # the agent treats the app as uid_only and refuses pair/unpair (ADR-0002 amendment).
@@ -15,11 +17,20 @@ config=release
 swift build -c "$config" --product FogarDesktop
 bin=$(swift build -c "$config" --show-bin-path)/FogarDesktop
 
-app="$here/build/Fogar Desktop.app"
+if [ "$config" = debug ]; then
+  app="$here/build/Fogar Desktop (debug).app"
+else
+  app="$here/build/Fogar Desktop.app"
+fi
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources/Fonts"
 cp "$bin" "$app/Contents/MacOS/FogarDesktop"
 cp Sources/FogarDesktop/Info.plist "$app/Contents/Info.plist"
+if [ "$config" = debug ]; then
+  /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.fogar.desktop.debug" \
+    -c "Set :CFBundleName Fogar Desktop (debug)" -c "Set :CFBundleDisplayName Fogar Desktop (debug)" \
+    "$app/Contents/Info.plist"
+fi
 cp Resources/Fonts/* "$app/Contents/Resources/Fonts/"
 
 # Icon: Resources/AppIcon.png (scripts/make-icon.swift) -> .icns.

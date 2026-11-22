@@ -270,7 +270,7 @@ private struct Composicion: View {
             if micro == .pedirPermiso || micro == .denegado {
                 HStack(spacing: 10) {
                     if micro == .pedirPermiso {
-                        Button { Task { await conv.pedirPermiso() } } label: { Text("Permitir el micrófono") }
+                        Button { conv.pedirPermisoAhora() } label: { Text("Permitir el micrófono") }
                             .buttonStyle(Pildora(pequena: true, ocupado: conv.pidiendoPermiso))
                             .disabled(conv.pidiendoPermiso)
                     } else {
@@ -337,7 +337,7 @@ private struct CampoTexto: View {
             .padding(.horizontal, 6)
             .padding(.vertical, 7)
             .focused(cajaEnfocada)
-            .onSubmit { Task { await conv.enviar() } }
+            .onSubmit { conv.enviarAhora() }
             .accessibilityLabel("Mensaje para Fogar")
             .accessibilityHint("Intro envía. Opción e Intro añade una línea.")
     }
@@ -351,14 +351,14 @@ private struct BotonDerecho: View {
         Group {
             if conv.cancelable {
                 BotonRedondo(icono: "stop.fill", etiqueta: "Cancelar", principal: true) {
-                    Task { await conv.cancelar() }
+                    conv.cancelarAhora()
                 }
                 .keyboardShortcut(".", modifiers: .command)
                 .help("Cancelar la respuesta (⌘.)")
                 .transition(.scale(scale: 0.8).combined(with: .opacity))
             } else {
                 BotonRedondo(icono: "arrow.up", etiqueta: "Enviar", principal: true, ocupado: conv.enviando) {
-                    Task { await conv.enviar() }
+                    conv.enviarAhora()
                 }
                 .disabled(!conv.puedeEnviar)
                 .help("Enviar (Intro)")
@@ -488,12 +488,9 @@ private struct BotonMicro: View {
         switch estado {
         case .listo:
             conv.pulsar()
-            Task {
-                try? await Task.sleep(for: .milliseconds(Int(Conversacion.umbralMantener * 1000) + 20))
-                // Only a press still held is promoted (the model also checks its own `pulsado`).
-                if pulsando { conv.comprobarMantener() }
-            }
-        case .pedirPermiso: Task { await conv.pedirPermiso() }
+            // Only a press still held is promoted (the release clears it in the model).
+            conv.vigilarMantener()
+        case .pedirPermiso: conv.pedirPermisoAhora()
         case .denegado: conv.abrirAjustesMicro()
         default: break
         }
@@ -503,7 +500,7 @@ private struct BotonMicro: View {
     private func accion() {
         switch estado {
         case .listo: conv.alternar()
-        case .pedirPermiso: Task { await conv.pedirPermiso() }
+        case .pedirPermiso: conv.pedirPermisoAhora()
         case .denegado: conv.abrirAjustesMicro()
         default: break
         }
