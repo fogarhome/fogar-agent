@@ -39,12 +39,14 @@ pub(crate) fn default_state_dir() -> Option<PathBuf> {
 /// elsewhere gets its own, derived from the path (`instance::keychain_service`), so agents run
 /// side by side for measurements never share or overwrite one pairing.
 pub(crate) fn secret_store(state_dir: &Path) -> std::io::Result<Arc<dyn SecretStore>> {
-    Ok(Arc::new(keychain_store(state_dir, default_state_dir().as_deref())))
+    Ok(Arc::new(keychain_store(state_dir, default_state_dir().as_deref())?))
 }
 
-fn keychain_store(state_dir: &Path, default: Option<&Path>) -> MacKeychainStore {
-    let service = crate::instance::keychain_service(KEYCHAIN_SERVICE, state_dir, default);
-    MacKeychainStore::with_service(&service)
+/// `state_dir` exists here (validated by `ensure_private_dir` before any adapter is built).
+fn keychain_store(state_dir: &Path, default: Option<&Path>) -> std::io::Result<MacKeychainStore> {
+    let service =
+        crate::instance::keychain_service_canonical(KEYCHAIN_SERVICE, state_dir, default)?;
+    Ok(MacKeychainStore::with_service(&service))
 }
 
 pub(crate) fn power_policy() -> Arc<dyn PowerPolicy> {
@@ -67,16 +69,24 @@ pub(crate) fn build(state_dir: &Path, with_ipc: bool) -> std::io::Result<Platfor
 mod tests {
     use super::*;
 
-    /// The default directory keeps the frozen item; an explicit one has its own, stable service.
+    /// The default directory keeps the frozen item (also through a symlink); an explicit one has
+    /// its own service, the same for every spelling of the path.
     #[test]
     fn explicit_state_dir_has_its_own_keychain_service() {
-        let default = Path::new("/Users/x/Library/Application Support/com.fogar.agent");
-        assert_eq!(keychain_store(default, Some(default)).service(), KEYCHAIN_SERVICE);
-        let a = keychain_store(Path::new("/tmp/fogar-a"), Some(default));
-        assert_eq!(a.service(), "com.fogar.agent.dir-38520729324438e5");
-        assert_ne!(
-            a.service(),
-            keychain_store(Path::new("/tmp/fogar-b"), Some(default)).service()
-        );
+        let base = std::env::temp_dir().join(format!("fogar-kc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let default = base.join("default");
+        let a = base.join("a");
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::create_dir_all(a.join("x")).unwrap();
+        std::os::unix::fs::symlink(&default, base.join("d-link")).unwrap();
+        let svc = |p: &Path| keychain_store(p, Some(&default)).unwrap().service().to_owned();
+        assert_eq!(svc(&default), KEYCHAIN_SERVICE);
+        assert_eq!(svc(&base.join("d-link")), KEYCHAIN_SERVICE);
+        let sa = svc(&a);
+        assert!(sa.starts_with("com.fogar.agent.dir-"));
+        assert_eq!(svc(&a.join("x/..")), sa);
+        assert_ne!(sa, svc(&a.join("x")));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

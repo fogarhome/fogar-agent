@@ -63,6 +63,28 @@ nonisolated final class FakeRegistro: RegistroAgente, @unchecked Sendable {
         #expect(otra.estado == .desactivado)
     }
 
+    /// A freshly copied app: macOS may answer `notFound` before the first registration.
+    @Test func noEncontradoAntesDelPrimerRegistroSeRegistra() async {
+        let d = defaults()
+        let r = FakeRegistro(.noEncontrado)
+        let s = ServicioAgente(registro: r, defaults: d)
+        await s.arrancar()
+        #expect(r.registros == 1)
+        #expect(s.estado == .activo)
+        #expect(d.bool(forKey: ServicioAgente.claveRegistroInicial))
+    }
+
+    /// After the first registration, `notFound` is shown, not silently re-registered.
+    @Test func noEncontradoDespuesDelPrimerRegistroSeMuestra() async {
+        let d = defaults()
+        d.set(true, forKey: ServicioAgente.claveRegistroInicial)
+        let r = FakeRegistro(.noEncontrado)
+        let s = ServicioAgente(registro: r, defaults: d)
+        await s.arrancar()
+        #expect(r.registros == 0)
+        #expect(s.estado == .noEncontrado)
+    }
+
     @Test func pendienteDeAprobacionSeMuestraSinInsistir() async {
         let r = FakeRegistro(.desactivado, trasRegistrar: .pendienteAprobacion)
         let s = ServicioAgente(registro: r, defaults: defaults())

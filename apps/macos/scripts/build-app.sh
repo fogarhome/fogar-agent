@@ -1,5 +1,7 @@
 #!/bin/sh
-# Builds Fogar Desktop into build/Fogar Desktop.app and signs it.
+# Builds Fogar Desktop into build/Fogar Desktop.app and signs it. DEVELOPMENT ONLY: Apple Development
+# identity, no secure timestamp, no notarization; not for distribution (Developer ID, notarization
+# and updates are S8).
 #   scripts/build-app.sh            release build, with the Rust agent inside (S2 PR 6):
 #                                   Contents/MacOS/fogar-agentd + its LaunchAgent plist in
 #                                   Contents/Library/LaunchAgents/com.fogar.agent.plist (BundleProgram),
@@ -91,7 +93,7 @@ if [ "$config" = release ]; then
 fi
 codesign --force --options runtime --timestamp=none \
   --entitlements Packaging/FogarDesktop.entitlements --sign "$identity" "$app"
-codesign --verify --strict "$app"
+codesign --verify --deep --strict "$app" # --deep only to verify, never to sign
 
 # What the app's peer check and TCC need, checked on what was just signed.
 fail() { echo "error: $*" >&2; exit 1; }
@@ -109,6 +111,14 @@ if [ "$config" = release ]; then
   [ "$(sig_field "$agent" Identifier)" = com.fogar.agent ] || fail "the agent is not signed as com.fogar.agent"
   [ "$(sig_field "$agent" TeamIdentifier)" = "$(sig_field "$app" TeamIdentifier)" ] \
     || fail "the agent and the app are signed by different Teams"
+  # Same signing certificate, byte for byte (a self-signed certificate has no Team to compare).
+  if [ "$identity" != - ]; then
+    certs=$(mktemp -d)
+    codesign -d --extract-certificates="$certs/agent." "$agent" 2>/dev/null
+    codesign -d --extract-certificates="$certs/app." "$app" 2>/dev/null
+    cmp -s "$certs/agent.0" "$certs/app.0" || fail "the agent and the app are signed with different certificates"
+    rm -rf "$certs"
+  fi
   codesign -dvvv "$agent" 2>&1 | grep -Eq '^CodeDirectory .*flags=.*runtime' || fail "the agent lacks the hardened runtime"
   for forbidden in com.apple.security.get-task-allow com.apple.security.cs.disable-library-validation \
     com.apple.security.cs.allow-dyld-environment-variables; do

@@ -72,6 +72,8 @@ final class ServicioAgente {
     @ObservationIgnored private let registro: any RegistroAgente
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private var observador: (any NSObjectProtocol)?
+    /// Bumped by every change: a refresh that read before it must not overwrite its result.
+    @ObservationIgnored private var cambios = 0
     /// Set once the first automatic registration has been tried, whatever its outcome: removing
     /// the agent here or in System Settings is then the person's decision, not undone at launch.
     static let claveRegistroInicial = "agente.registroInicialIntentado"
@@ -92,16 +94,24 @@ final class ServicioAgente {
             }
         }
         let actual = await leer()
-        if actual == .desactivado, !defaults.bool(forKey: Self.claveRegistroInicial) {
+        // Before the first registration, `notFound` means the same as `notRegistered`: the plist
+        // is in the bundle (`incluido`), but macOS may not have indexed a freshly copied app yet.
+        if !defaults.bool(forKey: Self.claveRegistroInicial), actual == .desactivado || actual == .noEncontrado {
             defaults.set(true, forKey: Self.claveRegistroInicial)
             await registrar()
         } else {
-            if actual != .noIncluido { defaults.set(true, forKey: Self.claveRegistroInicial) }
+            // Mark only what proves an earlier registration; anything else leaves the first one owed.
+            if actual == .activo || actual == .pendienteAprobacion { defaults.set(true, forKey: Self.claveRegistroInicial) }
             estado = actual
         }
     }
 
-    func refrescar() async { estado = await leer() }
+    /// Re-reads the state, unless a change started meanwhile: its own read is the fresher one.
+    func refrescar() async {
+        let generacion = cambios
+        let leido = await leer()
+        if !trabajando, generacion == cambios { estado = leido }
+    }
 
     func registrar() async { await cambiar { try $0.registrar() } }
     func quitar() async { await cambiar { try $0.quitar() } }
@@ -115,6 +125,7 @@ final class ServicioAgente {
 
     private func cambiar(_ accion: @escaping @Sendable (any RegistroAgente) throws -> Void) async {
         guard !trabajando else { return }
+        cambios += 1
         trabajando = true
         error = nil
         let r = registro

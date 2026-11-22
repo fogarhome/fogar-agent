@@ -56,7 +56,10 @@ inside out, no `--deep`; then it checks what it signed and fails on any mismatch
 - Agents started by hand with `--state-dir` other than the default use their own Keychain service
   (`com.fogar.agent.dir-<hash of the path>`), so measurement runs never touch the real pairing.
 
-Out of scope here: Developer ID, notarization, updates, an installer.
+`build-app.sh` is **for development only**: Apple Development identity (Personal Team), no
+secure timestamp (`--timestamp=none`), no notarization. A build to give to anyone else needs
+Developer ID, timestamp, notarization and updates: S8. Out of scope here: all of that and an
+installer.
 
 ## Without the Rust agent: the stand-in
 
@@ -118,8 +121,8 @@ Golden JSON from the Rust tests, framing, the pairing code check, the app's link
 (status and conversation) against a scripted agent on a real Unix socket, the conversation model
 (take gestures, visible-turn rule, microphone states), the agent's registration (`ServicioAgente`
 against a fake registry), and the stand-in's conversation rules. In CI (`macos` job),
-`scripts/ci-signed-agents.sh` first signs a small test server four ways with a temporary
+`scripts/ci-signed-agents.sh` first signs a small test server six ways with a temporary
 self-signed certificate, and `SignedAgentTests` runs the app's real peer check against each:
-`com.fogar.agent` with the hardened runtime is accepted; another identifier, no hardened runtime or
-`get-task-allow` are refused (the certificate's hash stands in for Apple's anchor, and the real
+`com.fogar.agent` with the hardened runtime is accepted; another identifier, no hardened runtime,
+`get-task-allow`, `allow-dyld-environment-variables` or `disable-library-validation` are refused (the certificate's hash stands in for Apple's anchor, and the real
 anchor is checked to refuse it). Without those variables that suite is skipped.

@@ -101,14 +101,15 @@ jobs:
           swift build -c release --product FogarDesktop
           bin="$(swift build -c release --show-bin-path)/FogarDesktop"
           if grep -q FOGAR_AGENT_UNSIGNED "$bin"; then echo "release binary contains FOGAR_AGENT_UNSIGNED"; exit 1; fi
-      # S2 PR 6: the app with the agent inside, signed ad hoc (no identity on the runner). The
+      # S2 PR 6: the app with the agent inside, signed with the temporary certificate of the
+      # signed-agents step, so the "same certificate" check compares real signatures. The
       # script itself checks the layout, the signatures and the entitlements; then the packaged
       # agent must start under the hardened runtime, create run/ (0700) and its socket, and stop
       # cleanly on SIGTERM.
-      - name: Package Fogar Desktop.app with the agent (ad hoc) and check it
+      - name: Package Fogar Desktop.app with the agent (temporary certificate) and check it
         run: |
           cd apps/macos
-          scripts/build-app.sh
+          FOGAR_SIGN_IDENTITY="$FOGAR_CI_TEST_CERT_SHA1" scripts/build-app.sh
           agent="build/Fogar Desktop.app/Contents/MacOS/fogar-agentd"
           state="$RUNNER_TEMP/agent-state"
           "$agent" run --state-dir "$state" & pid=$!

@@ -6,9 +6,24 @@
 //! would change the others'. With an explicit state directory other than the default one, the
 //! agent uses its own Keychain service, derived from the directory so the same directory always
 //! finds its own item again. The default (no `--state-dir`, or the default path spelled out)
-//! keeps the frozen service name (fogar-macos-daemon hard rule 2).
+//! keeps the frozen service name (fogar-macos-daemon hard rule 2). Paths are compared and hashed
+//! canonical (`keychain_service_canonical`).
 
 use std::path::Path;
+
+/// [`keychain_service`] on the canonical paths (symlinks and `..` resolved), so two spellings of
+/// one directory share one service and the default directory is recognised however it is
+/// written. `state_dir` must exist (call after `ensure_private_dir`); a `default` that does not
+/// exist yet cannot be the same directory and is ignored.
+pub(crate) fn keychain_service_canonical(
+    base: &str,
+    state_dir: &Path,
+    default: Option<&Path>,
+) -> std::io::Result<String> {
+    let dir = std::fs::canonicalize(state_dir)?;
+    let default = default.and_then(|d| std::fs::canonicalize(d).ok());
+    Ok(keychain_service(base, &dir, default.as_deref()))
+}
 
 /// The Keychain service for `state_dir`: `base` when it is the default state directory (or there
 /// is none), else `<base>.dir-<16 hex digits>`, a stable FNV-1a 64 hash of the path's bytes.
@@ -62,6 +77,36 @@ mod tests {
         assert_eq!(a, "com.fogar.agent.dir-38520729324438e5");
         // No default directory (HOME unset): an explicit directory still gets its own service.
         assert_eq!(a, keychain_service(BASE, Path::new("/tmp/fogar-a"), None));
+    }
+
+    /// `..` and a symlink to the same directory give the same service; a symlink to the default
+    /// directory keeps the frozen one.
+    #[test]
+    fn canonical_paths_share_one_service() {
+        let base = std::env::temp_dir().join(format!("fogar-inst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        let default = base.join("default");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        std::fs::create_dir_all(&default).unwrap();
+        std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
+        std::os::unix::fs::symlink(&default, base.join("link-default")).unwrap();
+        let svc = |p: &Path| keychain_service_canonical(BASE, p, Some(&default)).unwrap();
+        let direct = svc(&real);
+        assert_ne!(direct, BASE);
+        assert_eq!(svc(&real.join("sub/..")), direct);
+        assert_eq!(svc(&base.join("link")), direct);
+        assert_eq!(svc(&base.join("link-default")), BASE);
+        assert_eq!(svc(&default.join("../default")), BASE);
+        // A default that does not exist is never "the same directory".
+        let missing = base.join("missing");
+        assert_eq!(
+            keychain_service_canonical(BASE, &real, Some(&missing)).unwrap(),
+            direct
+        );
+        // The state directory itself must exist.
+        assert!(keychain_service_canonical(BASE, &missing, Some(&default)).is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

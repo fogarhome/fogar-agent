@@ -67,6 +67,14 @@ struct SignedAgentTests {
         #expect(try !verifica("depurable"))
     }
 
+    @Test func rechazaVariablesDeEntornoDeDyld() throws {
+        #expect(try !verifica("dyld"))
+    }
+
+    @Test func rechazaSinValidacionDeBibliotecas() throws {
+        #expect(try !verifica("sinlv"))
+    }
+
     @Test func rechazaOtroEquipo() throws {
         #expect(try !verifica("ok", equipo: "OTROEQUIPO"))
     }

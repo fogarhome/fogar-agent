@@ -1,11 +1,13 @@
 #!/bin/sh
-# CI only (job `macos`): builds scripts/ci/peer-agent.c and signs it four ways with a temporary
+# CI only (job `macos`): builds scripts/ci/peer-agent.c and signs it six ways with a temporary
 # self-signed code-signing certificate (Team "FOGARTEST1" in its OU), so the app's peer check
 # (Sources/FogarWire/PeerCheck.swift) is tested against real signed processes:
 #   ok          identifier com.fogar.agent, hardened runtime             -> accepted
 #   otro        identifier com.fogar.otro, hardened runtime              -> refused (identifier)
 #   sinruntime  identifier com.fogar.agent, no hardened runtime          -> refused (runtime flag)
 #   depurable   identifier com.fogar.agent, runtime + get-task-allow     -> refused (entitlement)
+#   dyld        identifier com.fogar.agent, runtime + allow-dyld-environment-variables -> refused
+#   sinlv       identifier com.fogar.agent, runtime + disable-library-validation       -> refused
 # A self-signed certificate is not Apple's: the tests swap `anchor apple generic` for the
 # certificate's own hash and also check that the real anchor refuses it. Writes the paths and the
 # hash as FOGAR_CI_* variables to $GITHUB_ENV (or prints them). Never run it on a personal Mac:
@@ -48,11 +50,16 @@ security import "$out/cert.p12" -k "$kc" -P "$pass" -T /usr/bin/codesign >/dev/n
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pass" "$kc" >/dev/null
 
 clang -O2 -Wall -Werror -o "$out/peer-agent" "$here/ci/peer-agent.c"
-cat > "$out/debug.entitlements" <<'ENT'
+entitlement() { # file key
+  cat > "$out/$1" <<ENT
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict><key>com.apple.security.get-task-allow</key><true/></dict></plist>
+<plist version="1.0"><dict><key>$2</key><true/></dict></plist>
 ENT
+}
+entitlement debug.entitlements com.apple.security.get-task-allow
+entitlement dyld.entitlements com.apple.security.cs.allow-dyld-environment-variables
+entitlement sinlv.entitlements com.apple.security.cs.disable-library-validation
 
 sign() { # name identifier [codesign options...]
   name=$1 id=$2
@@ -70,7 +77,9 @@ fi
 sign otro com.fogar.otro --options runtime
 sign sinruntime com.fogar.agent
 sign depurable com.fogar.agent --options runtime --entitlements "$out/debug.entitlements"
-for a in ok otro sinruntime depurable; do codesign -dvv "$out/agent-$a" 2>&1 | grep -E '^(Identifier|CodeDirectory)'; done
+sign dyld com.fogar.agent --options runtime --entitlements "$out/dyld.entitlements"
+sign sinlv com.fogar.agent --options runtime --entitlements "$out/sinlv.entitlements"
+for a in ok otro sinruntime depurable dyld sinlv; do codesign -dvv "$out/agent-$a" 2>&1 | grep -E '^(Identifier|CodeDirectory)'; done
 
 vars="FOGAR_CI_SIGNED_AGENTS=$out
 FOGAR_CI_TEST_TEAM=$team
