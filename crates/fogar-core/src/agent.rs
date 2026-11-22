@@ -15,6 +15,7 @@
 //! Invariant: `Config::close_timeout` < budget/2 (1 s vs 2 s for the daemon's 4 s budget).
 
 use crate::{
+    capture::CaptureGate,
     config::Config,
     crashloop::BootMode,
     engine::Engine,
@@ -193,14 +194,15 @@ impl<C: Clock> Agent<C> {
             clock: ports.clock.clone(),
             cfg: cfg.clone(),
             stats: stats.clone(),
-            audio_in: ports.audio_in,
             audio_out: ports.audio_out,
             out_tx,
             in_rx,
             cmd_rx,
             conv: conv_tx,
         };
-        data.spawn(engine.run(ingress.clone()));
+        // The microphone goes straight to the consent gate: the engine never holds it.
+        let capture = CaptureGate::new(ports.audio_in, &cfg, stats.clone());
+        data.spawn(engine.run(capture, ingress.clone()));
 
         let link = LinkCtx {
             clock: ports.clock.clone(),
@@ -237,6 +239,7 @@ impl<C: Clock> Agent<C> {
                     write_timeout: cfg.write_timeout,
                     idle_timeout: cfg.ipc_idle_timeout,
                     pair_from_uid_only_peers: cfg.pair_from_uid_only_peers,
+                    permission_wait: cfg.mic_permission_wait,
                 },
                 pairing,
                 cmd_tx,

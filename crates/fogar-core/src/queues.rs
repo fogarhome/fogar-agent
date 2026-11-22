@@ -4,13 +4,15 @@
 //!
 //! | Queue | Producer -> consumer | Capacity | When full |
 //! |---|---|---|---|
-//! | mic chunks (`EventStream<AudioChunk>`) | audio adapter -> capture gate | `MIC_CHUNKS` (~1 s of 20 ms chunks) | adapter drops NEWEST, counts (`EventStream::dropped`); never blocks the audio thread. No producer in S2 sub-PR 3a (the mic is never opened; 3b adds the gate) |
-//! | uplink audio (`out` channel, `Frame::Binary`) | engine -> link session | shares `OUTBOUND` | shed NEWEST, count `uplink_audio_shed` (`try_send`); the gateway would close a slow client anyway. No producer in 3a |
+//! | mic chunks (`EventStream<AudioChunk>`) | audio adapter -> capture gate | `MIC_CHUNKS` (~1 s of 20 ms chunks) | adapter drops NEWEST, counts (`EventStream::dropped`); never blocks the audio thread. Only open while a take is open (`capture.rs`, the consent gate) |
+//! | capture device jobs (blocking `AudioSource::open` / drop of `ActiveCapture`, issue #24) | capture gate -> tokio blocking pool, one owned `JoinSet` | `CAPTURE_JOBS` in flight | admission control: a `CaptureStart` while one runs is refused `Busy` at once; a release is never refused (at most one more, since a take only opens with the set empty); each job is bounded by the adapter (`OPEN_BLOCK_MAX` / `DROP_BLOCK_MAX`) and an open also by `capture::OPEN_DEADLINE` on the core side (late result released); on stop the gate waits `capture::RELEASE_WAIT_ON_STOP`, then detaches |
+//! | permission request waiters | IPC `RequestMicPermission` -> capture gate | `IPC_MAX_CONNS` on one pending prompt | an extra waiter is answered at once with the current status; each waiter's IPC side gives up after `Config::mic_permission_wait` and gets the current status |
+//! | uplink audio (`out` channel, `Frame::Binary`) | engine -> link session | shares `OUTBOUND` | shed NEWEST, count `uplink_audio_shed` (`try_send`); the gateway would close a slow client anyway. Produced only while a take records |
 //! | uplink control (`out` channel, `Frame::Text`) | engine -> link session | shares `OUTBOUND` | must-deliver while connected: `reserve()` with `write_timeout`; on deadline count `uplink_control_dropped` and return the turn machine to Idle (the session itself is kept) |
 //! | inbound JSON events | link session -> engine | `INBOUND` messages AND `INBOUND_BYTES` bytes | must-deliver: byte charge + `reserve()` with `inbound_deadline` (< gateway `CLIENT_SEND_TIMEOUT_S` = 10 s); on deadline the session ends as `EngineStalled` and reconnects |
 //! | inbound TTS audio | link session -> engine | shares `INBOUND` and `INBOUND_BYTES` | shed NEWEST, count `inbound_audio_shed` (`try_send` / `try_charge`); the session never waits on audio |
 //! | playback buffer | engine -> audio sink adapter | adapter-owned, bounded | `ActivePlayback::write` accepts what fits; engine counts the rest in `tts_samples_dropped` |
-//! | engine commands (typed text, cancel) | IPC connections -> engine | `ENGINE_COMMANDS` | the IPC answers "busy" at once (`try_send`, never waits) and counts `engine_commands_busy`; each command carries a `oneshot` the IPC awaits under `write_timeout`, and a command whose reply was abandoned is skipped, not executed late |
+//! | engine commands (typed text, cancel, capture start/end, permission request) | IPC connections -> engine | `ENGINE_COMMANDS` | the IPC answers "busy" at once (`try_send`, never waits) and counts `engine_commands_busy`; each command carries a `oneshot` the IPC awaits under `write_timeout`, and a command whose reply was abandoned is skipped, not executed late |
 //! | conversation view | engine -> each conversation-subscribed connection | `watch` (1) | coalesce: latest view wins, never a backlog; each push runs under `write_timeout` and a miss closes the connection; the view itself is bounded (`CONVERSATION_MAX_TURNS`, `CONVERSATION_MAX_TEXT_BYTES`) |
 //! | link state / health | many -> readers | `watch` (1) | coalesce: latest value wins |
 //! | IPC connections | IPC adapter -> service | `IPC_MAX_CONNS` concurrent (subscribers included) | further accepts wait (the accept branch is disabled while full); a connection idle for `Config::ipc_idle_timeout` (30 s) is closed, so silent clients cannot hold the slots; a SUBSCRIBED connection is exempt from the idle close but each push runs under `write_timeout` and a miss closes it |
@@ -35,6 +37,8 @@ const fn nz(n: usize) -> NonZeroUsize {
 
 /// 50 x 20 ms = 1 s of capture.
 pub const MIC_CHUNKS: NonZeroUsize = nz(50);
+/// Blocking capture device jobs (open or release) in flight at once (`capture.rs`).
+pub const CAPTURE_JOBS: usize = 1;
 /// Engine -> link session.
 pub const OUTBOUND: usize = 64;
 /// Link session -> engine.

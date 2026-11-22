@@ -14,7 +14,8 @@ use fogar_ports::{
     audio::MicPermission,
     ipc::{
         CONVERSATION_MAX_TEXT_BYTES, CONVERSATION_MAX_TURNS, ConversationView, Notice,
-        ProgressKind, ServiceState, TurnAudio, TurnOutcome, TurnSource, TurnView,
+        ProgressKind, SEND_TEXT_MAX_BYTES, ServiceState, TurnAudio, TurnOutcome, TurnSource,
+        TurnView,
     },
 };
 use fogar_proto::server::{
@@ -24,12 +25,21 @@ use fogar_proto::server::{
 /// Longest gateway id or code kept (`turn_id`, `conversation`, error code).
 pub const ID_MAX_BYTES: usize = 128;
 
+/// Longest live partial kept while recording (the gateway's partial is the whole utterance so
+/// far; the view must stay well inside one IPC frame).
+pub const LIVE_MAX_BYTES: usize = 4 * 1024;
+
 /// `s` cut to [`ID_MAX_BYTES`] at a char boundary.
 fn bounded(s: &str) -> &str {
-    if s.len() <= ID_MAX_BYTES {
+    cut(s, ID_MAX_BYTES)
+}
+
+/// `s` cut to `max` bytes at a char boundary.
+fn cut(s: &str, max: usize) -> &str {
+    if s.len() <= max {
         return s;
     }
-    let mut n = ID_MAX_BYTES;
+    let mut n = max;
     while !s.is_char_boundary(n) {
         n -= 1;
     }
@@ -173,12 +183,50 @@ pub fn sent(v: &mut ConversationView, text: &str) -> bool {
         end(t, TurnOutcome::Replaced);
     }
     v.notice = None;
+    // Whatever waited for review was either this text or is superseded by it.
+    v.draft = None;
     let mut t = TurnView::default();
     t.mine = text.to_owned();
     t.source = TurnSource::Mine;
     v.turns.push(t);
     trim(v);
     true
+}
+
+/// A take opened: the live line starts empty and the last notice is cleared (a new action).
+pub fn take_started(v: &mut ConversationView) -> bool {
+    let changed = !v.live.is_empty() || v.notice.is_some();
+    v.live.clear();
+    v.notice = None;
+    changed
+}
+
+/// A `transcription_partial` while recording: the live line (bounded).
+pub fn partial(v: &mut ConversationView, text: &str) -> bool {
+    let text = cut(text, LIVE_MAX_BYTES);
+    if v.live == text {
+        return false;
+    }
+    v.live.clear();
+    v.live.push_str(text);
+    true
+}
+
+/// The take ended: no live line; `notice` says why when it was cut automatically.
+pub fn take_ended(v: &mut ConversationView, notice: Option<Notice>) -> bool {
+    let mut changed = !v.live.is_empty();
+    v.live.clear();
+    if notice.is_some() {
+        changed |= set(&mut v.notice, notice);
+    }
+    changed
+}
+
+/// The final transcript of a take ended with `Review` goes to the text box (bounded to what
+/// `SendText` accepts back).
+pub fn draft(v: &mut ConversationView, text: &str) -> bool {
+    let text = cut(text, SEND_TEXT_MAX_BYTES);
+    set(&mut v.draft, Some(text.to_owned()))
 }
 
 /// The wait for our turn ended without a `turn_start` (timeout, cancel, uplink failure).
