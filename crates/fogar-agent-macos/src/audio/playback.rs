@@ -13,7 +13,10 @@
 //!
 //! A dead output (fatal device error, or no callback for 2 s after a 6 s start grace) accepts
 //! nothing and reports nothing queued, so the core does not wait on audio that will never play.
-//! The port has no health method yet (follow-up in the contract).
+//! The port has no health method yet (follow-up in the contract). Caveat: a stall does not empty
+//! the ring (only the RT side can pop it), so if the callbacks come back, what was queued before
+//! the stall plays late unless the core calls `stop()` first; a dead output does not recover by
+//! itself either (follow-up in fogar-core: drop and reopen).
 
 use super::capture::{is_fatal, map_cpal};
 use crate::rt::{
@@ -302,9 +305,8 @@ mod tests {
     /// nothing and reports nothing queued, so the core never waits on audio that cannot play.
     #[test]
     fn a_dead_output_accepts_and_queues_nothing() {
-        let Ok(mut pb) = open_device(AudioFormat::mono(24_000)) else {
-            return; // no output device on this machine
-        };
+        // Every Mac, including the CI runner, has an output: no device is a failure here.
+        let mut pb = open_device(AudioFormat::mono(24_000)).expect("no output device");
         assert!(pb.write(&[0; 2_400]) > 0);
         assert!(pb.queued_samples() > 0 || pb.shared.callbacks.load(Ordering::Relaxed) > 0);
         pb.shared.failed.store(true, Ordering::Relaxed);

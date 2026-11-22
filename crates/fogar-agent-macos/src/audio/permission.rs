@@ -50,8 +50,13 @@ fn media_type_audio() -> &'static AnyObject {
     unsafe { AVMediaTypeAudio }
 }
 
-/// Current microphone permission. Never prompts.
+/// Current microphone permission. Never prompts. Runs in its own autorelease pool: it is
+/// called every second from the capture thread, which has no pool of its own.
 pub(crate) fn status() -> MicPermission {
+    autoreleasepool(|_| status_inner())
+}
+
+fn status_inner() -> MicPermission {
     let Some(cls) = capture_device_class() else {
         return MicPermission::NotDetermined;
     };

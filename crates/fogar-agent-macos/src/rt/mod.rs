@@ -16,18 +16,27 @@ pub(crate) mod test_support {
 
     static SERIAL: Mutex<()> = Mutex::new(());
 
-    /// Fails if `f` grows the heap at all (peak above the starting live size). The allocator
-    /// counts process-wide and tests run in parallel, so a disturbed measurement is retried; an
-    /// allocating `f` fails every attempt. `f` must be repeatable.
-    pub(crate) fn assert_no_alloc(what: &str, mut f: impl FnMut()) {
+    /// Fails if `f` grows the heap at all (peak above the starting live size). Every attempt
+    /// runs `f` ONCE on a fresh state from `setup` (built outside the measurement), so an
+    /// allocation on the first call shows up in every attempt and retries cannot hide it. The
+    /// allocator counts process-wide and tests run in parallel: a measurement disturbed by
+    /// another thread is retried.
+    pub(crate) fn assert_no_alloc<S>(
+        what: &str,
+        mut setup: impl FnMut() -> S,
+        mut f: impl FnMut(&mut S),
+    ) {
         let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let mut last = 0;
         for _ in 0..100 {
+            let mut state = setup();
             fogar_testalloc::reset_peak();
             let before = fogar_testalloc::live_bytes();
-            f();
+            f(&mut state);
             last = fogar_testalloc::peak_bytes() - before;
-            if last <= 0 && fogar_testalloc::live_bytes() == before {
+            let clean = last <= 0 && fogar_testalloc::live_bytes() == before;
+            drop(state);
+            if clean {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(2));

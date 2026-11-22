@@ -359,11 +359,18 @@ mod tests {
         let mut w = InputWriter::new(prod, 2, beat.clone());
         let block: Vec<f32> = [0.5f32, -0.25].repeat(1024);
         let before = COUNTERS.input_overrun_frames.load(Ordering::Relaxed);
-        assert_no_alloc("InputWriter::write", || w.write(&block));
+        assert_no_alloc(
+            "InputWriter::write",
+            || {
+                let (prod, cons) = rtrb::RingBuffer::<f32>::new(4800);
+                (InputWriter::new(prod, 2, Arc::new(AtomicU64::new(0))), cons)
+            },
+            |(w, _)| w.write(&block),
+        );
         for _ in 0..10 {
             w.write(&block);
         }
-        assert!(beat.load(Ordering::Relaxed) >= 11, "per-capture heartbeat");
+        assert!(beat.load(Ordering::Relaxed) >= 10, "per-capture heartbeat");
         assert!(COUNTERS.input_overrun_frames.load(Ordering::Relaxed) > before);
         assert_eq!(cons.slots(), 4800);
         let c = cons.read_chunk(4800).unwrap();
@@ -390,7 +397,18 @@ mod tests {
         r.fill(&mut out);
         assert_eq!(out, [0.0, 0.0, 0.1, 0.1, 0.2, 0.2, 0.3, 0.3]);
         assert_eq!(shared.consumed.load(Ordering::Acquire), 4);
-        assert_no_alloc("OutputReader::fill", || r.fill(&mut out));
+        assert_no_alloc(
+            "OutputReader::fill",
+            || {
+                let (mut prod, cons) = rtrb::RingBuffer::<f32>::new(64);
+                for _ in 0..10 {
+                    let _ = prod.push(0.5);
+                }
+                let r = OutputReader::new(cons, 2, Arc::new(PlaybackShared::default()));
+                (r, prod, [0f32; 32])
+            },
+            |(r, _, out)| r.fill(out),
+        );
         assert!(shared.callbacks.load(Ordering::Relaxed) >= 1);
         // Barge-in: everything pushed so far is discarded, the rest is silence.
         let pushed = 10;
@@ -549,10 +567,18 @@ mod tests {
         let input = tone(48_000, 440.0, 960);
         let mut out = Vec::with_capacity(r.max_output(960) * 4);
         r.process(&input, &mut out);
-        assert_no_alloc("Resampler::process", || {
-            out.clear();
-            r.process(&input, &mut out);
-        });
+        // Steady state = after one warm-up call (part of the setup, not measured).
+        assert_no_alloc(
+            "Resampler::process",
+            || {
+                let mut r = Resampler::new(48_000, 16_000, 960).unwrap();
+                let mut out = Vec::with_capacity(r.max_output(960) * 4);
+                r.process(&input, &mut out);
+                out.clear();
+                (r, out)
+            },
+            |(r, out)| r.process(&input, out),
+        );
         assert!(r.pending_input() > 0);
         r.reset();
         assert_eq!(r.pending_input(), 0);
