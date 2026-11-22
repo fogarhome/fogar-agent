@@ -10,22 +10,27 @@ enum EnlaceConversacion: Equatable {
     case sinAgente
     /// The agent answered `refused`: the conversation is only for the app signed like the agent.
     case soloAppFirmada
-    /// The agent speaks another version or something this app cannot read (`AgentLink` says which).
+    /// The agent speaks another version, sends something this app cannot read, or is not provably
+    /// our agent (`AgentLink` says which).
     case noDisponible
     /// Subscribed: the agent pushes the latest view on every change.
     case viva
 }
 
 /// The app's conversation with the agent (IPC v4): ONE long connection that is subscribed to the
-/// conversation and also carries every conversation request. It has to be one: the agent only lets
-/// the subscribed connection start a take or confirm a turn as visible, and a take ends with
-/// `discard` when its connection goes.
+/// conversation and also carries the conversation's requests. It has to be one: the agent only
+/// lets the subscribed connection start a take or confirm a turn as visible, and a take ends with
+/// `discard` when its connection goes. (`request_mic_permission` is the exception: it may wait
+/// for the person at the system prompt, so it goes on a single-use connection of its own and
+/// never holds up a Cancel.)
 ///
 /// No request ids on the wire: the agent answers a connection's requests in order, and the only
 /// frame it sends unasked here is `conversation`. So every other frame answers the oldest request
-/// still waiting. A request that gets no answer in time closes the connection (the order could no
-/// longer be trusted) and every waiting request fails; the loop reconnects.
+/// still waiting. A request that gets no answer in time (counted from when its frame was written)
+/// closes the connection (the order could no longer be trusted) and every waiting request fails;
+/// the loop reconnects.
 ///
+/// Before a byte is sent, the server is authenticated (`VerificacionPar`, ADR-0002 mirrored).
 /// The app keeps the view in memory only: never on disk, never in logs.
 @Observable
 final class ConversationLink {
@@ -39,17 +44,21 @@ final class ConversationLink {
     @ObservationIgnored var alPerder: () -> Void = {}
 
     @ObservationIgnored let socketPath: String
+    @ObservationIgnored let verificacion: VerificacionPar
     @ObservationIgnored private var loop: Task<Void, Never>?
     @ObservationIgnored private var nap: Task<Void, Never>?
     @ObservationIgnored private var conexion: FramedConnection?
     /// Requests sent on `conexion` and not answered yet, oldest first.
     @ObservationIgnored private var pendientes: [(id: UInt64, k: CheckedContinuation<WireResponse, any Error>)] = []
+    /// Each waiting request's deadline, cancelled when its answer arrives.
+    @ObservationIgnored private var plazos: [UInt64: Task<Void, Never>] = [:]
     @ObservationIgnored private var siguienteId: UInt64 = 0
     /// Sends go out one after another, in the order they were asked for (the answers' order).
     @ObservationIgnored private var cola: Task<Void, Never>?
 
-    init(socketPath: String = AgentLink.defaultSocketPath) {
+    init(socketPath: String = AgentLink.defaultSocketPath, verificacion: VerificacionPar = AgentLink.verificacionPorDefecto) {
         self.socketPath = socketPath
+        self.verificacion = verificacion
     }
 
     func start() {
@@ -76,10 +85,11 @@ final class ConversationLink {
             var permanente = false
             var estuvoViva = false
             do {
-                let c = try await FramedConnection.connect(path: socketPath)
+                let v = verificacion
+                let c = try await FramedConnection.connect(path: socketPath, verificacion: v)
                 defer { c.cancel() }
                 try await withDeadline(.seconds(5)) {
-                    try await Self.saludar(c)
+                    try await Self.saludar(c, v)
                     try await c.send(WireCodec.encode(WireRequest.subscribeConversation))
                     // `conversation_subscribed`, then the first view (read by the loop below).
                     switch try WireCodec.decodeResponse(await c.receive()) {
@@ -94,12 +104,12 @@ final class ConversationLink {
                 backoff = .milliseconds(500)
                 defer { soltar(c) }
                 while !Task.isCancelled {
-                    let respuesta = try WireCodec.decodeResponse(await c.receive())
+                    let respuesta = try WireCodec.decodeResponseTolerante(await c.receive())
                     recibir(respuesta)
                 }
             } catch CommandError.refused {
                 enlace = .soloAppFirmada; permanente = true
-            } catch CommandError.versionMismatch, CommandError.unexpected, is DecodingError, LinkError.frame {
+            } catch CommandError.versionMismatch, CommandError.unexpected, is DecodingError, LinkError.frame, LinkError.notOurAgent {
                 enlace = .noDisponible; permanente = true
             } catch {
                 // Lost after it worked (agent restart, a request with no answer): look again soon.
@@ -121,7 +131,9 @@ final class ConversationLink {
             // The answer to the oldest request waiting. An answer nobody waits for (one that came
             // after its request timed out cannot: that closes the connection) is ignored.
             guard !pendientes.isEmpty else { return }
-            pendientes.removeFirst().k.resume(returning: r)
+            let p = pendientes.removeFirst()
+            plazos.removeValue(forKey: p.id)?.cancel()
+            p.k.resume(returning: r)
         }
     }
 
@@ -131,6 +143,8 @@ final class ConversationLink {
         if conexion === c { conexion = nil }
         let fallidos = pendientes
         pendientes.removeAll()
+        for (_, t) in plazos { t.cancel() }
+        plazos.removeAll()
         for p in fallidos { p.k.resume(throwing: CommandError.noAnswer) }
         if enlace == .viva { enlace = .buscando }
         alPerder()
@@ -143,9 +157,12 @@ final class ConversationLink {
         nap = nil
     }
 
-    nonisolated private static func saludar(_ c: FramedConnection) async throws {
+    /// `hello`, then the process that answered is checked again before anything else is sent.
+    nonisolated private static func saludar(_ c: FramedConnection, _ v: VerificacionPar) async throws {
         try await c.send(WireCodec.encode(WireRequest.hello(WireHello(version: ipcVersion))))
-        switch try WireCodec.decodeResponse(await c.receive()) {
+        let respuesta = try WireCodec.decodeResponse(await c.receive())
+        try await c.reverificar(v)
+        switch respuesta {
         case .hello(let h) where h.version == ipcVersion: return
         case .hello(let h): throw CommandError.versionMismatch(agent: h.version)
         case .refused: throw CommandError.refused
@@ -156,7 +173,8 @@ final class ConversationLink {
     // MARK: Requests
 
     /// Sends `request` on the conversation connection and waits for its answer (`refused` is
-    /// returned as an answer: what it means depends on the request).
+    /// returned as an answer: what it means depends on the request). `plazo` counts from when the
+    /// frame was written, not from when it was queued behind earlier requests.
     func pedir(_ request: WireRequest, plazo: Duration = .seconds(5)) async throws(CommandError) -> WireResponse {
         guard let c = conexion else { throw .agentNotRunning }
         let cuerpo: Data
@@ -169,17 +187,57 @@ final class ConversationLink {
                 let anterior = cola
                 cola = Task {
                     await anterior?.value
-                    do { try await c.send(cuerpo) } catch { c.cancel() }
-                }
-                // The deadline: past it the answers' order is lost, so the connection goes.
-                Task { [weak self] in
-                    try? await Task.sleep(for: plazo)
-                    guard let self, self.pendientes.contains(where: { $0.id == id }) else { return }
-                    c.cancel()
+                    // Answered or failed meanwhile (the connection dropped): nothing to write.
+                    guard pendientes.contains(where: { $0.id == id }) else { return }
+                    do {
+                        try await c.send(cuerpo)
+                    } catch {
+                        c.cancel()
+                        return
+                    }
+                    guard pendientes.contains(where: { $0.id == id }) else { return }
+                    // The deadline: past it the answers' order is lost, so the connection goes.
+                    plazos[id] = Task { [weak self] in
+                        try? await Task.sleep(for: plazo)
+                        guard !Task.isCancelled, let self, self.pendientes.contains(where: { $0.id == id }) else { return }
+                        c.cancel()
+                    }
                 }
             }
         } catch let e as CommandError {
             throw e
+        } catch {
+            throw .noAnswer
+        }
+    }
+
+    /// One request on a connection of its own (`hello` → request → answer → close), for what may
+    /// wait on the person (the microphone permission prompt). Does not need the subscription.
+    /// `plazo` counts from when the request was written.
+    func pedirAparte(_ request: WireRequest, plazo: Duration) async throws(CommandError) -> WireResponse {
+        let path = socketPath
+        let v = verificacion
+        do {
+            let c = try await FramedConnection.connect(path: path, verificacion: v)
+            defer { c.cancel() }
+            try await withDeadline(.seconds(5)) {
+                try await Self.saludar(c, v)
+                try await c.send(WireCodec.encode(request))
+            }
+            return try await withDeadline(plazo) {
+                while true {
+                    switch try WireCodec.decodeResponseTolerante(await c.receive()) {
+                    case .event, .status, .conversation: continue // never the answer
+                    case let answer: return answer
+                    }
+                }
+            }
+        } catch let e as CommandError {
+            throw e
+        } catch LinkError.unavailable {
+            throw .agentNotRunning
+        } catch LinkError.notOurAgent {
+            throw .notOurAgent
         } catch {
             throw .noAnswer
         }

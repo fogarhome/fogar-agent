@@ -141,6 +141,7 @@ private struct Pie: View {
         case .versionMismatch: "Agente de otra versión"
         case .refused: "Agente rechaza la app"
         case .noLiveStatus, .unintelligible: "Agente desactualizado"
+        case .noVerificado: "Agente sin verificar"
         }
     }
 }

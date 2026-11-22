@@ -18,13 +18,22 @@ agent treats it as `uid_only`: status works, pair/unpair are refused.
 
 ## Without the Rust agent: the stand-in
 
-`fogar-standin` speaks the same frames and plays scripted states (synthetic data):
+`fogar-standin` speaks the same frames and plays scripted states (synthetic data). It listens on
+`/tmp/fogar-standin/agent.sock` by default and refuses the real agent's socket path.
 
 ```sh
-swift run fogar-standin --socket /tmp/fogar-standin/agent.sock --phase not_paired --gateways 2
+swift run fogar-standin --phase ready --gateways 2
 scripts/build-app.sh --debug
-FOGAR_AGENT_SOCKET=/tmp/fogar-standin/agent.sock "build/Fogar Desktop.app/Contents/MacOS/FogarDesktop"
+FOGAR_AGENT_SOCKET=/tmp/fogar-standin/agent.sock FOGAR_AGENT_UNSIGNED=1 \
+  "build/Fogar Desktop.app/Contents/MacOS/FogarDesktop"
 ```
+
+The app authenticates the server behind the socket before sending anything (ADR-0002, mirrored):
+the socket and its directory must be the user's (directory 0700, no symlinks), the server must run
+as the same user, and its code must be signed by the app's own Team with the identifier
+`com.fogar.agent` (GUESSED until PR 6 packages the agent) and the hardened runtime. The unsigned
+stand-in passes only in a debug build started with `FOGAR_AGENT_UNSIGNED=1`; a release build has no
+such switch.
 
 Only debug builds honour `FOGAR_AGENT_SOCKET`. Phases: `not_paired`, `connecting`, `ready`,
 `reconnecting`, `parked_repair`, `parked_agent_refused`, `parked_client_error`, `stopping` (also typed
@@ -39,7 +48,8 @@ reply (preparing → thinking → «Usando ha_call_service…» → text); text 
 an error or a timeout. The reply's audio «plays» only after the app's `turn_visible` and is dropped
 2 s later otherwise (the turn shows «sin sonido»). A take plays partials of a phrase, then goes quiet:
 5 s later the agent cuts it to review. `--mic not_determined|granted|denied|restricted` (default
-`not_determined`), `--mic-deny` (the permission prompt says no), `--transcriber down`, `--tts down`.
+`not_determined`), `--mic-deny` (the permission prompt says no), `--mic-prompt-secs N` (how long the
+prompt takes), `--no-mic`, `--transcriber down`, `--tts down`.
 On stdin: `push` (Fogar writes on its own), `dia` (a new day), `mic <state>`, `transcriber <state>`,
 `tts <state>`, `silencio` / `seguridad` (cut the open take), `frase_perdida`. Launch arguments `-seccion emparejar` and `-apariencia clara|oscura|sistema` pick the
 screen and appearance.

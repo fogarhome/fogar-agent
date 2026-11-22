@@ -16,6 +16,9 @@ enum AgentState: Equatable {
     case noLiveStatus
     /// The agent sent something this app cannot decode (e.g. a new phase without a version bump).
     case unintelligible
+    /// Something listens on the agent's socket, but it is not provably our agent (signature, user
+    /// or directory). Nothing was sent to it.
+    case noVerificado
     /// Subscribed: the latest status the agent pushed.
     case live(WireStatus)
 
@@ -33,6 +36,8 @@ enum CommandError: Error, Equatable {
     case refused
     case noAnswer
     case unexpected
+    /// What answers on the socket is not provably our agent: nothing was sent.
+    case notOurAgent
 }
 
 /// The app's single link to the agent: one long subscription for live status, plus a short
@@ -53,11 +58,22 @@ final class AgentLink {
     @ObservationIgnored private var desemparejando = false
 
     @ObservationIgnored let socketPath: String
+    @ObservationIgnored let verificacion: VerificacionPar
     @ObservationIgnored private var loop: Task<Void, Never>?
     @ObservationIgnored private var nap: Task<Void, Never>?
 
-    init(socketPath: String = AgentLink.defaultSocketPath) {
+    init(socketPath: String = AgentLink.defaultSocketPath, verificacion: VerificacionPar = AgentLink.verificacionPorDefecto) {
         self.socketPath = socketPath
+        self.verificacion = verificacion
+    }
+
+    /// Release: only the signed agent. Debug builds accept an unsigned server of the same user
+    /// ONLY when `FOGAR_AGENT_UNSIGNED=1` is set explicitly (the stand-in, see the README).
+    static var verificacionPorDefecto: VerificacionPar {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["FOGAR_AGENT_UNSIGNED"] == "1" { return .mismoUsuario }
+        #endif
+        return .agenteFirmado
     }
 
     static var defaultSocketPath: String {
@@ -90,11 +106,12 @@ final class AgentLink {
         while !Task.isCancelled {
             var permanent = false // retrying soon would not change the answer
             do {
-                let c = try await FramedConnection.connect(path: socketPath)
+                let v = verificacion
+                let c = try await FramedConnection.connect(path: socketPath, verificacion: v)
                 defer { c.cancel() }
                 // Every outside await has a deadline; only the event stream itself is open-ended.
                 try await withDeadline(.seconds(5)) {
-                    try await self.handshake(c)
+                    try await self.handshake(c, v)
                     try await c.send(WireCodec.encode(WireRequest.subscribe))
                 }
                 while !Task.isCancelled {
@@ -116,6 +133,8 @@ final class AgentLink {
                 set(.noLiveStatus); permanent = true
             } catch is DecodingError, LinkError.frame {
                 set(.unintelligible); permanent = true
+            } catch LinkError.notOurAgent {
+                set(.noVerificado); permanent = true
             } catch {
                 // Socket gone, agent restarted or wedged: honestly «not running» until it answers.
                 set(.notRunning)
@@ -184,7 +203,7 @@ final class AgentLink {
             // Only when the agent surely did nothing: after `noAnswer` it may still unpair, and its
             // `not_paired` must not read as a revocation (the next `not_paired` clears the flag).
             switch error {
-            case .agentNotRunning, .refused, .versionMismatch: desemparejando = false
+            case .agentNotRunning, .refused, .versionMismatch, .notOurAgent: desemparejando = false
             case .noAnswer, .unexpected: break
             }
             throw error
@@ -199,11 +218,12 @@ final class AgentLink {
 
     private func command(_ request: WireRequest, timeout: Duration) async throws(CommandError) -> WireResponse {
         let path = socketPath
+        let v = verificacion
         do {
             return try await withDeadline(timeout) {
-                let c = try await FramedConnection.connect(path: path)
+                let c = try await FramedConnection.connect(path: path, verificacion: v)
                 defer { c.cancel() }
-                try await self.handshake(c)
+                try await self.handshake(c, v)
                 try await c.send(WireCodec.encode(request))
                 while true {
                     switch try WireCodec.decodeResponse(await c.receive()) {
@@ -217,15 +237,20 @@ final class AgentLink {
             throw e
         } catch LinkError.unavailable {
             throw .agentNotRunning
+        } catch LinkError.notOurAgent {
+            throw .notOurAgent
         } catch {
             throw .noAnswer
         }
     }
 
-    /// `hello`: the agent answers with its own version (mismatch included) or `refused`.
-    nonisolated private func handshake(_ c: FramedConnection) async throws {
+    /// `hello`: the agent answers with its own version (mismatch included) or `refused`. The
+    /// process that wrote the answer is checked again before anything else is sent.
+    nonisolated private func handshake(_ c: FramedConnection, _ v: VerificacionPar) async throws {
         try await c.send(WireCodec.encode(WireRequest.hello(WireHello(version: ipcVersion))))
-        switch try WireCodec.decodeResponse(await c.receive()) {
+        let respuesta = try WireCodec.decodeResponse(await c.receive())
+        try await c.reverificar(v)
+        switch respuesta {
         case .hello(let h) where h.version == ipcVersion: return
         case .hello(let h): throw CommandError.versionMismatch(agent: h.version)
         case .refused: throw CommandError.refused
@@ -244,6 +269,7 @@ private extension AgentState {
         case .refused: "refused"
         case .noLiveStatus: "noLiveStatus"
         case .unintelligible: "unintelligible"
+        case .noVerificado: "noVerificado"
         case .live(let s): "live.\(s.link)"
         }
     }

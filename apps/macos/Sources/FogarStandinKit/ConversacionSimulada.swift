@@ -30,6 +30,8 @@ public struct ConversacionSimulada: Sendable {
     public var notice: WireNotice?
     /// Whether the link to the gateway is ready (text and takes need it).
     public var listo: Bool
+    /// This machine has no microphone the agent can use.
+    public var sinMicro = false
     /// The connection that owns the open take (it ends with `discard` if that connection goes).
     public private(set) var tomaDe: Int?
     /// Turns confirmed on screen by the app (`turn_visible`): only their audio may play.
@@ -75,6 +77,7 @@ public struct ConversacionSimulada: Sendable {
             else if tomaDe != nil || activity == .recording { .busy }
             else if mic == .notDetermined { .permissionNotDetermined }
             else if mic == .denied || mic == .restricted { .permissionDenied }
+            else if sinMicro { .noMicrophone }
             else if !listo { .notReady }
             else if transcriber == .down { .noTranscriber }
             else { nil }
@@ -92,8 +95,15 @@ public struct ConversacionSimulada: Sendable {
         live = texto
     }
 
-    /// `capture_end`: idempotent. Returns the transcript to send when `then` is `send`.
-    public mutating func terminarToma(_ then: WireThen) -> (respuesta: WireResponse, enviar: String?) {
+    /// `capture_end` from connection `conexion`: only the take's owner ends it; idempotent.
+    /// Returns the transcript to send when `then` is `send`.
+    public mutating func terminarToma(_ then: WireThen, conexion: Int) -> (respuesta: WireResponse, enviar: String?) {
+        guard tomaDe == conexion else { return (.captureEnded, nil) }
+        return terminarToma(then)
+    }
+
+    /// Ends the open take whoever owns it (the agent's own cuts and a lost connection).
+    mutating func terminarToma(_ then: WireThen) -> (respuesta: WireResponse, enviar: String?) {
         guard activity == .recording else { return (.captureEnded, nil) }
         let texto = live.trimmingCharacters(in: .whitespacesAndNewlines)
         tomaDe = nil
@@ -134,8 +144,10 @@ public struct ConversacionSimulada: Sendable {
         return .turnCancelSent
     }
 
-    /// `turn_visible`: the app shows this turn, so its audio may play.
-    public mutating func turnoVisible(_ id: String) -> WireResponse {
+    /// `turn_visible`: the app shows this turn, so its audio may play. Only from a connection
+    /// subscribed to the conversation (GUESSED answer for any other: `refused`).
+    public mutating func turnoVisible(_ id: String, suscrita: Bool = true) -> WireResponse {
+        guard suscrita else { return .refused(WireRefused(reason: "not subscribed")) }
         guard turno(id) != nil else { return .turnVisibleNoted }
         visibles.insert(id)
         if awaitingVisible == id {

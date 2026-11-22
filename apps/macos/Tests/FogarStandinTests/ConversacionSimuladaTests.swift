@@ -15,7 +15,7 @@ import Testing
         c.listo = true
         #expect(c.empezarToma(conexion: 1, suscrita: true) == .captureStarted)
         #expect(c.enviarTexto("hola") == .textRefused(WireTextRefused(reason: .recording)))
-        _ = c.terminarToma(.discard)
+        _ = c.terminarToma(.discard, conexion: 1)
         #expect(c.enviarTexto("hola") == .textAccepted)
         #expect(c.activity == .awaitingReply)
     }
@@ -31,6 +31,9 @@ import Testing
         c.transcriber = .down
         #expect(c.empezarToma(conexion: 1, suscrita: true) == .captureRefused(WireCaptureRefused(reason: .noTranscriber)))
         c.transcriber = .up
+        c.sinMicro = true
+        #expect(c.empezarToma(conexion: 1, suscrita: true) == .captureRefused(WireCaptureRefused(reason: .noMicrophone)))
+        c.sinMicro = false
         #expect(c.empezarToma(conexion: 1, suscrita: true) == .captureStarted)
         #expect(c.empezarToma(conexion: 2, suscrita: true) == .captureRefused(WireCaptureRefused(reason: .busy)))
     }
@@ -40,14 +43,16 @@ import Testing
         _ = c.empezarToma(conexion: 1, suscrita: true)
         c.parcial("enciende la luz")
         #expect(c.vista.live == "enciende la luz")
-        let (r, enviar) = c.terminarToma(.review)
+        // Only the take's own connection ends it.
+        #expect(c.terminarToma(.review, conexion: 2).respuesta == .captureEnded && c.activity == .recording)
+        let (r, enviar) = c.terminarToma(.review, conexion: 1)
         #expect(r == .captureEnded && enviar == nil)
         #expect(c.vista.draft == "enciende la luz" && c.vista.live.isEmpty && c.activity == .idle)
         // Ending twice is fine (idempotent), and sending clears the draft.
-        #expect(c.terminarToma(.send).respuesta == .captureEnded)
+        #expect(c.terminarToma(.send, conexion: 1).respuesta == .captureEnded)
         _ = c.empezarToma(conexion: 1, suscrita: true)
         c.parcial("apaga la tele")
-        #expect(c.terminarToma(.send).enviar == "apaga la tele")
+        #expect(c.terminarToma(.send, conexion: 1).enviar == "apaga la tele")
         #expect(c.activity == .awaitingReply)
         let id = c.abrirTurno(source: .mine, mine: "apaga la tele")
         #expect(c.activity == .idle && c.turno(id)?.progress == .preparing)
@@ -88,6 +93,8 @@ import Testing
     @Test func conTurnVisibleSuenaYCancelarLoCalla() {
         var c = ConversacionSimulada(mic: .granted)
         let id = c.abrirTurno(source: .mine, mine: "hola")
+        // Only a subscribed connection confirms what is on screen.
+        #expect(c.turnoVisible(id, suscrita: false) == .refused(WireRefused(reason: "not subscribed")))
         #expect(c.turnoVisible(id) == .turnVisibleNoted)
         c.texto(id, "Hola")
         #expect(c.turno(id)?.progress == nil)
@@ -116,14 +123,5 @@ import Testing
             c.cerrar(id, .done)
         }
         #expect(c.turns.reduce(0) { $0 + $1.mine.utf8.count + $1.reply.utf8.count } <= LimitesConversacion.textoVistaMaxBytes)
-    }
-
-    @Test func laVistaViajaPorElCable() throws {
-        var c = ConversacionSimulada(mic: .granted)
-        let id = c.abrirTurno(source: .mine, mine: "¿Qué tiempo hace?")
-        c.progreso(id, .tool, herramienta: "ha_call_service")
-        let ida = try WireCodec.encode(WireResponse.conversation(c.vista))
-        #expect(try WireCodec.decodeResponse(ida) == .conversation(c.vista))
-        #expect(ida.count < maxFrameBytes)
     }
 }

@@ -35,6 +35,10 @@ enum Textos {
             return Titular(titulo: "La app no entiende al agente",
                            sub: "El agente ha contado algo que esta app no sabe leer. Seguramente uno de los dos está desactualizado: actualiza los dos.",
                            tono: .bad)
+        case .noVerificado:
+            return Titular(titulo: "No parece el agente de Fogar",
+                           sub: "Algo responde en el sitio del agente, pero no está firmado como esta app. Por seguridad, la app no le cuenta nada. Reinstala Fogar Desktop con su agente.",
+                           tono: .bad)
         case .refused:
             return Titular(titulo: "El agente no deja entrar a esta app",
                            sub: "El agente ha rechazado la conexión. Comprueba que la app y el agente son de la misma instalación.",
@@ -130,6 +134,7 @@ enum Textos {
         case .versionMismatch: "Agente · otra versión"
         case .refused: "Agente · rechaza la app"
         case .noLiveStatus, .unintelligible: "Agente · desactualizado"
+        case .noVerificado: "Agente · sin verificar"
         }
     }
 
@@ -163,6 +168,7 @@ enum Textos {
         case .refused: "El agente no deja hacer esto desde esta app: no está firmada por el mismo firmante que el agente."
         case .noAnswer: "El agente no ha contestado a tiempo. Prueba otra vez."
         case .unexpected: "El agente ha contestado algo que esta app no esperaba. Prueba otra vez."
+        case .notOurAgent: "Lo que responde en el sitio del agente no está firmado como esta app: no le he enviado nada."
         }
     }
 

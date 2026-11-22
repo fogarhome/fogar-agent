@@ -4,9 +4,18 @@ import Foundation
 /// What the conversation says. Same voice as the rest of `Textos`: Spanish, short, only what the
 /// agent knows.
 extension Textos {
-    /// `refused` to a conversation request: the agent's command queue was full (busy), or the
-    /// app is not the signed one.
-    static let conversacionOcupada = "El agente no ha aceptado esto ahora. Prueba otra vez en un momento."
+    /// `refused` to a conversation request, by the agent's reason (`fogar-core::ipc`).
+    static func rechazo(_ motivo: String) -> String {
+        switch motivo {
+        case "engine busy": "El agente está ocupado ahora mismo. Prueba otra vez en un momento."
+        case "needs the signed Fogar app": "El agente solo deja hacer esto a la app de Fogar firmada como él."
+        case "unsupported request": "Este agente todavía no sabe hacer esto. Instala el agente que va con esta app."
+        case "ipc version mismatch": "El agente habla otra versión que esta app. Actualiza el que esté atrasado."
+        default: "El agente no ha aceptado esto. Prueba otra vez."
+        }
+    }
+
+    static let tomaPerdida = "Se perdió la conexión con el agente y la grabación se descartó. Vuelve a grabar cuando reconecte."
 
     static let microDenegado = "Fogar no puede usar el micrófono. Ábrelo en Ajustes del Sistema → Privacidad y seguridad → Micrófono."
 
@@ -52,6 +61,7 @@ extension Textos {
         case .sinTranscriptor: "El gateway no tiene transcriptor ahora. Puedes escribir."
         case .pedirPermiso: "Fogar necesita tu permiso para usar el micrófono."
         case .denegado: microDenegado
+        case .desconocido: "Fogar aún no sabe si puede usar el micrófono de este Mac. Puedes escribir."
         }
     }
 
@@ -71,7 +81,7 @@ extension Textos {
         switch p {
         case .preparing: "Preparando…"
         case .thinking: "Pensando…"
-        case .tool: herramienta.map { "Usando \($0)…" } ?? "Usando una herramienta…"
+        case .tool: herramienta.flatMap(nombreSeguro).map { "Usando \($0)…" } ?? "Usando una herramienta…"
         case .working: "Trabajando…"
         }
     }
@@ -85,8 +95,19 @@ extension Textos {
         case .replaced?: "Fogar pasó a tu siguiente mensaje."
         case .timeout?: "Fogar tardó demasiado y lo dejó."
         case .closed?: "Se cerró la conexión con el gateway."
-        case .error?: t.error_code.map { "Algo falló en el gateway (\($0))." } ?? "Algo falló en el gateway."
+        case .error?: t.error_code.flatMap(nombreSeguro).map { "Algo falló en el gateway (\($0))." } ?? "Algo falló en el gateway."
         }
+    }
+
+    /// A tool name or error code is shown only when it is a plain identifier (`[A-Za-z0-9_.:-]`,
+    /// 1–64): anything else from the gateway could be text dressed up as the app's own words.
+    static func nombreSeguro(_ s: String) -> String? {
+        guard (1...64).contains(s.unicodeScalars.count),
+              s.unicodeScalars.allSatisfy({ c in
+                  ("a"..."z").contains(c) || ("A"..."Z").contains(c) || ("0"..."9").contains(c) || "_.:-".unicodeScalars.contains(c)
+              })
+        else { return nil }
+        return s
     }
 
     static let pushEtiqueta = "Fogar te escribió"

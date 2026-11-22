@@ -1,12 +1,15 @@
 // A stand-in for fogar-agent's UI socket, for developing and screenshotting Fogar Desktop without
 // the Rust agent. It speaks the same frames (FogarWire) and plays scripted states. Synthetic data.
 //
-//   swift run fogar-standin [--socket PATH] [--phase not_paired|connecting|ready|reconnecting|
+//   swift run fogar-standin [--socket PATH (default /tmp/fogar-standin/agent.sock)] [--phase not_paired|connecting|ready|reconnecting|
 //       parked_repair|parked_agent_refused|parked_conversation_taken|parked_client_error|stopping]
 //       [--version N]
 //       [--gateways 0|1|2] [--refuse-pair] [--peer uid_only|same_signer] [--boot safe] [--old]
 //       [--mic granted|denied|not_determined|restricted] [--mic-deny] [--transcriber up|down|degraded]
-//       [--tts up|down]
+//       [--tts up|down] [--mic-prompt-secs N] [--no-mic]
+//
+// Never the real agent's socket: it refuses that path. The app trusts this unsigned stand-in only
+// in a debug build started with FOGAR_AGENT_UNSIGNED=1 (see the README).
 //
 // Pairing codes decide the outcome: 482913 pairs; 111111 invalid_code, 222222 unreachable,
 // 333333 not_a_gateway, 444444 gateway_error, 555555 storage_failed, 666666 busy,
@@ -26,7 +29,8 @@ import Foundation
 import Network
 
 struct Options {
-    var socket = AgentSocket.path(allowOverride: true)
+    var socket = ProcessInfo.processInfo.environment["FOGAR_AGENT_SOCKET"].flatMap { $0.isEmpty ? nil : $0 }
+        ?? "/tmp/fogar-standin/agent.sock"
     var phase = "not_paired"
     var version: UInt32 = ipcVersion
     var gateways = 1
@@ -39,6 +43,9 @@ struct Options {
     var micDeny = false
     var transcriber = WireService.up
     var tts = WireService.up
+    /// How long the «system prompt» takes to answer `request_mic_permission`.
+    var micPromptSecs = 0.7
+    var noMic = false
 
     init(_ args: [String]) {
         var it = args.dropFirst().makeIterator()
@@ -56,6 +63,8 @@ struct Options {
             case "--mic-deny": micDeny = true
             case "--transcriber": transcriber = WireService(rawValue: it.next() ?? "") ?? transcriber
             case "--tts": tts = WireService(rawValue: it.next() ?? "") ?? tts
+            case "--mic-prompt-secs": micPromptSecs = Double(it.next() ?? "") ?? micPromptSecs
+            case "--no-mic": noMic = true
             default: fail("unknown argument \(a)")
             }
         }
@@ -86,7 +95,20 @@ actor StandIn {
         gateway = options.phase == "not_paired" ? nil : greenHouse
         sim = ConversacionSimulada(mic: options.mic, transcriber: options.transcriber, tts: options.tts,
                                    listo: options.phase == "ready")
+        sim.sinMicro = options.noMic
     }
+
+    /// Every task the stand-in starts, kept until done.
+    private var tareas: [Int: Task<Void, Never>] = [:]
+    private var siguienteTarea = 0
+
+    /// A number for the next task (stored in `tareas`, forgotten by the task when it ends).
+    private func registrar() -> Int {
+        siguienteTarea += 1
+        return siguienteTarea
+    }
+
+    private func olvidar(_ id: Int) { tareas[id] = nil }
 
     var status: WireStatus {
         let phase: WirePhase = switch link {
@@ -196,6 +218,7 @@ actor StandIn {
     // MARK: Conversation (IPC v4)
 
     /// A conversation request from connection `id` (`suscrita`: it sent `subscribe_conversation`).
+    /// Like the core, the view that changed is pushed AFTER the answer (`serve` calls `difundir`).
     func conversar(_ request: WireRequest, conexion id: Int, suscrita: Bool) async -> WireResponse {
         guard options.peer == .sameSigner, !options.old else { return soloAppFirmada }
         let respuesta: WireResponse
@@ -209,20 +232,19 @@ actor StandIn {
             respuesta = sim.empezarToma(conexion: id, suscrita: suscrita)
             if case .captureStarted = respuesta { escuchar() }
         case .captureEnd(let e):
-            let (r, enviar) = sim.terminarToma(e.then)
+            let (r, enviar) = sim.terminarToma(e.then, conexion: id)
             respuesta = r
             if let enviar { responder(a: enviar) }
         case .cancelTurn:
             respuesta = sim.cancelar()
         case .turnVisible(let v):
-            respuesta = sim.turnoVisible(v.turn_id)
+            respuesta = sim.turnoVisible(v.turn_id, suscrita: suscrita)
         case .requestMicPermission:
-            try? await Task.sleep(for: .milliseconds(700)) // the system prompt
+            try? await Task.sleep(for: .seconds(options.micPromptSecs)) // the system prompt
             respuesta = sim.pedirPermiso(concede: !options.micDeny)
         default:
             return .refused(WireRefused(reason: "unsupported request"))
         }
-        await difundir()
         return respuesta
     }
 
@@ -238,7 +260,7 @@ actor StandIn {
     }
 
     /// Latest view to every conversation subscriber (a slow one is dropped, like the core).
-    private func difundir() async {
+    func difundir() async {
         let push = WireResponse.conversation(sim.vista)
         for (id, c) in conversacion {
             do { try await withDeadline(.seconds(2)) { try await c.send(WireCodec.encode(push)) } } catch {
@@ -256,7 +278,9 @@ actor StandIn {
 
     /// The scripted reply to a sent text: preparing, thinking, a tool, then the words.
     private func responder(a texto: String, push: Bool = false) {
-        Task {
+        let n = registrar()
+        tareas[n] = Task {
+            defer { olvidar(n) }
             try? await Task.sleep(for: .milliseconds(push ? 0 : 400))
             var abierto = ""
             await cambiar { abierto = $0.abrirTurno(source: push ? .push : .mine, mine: push ? "" : texto) }
@@ -283,9 +307,11 @@ actor StandIn {
                 if primero {
                     primero = false
                     await cambiar { $0.llegaAudio(id) }
-                    Task {
+                    let m = registrar()
+                    tareas[m] = Task {
+                        defer { olvidar(m) }
                         try? await Task.sleep(for: .seconds(2))
-                        await self.cambiar { $0.plazoVencido(id) }
+                        await cambiar { $0.plazoVencido(id) }
                     }
                 }
                 try? await Task.sleep(for: .milliseconds(70))
@@ -299,7 +325,9 @@ actor StandIn {
 
     /// A take: partials of a scripted phrase, then nothing (the agent cuts to review after 5 s).
     private func escuchar() {
-        Task {
+        let n = registrar()
+        tareas[n] = Task {
+            defer { olvidar(n) }
             let frase = "Enciende la luz del salón y bájala al sesenta por ciento"
             var dicho = ""
             for palabra in frase.split(separator: " ") {
@@ -331,6 +359,11 @@ actor StandIn {
     }
 }
 
+func enviar(_ c: FramedConnection, _ r: WireResponse) async throws {
+    let cuerpo = try WireCodec.encode(r)
+    try await withDeadline(.seconds(2)) { try await c.send(cuerpo) }
+}
+
 /// Connection numbers (a take belongs to the connection that opened it).
 actor Contador {
     private var n = 0
@@ -350,21 +383,27 @@ func serve(_ c: FramedConnection, _ agent: StandIn) async {
             // Like the real agent: `hello` first, or the connection is dropped.
             if case .hello = request { saludado = true } else if !saludado { return }
             let response: WireResponse
+            var conversacion = false
             switch request {
             case .subscribeConversation, .sendText, .captureStart, .captureEnd, .cancelTurn, .turnVisible,
                  .requestMicPermission:
                 response = await agent.conversar(request, conexion: id, suscrita: suscrita)
+                conversacion = true
             default:
                 response = await agent.answer(request)
             }
-            try await c.send(WireCodec.encode(response))
+            // Every write has a deadline: a client that stops reading is dropped, like the core.
+            try await enviar(c, response)
             if case .subscribe = request, case .subscribed = response {
                 await agent.subscribe(c)
-                try await c.send(WireCodec.encode(WireResponse.event(await agent.status)))
+                try await enviar(c, WireResponse.event(await agent.status))
             }
             if case .conversationSubscribed = response {
                 suscrita = true
-                try await c.send(WireCodec.encode(await agent.suscribirConversacion(id, c)))
+                try await enviar(c, await agent.suscribirConversacion(id, c))
+            } else if conversacion {
+                // Like the core: the changed view follows the answer.
+                await agent.difundir()
             }
         }
     } catch {
@@ -373,11 +412,15 @@ func serve(_ c: FramedConnection, _ agent: StandIn) async {
 }
 
 let options = Options(CommandLine.arguments)
+// Never the real agent's socket: the stand-in unlinks its path before listening.
+if options.socket == AgentSocket.defaultPath { fail("refusing the real agent's socket \(options.socket); use another --socket") }
 let agent = StandIn(options)
 let dir = (options.socket as NSString).deletingLastPathComponent
 do {
     try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true,
                                             attributes: [.posixPermissions: 0o700])
+    // The app only talks to a socket in a private directory (0700, ours).
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
 } catch { fail("cannot create \(dir): \(error)") }
 unlink(options.socket)
 

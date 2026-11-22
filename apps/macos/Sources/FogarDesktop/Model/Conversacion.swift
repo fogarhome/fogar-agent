@@ -16,6 +16,8 @@ enum EstadoMicro: Equatable {
     case pedirPermiso
     /// Denied or restricted in System Settings.
     case denegado
+    /// The agent does not know the permission (`unknown`): no take is offered.
+    case desconocido
 }
 
 /// The take as this app drives it. The agent's `activity` is the truth about the microphone; this
@@ -37,6 +39,8 @@ enum Toma: Equatable {
 final class Conversacion {
     /// A press held this long is «mantener» (release sends); shorter is a click.
     static let umbralMantener: TimeInterval = 0.3
+    /// `fogar_ports::ipc::SEND_TEXT_MAX_BYTES`.
+    static let textoMaxBytes = 8 * 1024
 
     let link: ConversationLink
     /// The text box.
@@ -45,6 +49,8 @@ final class Conversacion {
     /// One sentence about the last thing that went wrong (cleared by the next action).
     private(set) var aviso: String?
     private(set) var enviando = false
+    /// The system's microphone prompt may be open: no second request meanwhile.
+    private(set) var pidiendoPermiso = false
     /// Whether the conversation is on screen (section selected, window visible): only then is a
     /// push confirmed, so only then can it sound.
     var aLaVista = false {
@@ -52,12 +58,14 @@ final class Conversacion {
     }
     /// The draft last copied into the box, so the same draft is not copied twice.
     @ObservationIgnored private var ultimoBorrador: String?
-    /// Turn ids already confirmed (bounded: the view never holds more than 20 turns).
+    /// Turn ids the agent noted as visible (`turn_visible_noted`), bounded; and those in flight.
     @ObservationIgnored private var confirmados: [String] = []
-    /// The agent showed `recording` during this take (so a later `idle` means the take ended).
-    @ObservationIgnored private var vioGrabando = false
+    @ObservationIgnored private var confirmando: Set<String> = []
     /// Bumped when the draft lands in the box (the view focuses the field).
     private(set) var borradorNuevo = 0
+    /// Every task this model starts (forgotten when done), so none is left without an owner.
+    @ObservationIgnored private var tareas: [UInt64: Task<Void, Never>] = [:]
+    @ObservationIgnored private var siguienteTarea: UInt64 = 0
 
     init(link: ConversationLink) {
         self.link = link
@@ -69,15 +77,15 @@ final class Conversacion {
 
     // MARK: Derived state
 
-    /// Whether the agent's microphone is open for this take.
-    var grabando: Bool { vivo && vista?.activity == .recording }
-
     /// The conversation connection is up (otherwise the view on screen is the last one seen).
     var vivo: Bool { link.enlace == .viva }
 
+    /// The agent's microphone is open (its own word, never this app's guess).
+    var grabando: Bool { vivo && vista?.activity == .recording }
+
     /// A turn is open, a reply is awaited or audio plays: «Cancelar» makes sense.
     var cancelable: Bool {
-        guard link.enlace == .viva, let v = vista else { return false }
+        guard vivo, let v = vista else { return false }
         return Self.cancelable(v)
     }
 
@@ -100,7 +108,8 @@ final class Conversacion {
         switch v.mic {
         case .notDetermined: return .pedirPermiso
         case .denied, .restricted: return .denegado
-        case .granted, .unknown: break
+        case .unknown: return .desconocido
+        case .granted: break
         }
         return v.transcriber == .down ? .sinTranscriptor : .listo
     }
@@ -108,7 +117,7 @@ final class Conversacion {
     /// Text that may be sent now (trimmed, within the agent's limit, no take open).
     var puedeEnviar: Bool {
         let t = texto.trimmingCharacters(in: .whitespacesAndNewlines)
-        return !t.isEmpty && link.enlace == .viva && !grabando && toma == .ninguna && !enviando
+        return !t.isEmpty && vivo && !grabando && toma == .ninguna && !enviando
     }
 
     // MARK: The agent's view
@@ -123,24 +132,31 @@ final class Conversacion {
         } else if v.draft == nil {
             ultimoBorrador = nil
         }
-        // The agent ended the take on its own (silence, safety limit, connection): forget the hands.
-        if v.activity == .recording {
-            vioGrabando = true
-        } else if vioGrabando {
-            vioGrabando = false
-            if case .abierta = toma { toma = .ninguna }
-            if toma == .cerrando { toma = .ninguna }
+        // After `capture_started`, any view without `recording` means the take is over (cut by the
+        // agent, or ended): the agent pushes the newest view only, never an older one.
+        if v.activity != .recording {
+            switch toma {
+            case .abierta, .cerrando: toma = .ninguna
+            default: break
+            }
         }
         confirmar(v)
     }
 
     /// `turn_visible` for what is on screen: my turns always (I just wrote or spoke, and the menu
-    /// bar says «hablando»), a push only while the conversation is in view.
+    /// bar says «hablando»), a push only while the conversation is in view. A turn counts as
+    /// confirmed only once the agent noted it; a failed confirmation is retried on the next view.
     private func confirmar(_ v: WireConversation) {
-        for id in Self.porConfirmar(v, aLaVista: aLaVista, ya: Set(confirmados)) {
-            confirmados.append(id)
-            if confirmados.count > 64 { confirmados.removeFirst(confirmados.count - 64) }
-            Task { _ = try? await link.pedir(.turnVisible(WireTurnVisible(turn_id: id))) }
+        for id in Self.porConfirmar(v, aLaVista: aLaVista, ya: Set(confirmados).union(confirmando)) {
+            confirmando.insert(id)
+            lanzar { [weak self] in
+                guard let self else { return }
+                let r = try? await self.link.pedir(.turnVisible(WireTurnVisible(turn_id: id)))
+                self.confirmando.remove(id)
+                guard case .turnVisibleNoted? = r else { return }
+                self.confirmados.append(id)
+                if self.confirmados.count > 64 { self.confirmados.removeFirst(self.confirmados.count - 64) }
+            }
         }
     }
 
@@ -155,6 +171,14 @@ final class Conversacion {
             ids.append(id)
         }
         return ids
+    }
+
+    /// The conversation connection dropped: the agent ended any take with it (`discard`), and a
+    /// new subscription starts its confirmations from scratch.
+    private func perdido() {
+        toma = .ninguna
+        confirmados.removeAll()
+        confirmando.removeAll()
     }
 
     // MARK: Text
@@ -172,7 +196,7 @@ final class Conversacion {
                 // Only now: a refused text stays in the box to try again.
                 if texto.trimmingCharacters(in: .whitespacesAndNewlines) == t { texto = "" }
             case .textRefused(let r): aviso = Textos.rechazoTexto(r.reason)
-            case .refused: aviso = Textos.conversacionOcupada
+            case .refused(let r): aviso = Textos.rechazo(r.reason)
             default: aviso = Textos.fallo(CommandError.unexpected)
             }
         } catch {
@@ -180,15 +204,12 @@ final class Conversacion {
         }
     }
 
-    /// `fogar_ports::ipc::SEND_TEXT_MAX_BYTES`.
-    static let textoMaxBytes = 8 * 1024
-
     func cancelar() async {
         aviso = nil
         do {
             switch try await link.pedir(.cancelTurn) {
             case .turnCancelSent: break
-            case .refused: aviso = Textos.conversacionOcupada
+            case .refused(let r): aviso = Textos.rechazo(r.reason)
             default: aviso = Textos.fallo(CommandError.unexpected)
             }
         } catch {
@@ -199,13 +220,18 @@ final class Conversacion {
     // MARK: The take
 
     /// The pointer went down on the microphone button: the take opens at once (no speech lost);
-    /// the release decides whether it was a click or a hold.
+    /// the release decides whether it was a click or a hold. On an open clicked take, the button
+    /// stops it to review.
     func pulsar(ahora: Date = Date()) {
-        guard toma == .ninguna, !grabando else { return }
-        empezar(ahora: ahora)
+        switch toma {
+        case .ninguna where !grabando: empezar(ahora: ahora)
+        case .abierta(false, _, false): terminar(.review)
+        default: break
+        }
     }
 
-    /// The pointer came up. Held past the threshold: send. A click leaves the take open.
+    /// The pointer came up (or the gesture was cancelled). Held past the threshold: send. A click
+    /// leaves the take open.
     func soltar(ahora: Date = Date()) {
         switch toma {
         case .abriendo(let desde, true, let fin):
@@ -220,7 +246,8 @@ final class Conversacion {
         }
     }
 
-    /// Called while the pointer stays down: past the threshold the take shows «suelta para enviar».
+    /// Called while the pointer is still down: past the threshold the take shows «suelta para
+    /// enviar». Only a live press is promoted (the release clears `pulsado`).
     func comprobarMantener(ahora: Date = Date()) {
         if case .abierta(false, let desde, true) = toma, ahora.timeIntervalSince(desde) >= Self.umbralMantener {
             toma = .abierta(mantener: true, desde: desde, pulsado: true)
@@ -240,41 +267,54 @@ final class Conversacion {
     func enviarYa() { terminar(.send) }
     func descartar() { terminar(.discard) }
 
+    /// The conversation left the screen with a take open: never keep listening unseen, and never
+    /// send what nobody reviewed. The transcript goes to the box.
+    func vistaDesaparece() {
+        switch toma {
+        case .abriendo, .abierta: terminar(.review)
+        default: break
+        }
+    }
+
     private func empezar(ahora: Date, pulsado: Bool = true) {
         aviso = nil
         toma = .abriendo(desde: ahora, pulsado: pulsado, fin: nil)
-        Task {
+        lanzar { [weak self] in
+            guard let self else { return }
             do {
                 // GUESSED: the gesture only feeds the agent's metrics and is not known before the
                 // release (the take opens on press so no speech is lost): reported `toggle`.
-                switch try await link.pedir(.captureStart(WireCaptureStart(gesture: .toggle))) {
-                case .captureStarted:
-                    guard case .abriendo(let desde, let pulsado, let fin) = toma else {
-                        // The link dropped meanwhile: make sure nothing stays open.
-                        enviarFin(.discard)
-                        return
-                    }
-                    if let fin {
-                        toma = .cerrando
-                        enviarFin(fin)
-                    } else {
-                        toma = .abierta(mantener: false, desde: desde, pulsado: pulsado)
-                        comprobarMantener()
-                    }
-                case .captureRefused(let r):
-                    toma = .ninguna
-                    aviso = Textos.rechazoToma(r.reason)
-                case .refused:
-                    toma = .ninguna
-                    aviso = Textos.conversacionOcupada
-                default:
-                    toma = .ninguna
-                    aviso = Textos.fallo(CommandError.unexpected)
-                }
+                let r = try await self.link.pedir(.captureStart(WireCaptureStart(gesture: .toggle)))
+                self.alAbrir(r)
             } catch {
-                toma = .ninguna
-                aviso = Textos.fallo(error)
+                self.toma = .ninguna
+                self.aviso = Textos.fallo(error)
             }
+        }
+    }
+
+    /// The answer to `capture_start`.
+    private func alAbrir(_ r: WireResponse) {
+        switch r {
+        case .captureStarted:
+            // Not opening any more: the link dropped meanwhile (the agent discarded it with it).
+            guard case .abriendo(let desde, let pulsado, let fin) = toma else { return }
+            if let fin {
+                toma = .cerrando
+                enviarFin(fin)
+            } else {
+                toma = .abierta(mantener: false, desde: desde, pulsado: pulsado)
+                comprobarMantener()
+            }
+        case .captureRefused(let c):
+            toma = .ninguna
+            aviso = Textos.rechazoToma(c.reason)
+        case .refused(let c):
+            toma = .ninguna
+            aviso = Textos.rechazo(c.reason)
+        default:
+            toma = .ninguna
+            aviso = Textos.fallo(CommandError.unexpected)
         }
     }
 
@@ -293,32 +333,38 @@ final class Conversacion {
     }
 
     private func enviarFin(_ then: WireThen) {
-        Task {
+        lanzar { [weak self] in
+            guard let self else { return }
             do {
-                _ = try await link.pedir(.captureEnd(WireCaptureEnd(then: then)))
+                switch try await self.link.pedir(.captureEnd(WireCaptureEnd(then: then))) {
+                case .captureEnded: break
+                case .refused(let r): self.aviso = Textos.rechazo(r.reason)
+                default: self.aviso = Textos.fallo(CommandError.unexpected)
+                }
             } catch {
-                aviso = Textos.fallo(error)
+                // The connection dropped: the agent already discarded the take with it. Only say
+                // so when the person wanted to keep it.
+                if then != .discard { self.aviso = Textos.tomaPerdida }
             }
-            if toma == .cerrando { toma = .ninguna }
+            if self.toma == .cerrando { self.toma = .ninguna }
         }
-    }
-
-    /// The conversation connection dropped: the agent ended any take with it (`discard`).
-    private func perdido() {
-        toma = .ninguna
-        vioGrabando = false
     }
 
     // MARK: Permission
 
     func pedirPermiso() async {
+        guard !pidiendoPermiso else { return }
+        pidiendoPermiso = true
         aviso = nil
+        defer { pidiendoPermiso = false }
         do {
-            switch try await link.pedir(.requestMicPermission, plazo: .seconds(120)) {
+            // Its own connection: the system prompt can take as long as the person needs, and a
+            // Cancel on the conversation never waits behind it.
+            switch try await link.pedirAparte(.requestMicPermission, plazo: .seconds(120)) {
             case .micPermission(let p) where p.state == .denied || p.state == .restricted:
                 aviso = Textos.microDenegado
             case .micPermission: break
-            case .refused: aviso = Textos.conversacionOcupada
+            case .refused(let r): aviso = Textos.rechazo(r.reason)
             default: aviso = Textos.fallo(CommandError.unexpected)
             }
         } catch {
@@ -333,5 +379,15 @@ final class Conversacion {
         if let url = Self.ajustesMicro { NSWorkspace.shared.open(url) }
     }
 
-    func olvidarAviso() { aviso = nil }
+    // MARK: Tasks
+
+    /// Starts `op` as a task this model keeps until it is done.
+    private func lanzar(_ op: @escaping @MainActor () async -> Void) {
+        siguienteTarea += 1
+        let id = siguienteTarea
+        tareas[id] = Task { [weak self] in
+            await op()
+            self?.tareas[id] = nil
+        }
+    }
 }

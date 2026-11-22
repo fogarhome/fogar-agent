@@ -33,6 +33,14 @@ done
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
 rm -rf "$(dirname "$iconset")"
 
+# Nothing but the app's own binary in Contents/MacOS: anything else there would be signed and run
+# as part of the app (the agent joins it only through PR 6's packaging, which changes this check).
+extra=$(ls -A "$app/Contents/MacOS" | grep -vx FogarDesktop || true)
+if [ -n "$extra" ]; then
+  echo "error: unexpected files in Contents/MacOS: $extra" >&2
+  exit 1
+fi
+
 identity=${FOGAR_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Apple Development/ {print $2; exit}')}
 if [ -z "$identity" ]; then
   identity=-

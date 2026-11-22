@@ -54,7 +54,7 @@ struct MenuBarView: View {
                 case .live(let s) where s.phase == .notPaired:
                     Button { abrir(.emparejar) } label: { Text("Emparejar este Mac…") }
                         .buttonStyle(Pildora(pequena: true, ancho: true))
-                case .notRunning, .refused, .noLiveStatus, .unintelligible:
+                case .notRunning, .refused, .noLiveStatus, .unintelligible, .noVerificado:
                     Button { link.retryNow() } label: { Text("Volver a llamar al agente") }
                         .buttonStyle(Pildora(pequena: true, ancho: true))
                 default:

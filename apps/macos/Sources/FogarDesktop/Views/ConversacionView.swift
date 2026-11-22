@@ -41,6 +41,8 @@ struct ConversacionView: View {
         .onDisappear {
             aparecida = false
             conv.aLaVista = false
+            // Never keep listening out of sight: an open take goes to the box for review.
+            conv.vistaDesaparece()
         }
         .onChange(of: ventanaVisible) { _, v in conv.aLaVista = aparecida && v }
         .onChange(of: conv.borradorNuevo) { cajaEnfocada = true }
@@ -65,11 +67,13 @@ struct ConversacionView: View {
 
 // MARK: El hilo
 
-/// The turns, newest at the bottom, in a reading column. Follows new text unless the person
-/// scrolled up to read.
+/// The turns, newest at the bottom, in a reading column. Follows new text only while the person
+/// is at the bottom: scrolled up to read, it stays put. Tokens scroll without animation.
 private struct Hilo: View {
     let vista: WireConversation?
     @Environment(\.accessibilityReduceMotion) private var reduce
+    /// The bottom marker is on screen (a lazy stack reports it appearing and disappearing).
+    @State private var alFinal = true
 
     var body: some View {
         let turnos = vista?.turns ?? []
@@ -87,6 +91,8 @@ private struct Hilo: View {
                             .transition(reduce ? .opacity : .opacity.combined(with: .offset(y: 10)))
                     }
                     Color.clear.frame(height: 1).id("fin")
+                        .onAppear { alFinal = true }
+                        .onDisappear { alFinal = false }
                 }
                 .padding(.horizontal, 32)
                 .padding(.top, 28)
@@ -98,16 +104,21 @@ private struct Hilo: View {
             }
             .defaultScrollAnchor(.bottom)
             .scrollIndicators(.automatic)
-            .onChange(of: firma(turnos)) {
+            // A new turn: always to the bottom (I just wrote, or Fogar wrote), gently.
+            .onChange(of: turnos.count) {
                 withAnimation(reduce ? nil : .easeOut(duration: Medida.base)) { proxy.scrollTo("fin", anchor: .bottom) }
+            }
+            // New text in the last turn: follow it only from the bottom, without animating per token.
+            .onChange(of: firma(turnos)) {
+                if alFinal { proxy.scrollTo("fin", anchor: .bottom) }
             }
         }
     }
 
-    /// Changes whenever something new arrives at the bottom (a turn, a token, a progress step).
+    /// Changes whenever the last turn grows (a token, a progress step, its end).
     private func firma(_ t: [WireTurn]) -> String {
         guard let u = t.last else { return "" }
-        return "\(t.count).\(u.turn_id).\(u.reply.utf8.count).\(u.progress?.rawValue ?? "").\(u.outcome?.rawValue ?? "")"
+        return "\(u.turn_id).\(u.reply.utf8.count).\(u.progress?.rawValue ?? "").\(u.outcome?.rawValue ?? "")"
     }
 }
 
@@ -213,8 +224,10 @@ private struct TurnoVista: View {
 
 // MARK: La caja
 
-/// The text box and everything around it: the line about what went wrong, the box itself (or the
-/// take while recording), and the permission action when the microphone needs one.
+/// The text box and everything around it: the line about what went wrong, the box itself (the
+/// field, or the take while recording) and the permission action when the microphone needs one.
+/// The microphone button stays in the same place in every state, so a held press keeps its
+/// gesture from press to release.
 private struct Composicion: View {
     let listo: Bool
     var cajaEnfocada: FocusState<Bool>.Binding
@@ -234,18 +247,17 @@ private struct Composicion: View {
                 .transition(.opacity)
                 .accessibilityElement(children: .combine)
             }
-            Group {
-                if conv.grabando || conv.toma != .ninguna && conv.toma != .cerrando {
-                    TomaVista()
-                } else if conv.vista?.activity == .transcribing && conv.vivo {
-                    HStack(spacing: 10) {
-                        Giro().frame(width: 14, height: 14).foregroundStyle(Color.huesoSuave)
-                        Text("Transcribiendo…").font(Tipo.cuerpo).suave()
-                        Spacer(minLength: 0)
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .bottom, spacing: 8) {
+                    contenido
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    BotonMicro(estado: micro)
+                    if !enToma {
+                        BotonDerecho()
                     }
-                    .frame(minHeight: 34)
-                } else {
-                    Escribir(micro: micro, cajaEnfocada: cajaEnfocada)
+                }
+                if enToma, !mantener {
+                    SalidasDeLaToma(abierta: conv.grabando)
                 }
             }
             .padding(12)
@@ -259,7 +271,8 @@ private struct Composicion: View {
                 HStack(spacing: 10) {
                     if micro == .pedirPermiso {
                         Button { Task { await conv.pedirPermiso() } } label: { Text("Permitir el micrófono") }
-                            .buttonStyle(Pildora(pequena: true))
+                            .buttonStyle(Pildora(pequena: true, ocupado: conv.pidiendoPermiso))
+                            .disabled(conv.pidiendoPermiso)
                     } else {
                         Button { conv.abrirAjustesMicro() } label: { Text("Abrir Ajustes del Sistema") }
                             .buttonStyle(Pildora(pequena: true))
@@ -267,7 +280,7 @@ private struct Composicion: View {
                     Text(Textos.micro(micro)).meta().fixedSize(horizontal: false, vertical: true)
                 }
                 .padding(.horizontal, 4)
-            } else if micro == .sinTranscriptor {
+            } else if micro == .sinTranscriptor || micro == .desconocido {
                 Text(Textos.micro(micro)).meta().padding(.horizontal, 6)
             }
         }
@@ -276,40 +289,66 @@ private struct Composicion: View {
         .animation(reduce ? nil : .easeOut(duration: Medida.base), value: lineaArriba?.texto)
     }
 
+    /// The person's hands are in a take (opening, open or closing) or the agent records.
+    private var enToma: Bool { conv.grabando || conv.toma != .ninguna }
+
+    private var mantener: Bool {
+        if case .abierta(true, _, _) = conv.toma { true } else { false }
+    }
+
+    @ViewBuilder private var contenido: some View {
+        if enToma {
+            TomaVista(mantener: mantener)
+        } else if conv.vista?.activity == .transcribing && conv.vivo {
+            HStack(spacing: 10) {
+                Giro().frame(width: 14, height: 14).foregroundStyle(Color.huesoSuave)
+                Text("Transcribiendo…").font(Tipo.cuerpo).suave()
+            }
+            .frame(minHeight: 34)
+        } else {
+            CampoTexto(cajaEnfocada: cajaEnfocada)
+        }
+    }
+
     private struct Linea { let tono: Tono; let texto: String }
 
     /// One line at most: the model's own feedback first, then the agent's notice, then the link.
     private var lineaArriba: Linea? {
         if let a = conv.aviso { return Linea(tono: .bad, texto: a) }
         if conv.vivo, let n = conv.vista?.notice { return Linea(tono: .warn, texto: Textos.aviso(n)) }
-        let listo = self.listo
         if let e = Textos.enlace(conv.link.enlace, listo: listo) { return Linea(tono: .off, texto: e) }
         return nil
     }
 }
 
-/// The text box: the field, the microphone, and send (or cancel while Fogar answers).
-private struct Escribir: View {
-    let micro: EstadoMicro
+/// The text field: Return sends, Option-Return adds a line.
+private struct CampoTexto: View {
     var cajaEnfocada: FocusState<Bool>.Binding
     @Environment(Conversacion.self) private var conv
 
     var body: some View {
         @Bindable var conv = conv
-        HStack(alignment: .bottom, spacing: 8) {
-            TextField("Escribe a Fogar…", text: $conv.texto, axis: .vertical)
-                .textFieldStyle(.plain)
-                .font(Tipo.texto(16))
-                .foregroundStyle(Color.hueso)
-                .lineLimit(1...8)
-                .lineSpacing(3)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 7)
-                .focused(cajaEnfocada)
-                .onSubmit { Task { await conv.enviar() } }
-                .accessibilityLabel("Mensaje para Fogar")
-                .accessibilityHint("Intro envía. Opción e Intro añade una línea.")
-            BotonMicro(estado: micro)
+        TextField("Escribe a Fogar…", text: $conv.texto, axis: .vertical)
+            .textFieldStyle(.plain)
+            .font(Tipo.texto(16))
+            .foregroundStyle(Color.hueso)
+            .lineLimit(1...8)
+            .lineSpacing(3)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 7)
+            .focused(cajaEnfocada)
+            .onSubmit { Task { await conv.enviar() } }
+            .accessibilityLabel("Mensaje para Fogar")
+            .accessibilityHint("Intro envía. Opción e Intro añade una línea.")
+    }
+}
+
+/// Send, or cancel while Fogar answers.
+private struct BotonDerecho: View {
+    @Environment(Conversacion.self) private var conv
+
+    var body: some View {
+        Group {
             if conv.cancelable {
                 BotonRedondo(icono: "stop.fill", etiqueta: "Cancelar", principal: true) {
                     Task { await conv.cancelar() }
@@ -330,89 +369,109 @@ private struct Escribir: View {
     }
 }
 
-/// The take: a very visible «Grabando», what Fogar understands so far, and the three ways out
-/// (or «suelta para enviar» while the button is held).
+/// The take: «Grabando» only once the agent says the microphone is open (before that, «Abriendo
+/// el micrófono…»), and what Fogar understands so far.
 private struct TomaVista: View {
+    let mantener: Bool
     @Environment(Conversacion.self) private var conv
 
     var body: some View {
-        let mantener = if case .abierta(true, _, _) = conv.toma { true } else { false }
-        let parcial = conv.vista?.live ?? ""
-        VStack(alignment: .leading, spacing: 12) {
+        let grabando = conv.grabando
+        let parcial = grabando ? conv.vista?.live ?? "" : ""
+        VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
-                Brasa(tam: 10)
-                Text("Grabando").font(Tipo.texto(14, peso: 600)).foregroundStyle(Color.hueso)
+                if grabando {
+                    Brasa(tam: 10)
+                    Text("Grabando").font(Tipo.texto(14, peso: 600)).foregroundStyle(Color.hueso)
+                } else {
+                    Giro().frame(width: 12, height: 12).foregroundStyle(Color.huesoSuave)
+                    Text("Abriendo el micrófono…").font(Tipo.texto(14, peso: 550)).suave()
+                }
                 Spacer(minLength: 0)
                 if mantener {
                     Text("Suelta para enviar").meta()
                 }
             }
             .accessibilityElement(children: .combine)
-            .accessibilityLabel(mantener ? "Grabando. Suelta para enviar." : "Grabando")
-            Text(parcial.isEmpty ? "Te escucho…" : parcial)
-                .font(Tipo.texto(16))
-                .foregroundStyle(parcial.isEmpty ? Color.huesoTenue : Color.hueso)
-                .lineSpacing(3)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentTransition(.opacity)
-                .animation(.easeOut(duration: Medida.rapido), value: parcial)
-                .accessibilityAddTraits(.updatesFrequently)
-            if !mantener {
-                HStack(spacing: 8) {
-                    Button { conv.descartar() } label: { Text("Descartar") }
-                        .buttonStyle(Pildora(pequena: true))
-                        .keyboardShortcut(.cancelAction)
-                        .help("Descartar (Esc)")
-                    Spacer(minLength: 0)
-                    Button { conv.parar() } label: { Text("Parar y revisar") }
-                        .buttonStyle(Pildora(pequena: true))
-                    Button { conv.enviarYa() } label: { Text("Enviar ya") }
-                        .buttonStyle(Pildora(variante: .principal, pequena: true))
-                        .keyboardShortcut(.defaultAction)
-                        .help("Enviar sin revisar (Intro)")
-                }
+            .accessibilityLabel(grabando ? (mantener ? "Grabando. Suelta para enviar." : "Grabando") : "Abriendo el micrófono")
+            if grabando {
+                Text(parcial.isEmpty ? "Te escucho…" : parcial)
+                    .font(Tipo.texto(16))
+                    .foregroundStyle(parcial.isEmpty ? Color.huesoTenue : Color.hueso)
+                    .lineSpacing(3)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentTransition(.opacity)
+                    .animation(.easeOut(duration: Medida.rapido), value: parcial)
+                    .accessibilityAddTraits(.updatesFrequently)
             }
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
+    }
+}
+
+/// The three ways out of a clicked take. Esc discards and Return sends, also while the take is
+/// still opening (it ends as soon as the agent opens it).
+private struct SalidasDeLaToma: View {
+    let abierta: Bool
+    @Environment(Conversacion.self) private var conv
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button { conv.descartar() } label: { Text("Descartar") }
+                .buttonStyle(Pildora(pequena: true))
+                .keyboardShortcut(.cancelAction)
+                .help("Descartar (Esc)")
+            Spacer(minLength: 0)
+            Button { conv.parar() } label: { Text("Parar y revisar") }
+                .buttonStyle(Pildora(pequena: true))
+                .disabled(!abierta)
+            Button { conv.enviarYa() } label: { Text("Enviar ya") }
+                .buttonStyle(Pildora(variante: .principal, pequena: true))
+                .keyboardShortcut(.defaultAction)
+                .help("Enviar sin revisar (Intro)")
+                .disabled(!abierta)
         }
     }
 }
 
 /// The microphone: press to record. A short click leaves the take open (review or send); held
-/// past 300 ms, releasing sends. Space or VoiceOver's action start a clicked take.
+/// past 300 ms, releasing sends. A cancelled gesture counts as a release. Clicking it again on an
+/// open clicked take stops it to review. Space or VoiceOver's action start a clicked take.
 private struct BotonMicro: View {
     let estado: EstadoMicro
     @Environment(Conversacion.self) private var conv
-    @State private var pulsado = false
+    /// Reset by SwiftUI when the gesture ends OR is cancelled: the release always arrives.
+    @GestureState private var pulsando = false
     @State private var hover = false
     @FocusState private var enfocado: Bool
 
     var body: some View {
         let usable = estado == .listo || estado == .pedirPermiso || estado == .denegado
-        Image(systemName: estado == .listo || estado == .pedirPermiso ? "mic" : "mic.slash")
+        let activo = conv.grabando
+        Image(systemName: activo ? "mic.fill" : estado == .listo || estado == .pedirPermiso ? "mic" : "mic.slash")
             .font(.system(size: 15, weight: .medium))
-            .foregroundStyle(Color.hueso)
+            .foregroundStyle(activo ? Color.llama : Color.hueso)
             .frame(width: 34, height: 34)
-            .background(Circle().fill(pulsado ? Color.veloAlto : hover && usable ? Color.velo : .clear))
+            .background(Circle().fill(pulsando ? Color.veloAlto : (hover && usable) || activo ? Color.velo : .clear))
             .overlay { Circle().strokeBorder(Color.hueso, lineWidth: 2).padding(-3).opacity(enfocado ? 1 : 0) }
             .contentShape(Circle())
-            .opacity(usable ? 1 : 0.42)
-            .scaleEffect(pulsado ? 0.94 : 1)
-            .animation(.timingCurve(0.23, 1, 0.32, 1, duration: Medida.pulsar), value: pulsado)
+            .opacity(usable || activo ? 1 : 0.42)
+            .scaleEffect(pulsando ? 0.94 : 1)
+            .animation(.timingCurve(0.23, 1, 0.32, 1, duration: Medida.pulsar), value: pulsando)
             .onHover { hover = $0 }
             .gesture(
                 DragGesture(minimumDistance: 0)
-                    .onChanged { _ in
-                        guard !pulsado, usable else { return }
-                        pulsado = true
-                        presionar()
-                    }
-                    .onEnded { _ in
-                        guard pulsado else { return }
-                        pulsado = false
-                        // Always: the state may have changed while held, and a take must never
-                        // stay waiting for a release that already happened (no-op without one).
-                        conv.soltar()
-                    }
+                    .updating($pulsando) { _, estadoGesto, _ in estadoGesto = true }
             )
+            .onChange(of: pulsando) { _, ahora in
+                if ahora {
+                    if usable { presionar() }
+                } else {
+                    // Ended or cancelled: always reaches the take (a no-op without one).
+                    conv.soltar()
+                }
+            }
             .focusable(usable)
             .focused($enfocado)
             .focusEffectDisabled()
@@ -420,7 +479,7 @@ private struct BotonMicro: View {
             .help(Textos.micro(estado))
             .accessibilityElement()
             .accessibilityAddTraits(.isButton)
-            .accessibilityLabel(estado == .pedirPermiso ? "Permitir el micrófono" : "Micrófono")
+            .accessibilityLabel(estado == .pedirPermiso ? "Permitir el micrófono" : activo ? "Parar de grabar" : "Micrófono")
             .accessibilityHint(Textos.micro(estado))
             .accessibilityAction { accion() }
     }
@@ -431,7 +490,8 @@ private struct BotonMicro: View {
             conv.pulsar()
             Task {
                 try? await Task.sleep(for: .milliseconds(Int(Conversacion.umbralMantener * 1000) + 20))
-                if pulsado { conv.comprobarMantener() }
+                // Only a press still held is promoted (the model also checks its own `pulsado`).
+                if pulsando { conv.comprobarMantener() }
             }
         case .pedirPermiso: Task { await conv.pedirPermiso() }
         case .denegado: conv.abrirAjustesMicro()
