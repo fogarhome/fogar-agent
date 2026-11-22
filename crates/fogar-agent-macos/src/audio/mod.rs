@@ -105,6 +105,7 @@ impl AudioSink for MacAudioSink {
     fn capabilities(&self) -> AudioSinkCaps {
         let mut c = AudioSinkCaps::NONE;
         c.playback = Support::Native;
+        c.health = Support::Native;
         c
     }
 

@@ -481,7 +481,46 @@ pub mod audio_source {
 }
 
 pub mod audio_sink {
-    use fogar_ports::audio::{AudioError, AudioFormat, AudioSink};
+    use fogar_ports::audio::{ActivePlayback, AudioError, AudioFormat, AudioSink};
+
+    /// Issue #25: a fresh playback is alive; without `health` support `is_alive` is the default
+    /// `true`. Cheap: the core may call it before every `write`.
+    pub fn fresh_playback_is_alive(s: &dyn AudioSink) {
+        match s.open(AudioFormat::mono(24_000)) {
+            Err(AudioError::Unsupported(_)) => {
+                assert!(!s.capabilities().playback.is_available());
+                assert!(
+                    !s.capabilities().health.is_available(),
+                    "health without playback"
+                );
+            }
+            Err(e) => panic!("open failed: {e}"),
+            Ok(pb) => {
+                assert!(pb.is_alive(), "a fresh playback must be alive");
+                for _ in 0..1000 {
+                    assert!(pb.is_alive());
+                }
+            }
+        }
+    }
+
+    /// Issue #25: a playback that reports `!is_alive()` accepts nothing, queues nothing, and
+    /// stays dead (no recovery by itself). Precondition: `pb` is dead. Adapters call it from
+    /// a test that can break the output; the fake runs it after `FakeSpeaker::kill`.
+    /// OBLIGATION: an adapter that reports `AudioSinkCaps::health = Native` MUST have a test that
+    /// kills a real playback and calls this clause (the macro cannot break a device for it).
+    pub fn dead_playback_is_inert(pb: &mut dyn ActivePlayback) {
+        assert!(!pb.is_alive(), "precondition: a dead playback");
+        assert_eq!(
+            pb.write(&[0i16; 4800]),
+            0,
+            "a dead playback accepts nothing"
+        );
+        assert_eq!(pb.queued_samples(), 0, "a dead playback queues nothing");
+        pb.stop();
+        assert!(!pb.is_alive(), "a dead playback does not recover by itself");
+        assert_eq!(pb.write(&[0i16; 480]), 0);
+    }
 
     /// `write` never blocks and never accepts more than offered; `stop` empties the queue.
     pub fn write_is_bounded_and_stop_flushes(s: &dyn AudioSink) {
@@ -521,6 +560,10 @@ pub mod audio_sink {
                 #[test]
                 fn write_is_bounded_and_stop_flushes() {
                     c::write_is_bounded_and_stop_flushes(&$make)
+                }
+                #[test]
+                fn fresh_playback_is_alive() {
+                    c::fresh_playback_is_alive(&$make)
                 }
             }
         };

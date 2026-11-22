@@ -9,13 +9,30 @@
 //!   the sink, so no polling and no timers are needed for playback.
 //! - Sync, dyn-compatible traits: they are opened once per capture/turn, not per sample.
 //! - `drop(ActiveCapture)` stops capture; `drop(ActivePlayback)` closes the output device.
+//! - **Blocking budget (issue #24).** `open` (both ports) and dropping the handle it returns are
+//!   synchronous calls into the OS audio stack and MAY BLOCK the calling thread: `open` for up
+//!   to [`OPEN_BLOCK_MAX`], a drop for up to [`DROP_BLOCK_MAX`]. They are bounded (an adapter
+//!   never blocks longer: it gives up with an error, or abandons the stuck OS call on its own
+//!   thread), but far longer than an async worker may stall. The core MUST NOT call `open` or
+//!   drop an `ActiveCapture`/`ActivePlayback` on an async runtime thread (fogar-agentd runs a
+//!   `current_thread` runtime: WS, heartbeat and signals would freeze): it does both off the
+//!   runtime (`spawn_blocking` behind a bound, or a dedicated thread, with the handle moved in),
+//!   and backs off between failed reopen attempts. Every other method of these traits is cheap
+//!   and non-blocking.
 //!
 //! How Windows/Linux would do this: cpal over WASAPI / ALSA-PipeWire behind the same adapter
 //! shape (OS thread + ring + chunker); permission is a no-op `Granted` on Linux and the
 //! privacy toggle on Windows. No port change expected.
 
 use crate::{Support, events::EventStream};
-use std::{fmt, num::NonZeroUsize};
+use std::{fmt, num::NonZeroUsize, time::Duration};
+
+/// Upper bound an adapter may block in `AudioSource::open` / `AudioSink::open` (issue #24; the
+/// macOS adapter's stream-start deadline). Call `open` off the async runtime.
+pub const OPEN_BLOCK_MAX: Duration = Duration::from_secs(5);
+/// Upper bound an adapter may block when an `ActiveCapture` / `ActivePlayback` is dropped
+/// (issue #24; the macOS adapter's device-thread join deadline). Drop handles off the runtime.
+pub const DROP_BLOCK_MAX: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AudioFormat {
@@ -96,7 +113,8 @@ impl AudioSourceCaps {
     };
 }
 
-/// A running capture. Dropping it stops the device and closes the chunk stream.
+/// A running capture. Dropping it stops the device and closes the chunk stream. The drop may
+/// block for up to [`DROP_BLOCK_MAX`]: never drop it on an async runtime thread.
 pub trait ActiveCapture: Send + fmt::Debug {
     /// Format of the chunks delivered on the stream (mono). Stable for the capture's lifetime.
     fn format(&self) -> AudioFormat;
@@ -107,7 +125,8 @@ pub trait AudioSource: Send + Sync + 'static {
     fn capabilities(&self) -> AudioSourceCaps;
     /// Never prompts. `Unknown` when the platform has no permission model.
     fn mic_permission(&self) -> MicPermission;
-    /// Starts capture. Chunks arrive on the returned bounded stream (`capacity` chunks). When the
+    /// Starts capture. May block for up to [`OPEN_BLOCK_MAX`]: call it off the async runtime
+    /// (module docs). Chunks arrive on the returned bounded stream (`capacity` chunks). When the
     /// core lags, the adapter drops the newest chunk and counts it (`EventStream::dropped`).
     /// Errors: `Unsupported` if `capture` is Unsupported, `NoDevice`, ... and `PermissionDenied`
     /// whenever `mic_permission()` is `Denied`, `Restricted` or `NotDetermined`, WITHOUT touching
@@ -139,15 +158,20 @@ const _: Option<&dyn ActiveCapture> = None;
 #[non_exhaustive]
 pub struct AudioSinkCaps {
     pub playback: Support,
+    /// `ActivePlayback::is_alive` reports the output's real health (issue #25). When
+    /// Unsupported, `is_alive` is the default `true` and the core cannot detect a dead output.
+    pub health: Support,
 }
 
 impl AudioSinkCaps {
     pub const NONE: Self = Self {
         playback: Support::Unsupported,
+        health: Support::Unsupported,
     };
 }
 
-/// An open output stream. Dropping it closes the device (release it when idle: energy).
+/// An open output stream. Dropping it closes the device (release it when idle: energy). The
+/// drop may block for up to [`DROP_BLOCK_MAX`]: never drop it on an async runtime thread.
 pub trait ActivePlayback: Send + fmt::Debug {
     fn format(&self) -> AudioFormat;
     /// Non-blocking. Queues as many samples as fit into the adapter's bounded buffer and returns
@@ -157,11 +181,22 @@ pub trait ActivePlayback: Send + fmt::Debug {
     fn stop(&mut self);
     /// Samples queued but not yet played (used to decide when to close an idle device).
     fn queued_samples(&self) -> usize;
+    /// Health (issue #25). `false` once this output will never play again (fatal device error,
+    /// device gone, callbacks stopped): a dead playback accepts nothing (`write` returns 0) and
+    /// reports nothing queued, and it does NOT recover by itself. The core then drops it (off
+    /// the runtime) and opens a new one with backoff. Once `false` it stays `false` for this
+    /// handle. Cheap and non-blocking: the core may call it before every `write`.
+    /// Default `true`, matching `AudioSinkCaps::health` = Unsupported.
+    fn is_alive(&self) -> bool {
+        true
+    }
 }
 
 pub trait AudioSink: Send + Sync + 'static {
     fn capabilities(&self) -> AudioSinkCaps;
     /// Opens the output at `format` (slice 0 always asks for 24 kHz mono, the TTS format).
+    /// May block for up to [`OPEN_BLOCK_MAX`]: call it off the async runtime (module docs). A
+    /// fresh playback is alive (`is_alive()`).
     fn open(&self, format: AudioFormat) -> Result<Box<dyn ActivePlayback>, AudioError>;
 }
 
