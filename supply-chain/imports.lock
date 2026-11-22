@@ -1,6 +1,26 @@
 
 # cargo-vet imports lock
 
+[[publisher.bumpalo]]
+version = "3.20.3"
+when = "2026-05-22"
+user-id = 696
+user-login = "fitzgen"
+user-name = "Nick Fitzgerald"
+
+[[audits.bytecode-alliance.wildcard-audits.bumpalo]]
+who = "Nick Fitzgerald <fitzgen@gmail.com>"
+criteria = "safe-to-deploy"
+user-id = 696 # Nick Fitzgerald (fitzgen)
+start = "2019-03-16"
+end = "2026-08-21"
+
+[[audits.bytecode-alliance.audits.bumpalo]]
+who = "Nick Fitzgerald <fitzgen@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "3.20.3 -> 3.20.4"
+notes = "I am the author of this crate"
+
 [[audits.bytecode-alliance.audits.futures-core]]
 who = "Pat Hickey <phickey@fastly.com>"
 criteria = "safe-to-deploy"
@@ -66,6 +86,26 @@ criteria = "safe-to-deploy"
 delta = "0.50.1 -> 0.50.3"
 notes = "CI changes, Rust changes, nothing out of the ordinary."
 
+[[audits.bytecode-alliance.audits.pkg-config]]
+who = "Pat Hickey <phickey@fastly.com>"
+criteria = "safe-to-deploy"
+version = "0.3.25"
+notes = "This crate shells out to the pkg-config executable, but it appears to sanitize inputs reasonably."
+
+[[audits.bytecode-alliance.audits.pkg-config]]
+who = "Alex Crichton <alex@alexcrichton.com>"
+criteria = "safe-to-deploy"
+delta = "0.3.26 -> 0.3.29"
+notes = """
+No `unsafe` additions or anything outside of the purview of the crate in this
+change.
+"""
+
+[[audits.bytecode-alliance.audits.pkg-config]]
+who = "Chris Fallin <chris@cfallin.org>"
+criteria = "safe-to-deploy"
+delta = "0.3.29 -> 0.3.32"
+
 [[audits.bytecode-alliance.audits.rand]]
 who = "Alex Crichton <alex@alexcrichton.com>"
 criteria = "safe-to-deploy"
@@ -130,6 +170,24 @@ crate to use in practice but it's suitable for testing dependencies.
 who = "Pat Hickey <p.hickey@f5.com>"
 criteria = "safe-to-deploy"
 delta = "1.8.1 -> 1.8.2"
+
+[[audits.embark-studios.audits.ndk-context]]
+who = "Johan Andersson <opensource@embark-studios.com>"
+criteria = "safe-to-deploy"
+version = "0.1.1"
+notes = "Tiny crate that initializes Android with FFI, looks sane. No other ambient capabilities"
+
+[[audits.embark-studios.audits.thiserror]]
+who = "Johan Andersson <opensource@embark-studios.com>"
+criteria = "safe-to-deploy"
+version = "1.0.40"
+notes = "Wrapper over implementation crate, found no unsafe or ambient capabilities used"
+
+[[audits.embark-studios.audits.thiserror-impl]]
+who = "Johan Andersson <opensource@embark-studios.com>"
+criteria = "safe-to-deploy"
+version = "1.0.40"
+notes = "Found no unsafe or ambient capabilities used"
 
 [[audits.embark-studios.audits.valuable]]
 who = "Johan Andersson <opensource@embark-studios.com>"
@@ -265,10 +323,27 @@ who = "David Cook <dcook@divviup.org>"
 criteria = "safe-to-deploy"
 delta = "2.5.0 -> 2.6.1"
 
+[[audits.isrg.audits.thiserror]]
+who = "Brandon Pitman <bran@bran.land>"
+criteria = "safe-to-deploy"
+delta = "1.0.40 -> 1.0.43"
+
+[[audits.isrg.audits.thiserror-impl]]
+who = "Brandon Pitman <bran@bran.land>"
+criteria = "safe-to-deploy"
+delta = "1.0.40 -> 1.0.43"
+
 [[audits.isrg.audits.untrusted]]
 who = "David Cook <dcook@divviup.org>"
 criteria = "safe-to-deploy"
 version = "0.7.1"
+
+[[audits.mozilla.audits.block2]]
+who = "Andy Leiserson <aleiserson@mozilla.com>"
+criteria = "safe-to-deploy"
+version = "0.6.2"
+notes = "Contains unsafe code to interoperate with the ObjC runtime."
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
 
 [[audits.mozilla.audits.chacha20]]
 who = "Alex Franchuk <afranchuk@mozilla.com>"
@@ -307,6 +382,95 @@ aggregated-from = "https://raw.githubusercontent.com/mozilla/cargo-vet/main/supp
 who = "Mike Hommey <mh+mozilla@glandium.org>"
 criteria = "safe-to-deploy"
 delta = "0.3.27 -> 0.3.28"
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.num-derive]]
+who = "Josh Stone <jistone@redhat.com>"
+criteria = "safe-to-deploy"
+version = "0.3.3"
+notes = "All code written or reviewed by Josh Stone."
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.num-derive]]
+who = "Mike Hommey <mh+mozilla@glandium.org>"
+criteria = "safe-to-deploy"
+delta = "0.3.3 -> 0.4.0"
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.num-derive]]
+who = "Mike Hommey <mh+mozilla@glandium.org>"
+criteria = "safe-to-deploy"
+delta = "0.4.0 -> 0.4.2"
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.objc2]]
+who = "Andy Leiserson <aleiserson@mozilla.com>"
+criteria = "safe-to-deploy"
+version = "0.6.3"
+notes = """
+Contains substantial unsafe code, as is typical for FFI.
+
+The (non-published) `header-translator` crate that produces generated bindings
+appearing in other `objc2-*` crates was also reviewed, in lieu of a full review
+of the generated bindings.
+"""
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.objc2]]
+who = "Erich Gubler <erichdongubler@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "0.6.3 -> 0.6.5"
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.objc2-core-foundation]]
+who = "Andy Leiserson <aleiserson@mozilla.com>"
+criteria = "safe-to-deploy"
+version = "0.3.2"
+notes = """
+Contains substantial unsafe code, as is typical for FFI.
+
+The (non-published) `header-translator` crate that produces generated bindings
+in this crate was also reviewed, in lieu of a full review of the generated
+bindings.
+
+Users of this crate should be aware of the information in
+https://github.com/madsmtm/objc2/blob/main/crates/objc2/src/topics/frameworks_soundness.md.
+"""
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.objc2-encode]]
+who = "Andy Leiserson <aleiserson@mozilla.com>"
+criteria = "safe-to-deploy"
+version = "4.1.0"
+notes = "Support library for objc2 with no unsafe code"
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.objc2-foundation]]
+who = "Andy Leiserson <aleiserson@mozilla.com>"
+criteria = "safe-to-deploy"
+version = "0.3.2"
+notes = """
+Contains substantial unsafe code, as is typical for FFI.
+
+The (non-published) `header-translator` crate that produces generated bindings
+in this crate was also reviewed, in lieu of a full review of the generated
+bindings.
+
+Users of this crate should be aware of the information in
+https://github.com/madsmtm/objc2/blob/main/crates/objc2/src/topics/frameworks_soundness.md.
+"""
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.pkg-config]]
+who = "Mike Hommey <mh+mozilla@glandium.org>"
+criteria = "safe-to-deploy"
+delta = "0.3.25 -> 0.3.26"
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.pkg-config]]
+who = "Max Inden <mail@max-inden.de>"
+criteria = "safe-to-deploy"
+delta = "0.3.32 -> 0.3.34"
 aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
 
 [[audits.mozilla.audits.quote]]
@@ -396,6 +560,18 @@ criteria = "safe-to-deploy"
 version = "2.5.0"
 notes = "The goal is to provide some constant-time correctness for cryptographic implementations. The approach is reasonable, it is known to be insufficient but this is pointed out in the documentation."
 aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.thiserror]]
+who = "Jan-Erik Rediger <jrediger@mozilla.com>"
+criteria = "safe-to-deploy"
+delta = "1.0.43 -> 1.0.69"
+aggregated-from = "https://raw.githubusercontent.com/mozilla/glean/main/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.thiserror-impl]]
+who = "Jan-Erik Rediger <jrediger@mozilla.com>"
+criteria = "safe-to-deploy"
+delta = "1.0.43 -> 1.0.69"
+aggregated-from = "https://raw.githubusercontent.com/mozilla/glean/main/supply-chain/audits.toml"
 
 [[audits.mozilla.audits.tracing-core]]
 who = "Alex Franchuk <afranchuk@mozilla.com>"

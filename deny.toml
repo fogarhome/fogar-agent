@@ -44,8 +44,8 @@ wildcards = "deny"
 allow-wildcard-paths = true
 deny = [
   # Apple bindings only through the macOS adapter crate (and the binding crates' own families).
-  { crate = "objc2", wrappers = ["fogar-agent-macos", "objc2-foundation", "objc2-core-foundation", "objc2-io-kit", "objc2-security", "block2", "dispatch2"], reason = "macOS APIs only via fogar-agent-macos" },
-  { crate = "windows", wrappers = ["fogar-agent-windows"], reason = "Win32 only via fogar-agent-windows (S8)" },
+  { crate = "objc2", wrappers = ["fogar-agent-macos", "objc2-foundation", "objc2-core-foundation", "objc2-io-kit", "objc2-security", "block2", "dispatch2", "cpal", "objc2-core-audio", "objc2-core-audio-types", "objc2-audio-toolbox", "objc2-avf-audio", "coreaudio-rs"], reason = "macOS APIs only via fogar-agent-macos (S2 audio goes through cpal and the objc2 CoreAudio bindings)" },
+  { crate = "windows", wrappers = ["fogar-agent-windows", "cpal"], reason = "Win32 only via fogar-agent-windows (S8); cpal's WASAPI backend is never built (cpal is only in fogar-agent-macos's macOS target table), it shows up because deny merges every [graph] target" },
   { crate = "openssl", reason = "TLS is rustls (S1)" },
   { crate = "openssl-sys", reason = "TLS is rustls (S1)" },
   { crate = "native-tls", reason = "TLS is rustls (S1)" },
