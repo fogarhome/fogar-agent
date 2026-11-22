@@ -41,9 +41,15 @@ use fogar_ports::{
     events::EventStream,
     ipc::{CaptureGesture, CaptureRefusal, CaptureThen, Notice, ServiceState},
 };
-use std::{sync::Arc, time::Duration};
-use tokio::{sync::oneshot, task::JoinSet};
+use std::{convert::Infallible, sync::Arc, time::Duration};
+use tokio::{
+    sync::oneshot,
+    task::{AbortHandle, JoinSet},
+};
 
+/// **Issue #31.** Running the device calls on tokio's blocking pool is a temporary exception
+/// (review M2, see [`spawn_device_job`]) until the audio port is async in the adapter.
+///
 /// Core-side bound on one open (the adapter's own bound plus slack): past it the take is
 /// refused and the open's late result, if any, is released.
 pub(crate) const OPEN_DEADLINE: Duration =
@@ -99,16 +105,7 @@ pub(crate) fn decide(_start: &Start, c: Conditions) -> Result<(), CaptureRefusal
     if !c.capture.is_available() || c.backing_off {
         return Err(CaptureRefusal::NoMicrophone);
     }
-    match c.permission {
-        MicPermission::Granted => {}
-        // No permission model at all (Linux): opening cannot make an OS prompt appear.
-        MicPermission::Unknown if !c.permission_query.is_available() => {}
-        // Unknown on a platform that has a model fails closed, like NotDetermined.
-        MicPermission::NotDetermined | MicPermission::Unknown => {
-            return Err(CaptureRefusal::PermissionNotDetermined);
-        }
-        _ => return Err(CaptureRefusal::PermissionDenied),
-    }
+    permission_allows(c.permission_query, c.permission)?;
     if !c.ready.link_ready {
         return Err(CaptureRefusal::NotReady);
     }
@@ -122,6 +119,32 @@ pub(crate) fn decide(_start: &Start, c: Conditions) -> Result<(), CaptureRefusal
         return Err(CaptureRefusal::Busy);
     }
     Ok(())
+}
+
+/// Only `Granted`, or `Unknown` on a platform without a permission model, may touch the device.
+fn permission_allows(query: Support, p: MicPermission) -> Result<(), CaptureRefusal> {
+    match p {
+        MicPermission::Granted => Ok(()),
+        // No permission model at all (Linux): opening cannot make an OS prompt appear.
+        MicPermission::Unknown if !query.is_available() => Ok(()),
+        // Unknown on a platform that has a model fails closed, like NotDetermined.
+        MicPermission::NotDetermined | MicPermission::Unknown => {
+            Err(CaptureRefusal::PermissionNotDetermined)
+        }
+        _ => Err(CaptureRefusal::PermissionDenied),
+    }
+}
+
+/// The ONLY spawn of blocking work in fogar-core. Review M2 (architecture owner's decision): a
+/// TEMPORARY exception to "no blocking work in core" until the audio port becomes async in the
+/// adapter (issue #31); then this function and its `allow` go away. Every device call of the
+/// gate (open, drop of a capture) goes through here and nothing else may.
+#[allow(clippy::disallowed_methods)] // M2 exception, issue #31 (see above).
+fn spawn_device_job(
+    jobs: &mut JoinSet<Job>,
+    job: impl FnOnce() -> Job + Send + 'static,
+) -> AbortHandle {
+    jobs.spawn_blocking(job)
 }
 
 /// Why a take is being closed by something other than the person.
@@ -156,7 +179,8 @@ impl Cut {
 
 pub(crate) type Reply = oneshot::Sender<Result<(), CaptureRefusal>>;
 /// Receiving half of the take's owner channel (the IPC connection keeps the sender).
-pub(crate) type Owner = oneshot::Receiver<()>;
+/// Never carries a value (review B1): only its closing matters.
+pub(crate) type Owner = oneshot::Receiver<Infallible>;
 
 /// What the engine must act on after [`CaptureGate::next`].
 #[derive(Debug)]
@@ -217,8 +241,9 @@ enum Take {
         gesture: CaptureGesture,
         since: Mono,
         /// `None` while a previous take's release still runs: the open starts when it ends
-        /// (the device is never opened while it is still closing).
-        job: Option<tokio::task::Id>,
+        /// (the device is never opened while it is still closing). The handle aborts an open
+        /// that has not started yet when nobody waits for it any more (review B3).
+        job: Option<AbortHandle>,
     },
     Open(Box<OpenTake>),
 }
@@ -299,6 +324,11 @@ impl CaptureGate {
         matches!(self.take, Take::Open(_))
     }
 
+    /// A take is open or about to be (the person pressed and the device is opening).
+    pub(crate) fn is_active(&self) -> bool {
+        !matches!(self.take, Take::Idle)
+    }
+
     fn busy(&self) -> bool {
         !matches!(self.take, Take::Idle) || self.opens.len() >= queues::CAPTURE_JOBS
     }
@@ -339,15 +369,14 @@ impl CaptureGate {
         };
     }
 
-    fn spawn_open(&mut self) -> tokio::task::Id {
+    fn spawn_open(&mut self) -> AbortHandle {
         let mic = self.mic.clone();
         Stats::inc(&self.stats.capture_audio_jobs);
-        let id = self
-            .jobs
-            .spawn_blocking(move || Job::Opened(mic.open(queues::MIC_CHUNKS)))
-            .id();
-        self.opens.push(id);
-        id
+        let handle = spawn_device_job(&mut self.jobs, move || {
+            Job::Opened(mic.open(queues::MIC_CHUNKS))
+        });
+        self.opens.push(handle.id());
+        handle
     }
 
     fn count_refusal(&self, why: CaptureRefusal) {
@@ -425,7 +454,14 @@ impl CaptureGate {
     pub(crate) fn close(&mut self, now: Mono, opening: CaptureRefusal) -> Option<Closed> {
         match std::mem::replace(&mut self.take, Take::Idle) {
             Take::Idle => None,
-            Take::Opening { reply, .. } => {
+            Take::Opening { reply, job, .. } => {
+                // Abandoned before the device opened (review B2): counted, no backoff (a
+                // failure of the device is not what happened); an open not started yet is
+                // aborted, a running one is released when it comes back.
+                if let Some(job) = job {
+                    job.abort();
+                }
+                Stats::inc(&self.stats.captures_discarded);
                 let _ = reply.send(Err(opening));
                 None
             }
@@ -451,7 +487,7 @@ impl CaptureGate {
         drop(stream);
         Stats::inc(&self.stats.capture_audio_jobs);
         self.releasing += 1;
-        self.jobs.spawn_blocking(move || {
+        spawn_device_job(&mut self.jobs, move || {
             drop(capture);
             Job::Released
         });
@@ -508,24 +544,36 @@ impl CaptureGate {
             Woke::Job(j) => self.on_job(j, now),
             Woke::Chunk(Some(c)) => GateEvent::Chunk(c),
             Woke::Chunk(None) => GateEvent::Cut(Cut::DeviceEnded),
-            Woke::OwnerGone => match &self.take {
-                Take::Open(_) => GateEvent::Cut(Cut::OwnerGone),
-                _ => {
-                    // Nobody waits for this take any more: abandon the open (its result is
-                    // released when it comes).
-                    self.take = Take::Idle;
+            Woke::OwnerGone => match std::mem::replace(&mut self.take, Take::Idle) {
+                Take::Open(t) => {
+                    self.take = Take::Open(t);
+                    GateEvent::Cut(Cut::OwnerGone)
+                }
+                Take::Opening { job, .. } => {
+                    // Nobody waits for this take any more (review B3): an open not started yet
+                    // is aborted; a running one is released when it comes back.
+                    if let Some(job) = job {
+                        job.abort();
+                    }
                     Stats::inc(&self.stats.captures_discarded);
                     GateEvent::Nothing
                 }
+                Take::Idle => GateEvent::Nothing,
             },
             Woke::Deadline => match (&self.take, deadline) {
                 (Take::Open(_), Some((_, cut))) => GateEvent::Cut(cut),
                 (Take::Opening { .. }, _) => {
-                    let Take::Opening { reply, .. } = std::mem::replace(&mut self.take, Take::Idle)
+                    let Take::Opening { reply, job, .. } =
+                        std::mem::replace(&mut self.take, Take::Idle)
                     else {
                         return GateEvent::Nothing;
                     };
-                    self.open_failed(now);
+                    // Review B2: back off only if the device was actually being opened (not
+                    // while waiting for the previous release); counted either way.
+                    if job.is_some() {
+                        self.open_failed(now);
+                    }
+                    self.count_refusal(CaptureRefusal::NoMicrophone);
                     GateEvent::Refused {
                         reply,
                         why: CaptureRefusal::NoMicrophone,
@@ -575,11 +623,24 @@ impl CaptureGate {
             // for it may open now.
             (Ok((_, Job::Released)), _) | (Err(_), None) => {
                 self.releasing = self.releasing.saturating_sub(1);
-                if self.releasing == 0 && matches!(self.take, Take::Opening { job: None, .. }) {
-                    let id = self.spawn_open();
-                    if let Take::Opening { job, .. } = &mut self.take {
-                        *job = Some(id);
-                    }
+                if self.releasing > 0 || !matches!(self.take, Take::Opening { job: None, .. }) {
+                    return GateEvent::Nothing;
+                }
+                // Review F3: the permission may have changed while waiting for the release.
+                let caps = self.mic.capabilities();
+                if let Err(why) =
+                    permission_allows(caps.permission_query, self.mic.mic_permission())
+                {
+                    let Take::Opening { reply, .. } = std::mem::replace(&mut self.take, Take::Idle)
+                    else {
+                        return GateEvent::Nothing;
+                    };
+                    self.count_refusal(why);
+                    return GateEvent::Refused { reply, why };
+                }
+                let handle = self.spawn_open();
+                if let Take::Opening { job, .. } = &mut self.take {
+                    *job = Some(handle);
                 }
                 return GateEvent::Nothing;
             }
@@ -587,7 +648,7 @@ impl CaptureGate {
         if let Some(i) = was_open {
             self.opens.swap_remove(i);
         }
-        let ours = matches!(&self.take, Take::Opening { job: Some(job), .. } if *job == id);
+        let ours = matches!(&self.take, Take::Opening { job: Some(job), .. } if job.id() == id);
         if !ours {
             // A late open nobody waits for: release it at once, never use it.
             if let Ok((capture, stream)) = result {
@@ -661,7 +722,7 @@ impl CaptureGate {
             while let Some(j) = jobs.join_next().await {
                 // A late open still releases its device, on the blocking pool.
                 if let Ok(Job::Opened(Ok((capture, _stream)))) = j {
-                    jobs.spawn_blocking(move || {
+                    spawn_device_job(jobs, move || {
                         drop(capture);
                         Job::Released
                     });
@@ -795,7 +856,7 @@ mod tests {
         g: &mut CaptureGate,
         clock: &TestClock,
     ) -> (
-        oneshot::Sender<()>,
+        oneshot::Sender<Infallible>,
         oneshot::Receiver<Result<(), CaptureRefusal>>,
     ) {
         let (owner_tx, owner) = oneshot::channel();
@@ -953,8 +1014,13 @@ mod tests {
             "5 s after the last NEW partial"
         );
         assert!(mic.is_open(), "the engine closes it");
-        g.close(clock.now(), CaptureRefusal::Busy);
-        assert!(!mic.is_open() || matches!(g.next(&clock).await, GateEvent::Nothing));
+        assert!(g.close(clock.now(), CaptureRefusal::Busy).is_some());
+        assert!(
+            matches!(g.next(&clock).await, GateEvent::Nothing),
+            "the release job"
+        );
+        assert!(!mic.is_open(), "the device is released");
+        assert!(!g.is_active() && !g.busy());
     }
 
     /// A new take right after the previous one ended waits for that release instead of being
@@ -1019,22 +1085,90 @@ mod tests {
         assert!(!mic.is_open());
     }
 
-    #[tokio::test(start_paused = true)]
+    /// Branch pinned: the connection leaves while `open` is still blocked, so the gate sees
+    /// `OwnerGone` first (abandons the take); the open's late result is then released.
+    #[tokio::test(flavor = "current_thread")]
     async fn an_owner_gone_while_opening_never_records() {
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let (mut g, stats) = gate(Arc::new(BlockingMic {
+            release: Mutex::new(release_rx),
+            seen: seen.clone(),
+        }));
+        let clock = TestClock::new();
+        let (owner, _answer) = start(&mut g, &clock).await;
+        // The open is running (blocked in the device), so B3's abort cannot cancel it.
+        while seen.lock().unwrap().open_thread.is_none() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(owner);
+        assert!(
+            matches!(g.next(&clock).await, GateEvent::Nothing),
+            "owner gone"
+        );
+        assert!(!g.is_active());
+        assert_eq!(stats.snapshot().captures_discarded, 1);
+        release_tx.send(()).unwrap();
+        assert!(
+            matches!(g.next(&clock).await, GateEvent::Nothing),
+            "late open"
+        );
+        assert!(
+            matches!(g.next(&clock).await, GateEvent::Nothing),
+            "released"
+        );
+        assert!(seen.lock().unwrap().drop_thread.is_some());
+        assert!(!g.is_open() && !g.busy());
+        assert_eq!(stats.snapshot().captures_opened, 0);
+    }
+
+    /// Branch pinned: the open already finished when the gate looks, and its connection is
+    /// gone: the job branch wins (biased) and the handle is released, never used.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_open_finished_after_its_owner_left_is_released() {
         let mic = FakeMic::healthy();
-        let (mut g, _) = gate(Arc::new(mic.clone()));
+        let (mut g, stats) = gate(Arc::new(mic.clone()));
         let clock = TestClock::new();
         let (owner, _answer) = start(&mut g, &clock).await;
         drop(owner);
-        // Either the owner or the job wins first; in no order does a take open.
-        for _ in 0..3 {
-            if let GateEvent::Opened { .. } = g.next(&clock).await {
-                panic!("opened for nobody")
-            }
-            if !mic.is_open() && !g.busy() {
-                break;
-            }
+        // Let the blocking pool finish the (instant) open before the gate polls.
+        while mic.opens() == 0 {
+            std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(!g.is_open() && !mic.is_open());
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            matches!(g.next(&clock).await, GateEvent::Nothing),
+            "open done"
+        );
+        assert!(
+            matches!(g.next(&clock).await, GateEvent::Nothing),
+            "released"
+        );
+        assert!(!mic.is_open());
+        let s = stats.snapshot();
+        assert_eq!((s.captures_opened, s.captures_discarded), (0, 1));
+    }
+
+    /// Review F3: the permission is read again when a start that waited for the previous
+    /// release is about to touch the device.
+    #[tokio::test(start_paused = true)]
+    async fn a_start_waiting_for_the_release_rechecks_the_permission() {
+        let mic = FakeMic::healthy();
+        let (mut g, _) = gate(Arc::new(mic.clone()));
+        let clock = TestClock::new();
+        let (_o1, _a1) = start(&mut g, &clock).await;
+        let GateEvent::Opened { reply } = g.next(&clock).await else {
+            panic!()
+        };
+        reply.send(Ok(())).unwrap();
+        assert!(g.close(clock.now(), CaptureRefusal::Busy).is_some());
+        let (_o2, _a2) = start(&mut g, &clock).await;
+        mic.set_permission(P::Denied); // revoked in System Settings meanwhile
+        match g.next(&clock).await {
+            GateEvent::Refused { why, .. } => assert_eq!(why, CaptureRefusal::PermissionDenied),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(mic.opens(), 1);
+        assert!(!g.is_active());
     }
 }

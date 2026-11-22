@@ -17,6 +17,9 @@ disallowed-methods = [
   { path = "tokio::spawn", reason = "spawn only through an owned TaskTracker/JoinSet (structured concurrency)" },
   { path = "tokio::task::spawn", reason = "spawn only through an owned TaskTracker/JoinSet" },
   { path = "tokio::task::spawn_blocking", reason = "no blocking work in core" },
+  # Architecture owner (review M2 of #30): the capture gate's single, justified `#[allow]` in
+  # fogar-core/src/capture.rs (`spawn_device_job`) is a TEMPORARY exception until issue #31.
+  { path = "tokio::task::JoinSet::spawn_blocking", reason = "no blocking work in core (temporary exception: capture.rs spawn_device_job, issue #31)" },
   { path = "tokio::sync::mpsc::unbounded_channel", reason = "every queue is bounded" },
 ]
 disallowed-types = [

@@ -39,7 +39,7 @@ use fogar_ports::{
     },
     tailnet::TailnetPeers,
 };
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{convert::Infallible, future::Future, sync::Arc, time::Duration};
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinSet,
@@ -259,59 +259,66 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
     let mut last_pushed: Option<StatusReport> = None;
     // Sending half of the owner channel of the take this connection opened: dropping it (the
     // connection closes, or stops being subscribed) ends that take with `Discard`.
-    let mut take_owner: Option<oneshot::Sender<()>> = None;
+    let mut take_owner: Option<oneshot::Sender<Infallible>> = None;
+    // A request read while this connection waited for its `CaptureStart` answer (review F1:
+    // that wait also watches for the peer leaving); served next.
+    let mut pipelined: Option<IpcRequest> = None;
     loop {
-        let req = tokio::select! {
-            biased;
-            () = c.cancel.cancelled() => return,
-            // Requests BEFORE pushes (review M2): a dense token stream must never starve a
-            // CancelTurn/SendText on a subscribed connection.
-            r = recv_within(&*c.clock, &mut c.conn, (!subscribed && !conv_subscribed).then_some(c.limits.idle_timeout)) => match r {
-                Some(Ok(Some(req))) => req,
-                // Idle, peer gone or a bad frame: close the connection (dropping it).
-                None | Some(Ok(None) | Err(_)) => return,
-            },
-            r = view.changed(), if subscribed => {
-                if r.is_err() {
-                    return;
-                }
-                let rep = report(&c.health, &view.borrow_and_update(), c.peer_check);
-                if last_pushed.as_ref() == Some(&rep) {
+        let req = if let Some(r) = pipelined.take() {
+            r
+        } else {
+            tokio::select! {
+                biased;
+                () = c.cancel.cancelled() => return,
+                // Requests BEFORE pushes (review M2): a dense token stream must never starve a
+                // CancelTurn/SendText on a subscribed connection.
+                r = recv_within(&*c.clock, &mut c.conn, (!subscribed && !conv_subscribed).then_some(c.limits.idle_timeout)) => match r {
+                    Some(Ok(Some(req))) => req,
+                    // Idle, peer gone or a bad frame: close the connection (dropping it).
+                    None | Some(Ok(None) | Err(_)) => return,
+                },
+                r = view.changed(), if subscribed => {
+                    if r.is_err() {
+                        return;
+                    }
+                    let rep = report(&c.health, &view.borrow_and_update(), c.peer_check);
+                    if last_pushed.as_ref() == Some(&rep) {
+                        continue;
+                    }
+                    if !c.send(IpcResponse::Event(rep.clone())).await {
+                        return;
+                    }
+                    last_pushed = Some(rep);
                     continue;
                 }
-                if !c.send(IpcResponse::Event(rep.clone())).await {
-                    return;
-                }
-                last_pushed = Some(rep);
-                continue;
-            }
-            // The conversation, and the voice state inside the status report.
-            r = conv.changed(), if subscribed || conv_subscribed => {
-                if r.is_err() {
-                    return;
-                }
-                let (latest, voice) = {
-                    let v = conv.borrow_and_update();
-                    // Status only: mark seen, no copy of the view.
-                    (conv_subscribed.then(|| v.clone()), (v.transcriber, v.tts))
-                };
-                if let Some(latest) = latest
-                    && !c.send(IpcResponse::Conversation(latest)).await
-                {
-                    return;
-                }
-                // Only a voice change rebuilds the status report (tokens alone never do).
-                let pushed_voice = last_pushed.as_ref().map(|r| (r.transcriber, r.tts));
-                if subscribed && pushed_voice != Some(voice) {
-                    let rep = report(&c.health, &view.borrow(), c.peer_check);
-                    if last_pushed.as_ref() != Some(&rep) {
-                        if !c.send(IpcResponse::Event(rep.clone())).await {
-                            return;
-                        }
-                        last_pushed = Some(rep);
+                // The conversation, and the voice state inside the status report.
+                r = conv.changed(), if subscribed || conv_subscribed => {
+                    if r.is_err() {
+                        return;
                     }
+                    let (latest, voice) = {
+                        let v = conv.borrow_and_update();
+                        // Status only: mark seen, no copy of the view.
+                        (conv_subscribed.then(|| v.clone()), (v.transcriber, v.tts))
+                    };
+                    if let Some(latest) = latest
+                        && !c.send(IpcResponse::Conversation(latest)).await
+                    {
+                        return;
+                    }
+                    // Only a voice change rebuilds the status report (tokens alone never do).
+                    let pushed_voice = last_pushed.as_ref().map(|r| (r.transcriber, r.tts));
+                    if subscribed && pushed_voice != Some(voice) {
+                        let rep = report(&c.health, &view.borrow(), c.peer_check);
+                        if last_pushed.as_ref() != Some(&rep) {
+                            if !c.send(IpcResponse::Event(rep.clone())).await {
+                                return;
+                            }
+                            last_pushed = Some(rep);
+                        }
+                    }
+                    continue;
                 }
-                continue;
             }
         };
         let resp = match req {
@@ -423,30 +430,54 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
                 IpcResponse::CaptureRefused(CaptureRefusal::Busy)
             }
             IpcRequest::CaptureStart { gesture } => {
-                let (owner_tx, owner) = oneshot::channel();
+                let (owner_tx, owner) = oneshot::channel::<Infallible>();
                 take_owner = Some(owner_tx);
                 let start = Start::UserAct(UserAct { gesture });
                 // The engine answers after the device opened (off the runtime, bounded).
                 let within = c.limits.write_timeout + OPEN_DEADLINE;
-                match c
-                    .ask_within(within, |reply| Command::CaptureStart {
+                let answer = ask(&*c.clock, &c.cmds, within, &c.health.stats, |reply| {
+                    Command::CaptureStart {
                         start,
                         owner,
                         reply,
-                    })
-                    .await
-                {
+                    }
+                });
+                tokio::pin!(answer);
+                // Review F1: while the device opens, the app may leave. Then the owner is
+                // dropped at once, so the take never streams audio for nobody.
+                let answer = loop {
+                    tokio::select! {
+                        biased;
+                        () = c.cancel.cancelled() => return,
+                        a = &mut answer => break a,
+                        r = c.conn.recv(), if pipelined.is_none() => match r {
+                            Ok(Some(req)) => pipelined = Some(req),
+                            Ok(None) | Err(_) => return,
+                        },
+                    }
+                };
+                match answer {
                     Some(Ok(())) => IpcResponse::CaptureStarted,
                     Some(Err(r)) => IpcResponse::CaptureRefused(r),
                     None => BUSY,
                 }
             }
-            IpcRequest::CaptureEnd { then } => {
+            // Review M1: only the connection whose take is open can end it.
+            IpcRequest::CaptureEnd { then }
+                if take_owner.as_ref().is_some_and(|o| !o.is_closed()) =>
+            {
                 match c.ask(|reply| Command::CaptureEnd(then, reply)).await {
                     Some(()) => IpcResponse::CaptureEnded,
                     None => BUSY,
                 }
             }
+            // This connection's take already ended (an automatic cut, its own earlier end):
+            // ending stays idempotent, and touches nothing.
+            IpcRequest::CaptureEnd { .. } if take_owner.is_some() => IpcResponse::CaptureEnded,
+            // Never had a take: it cannot end someone else's.
+            IpcRequest::CaptureEnd { .. } => IpcResponse::Refused {
+                reason: "no take on this connection",
+            },
             IpcRequest::RequestMicPermission => {
                 let within = c.limits.permission_wait;
                 match c.ask_within(within, Command::RequestMicPermission).await {

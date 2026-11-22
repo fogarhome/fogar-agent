@@ -564,3 +564,37 @@ async fn gateway_traffic_alone_never_opens_the_microphone() {
     assert_eq!((rig.mic.opens(), rig.mic.permission_requests()), (0, 0));
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
+
+/// Review M1: another connection of the same signed app cannot end someone else's take; the
+/// owner can, and ending again stays idempotent for it.
+#[tokio::test(start_paused = true)]
+async fn only_the_connection_that_opened_the_take_can_end_it() {
+    let mut rig = rig_with(MockConfig::default()).start();
+    wait_ready(&mut rig.health).await;
+    let (mut a, _) = subscribe(&rig).await;
+    let (mut b, _) = subscribe(&rig).await;
+    start_take(&mut a).await;
+    speak(&rig, 500).await;
+    for then in [CaptureThen::Send, CaptureThen::Review, CaptureThen::Discard] {
+        assert_eq!(
+            ask(&mut b, end(then)).await,
+            IpcResponse::Refused {
+                reason: "no take on this connection"
+            }
+        );
+    }
+    assert!(rig.mic.is_open(), "untouched by the other connection");
+    assert_eq!(rig.health.conversation().activity, UserActivity::Recording);
+    assert_eq!(
+        ask(&mut a, end(CaptureThen::Discard)).await,
+        IpcResponse::CaptureEnded
+    );
+    eventually(Duration::from_secs(5), || !rig.mic.is_open()).await;
+    assert_eq!(
+        ask(&mut a, end(CaptureThen::Send)).await,
+        IpcResponse::CaptureEnded
+    );
+    settle().await;
+    assert!(rig.link.log().sends.is_empty());
+    assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
+}

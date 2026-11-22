@@ -111,6 +111,10 @@ impl<C: Clock> Engine<C> {
             tokio::select! {
                 biased;
                 () = ingress.cancelled() => break,
+                // Review M3: the take before the gateway. A gateway that keeps `in_rx` full must
+                // never starve the take's cuts (safety, silence, owner gone) or its device jobs;
+                // the take's own events are bounded by the device (50 chunks/s) and its timers.
+                ev = st.capture.next(&*self.clock) => self.on_capture(&mut st, ev).await,
                 ev = self.in_rx.recv() => match ev {
                     None => break,
                     Some(ev) => self.on_inbound(&mut st, ev).await,
@@ -119,7 +123,6 @@ impl<C: Clock> Engine<C> {
                     None => cmds_open = false,
                     Some(cmd) => self.on_command(&mut st, cmd).await,
                 },
-                ev = st.capture.next(&*self.clock) => self.on_capture(&mut st, ev).await,
                 () = sleep_until_opt(&*self.clock, wake_at), if wake_at.is_some() => {
                     let transcribing = matches!(st.turns.phase(), UserPhase::AwaitTranscription { .. });
                     if let Some(fx) = st.turns.on_tick(self.clock.now()) {
@@ -169,7 +172,8 @@ impl<C: Clock> Engine<C> {
                 if reply.is_closed() {
                     return;
                 }
-                if st.turns.phase() == UserPhase::Recording {
+                // Also while the device is opening (review B4): the take is already the person's.
+                if st.turns.phase() == UserPhase::Recording || st.capture.is_active() {
                     let _ = reply.send(Err(TextRefusal::Recording));
                     return;
                 }
@@ -494,9 +498,12 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
     use super::*;
     use crate::{capture::CaptureGate, queues, queues::ByteBudget};
+    use fogar_ports::ipc::CaptureGesture;
     use fogar_proto::server::Capabilities;
     use fogar_testkit::{FakeMic, FakeSpeaker, TestClock};
+    use std::convert::Infallible;
     use std::time::Duration;
+    use tokio::sync::{mpsc, watch};
     use tokio::task::JoinSet;
 
     // ---- property: the gateway alone never opens the microphone (spec S2) ----------------
@@ -519,7 +526,10 @@ mod tests {
         let id = *r.pick(&["t-1", "t-2", "", "x"]);
         let seq = r.next() % 4;
         let text = *r.pick(&["", "pon la serie", "hola", "  "]);
-        match r.next() % 14 {
+        match r.next() % 17 {
+            14 => r#"{"type":"transcription_partial","text":"#.into(),
+            15 => r#"{"type":"status","service":"transcriber","state":"degraded"}"#.into(),
+            16 => r#"not json at all {{{"#.into(),
             0 => format!(r#"{{"type":"transcription_partial","text":"{text}"}}"#),
             1 => format!(r#"{{"type":"transcription","text":"{text}"}}"#),
             2 => {
@@ -553,41 +563,146 @@ mod tests {
         }
     }
 
+    /// The engine wired to fakes, driven directly (no link, no IPC adapter).
+    struct Harness {
+        mic: FakeMic,
+        stats: Arc<Stats>,
+        conv: watch::Receiver<ConversationView>,
+        in_tx: mpsc::Sender<Inbound>,
+        cmd_tx: mpsc::Sender<Command>,
+        out_rx: mpsc::Receiver<Frame>,
+        budget: ByteBudget,
+        stop: CancellationToken,
+        tasks: JoinSet<()>,
+    }
+
+    fn harness(mic: FakeMic, cfg: Config) -> Harness {
+        let clock = Arc::new(TestClock::new());
+        let cfg = Arc::new(cfg);
+        let stats = Arc::new(Stats::default());
+        let (out_tx, out_rx) = mpsc::channel(queues::OUTBOUND);
+        let (in_tx, in_rx) = mpsc::channel(queues::INBOUND);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(queues::ENGINE_COMMANDS);
+        let (conv_tx, conv) = watch::channel(ConversationView::default());
+        let engine = Engine {
+            clock,
+            cfg: cfg.clone(),
+            stats: stats.clone(),
+            audio_out: Arc::new(FakeSpeaker::healthy()),
+            out_tx,
+            in_rx,
+            cmd_rx,
+            conv: conv_tx,
+        };
+        let capture = CaptureGate::new(Arc::new(mic.clone()), &cfg, stats.clone());
+        let stop = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(engine.run(capture, stop.clone()));
+        Harness {
+            mic,
+            stats,
+            conv,
+            in_tx,
+            cmd_tx,
+            out_rx,
+            budget: ByteBudget::new(1 << 20),
+            stop,
+            tasks,
+        }
+    }
+
+    impl Harness {
+        async fn server(&self, json: &str) {
+            if let Ok(msg) = fogar_proto::decode_server(json) {
+                let charge = self.budget.try_charge(1).unwrap();
+                let _ = self.in_tx.send(Inbound::Server(msg, charge)).await;
+            }
+        }
+        async fn up(&self) {
+            let caps = Capabilities {
+                transcriber: true,
+                tts: true,
+                ..Capabilities::default()
+            };
+            self.in_tx.send(Inbound::SessionUp(caps)).await.unwrap();
+        }
+        /// The person's take, as only the IPC module could ask for it.
+        async fn press(&self) -> (oneshot::Sender<Infallible>, Result<(), CaptureRefusal>) {
+            let (owner_tx, owner) = oneshot::channel();
+            let (reply, answer) = oneshot::channel();
+            let start = Start::UserAct(crate::ipc::UserAct::for_test(CaptureGesture::Toggle));
+            self.cmd_tx
+                .send(Command::CaptureStart {
+                    start,
+                    owner,
+                    reply,
+                })
+                .await
+                .unwrap();
+            let got = tokio::time::timeout(Duration::from_secs(30), answer)
+                .await
+                .unwrap()
+                .unwrap();
+            (owner_tx, got)
+        }
+        async fn release(&self, then: CaptureThen) {
+            let (tx, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::CaptureEnd(then, tx))
+                .await
+                .unwrap();
+            rx.await.unwrap();
+        }
+        fn drain(&mut self) {
+            while self.out_rx.try_recv().is_ok() {}
+        }
+        async fn stop(mut self) {
+            self.stop.cancel();
+            while self.tasks.join_next().await.is_some() {}
+        }
+    }
+
     /// «Cualquier secuencia aleatoria de mensajes del gateway (ServerMsg, tramas de audio,
-    /// cierres, reconexiones), sin capture_start, deja FakeMic::opens() == 0» — also mixed with
-    /// every IPC command except `CaptureStart` (text, cancel, capture end, permission request).
+    /// cierres, reconexiones), sin capture_start, deja FakeMic::opens() == 0»: after one or more
+    /// legitimate takes (whose traffic includes partials and silence warnings), no random mix of
+    /// gateway traffic and IPC commands other than `CaptureStart` (texts and cancels that really
+    /// run, capture ends, permission requests) opens the microphone again.
     #[tokio::test(start_paused = true)]
     async fn no_gateway_sequence_opens_the_microphone() {
         for seed in 1..=64u64 {
             let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-            let mic = if seed % 2 == 0 {
-                FakeMic::healthy()
-            } else {
+            let mic = if seed % 4 == 3 {
                 FakeMic::not_determined()
+            } else {
+                FakeMic::healthy()
             };
-            let clock = Arc::new(TestClock::new());
-            let cfg = Arc::new(Config::default());
-            let stats = Arc::new(Stats::default());
-            let (out_tx, mut out_rx) = mpsc::channel(queues::OUTBOUND);
-            let (in_tx, in_rx) = mpsc::channel(queues::INBOUND);
-            let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(queues::ENGINE_COMMANDS);
-            let (conv, conv_rx) = watch::channel(ConversationView::default());
-            let engine = Engine {
-                clock: clock.clone(),
-                cfg: cfg.clone(),
-                stats: stats.clone(),
-                audio_out: Arc::new(FakeSpeaker::healthy()),
-                out_tx,
-                in_rx,
-                cmd_rx,
-                conv,
-            };
-            let capture = CaptureGate::new(Arc::new(mic.clone()), &cfg, stats.clone());
-            let stop = CancellationToken::new();
-            let mut tasks = JoinSet::new();
-            tasks.spawn(engine.run(capture, stop.clone()));
-            let budget = ByteBudget::new(1 << 20);
-            let mut waiting = Vec::new();
+            let mut h = harness(mic, Config::default());
+            h.up().await;
+            // Legitimate takes first (none for a not-determined mic: refused).
+            for _ in 0..(1 + seed % 3) {
+                let (owner, answer) = h.press().await;
+                if answer.is_ok() {
+                    h.mic.push_all(fogar_testkit::tone_chunks(5, 0.3));
+                    h.server(r#"{"type":"transcription_partial","text":"pon"}"#)
+                        .await;
+                    h.server(r#"{"type":"status","service":"transcriber","state":"degraded"}"#)
+                        .await;
+                    for _ in 0..8 {
+                        h.server(&random_server_json(&mut r)).await;
+                    }
+                    h.release(*r.pick(&[CaptureThen::Send, CaptureThen::Review]))
+                        .await;
+                }
+                drop(owner);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                h.drain();
+            }
+            let baseline = h.mic.opens();
+            assert_eq!(baseline == 0, seed % 4 == 3, "seed {seed}");
+            let mut texts = Vec::new();
+            let mut cancels = Vec::new();
+            let mut ends = Vec::new();
+            let mut permission_asks = 0u32;
             for _ in 0..60 {
                 match r.next() % 10 {
                     0 => {
@@ -596,60 +711,136 @@ mod tests {
                             tts: r.next().is_multiple_of(2),
                             ..Capabilities::default()
                         };
-                        let _ = in_tx.send(Inbound::SessionUp(caps)).await;
+                        let _ = h.in_tx.send(Inbound::SessionUp(caps)).await;
                     }
                     1 => {
-                        let _ = in_tx.send(Inbound::SessionDown).await;
+                        let _ = h.in_tx.send(Inbound::SessionDown).await;
                     }
                     2 => {
                         let mut b = vec![0xA1, 0, (r.next() % 4) as u8];
                         b.extend((0..(r.next() % 64)).map(|_| r.next() as u8));
-                        let _ = in_tx
-                            .send(Inbound::Audio(b, budget.try_charge(1).unwrap()))
-                            .await;
+                        let charge = h.budget.try_charge(1).unwrap();
+                        let _ = h.in_tx.send(Inbound::Audio(b, charge)).await;
                     }
-                    3 => {
-                        let (tx, rx) = oneshot::channel();
-                        let cmd = match r.next() % 4 {
-                            0 => Command::SendText("hola".into(), oneshot::channel().0),
-                            1 => Command::Cancel(oneshot::channel().0),
-                            2 => {
-                                let then = *r.pick(&[
-                                    CaptureThen::Send,
-                                    CaptureThen::Review,
-                                    CaptureThen::Discard,
-                                ]);
-                                Command::CaptureEnd(then, oneshot::channel().0)
+                    3 => match r.next() % 4 {
+                        0 => {
+                            let (tx, rx) = oneshot::channel();
+                            if h.cmd_tx
+                                .try_send(Command::SendText("hola".into(), tx))
+                                .is_ok()
+                            {
+                                texts.push(rx);
                             }
-                            _ => Command::RequestMicPermission(tx),
-                        };
-                        waiting.push(rx);
-                        let _ = cmd_tx.try_send(cmd);
-                    }
-                    _ => {
-                        if let Ok(msg) = fogar_proto::decode_server(&random_server_json(&mut r)) {
-                            let charge = budget.try_charge(1).unwrap();
-                            let _ = in_tx.send(Inbound::Server(msg, charge)).await;
                         }
-                    }
+                        1 => {
+                            let (tx, rx) = oneshot::channel();
+                            if h.cmd_tx.try_send(Command::Cancel(tx)).is_ok() {
+                                cancels.push(rx);
+                            }
+                        }
+                        2 => {
+                            let then = *r.pick(&[
+                                CaptureThen::Send,
+                                CaptureThen::Review,
+                                CaptureThen::Discard,
+                            ]);
+                            let (tx, rx) = oneshot::channel();
+                            if h.cmd_tx.try_send(Command::CaptureEnd(then, tx)).is_ok() {
+                                ends.push(rx);
+                            }
+                        }
+                        _ => {
+                            let (tx, rx) = oneshot::channel();
+                            h.cmd_tx
+                                .send(Command::RequestMicPermission(tx))
+                                .await
+                                .unwrap();
+                            permission_asks += 1;
+                            // Answered before the next one, so none coalesce.
+                            tokio::time::timeout(Duration::from_secs(5), rx)
+                                .await
+                                .unwrap()
+                                .unwrap();
+                        }
+                    },
+                    _ => h.server(&random_server_json(&mut r)).await,
                 }
                 if r.next().is_multiple_of(4) {
                     tokio::time::sleep(Duration::from_millis(r.next() % 20_000)).await;
                 }
-                while out_rx.try_recv().is_ok() {}
+                h.drain();
                 tokio::task::yield_now().await;
-                assert_eq!(mic.opens(), 0, "seed {seed}");
+                assert_eq!(h.mic.opens(), baseline, "seed {seed}");
             }
             tokio::time::sleep(Duration::from_secs(400)).await;
-            assert_eq!(mic.opens(), 0, "seed {seed}");
+            assert_eq!(h.mic.opens(), baseline, "seed {seed}");
+            assert_eq!(h.mic.permission_requests(), permission_asks, "seed {seed}");
             assert_ne!(
-                conv_rx.borrow().activity,
+                h.conv.borrow().activity,
                 UserActivity::Recording,
                 "seed {seed}"
             );
-            assert_eq!(stats.snapshot().captures_opened, 0);
-            stop.cancel();
-            while tasks.join_next().await.is_some() {}
+            assert_eq!(
+                h.stats.snapshot().captures_opened,
+                u64::from(baseline),
+                "seed {seed}"
+            );
+            // The commands really ran (their replies were kept, so none was skipped).
+            for rx in texts {
+                assert!(rx.await.is_ok(), "seed {seed}: text answered");
+            }
+            for rx in cancels {
+                assert!(rx.await.is_ok(), "seed {seed}: cancel answered");
+            }
+            for rx in ends {
+                assert!(rx.await.is_ok(), "seed {seed}: end answered");
+            }
+            h.stop().await;
         }
+    }
+
+    /// Review M3: a gateway that keeps the inbound queue full must not starve the take. Real
+    /// (not paused) time: a busy runtime never auto-advances a paused clock.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_flooding_gateway_cannot_starve_the_safety_cut() {
+        let cfg = Config {
+            capture_safety_cut: Duration::from_millis(200),
+            ..Config::default()
+        };
+        let mut h = harness(FakeMic::healthy(), cfg);
+        h.up().await;
+        let (_owner, answer) = h.press().await;
+        assert_eq!(answer, Ok(()));
+        let in_tx = h.in_tx.clone();
+        let budget = h.budget.clone();
+        let flood = async move {
+            let msg = r#"{"type":"status","service":"tts","state":"restored"}"#;
+            loop {
+                let m = fogar_proto::decode_server(msg).unwrap();
+                let Some(charge) = budget.try_charge(1) else {
+                    tokio::task::yield_now().await;
+                    continue;
+                };
+                if in_tx.send(Inbound::Server(m, charge)).await.is_err() {
+                    break;
+                }
+            }
+        };
+        let mic = h.mic.clone();
+        let stats = h.stats.clone();
+        let watch = async move {
+            while mic.is_open() || stats.snapshot().captures_safety_cut == 0 {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::select! {
+            () = flood => panic!("flood stopped"),
+            r = tokio::time::timeout(Duration::from_secs(5), watch) => {
+                assert!(r.is_ok(), "the safety cut never came under the flood");
+            }
+        }
+        assert_eq!(h.stats.snapshot().captures_safety_cut, 1);
+        h.drain();
+        h.stop().await;
     }
 }
