@@ -1,0 +1,27 @@
+{
+  "cpu_pct_mean": 0.0057,
+  "footprint_end_mb": 3.77,
+  "ri_interrupt_wkups_per_s": 0.401,
+  "threads_max": 4,
+  "power_top_median": 0.0,
+  "slice": "S1",
+  "scenario": "agent unpaired, IPC socket listening, no client, idle",
+  "date": "2026-11-16",
+  "commit": "9013fea",
+  "machine": "Mac14,15 (MacBook Air 15-inch, Apple M2), macOS 26.5.1 (25F80), AC power, Low Power Mode off, no thermal warning",
+  "build": "cargo build --release -p fogar-agentd; codesign -s 'Apple Development' -i com.fogar.agent --options runtime",
+  "method": "perf/measure.sh: 120 s warm-up, 624 s window; CPU/wakeups/footprint exact from proc_pid_rusage deltas (perf/rusage.py), POWER/IDLEW from top every 30 s; 3 instances in parallel with separate --state-dir, median reported",
+  "runs": [
+    {"cpu_pct_mean": 0.0064, "ri_interrupt_wkups_per_s": 0.401, "footprint_end_mb": 3.75, "footprint_lifetime_max_mb": 4.69, "threads_max": 4},
+    {"cpu_pct_mean": 0.0057, "ri_interrupt_wkups_per_s": 0.401, "footprint_end_mb": 3.81, "footprint_lifetime_max_mb": 4.77, "threads_max": 4},
+    {"cpu_pct_mean": 0.0056, "ri_interrupt_wkups_per_s": 0.41, "footprint_end_mb": 3.77, "footprint_lifetime_max_mb": 4.77, "threads_max": 4}
+  ],
+  "notes": [
+    "Machine was NOT quiet: load average 45 -> 28 during the window (other agent sessions building/fuzzing, CPU ~0.4% idle). The package was rarely idle, so ri_pkg_idle_wkups and top IDLEW read 0 and are deliberately left out of this baseline (idle-gate.sh skips missing keys); ri_interrupt_wkups_per_s is the wakeup figure to compare. Re-measure on a quiet machine before tightening.",
+    "0.40 wakeups/s is most likely (source reading, not traced) two unaligned 10 s timers (Config::heartbeat_every in the runtime thread and the watchdog thread's park_timeout(10 s)) plus tokio wheel cascade; skill rule 2 says align them.",
+    "QoS: rusage reports CPU time only under UTILITY (default and background 0) in the window.",
+    "No power assertions held by fogar-agentd (pmset -g assertions).",
+    "No thread budget is declared for S1 yet; 4 threads observed.",
+    "NOT RUN: powermetrics (needs sudo), memory_pressure -S warn, burst-then-idle, 24 h soak."
+  ]
+}
