@@ -53,6 +53,7 @@
       "description": "Discover also finds gateways on Tailscale peers: TailnetPeers port (+FakeTailnet, contract suite), MacTailnet (Tailscale app CLI by absolute path, status --json), core probes saved + local + each peer's :8004 at once and returns every Fogar found; Linux uses NoTailnet",
       "passes": true,
       "evidence": "fogar-core tests/pairing.rs (tailnet peers, hanging/not-running tailnet within tailnet_timeout + probe_timeout); macOS adapter unit tests + tailnet contract green on the M2 with Tailscale 1.104.6; app on the M2 lists green-house at 100.64.0.10:8004 (screenshot in the PR). UNVERIFIED: Homebrew tailscaled setups (not supported), macOS CI runner (no Tailscale: Unavailable path only)"
-    }
+    },
+    {"id": "s2-app-conversation", "description": "Fogar Desktop: Conversación section (IPC v4 over one subscribed connection that also carries the requests): text box, microphone with click/review/send-now/discard and hold-to-send, live partial, draft to the box on review or automatic cut (never sent), turn_progress line, cancel (button and ⌘.), turn_visible for my turns always and pushes only with the conversation in view, menu bar icon at rest/recording/speaking, microphone states with their sentences. Stand-in plays the same rules (FogarStandinKit)", "passes": false, "evidence": "apps/macos swift test (ConversacionTests over a real Unix socket, FogarStandinTests) on the macOS CI job. NOT verified by eye on the Mac yet (built on Linux, no screenshots); real capture/playback in the agent land with S2 3b/3c and PR 6"}
   ]
 }

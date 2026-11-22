@@ -77,7 +77,7 @@ private struct Cabecera: View {
             Button("Reconectar", action: reconectar)
                 .buttonStyle(Pildora(variante: .principal))
                 .disabled(trabajando)
-        case .notRunning, .refused, .noLiveStatus, .unintelligible:
+        case .notRunning, .refused, .noLiveStatus, .unintelligible, .noVerificado:
             Button("Volver a llamar") { link.retryNow() }
                 .buttonStyle(Pildora())
         default:
@@ -100,6 +100,7 @@ private struct Cabecera: View {
         case .looking: "Llamando al agente…"
         case .notRunning: "Sin respuesta del agente \(Textos.desde(since, ahora: ahora)) · la app vuelve a llamar sola"
         case .versionMismatch, .refused, .noLiveStatus, .unintelligible: "El agente contesta, pero no se entienden"
+        case .noVerificado: "Lo que contesta no está verificado · la app no le envía nada"
         }
     }
 }

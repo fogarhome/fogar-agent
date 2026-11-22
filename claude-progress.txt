@@ -190,6 +190,27 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
 - Verified on the M2: the app lists green-house (100.64.0.10:8004). UNVERIFIED: Homebrew
   tailscaled; saved-by-name vs found-by-IP shows the same gateway twice (no instance_id in proto).
 
+## S2 — PR 5, the app's conversation (2026-11-22)
+- apps/macos: new section Conversación (⌘1; the others move to ⌘2–⌘4). ConversationLink = ONE long
+  connection subscribed to the conversation that also carries send_text / capture_* / cancel_turn /
+  turn_visible / request_mic_permission (the agent only accepts takes and confirmations from the
+  subscribed connection). No request ids: every non-`conversation` frame answers the oldest waiting
+  request; a request with no answer in its deadline closes the connection (order lost) and the loop
+  reconnects. Refused subscribe = «solo la app firmada» (permanent, 60 s retry).
+- Conversacion (model): take state from the hands (press opens at once; <300 ms = click with
+  Parar y revisar / Enviar ya / Descartar(Esc); held = release sends), the agent's activity is the
+  truth (an automatic cut resets it); draft copied once into the box; turn_visible for my open turns
+  always and for a push only while the section is on screen (window occlusion + section shown).
+  GUESSED: capture_start reports gesture `toggle` (the gesture is known only at release; metrics only).
+- Menu bar icon: rest / not connected / recording / speaking; the menu shows Cancelar while speaking.
+- RootView: the detail fills the split view (sidebar hidden = wider section, Sito 2026-11-18).
+- fogar-standin: conversation through FogarStandinKit.ConversacionSimulada (pure, tested), scripted
+  replies with progress, audio gated by turn_visible (2 s deadline -> muted), takes with partials and
+  the 5 s silence cut to review; stdin words push/dia/mic/transcriber/tts/silencio/seguridad.
+- NOT here: SMAppService registration + its state in Ajustes and the microphone entitlement /
+  NSMicrophoneUsageDescription in the app (E2, PR 6). UNVERIFIED by eye: everything visual
+  (built on Linux; CI compiles and runs swift test only).
+
 ## S2 — PR 4: macOS audio adapter (2026-11-22)
 - MacAudioSource / MacAudioSink real on cpal =0.18.2 + rtrb 0.4.1; mic permission through
   AVCaptureDevice (objc2/block2 msg_send, authorizationStatus never prompts; requestAccess only
@@ -203,6 +224,8 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
 - Review round 1 (2026-11-22): abandoned-open guard (no mic start after a timeout, reopen refused
   while in flight), per-capture heartbeat with 6 s first-callback grace, permission re-read every
   1 s, dead output reports 0 queued, deadline joins, usage-description check before requestAccess.
-- BLOCKED on the architecture owner: deny.toml wrappers for cpal + objc2-core-audio*, vet
-  imports/exemptions, geiger-darwin baseline (owner files, ADR-0007). Recipe in the PR.
+- Supply chain applied by the architecture owner in this PR (1e41a75: deny.toml wrappers, vet
+  imports/exemptions; geiger-darwin baseline regenerated on the Mac). Explicit safe-to-deploy
+  audits still owed for cpal, coreaudio-rs, objc2-core-audio(-types), objc2-audio-toolbox, rtrb,
+  mach2, dispatch2.
 - UNVERIFIED (M2): xruns at start, cost with mic open, TCC prompt/revoke, device loss, AirPods.

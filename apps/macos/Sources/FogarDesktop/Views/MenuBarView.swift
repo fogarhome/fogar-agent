@@ -5,6 +5,7 @@ import SwiftUI
 /// The menu bar quick view: the state at a glance and a way into the window. Never animates.
 struct MenuBarView: View {
     @Environment(AgentLink.self) private var link
+    @Environment(Conversacion.self) private var conversacion
     @Environment(Navegacion.self) private var nav
     @Environment(\.openWindow) private var openWindow
 
@@ -28,14 +29,32 @@ struct MenuBarView: View {
                 }
             }
 
+            if let modo = IconoModo(link.state, conversacion).texto {
+                // Speaking or recording: say so, and offer the way to stop it right here.
+                HStack(spacing: 10) {
+                    Text(modo == "grabando" ? "Fogar te está escuchando" : "Fogar está hablando")
+                        .font(Tipo.texto(14, peso: 550)).foregroundStyle(Color.hueso)
+                    Spacer(minLength: 0)
+                    if conversacion.cancelable {
+                        Button { conversacion.cancelarAhora() } label: { Text("Cancelar") }
+                            .buttonStyle(Pildora(pequena: true))
+                    } else if conversacion.grabando {
+                        Button { conversacion.descartar() } label: { Text("Descartar") }
+                            .buttonStyle(Pildora(pequena: true))
+                    }
+                }
+            }
+
             VStack(alignment: .leading, spacing: 8) {
-                Button { abrir(.estado) } label: { Text("Abrir Fogar Desktop") }
+                Button { abrir(.conversacion) } label: { Text("Hablar con Fogar") }
                     .buttonStyle(Pildora(variante: .principal, pequena: true, ancho: true))
+                Button { abrir(.estado) } label: { Text("Ver el estado") }
+                    .buttonStyle(Pildora(pequena: true, ancho: true))
                 switch link.state {
                 case .live(let s) where s.phase == .notPaired:
                     Button { abrir(.emparejar) } label: { Text("Emparejar este Mac…") }
                         .buttonStyle(Pildora(pequena: true, ancho: true))
-                case .notRunning, .refused, .noLiveStatus, .unintelligible:
+                case .notRunning, .refused, .noLiveStatus, .unintelligible, .noVerificado:
                     Button { link.retryNow() } label: { Text("Volver a llamar al agente") }
                         .buttonStyle(Pildora(pequena: true, ancho: true))
                 default:
@@ -68,31 +87,53 @@ struct MenuBarView: View {
     }
 }
 
-/// The menu bar icon: the F of the brand as a template image (follows the menu bar's own colour),
-/// with a small mark when Fogar is not connected. VoiceOver reads the state.
-struct MenuBarIcono: View {
-    let state: AgentState
-    let retirado: Bool
+/// What the menu bar icon says: at rest, recording, speaking, or not connected.
+enum IconoModo: Equatable {
+    case reposo, desconectado, grabando, hablando
 
-    var body: some View {
-        let ok = state.status?.phase == .ready
-        Image(nsImage: Self.icono(marca: !ok))
-            .accessibilityLabel("Fogar: \(Textos.titular(state, retirado: retirado).titulo)")
+    init(_ state: AgentState, _ c: Conversacion) {
+        if c.grabando { self = .grabando }
+        else if c.vivo, c.vista?.speaking == true { self = .hablando }
+        else { self = state.status?.phase == .ready ? .reposo : .desconectado }
     }
 
-    private static var cache: [Bool: NSImage] = [:]
+    var texto: String? {
+        switch self {
+        case .grabando: "grabando"
+        case .hablando: "hablando"
+        case .reposo, .desconectado: nil
+        }
+    }
+}
 
-    static func icono(marca: Bool) -> NSImage {
-        if let img = cache[marca] { return img }
+/// The menu bar icon: the F of the brand as a template image (follows the menu bar's own colour),
+/// with a small dot when Fogar is not connected, a solid ring while recording and two sound arcs
+/// while speaking. VoiceOver reads the state.
+struct MenuBarIcono: View {
+    let modo: IconoModo
+    let titular: String
+
+    var body: some View {
+        Image(nsImage: Self.icono(modo))
+            .accessibilityLabel("Fogar: \(modo.texto.map { $0.prefix(1).uppercased() + $0.dropFirst() } ?? titular)")
+    }
+
+    private static var cache: [IconoModo: NSImage] = [:]
+
+    static func icono(_ modo: IconoModo) -> NSImage {
+        if let img = cache[modo] { return img }
         let geo = LineaGeometry.shared
         let end = geo.idx["bar"]?.1 ?? 0
         let pts = Array(geo.word[0...end])
         let xs = pts.map(\.x), ys = pts.map(\.y)
         let minX = xs.min() ?? 0, maxX = xs.max() ?? 1, minY = ys.min() ?? 0, maxY = ys.max() ?? 1
-        let size = NSSize(width: 18, height: 18)
+        // Wider while recording or speaking: the mark sits beside the F, not on it.
+        let ancho: CGFloat = modo == .grabando || modo == .hablando ? 26 : 18
+        let size = NSSize(width: ancho, height: 18)
         let img = NSImage(size: size, flipped: true) { rect in
-            let k = min((rect.width - 3) / (maxX - minX), (rect.height - 3) / (maxY - minY))
-            let ox = (rect.width - (maxX - minX) * k) / 2, oy = (rect.height - (maxY - minY) * k) / 2
+            let caja = NSRect(x: 0, y: 0, width: 18, height: rect.height)
+            let k = min((caja.width - 3) / (maxX - minX), (caja.height - 3) / (maxY - minY))
+            let ox = (caja.width - (maxX - minX) * k) / 2, oy = (caja.height - (maxY - minY) * k) / 2
             let path = NSBezierPath()
             for (i, p) in pts.enumerated() {
                 let q = NSPoint(x: ox + (p.x - minX) * k, y: oy + (p.y - minY) * k)
@@ -102,15 +143,28 @@ struct MenuBarIcono: View {
             path.lineCapStyle = .round
             path.lineJoinStyle = .round
             NSColor.black.setStroke()
+            NSColor.black.setFill()
             path.stroke()
-            if marca {
-                NSColor.black.setFill()
+            switch modo {
+            case .reposo:
+                break
+            case .desconectado:
                 NSBezierPath(ovalIn: NSRect(x: rect.width - 6, y: rect.height - 6, width: 5, height: 5)).fill()
+            case .grabando:
+                NSBezierPath(ovalIn: NSRect(x: 17, y: 5, width: 8, height: 8)).fill()
+            case .hablando:
+                for (r, x) in [(3.5, 18.0), (6.5, 18.0)] {
+                    let arco = NSBezierPath()
+                    arco.appendArc(withCenter: NSPoint(x: x, y: 9), radius: r, startAngle: -50, endAngle: 50)
+                    arco.lineWidth = 1.5
+                    arco.lineCapStyle = .round
+                    arco.stroke()
+                }
             }
             return true
         }
         img.isTemplate = true
-        cache[marca] = img
+        cache[modo] = img
         return img
     }
 }

@@ -1,7 +1,9 @@
 #!/bin/sh
 # Builds Fogar Desktop into build/Fogar Desktop.app and signs it.
 #   scripts/build-app.sh            release build
-#   scripts/build-app.sh --debug    debug build (honours FOGAR_AGENT_SOCKET, for the stand-in agent)
+#   scripts/build-app.sh --debug    debug build (honours FOGAR_AGENT_SOCKET and FOGAR_AGENT_UNSIGNED,
+#                                   for the stand-in agent): "Fogar Desktop (debug).app", bundle id
+#                                   com.fogar.desktop.debug, so it is never mistaken for the real app
 # Signing: the first "Apple Development" identity in the keychain (free Personal Team), with the
 # hardened runtime the agent's peer check requires; ad hoc ("-") when there is none, in which case
 # the agent treats the app as uid_only and refuses pair/unpair (ADR-0002 amendment).
@@ -15,11 +17,20 @@ config=release
 swift build -c "$config" --product FogarDesktop
 bin=$(swift build -c "$config" --show-bin-path)/FogarDesktop
 
-app="$here/build/Fogar Desktop.app"
+if [ "$config" = debug ]; then
+  app="$here/build/Fogar Desktop (debug).app"
+else
+  app="$here/build/Fogar Desktop.app"
+fi
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources/Fonts"
 cp "$bin" "$app/Contents/MacOS/FogarDesktop"
 cp Sources/FogarDesktop/Info.plist "$app/Contents/Info.plist"
+if [ "$config" = debug ]; then
+  /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.fogar.desktop.debug" \
+    -c "Set :CFBundleName Fogar Desktop (debug)" -c "Set :CFBundleDisplayName Fogar Desktop (debug)" \
+    "$app/Contents/Info.plist"
+fi
 cp Resources/Fonts/* "$app/Contents/Resources/Fonts/"
 
 # Icon: Resources/AppIcon.png (scripts/make-icon.swift) -> .icns.
@@ -32,6 +43,14 @@ for s in 16 32 128 256 512; do
 done
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
 rm -rf "$(dirname "$iconset")"
+
+# Nothing but the app's own binary in Contents/MacOS: anything else there would be signed and run
+# as part of the app (the agent joins it only through PR 6's packaging, which changes this check).
+extra=$(ls -A "$app/Contents/MacOS" | grep -vx FogarDesktop || true)
+if [ -n "$extra" ]; then
+  echo "error: unexpected files in Contents/MacOS: $extra" >&2
+  exit 1
+fi
 
 identity=${FOGAR_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Apple Development/ {print $2; exit}')}
 if [ -z "$identity" ]; then
