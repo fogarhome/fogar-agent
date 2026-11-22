@@ -408,7 +408,9 @@ private struct BotonMicro: View {
                     .onEnded { _ in
                         guard pulsado else { return }
                         pulsado = false
-                        if estado == .listo { conv.soltar() }
+                        // Always: the state may have changed while held, and a take must never
+                        // stay waiting for a release that already happened (no-op without one).
+                        conv.soltar()
                     }
             )
             .focusable(usable)
