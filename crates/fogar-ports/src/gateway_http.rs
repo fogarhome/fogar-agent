@@ -44,6 +44,7 @@ pub struct PathId(String);
 impl PathId {
     pub fn new(s: &str) -> Option<PathId> {
         let ok = (1..=128).contains(&s.len())
+            && !matches!(s, "." | "..") // dot-segments would be normalised out of the closed route set
             && s.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'));
         ok.then(|| PathId(s.to_owned()))
@@ -247,6 +248,8 @@ mod tests {
             assert!(PathId::new(ok).is_some(), "{ok}");
         }
         for bad in [
+            ".",
+            "..",
             "",
             "../x",
             "a/b",
@@ -263,57 +266,155 @@ mod tests {
     }
 
     #[test]
+    fn path_id_dots_only_rejected_when_exact() {
+        for ok in ["a.b", "..x", "x..", ".a"] {
+            assert!(PathId::new(ok).is_some(), "{ok}");
+        }
+    }
+
+    #[test]
     fn calls_map_to_method_path_and_limits() {
-        let id = PathId::new("c1").unwrap();
-        let m = PathId::new("m9").unwrap();
+        let id = || PathId::new("c1").unwrap();
+        let m = || PathId::new("m9").unwrap();
+        // (call, method, path, authenticated, is_stream)
         let cases = [
-            (HttpCall::Login, "POST", "/auth/login".to_string(), false),
-            (HttpCall::UpdateMe, "PATCH", "/auth/me".into(), true),
+            (
+                HttpCall::WellKnown,
+                "GET",
+                "/.well-known/fogar-gateway",
+                false,
+                false,
+            ),
+            (
+                HttpCall::WellKnownLegacy,
+                "GET",
+                "/.well-known/jota-gateway",
+                false,
+                false,
+            ),
+            (HttpCall::Pair, "POST", "/pair", false, false),
+            (HttpCall::Login, "POST", "/auth/login", false, false),
+            (HttpCall::Logout, "POST", "/auth/logout", true, false),
+            (HttpCall::Me, "GET", "/auth/me", true, false),
+            (HttpCall::UpdateMe, "PATCH", "/auth/me", true, false),
             (
                 HttpCall::ListConversations,
                 "GET",
-                "/conversations".into(),
+                "/conversations",
                 true,
+                false,
+            ),
+            (
+                HttpCall::ListAgents,
+                "GET",
+                "/conversations/agents",
+                true,
+                false,
+            ),
+            (
+                HttpCall::GetConversation { id: id() },
+                "GET",
+                "/conversations/c1",
+                true,
+                false,
             ),
             (
                 HttpCall::GetMessages {
-                    id: id.clone(),
-                    before: Some(m.clone()),
+                    id: id(),
+                    before: None,
                 },
                 "GET",
-                "/conversations/c1/messages?before=m9".into(),
+                "/conversations/c1/messages",
                 true,
+                false,
+            ),
+            (
+                HttpCall::GetMessages {
+                    id: id(),
+                    before: Some(m()),
+                },
+                "GET",
+                "/conversations/c1/messages?before=m9",
+                true,
+                false,
+            ),
+            (
+                HttpCall::CreateConversation,
+                "POST",
+                "/conversations",
+                true,
+                false,
+            ),
+            (
+                HttpCall::PostMessage { id: id() },
+                "POST",
+                "/conversations/c1/messages",
+                true,
+                false,
             ),
             (
                 HttpCall::Withdraw {
-                    id: id.clone(),
-                    message: m.clone(),
+                    id: id(),
+                    message: m(),
                 },
                 "DELETE",
-                "/conversations/c1/messages/m9".into(),
+                "/conversations/c1/messages/m9",
+                true,
+                false,
+            ),
+            (
+                HttpCall::Cancel { id: id() },
+                "POST",
+                "/conversations/c1/cancel",
+                true,
+                false,
+            ),
+            (
+                HttpCall::Events { audio: false },
+                "GET",
+                "/events",
+                true,
                 true,
             ),
             (
                 HttpCall::Events { audio: true },
                 "GET",
-                "/events?audio=1".into(),
+                "/events?audio=1",
+                true,
                 true,
             ),
             (
-                HttpCall::Speech { id, message: m },
+                HttpCall::Speech {
+                    id: id(),
+                    message: m(),
+                },
                 "POST",
-                "/conversations/c1/messages/m9/speech".into(),
+                "/conversations/c1/messages/m9/speech",
+                true,
                 true,
             ),
         ];
-        for (call, method, path, auth) in cases {
+        for (call, method, path, auth, stream) in cases {
             assert_eq!(
-                (call.method(), call.path(), call.authenticated()),
-                (method, path, auth)
+                (
+                    call.method(),
+                    call.path(),
+                    call.authenticated(),
+                    call.is_stream()
+                ),
+                (method, path.to_string(), auth, stream),
+                "{call:?}"
             );
+            let list = matches!(
+                call,
+                HttpCall::ListConversations | HttpCall::ListAgents | HttpCall::GetMessages { .. }
+            );
+            let max = if list {
+                MAX_LIST_BODY_BYTES
+            } else {
+                MAX_BODY_BYTES
+            };
+            assert_eq!(call.max_body(), max, "{call:?}");
         }
-        assert_eq!(HttpCall::ListConversations.max_body(), MAX_LIST_BODY_BYTES);
-        assert_eq!(HttpCall::Me.max_body(), MAX_BODY_BYTES);
-        assert!(HttpCall::Events { audio: false }.is_stream() && !HttpCall::Me.is_stream());
     }
 }
