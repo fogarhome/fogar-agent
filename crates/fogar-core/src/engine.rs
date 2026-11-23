@@ -54,8 +54,9 @@ pub(crate) enum Command {
     },
     CaptureEnd(CaptureThen, oneshot::Sender<()>),
     RequestMicPermission(oneshot::Sender<MicPermission>),
-    /// The app shows this turn (its id as the view carries it): its audio may play.
-    TurnVisible(String, oneshot::Sender<()>),
+    /// The app shows this turn (its id as the view carries it): its audio may play. Answered
+    /// `false` when the id names more than one entry of the view (ambiguous: refused).
+    TurnVisible(String, oneshot::Sender<bool>),
 }
 
 /// Redacting `Debug`: the text is the user's.
@@ -264,7 +265,22 @@ impl<C: Clock> Engine<C> {
                 if reply.is_closed() {
                     return;
                 }
-                let _ = reply.send(());
+                // Review F2 of #32: the confirmation must name ONE entry of the view without
+                // ambiguity (ids are compared as the view shows them, truncated included).
+                // Follow-up: a per-entry nonce in TurnView/TurnVisible (protocol change).
+                let entries = self
+                    .conv
+                    .borrow()
+                    .turns
+                    .iter()
+                    .filter(|t| !id.is_empty() && t.turn_id == id)
+                    .count();
+                if entries > 1 {
+                    Stats::inc(&self.stats.turn_visible_refused);
+                    let _ = reply.send(false);
+                    return;
+                }
+                let _ = reply.send(true);
                 st.playback.visible(&id, self.clock.now());
             }
         }
@@ -697,13 +713,13 @@ mod tests {
             .await;
         }
         /// The app says it shows `id` (as only the IPC module would ask).
-        async fn visible(&self, id: &str) {
+        async fn visible(&self, id: &str) -> bool {
             let (tx, rx) = oneshot::channel();
             self.cmd_tx
                 .send(Command::TurnVisible(id.into(), tx))
                 .await
                 .unwrap();
-            rx.await.unwrap();
+            rx.await.unwrap()
         }
         async fn cancel(&self) {
             let (tx, rx) = oneshot::channel();
@@ -926,6 +942,8 @@ mod tests {
     /// turn does.
     #[tokio::test(start_paused = true)]
     async fn no_gateway_sequence_sounds_without_turn_visible() {
+        // Review H5 of #32: the traffic must really reach the gate (frames of a live turn).
+        let mut muted_total = 0u64;
         for seed in 1..=48u64 {
             let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
             let mut h = harness(FakeMic::healthy(), Config::default());
@@ -967,14 +985,16 @@ mod tests {
                 "seed {seed}"
             );
             assert_eq!(h.speaker.snapshot().opens, 0, "seed {seed}");
+            muted_total += s.tts_samples_muted;
             // Control: the same rig sounds once the app confirms a turn.
             h.turn_start("ok", 9, "user").await;
-            h.visible("ok").await;
+            assert!(h.visible("ok").await);
             h.audio(9, &pcm(1, 480)).await;
             settle().await;
             assert_eq!(h.speaker.snapshot().accepted, 480, "seed {seed}");
             h.stop().await;
         }
+        assert!(muted_total > 0, "no frame ever reached the gate");
     }
 
     /// A confirmed turn plays the audio that waited for the confirmation, in order, then the
@@ -1238,6 +1258,90 @@ mod tests {
             1,
             "a new session's turn waits for its own"
         );
+        h.stop().await;
+    }
+
+    /// Review H3 of #32: a turn waiting for its confirmation (or muted) does not keep the
+    /// output open.
+    #[tokio::test(start_paused = true)]
+    async fn an_unconfirmed_turn_does_not_keep_the_output_open() {
+        let h = harness(FakeMic::healthy(), Config::default());
+        h.up().await;
+        h.turn_start("t-1", 1, "user").await;
+        h.visible("t-1").await;
+        h.audio(1, &pcm(1, 480)).await;
+        h.turn_end("t-1").await;
+        settle().await;
+        h.speaker.drain();
+        h.turn_start("t-2", 2, "push").await;
+        h.audio(2, &pcm(1, 480)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let sp = h.speaker.snapshot();
+        assert_eq!((sp.opens, sp.open_now), (1, 0), "released while t-2 waited");
+        h.stop().await;
+    }
+
+    /// Review H4 of #32: confirmed audio lost because no output could open shows in the view.
+    #[tokio::test(start_paused = true)]
+    async fn confirmed_audio_lost_without_an_output_shows_in_the_view() {
+        let h = harness_with(
+            FakeMic::healthy(),
+            FakeSpeaker::minimal(),
+            Config::default(),
+        );
+        h.up().await;
+        h.turn_start("t-1", 1, "user").await;
+        h.visible("t-1").await;
+        h.audio(1, &pcm(1, 480)).await;
+        settle().await;
+        assert_eq!(h.audio_of("t-1"), Some(TurnAudio::Muted));
+        let s = h.stats.snapshot();
+        assert_eq!((s.tts_turns_unplayed, s.tts_samples_dropped), (1, 480));
+        h.stop().await;
+    }
+
+    /// Review F1/F2 of #32: a `turn_start` repeating the (id, seq) of a cut turn is a new
+    /// turn and inherits nothing; a confirmation naming two entries of the view is refused.
+    #[tokio::test(start_paused = true)]
+    async fn a_repeated_turn_start_after_cancel_needs_its_own_confirmation() {
+        let h = harness(FakeMic::healthy(), Config::default());
+        h.up().await;
+        h.turn_start("t-1", 1, "user").await;
+        assert!(h.visible("t-1").await);
+        h.audio(1, &pcm(1, 480)).await;
+        settle().await;
+        assert_eq!(h.speaker.snapshot().accepted, 480);
+        h.cancel().await;
+        h.turn_start("t-1", 1, "user").await;
+        h.audio(1, &pcm(1, 480)).await;
+        settle().await;
+        assert_eq!(
+            h.speaker.snapshot().accepted,
+            480,
+            "no inherited confirmation"
+        );
+        assert_eq!(h.conv.borrow().awaiting_visible.as_deref(), Some("t-1"));
+        // Two entries named "t-1" in the view: ambiguous, refused.
+        assert!(!h.visible("t-1").await);
+        assert_eq!(h.stats.snapshot().turn_visible_refused, 1);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(h.speaker.snapshot().accepted, 480);
+        assert_eq!(h.stats.snapshot().tts_turns_muted, 1);
+        h.stop().await;
+    }
+
+    /// Review F2 of #32: a new seq under an id already shown is ambiguous too.
+    #[tokio::test(start_paused = true)]
+    async fn the_same_id_with_another_seq_is_not_confirmed() {
+        let h = harness(FakeMic::healthy(), Config::default());
+        h.up().await;
+        h.turn_start("t-1", 1, "push").await;
+        h.turn_end("t-1").await;
+        h.turn_start("t-1", 2, "push").await;
+        h.audio(2, &pcm(1, 480)).await;
+        assert!(!h.visible("t-1").await);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(h.speaker.snapshot().opens, 0);
         h.stop().await;
     }
 }

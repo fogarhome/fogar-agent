@@ -340,3 +340,12 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
   RigBuilder::app_on_screen) but fogar-agentd is the orchestrator's and off limits while PR 6
   (#28) is open: left to the orchestrator. audit/geiger/miri NOT RUN (tools not installable
   here); loom PASS (heartbeat untouched).
+- Review round 1 of #32 (2026-11-23, same branch): H1 no retry timer while a release runs
+  (busy loop; test counts next() turns, 307k with the bug); H2 empty TTS frames ignored; H3 a
+  waiting or muted turn does not keep the output open; H4 confirmed audio lost without an
+  output marks the turn Muted (tts_turns_unplayed); H5 property asserts frames reached the gate,
+  timeouts in the off-runtime test. F1 a turn_start repeating the (id, seq) of an ended turn is
+  a new turn (own 2 s wait, no inherited confirmation); F2 TurnVisible naming more than one view
+  entry is refused ("ambiguous turn", turn_visible_refused); F3 an unsolicited origin "user" is a
+  push; F4 discarded audio is zeroed before reuse (not testable without unsafe). Follow-up: a
+  per-entry nonce in TurnView/TurnVisible (app <-> agent protocol change).

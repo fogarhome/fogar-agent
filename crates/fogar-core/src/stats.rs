@@ -128,6 +128,8 @@ counters! {
     tts_turns_seen: "turns the app confirmed visible in time (`TurnVisible`): their audio may play",
     tts_turns_muted: "turns whose audio was discarded: not confirmed visible within 2 s, or 3 s waited",
     tts_samples_muted: "TTS samples discarded because their turn was never confirmed visible",
+    tts_turns_unplayed: "confirmed turns whose audio was lost before anything played (failed open, no output)",
+    turn_visible_refused: "TurnVisible refused: the id names more than one entry of the view",
     playback_opens: "output device opens that succeeded",
     playback_open_failures: "output device opens that failed, timed out or gave a wrong format",
     playback_dead: "open outputs found dead (`is_alive` false) and released (issue #25)",

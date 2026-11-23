@@ -142,6 +142,13 @@ fn samples_duration(n: usize) -> Duration {
     Duration::from_micros(n.saturating_mul(1_000_000) / u64::from(TTS_RATE_HZ))
 }
 
+/// Review F4 of #32: discarded audio is zeroed before the buffer is reused, so no TTS content
+/// lingers in spare capacity.
+fn wipe(v: &mut Vec<i16>) {
+    v.fill(0);
+    v.clear();
+}
+
 fn earliest(a: Option<Mono>, b: Option<Mono>) -> Option<Mono> {
     match (a, b) {
         (Some(x), Some(y)) => Some(if x <= y { x } else { y }),
@@ -208,16 +215,14 @@ impl PlaybackGate {
     /// Follows the turn machine's current turn (`None` = no turn open). A new turn starts
     /// waiting for its confirmation now; whatever the previous one still had waiting is dropped.
     pub(crate) fn follow(&mut self, turn: Option<(&str, u16)>, now: Mono) {
+        // Review F1 of #32: a `turn_start` repeating the (id, seq) of a turn that already ended
+        // (turn_end, Cancel, barge-in) is a NEW turn: it waits for its own confirmation.
         let same = match (turn, self.turn.as_ref()) {
-            (Some((id, seq)), Some(t)) => t.turn_seq == seq && t.turn_id == id,
+            (Some((id, seq)), Some(t)) => t.turn_seq == seq && t.turn_id == id && !t.over,
             _ => false,
         };
         match turn {
-            Some(_) if same => {
-                if let Some(t) = self.turn.as_mut() {
-                    t.over = false;
-                }
-            }
+            Some(_) if same => {}
             Some((id, seq)) => {
                 self.discard_pending();
                 self.turn = Some(TurnPlay {
@@ -267,11 +272,22 @@ impl PlaybackGate {
         self.scratch.clear();
         self.scratch.extend(frame.samples());
         let n = self.scratch.len();
+        // Review H2 of #32: an empty frame carries nothing and must not cost a boundary entry.
+        if n == 0 {
+            return;
+        }
+        self.take_frame(frame.turn_seq, n, now);
+        wipe(&mut self.scratch);
+        self.rearm(now);
+    }
+
+    /// The frame in `scratch` (`n` > 0 samples) for `turn_seq`.
+    fn take_frame(&mut self, turn_seq: u16, n: usize, now: Mono) {
         let Some(t) = self.turn.as_mut() else {
             Stats::add(&self.stats.tts_samples_dropped, n as u64);
             return;
         };
-        if t.turn_seq != frame.turn_seq {
+        if t.turn_seq != turn_seq {
             Stats::add(&self.stats.tts_samples_dropped, n as u64);
             return;
         }
@@ -290,9 +306,8 @@ impl PlaybackGate {
             }
             Visible::Seen => {
                 if self.pending.is_empty() && self.alive_device() {
-                    let mut frame = std::mem::take(&mut self.scratch);
+                    let frame = std::mem::take(&mut self.scratch);
                     self.write(&frame, now);
-                    frame.clear();
                     self.scratch = frame;
                 } else if self.pending.len().saturating_add(n) > UNSEEN_MAX_SAMPLES {
                     // The device is not ready and 3 s already wait for it.
@@ -303,7 +318,6 @@ impl PlaybackGate {
                 }
             }
         }
-        self.rearm(now);
     }
 
     /// Barge-in / Cancel / the gateway's stop: silence at once, discard what waits.
@@ -311,7 +325,7 @@ impl PlaybackGate {
         if let Some(d) = self.device.as_mut() {
             d.stop();
         }
-        self.pending.clear();
+        wipe(&mut self.pending);
         self.pending_frames.clear();
         self.speaking = false;
         self.drain_at = None;
@@ -349,7 +363,7 @@ impl PlaybackGate {
                 _ => Stats::add(&self.stats.tts_samples_dropped, n),
             }
         }
-        self.pending.clear();
+        wipe(&mut self.pending);
         self.pending_frames.clear();
     }
 
@@ -358,7 +372,7 @@ impl PlaybackGate {
     fn mute(&mut self, now: Mono, dropped_frame: bool) {
         let had_audio = dropped_frame || !self.pending.is_empty();
         Stats::add(&self.stats.tts_samples_muted, self.pending.len() as u64);
-        self.pending.clear();
+        wipe(&mut self.pending);
         self.pending_frames.clear();
         if let Some(t) = self.turn.as_mut() {
             t.visible = Visible::Muted;
@@ -450,7 +464,7 @@ impl PlaybackGate {
             start = end;
         }
         self.pending = pending;
-        self.pending.clear();
+        wipe(&mut self.pending);
         self.pending_frames = frames;
         self.pending_frames.clear();
     }
@@ -469,9 +483,7 @@ impl PlaybackGate {
             return;
         }
         if !self.sink.capabilities().playback.is_available() {
-            Stats::add(&self.stats.tts_samples_dropped, self.pending.len() as u64);
-            self.pending.clear();
-            self.pending_frames.clear();
+            self.drop_confirmed();
             return;
         }
         let sink = self.sink.clone();
@@ -500,9 +512,27 @@ impl PlaybackGate {
         self.failures = self.failures.saturating_add(1);
         self.retry_at = Some(now.saturating_add(self.backoff()));
         // What waited for this device will not play in time.
-        Stats::add(&self.stats.tts_samples_dropped, self.pending.len() as u64);
-        self.pending.clear();
+        self.drop_confirmed();
+    }
+
+    /// Confirmed audio that waited for the device is lost (failed or late open, no output).
+    /// Review H4 of #32: if the turn has not played anything, the view says it stayed text
+    /// only (`Muted`), not just the counter.
+    fn drop_confirmed(&mut self) {
+        let n = self.pending.len();
+        if n == 0 {
+            return;
+        }
+        Stats::add(&self.stats.tts_samples_dropped, n as u64);
+        wipe(&mut self.pending);
         self.pending_frames.clear();
+        if let Some(t) = self.turn.as_mut()
+            && t.marked.is_none()
+        {
+            t.marked = Some(TurnAudio::Muted);
+            Stats::inc(&self.stats.tts_turns_unplayed);
+            self.mark = Some((t.view_id.clone(), TurnAudio::Muted));
+        }
     }
 
     /// Releases a device handle on the blocking pool. Never refused: a release must happen.
@@ -515,12 +545,17 @@ impl PlaybackGate {
         });
     }
 
-    /// Open, no turn needs it, nothing queued or waiting.
+    /// Open, and no confirmed turn needs it: nothing playing, nothing confirmed waiting, and
+    /// no open turn that may play (review H3 of #32: a turn still waiting for its confirmation,
+    /// or muted, does not keep the output open).
     fn idle(&self) -> bool {
         self.device.is_some()
             && !self.speaking
-            && self.pending.is_empty()
-            && self.turn.as_ref().is_none_or(|t| t.over)
+            && !(self.seen() && !self.pending.is_empty())
+            && self
+                .turn
+                .as_ref()
+                .is_none_or(|t| t.over || t.visible != Visible::Seen)
     }
 
     fn rearm(&mut self, now: Mono) {
@@ -544,11 +579,14 @@ impl PlaybackGate {
             .as_ref()
             .filter(|j| j.wanted)
             .map(|j| j.since.saturating_add(OPEN_DEADLINE));
+        // Review H1 of #32: not while a release runs (an open cannot start then, and the end
+        // of the release pumps anyway): a past `retry_at` would make `next` spin.
         let retry = self.retry_at.filter(|_| {
             self.seen()
                 && !self.pending.is_empty()
                 && self.device.is_none()
                 && self.open_job.is_none()
+                && self.releasing == 0
         });
         [visible, open, retry, self.drain_at, self.idle_close_at]
             .into_iter()
@@ -768,7 +806,9 @@ mod tests {
         }
         assert_eq!(seen.lock().unwrap().written, 0, "still opening");
         release_tx.send(()).unwrap();
-        g.next(&clock).await;
+        tokio::time::timeout(Duration::from_secs(10), g.next(&clock))
+            .await
+            .expect("the open came back");
         assert_eq!(
             seen.lock().unwrap().written,
             480,
@@ -776,7 +816,9 @@ mod tests {
         );
         g.link_down(clock.now());
         // The release job finishes on the blocking pool.
-        g.next(&clock).await;
+        tokio::time::timeout(Duration::from_secs(10), g.next(&clock))
+            .await
+            .expect("the release came back");
         let seen = seen.lock().unwrap();
         assert!(seen.open_thread.is_some() && seen.drop_thread.is_some());
         assert_ne!(seen.open_thread, Some(runtime_thread));
@@ -819,5 +861,106 @@ mod tests {
         let s = stats.snapshot();
         assert_eq!(s.playback_opens, 0, "a late device is never used");
         assert_eq!(seen.lock().unwrap().written, 0);
+    }
+
+    /// A speaker whose playbacks have the wrong format and whose drop blocks until the test
+    /// lets it go (a slow CoreAudio teardown).
+    #[derive(Debug)]
+    struct SlowDropSpeaker {
+        release: Arc<Mutex<std_mpsc::Receiver<()>>>,
+    }
+
+    #[derive(Debug)]
+    struct WrongFormat(Arc<Mutex<std_mpsc::Receiver<()>>>);
+
+    impl ActivePlayback for WrongFormat {
+        fn format(&self) -> AudioFormat {
+            AudioFormat::mono(48_000)
+        }
+        fn write(&mut self, pcm: &[i16]) -> usize {
+            pcm.len()
+        }
+        fn stop(&mut self) {}
+        fn queued_samples(&self) -> usize {
+            0
+        }
+    }
+
+    impl Drop for WrongFormat {
+        fn drop(&mut self) {
+            let _ = self.0.lock().unwrap().recv();
+        }
+    }
+
+    impl AudioSink for SlowDropSpeaker {
+        fn capabilities(&self) -> AudioSinkCaps {
+            let mut c = AudioSinkCaps::NONE;
+            c.playback = Support::Native;
+            c
+        }
+        fn open(&self, _format: AudioFormat) -> Result<Box<dyn ActivePlayback>, AudioError> {
+            Ok(Box::new(WrongFormat(self.release.clone())))
+        }
+    }
+
+    /// Review H1 of #32: confirmed audio waiting while a slow release runs must not make
+    /// `next` spin once the backoff has passed (real time, current-thread runtime).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_release_with_audio_waiting_does_not_spin() {
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let stats = Arc::new(Stats::default());
+        let mut g = PlaybackGate::new(
+            Arc::new(SlowDropSpeaker {
+                release: Arc::new(Mutex::new(release_rx)),
+            }),
+            stats.clone(),
+        );
+        let clock = TestClock::new();
+        g.follow(Some(("t-1", 1)), clock.now());
+        g.visible("t-1", clock.now());
+        let buf = frame(1, 480);
+        let f = fogar_proto::parse_tts_frame(&buf).unwrap();
+        g.on_frame(&f, clock.now());
+        // The open comes back with the wrong format: released (slowly), backoff 0.5 s.
+        tokio::time::timeout(Duration::from_secs(10), g.next(&clock))
+            .await
+            .expect("the open came back");
+        assert_eq!(stats.snapshot().playback_open_failures, 1);
+        // More confirmed audio arrives while the release is stuck.
+        g.on_frame(&f, clock.now());
+        let mut turns = 0u32;
+        let _ = tokio::time::timeout(Duration::from_millis(1500), async {
+            loop {
+                g.next(&clock).await;
+                turns += 1;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(turns <= 2, "next() spun {turns} times during the release");
+        drop(release_tx);
+    }
+
+    /// Review H2 of #32: empty frames cost nothing (no boundary entries, no mute).
+    #[test]
+    fn empty_frames_are_ignored() {
+        let mut g = PlaybackGate::new(
+            Arc::new(fogar_testkit::FakeSpeaker::healthy()),
+            Arc::new(Stats::default()),
+        );
+        let now = Mono(Duration::ZERO);
+        g.follow(Some(("t-1", 1)), now);
+        let empty = [fogar_proto::audio::TTS_MAGIC, 0, 1];
+        let odd = [fogar_proto::audio::TTS_MAGIC, 0, 1, 7];
+        for _ in 0..100_000 {
+            g.on_frame(&fogar_proto::parse_tts_frame(&empty).unwrap(), now);
+            g.on_frame(&fogar_proto::parse_tts_frame(&odd).unwrap(), now);
+        }
+        assert!(g.pending_frames.is_empty() && g.pending.is_empty());
+        assert_eq!(
+            g.awaiting_visible(),
+            Some("t-1"),
+            "still waiting, not muted"
+        );
     }
 }

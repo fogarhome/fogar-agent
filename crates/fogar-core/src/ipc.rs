@@ -498,7 +498,10 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
             }
             IpcRequest::TurnVisible { turn_id } => {
                 match c.ask(|reply| Command::TurnVisible(turn_id, reply)).await {
-                    Some(()) => IpcResponse::TurnVisibleNoted,
+                    Some(true) => IpcResponse::TurnVisibleNoted,
+                    Some(false) => IpcResponse::Refused {
+                        reason: "ambiguous turn",
+                    },
                     None => BUSY,
                 }
             }
