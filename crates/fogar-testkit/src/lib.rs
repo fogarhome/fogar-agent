@@ -17,7 +17,7 @@ pub use fakes::{
 };
 pub use gateway::{
     FakeGatewayHttp, FakeGatewayLink, FakeStreamBody, GatewayLog, HttpRoutes, MockConfig,
-    MockGateway, MockHttpServer, StreamStep,
+    MockGateway, MockHttpServer, RouteLog, StreamStep,
 };
 
 /// Runs an async contract clause on a fresh current-thread runtime with time and I/O enabled.

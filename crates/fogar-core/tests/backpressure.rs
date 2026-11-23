@@ -174,8 +174,9 @@ mod busy_downlink {
         async fn connect(
             &self,
             addr: &fogar_ports::gateway::GatewayAddr,
+            route: fogar_ports::gateway::WsRoute,
         ) -> Result<FloodSess, LinkError> {
-            let inner = self.inner.connect(addr).await?;
+            let inner = self.inner.connect(addr, route).await?;
             let rx = self.rx.lock().ok().and_then(|mut g| g.take());
             Ok(FloodSess { inner, rx })
         }

@@ -41,3 +41,8 @@ pub use http::{
 };
 pub use memory::{FAKE_MAX_FRAME, FakeGatewayLink, FakeSession};
 pub use ws::MockGateway;
+
+/// Which `WsRoute` each accepted connection used, oldest first.
+pub trait RouteLog {
+    fn routes_used(&self) -> Vec<fogar_ports::gateway::WsRoute>;
+}

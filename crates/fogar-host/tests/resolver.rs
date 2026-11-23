@@ -5,7 +5,7 @@
 
 use fogar_host::{HttpConfig, HttpGateway, Resolver, WsConfig, WsGatewayLink};
 use fogar_ports::{
-    gateway::{GatewayAddr, GatewayLink, LinkError},
+    gateway::{GatewayAddr, GatewayLink, LinkError, WsRoute},
     gateway_http::{GatewayHttp, HttpCall, HttpError},
 };
 use fogar_testkit::{HttpRoutes, MockConfig, MockGateway, MockHttpServer, run_async};
@@ -79,7 +79,7 @@ fn ws_refuses_a_lan_name_that_resolves_public() {
         let addr = GatewayAddr::parse("green-house:8004").unwrap();
         for ips in HOSTILE {
             let link = WsGatewayLink::with_resolver(WsConfig::default(), Fixed::new(ips));
-            let r = bounded(link.connect(&addr)).await;
+            let r = bounded(link.connect(&addr, WsRoute::Stream)).await;
             assert!(matches!(r, Err(LinkError::NotConfigured)), "{ips:?}");
         }
     })
@@ -118,7 +118,7 @@ fn ws_connects_to_the_resolved_private_address() {
         let addr = GatewayAddr::parse(&format!("green-house:{}", gw.addr().port())).unwrap();
         let res = Fixed::new(&["127.0.0.1"]);
         let link = WsGatewayLink::with_resolver(WsConfig::default(), res.clone());
-        let mut s = link.connect(&addr).await.unwrap();
+        let mut s = link.connect(&addr, WsRoute::Stream).await.unwrap();
         assert_eq!(res.lookups.load(Ordering::SeqCst), 1);
         fogar_ports::gateway::LinkSession::close(&mut s, 1000, "bye")
             .await

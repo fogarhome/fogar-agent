@@ -14,7 +14,8 @@
 
 use crate::net::{Conn, DialError, Resolver, SystemResolver, dial, platform_tls};
 use fogar_ports::gateway::{
-    Frame, GatewayAddr, GatewayLink, LinkError, LinkEvent, LinkSession, Scheme, cleartext_allowed,
+    Frame, GatewayAddr, GatewayLink, LinkError, LinkEvent, LinkSession, Scheme, WsRoute,
+    cleartext_allowed,
 };
 use fogar_proto::limits::WS_MAX_FRAME_BYTES;
 use futures_util::{SinkExt, StreamExt};
@@ -209,7 +210,7 @@ impl LinkSession for WsSession {
 impl<R: Resolver> GatewayLink for WsGatewayLink<R> {
     type Session = WsSession;
 
-    async fn connect(&self, addr: &GatewayAddr) -> Result<WsSession, LinkError> {
+    async fn connect(&self, addr: &GatewayAddr, route: WsRoute) -> Result<WsSession, LinkError> {
         let cfg = &self.cfg;
         let conn = match dial(
             &*self.resolver,
@@ -227,7 +228,7 @@ impl<R: Resolver> GatewayLink for WsGatewayLink<R> {
             Scheme::Plain => "ws",
             Scheme::Tls => "wss",
         };
-        let url = format!("{scheme}://{}/ws/stream", addr.authority());
+        let url = format!("{scheme}://{}{}", addr.authority(), route.path());
         let (ws, _resp) =
             tokio_tungstenite::client_async_with_config(url, conn, Some(ws_config(cfg.max_frame)))
                 .await

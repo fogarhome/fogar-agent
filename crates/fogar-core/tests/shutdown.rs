@@ -124,8 +124,9 @@ mod hung_close {
         async fn connect(
             &self,
             addr: &fogar_ports::gateway::GatewayAddr,
+            route: fogar_ports::gateway::WsRoute,
         ) -> Result<HungSess, LinkError> {
-            Ok(HungSess(self.0.connect(addr).await?))
+            Ok(HungSess(self.0.connect(addr, route).await?))
         }
     }
 }

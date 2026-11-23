@@ -621,9 +621,9 @@ pub mod gateway_link {
     //! Clauses run against a link and the address of a running mock gateway expecting
     //! `MockConfig::default().client_key`. `$make` builds `(link, mock_handle)` inside the
     //! runtime; the handle has `.addr() -> GatewayAddr` and `.control(Ctl) -> usize`.
-    use crate::gateway::{Ctl, MockConfig};
+    use crate::gateway::{Ctl, MockConfig, RouteLog};
     use fogar_ports::gateway::{
-        Frame, GatewayAddr, GatewayLink, LinkError, LinkEvent, LinkSession,
+        Frame, GatewayAddr, GatewayLink, LinkError, LinkEvent, LinkSession, WsRoute,
     };
     use fogar_proto::{ServerMsg, decode_server};
     use std::time::Duration;
@@ -651,7 +651,7 @@ pub mod gateway_link {
     }
 
     pub async fn connects_and_gets_ready<L: GatewayLink>(link: &L, addr: &GatewayAddr) {
-        let mut s = link.connect(addr).await.expect("connect");
+        let mut s = link.connect(addr, WsRoute::Stream).await.expect("connect");
         s.send(Frame::Text(handshake())).await.unwrap();
         loop {
             match next_msg(&mut s).await {
@@ -668,7 +668,7 @@ pub mod gateway_link {
         link: &L,
         addr: &GatewayAddr,
     ) {
-        let mut s = link.connect(addr).await.unwrap();
+        let mut s = link.connect(addr, WsRoute::Stream).await.unwrap();
         let big = Frame::Binary(vec![0; s.max_frame() + 1]);
         assert!(matches!(s.send(big).await, Err(LinkError::TooLarge { .. })));
         s.send(Frame::Text(handshake())).await.unwrap();
@@ -684,7 +684,7 @@ pub mod gateway_link {
     /// idle nor while frames are streaming in (review code#8: the first version only cancelled
     /// while nothing was in flight, so a `recv` that loses a frame it already took passed).
     pub async fn recv_is_cancel_safe<L: GatewayLink>(link: &L, addr: &GatewayAddr) {
-        let mut s = link.connect(addr).await.unwrap();
+        let mut s = link.connect(addr, WsRoute::Stream).await.unwrap();
         s.send(Frame::Text(handshake())).await.unwrap();
         loop {
             if let ServerMsg::Ready(_) = next_msg(&mut s).await {
@@ -757,7 +757,7 @@ pub mod gateway_link {
         addr: &GatewayAddr,
         control: impl Fn(Ctl) -> usize,
     ) {
-        let mut s = link.connect(addr).await.unwrap();
+        let mut s = link.connect(addr, WsRoute::Stream).await.unwrap();
         s.send(Frame::Text(handshake())).await.unwrap();
         loop {
             if let ServerMsg::Ready(_) = next_msg(&mut s).await {
@@ -788,7 +788,11 @@ pub mod gateway_link {
     /// NET-1: clear text to a public address is refused before any byte is sent.
     pub async fn cleartext_to_public_ip_is_refused<L: GatewayLink>(link: &L) {
         let public = GatewayAddr::parse("203.0.113.7:8004").expect("addr");
-        let r = tokio::time::timeout(Duration::from_secs(1), link.connect(&public)).await;
+        let r = tokio::time::timeout(
+            Duration::from_secs(1),
+            link.connect(&public, WsRoute::Stream),
+        )
+        .await;
         assert!(
             matches!(r, Ok(Err(LinkError::NotConfigured))),
             "plain ws to a public IP must be NotConfigured at once"
@@ -799,7 +803,7 @@ pub mod gateway_link {
     /// Whatever protocol generation the mock speaks (M19 4010, or 1008 + the old text), the
     /// close reaches the core intact and classifies as "re-pair".
     pub async fn bad_key_is_closed_as_repair<L: GatewayLink>(link: &L, addr: &GatewayAddr) {
-        let mut s = link.connect(addr).await.unwrap();
+        let mut s = link.connect(addr, WsRoute::Stream).await.unwrap();
         s.send(Frame::Text(
             r#"{"client_key":"wrong","input_mode":"audio","output_mode":["audio"]}"#.into(),
         ))
@@ -824,8 +828,25 @@ pub mod gateway_link {
         }
     }
 
+    /// A dictation connect reaches the gateway on `/speech/dictation`.
+    pub async fn route_selects_the_path<L: GatewayLink>(
+        link: &L,
+        gw: &impl RouteLog,
+        addr: &GatewayAddr,
+    ) {
+        let mut s = tokio::time::timeout(
+            Duration::from_secs(5),
+            link.connect(addr, WsRoute::Dictation),
+        )
+        .await
+        .expect("connect timed out")
+        .expect("connect");
+        assert_eq!(gw.routes_used().last(), Some(&WsRoute::Dictation));
+        s.close(1000, "").await.unwrap();
+    }
+
     /// `$make` must evaluate (inside the runtime) to `(link, gateway)` where `gateway` has
-    /// `.control(Ctl) -> usize`.
+    /// `.control(Ctl) -> usize` and implements `RouteLog`.
     #[macro_export]
     macro_rules! gateway_link_contract {
         ($make:expr) => {
@@ -866,6 +887,13 @@ pub mod gateway_link {
                     $crate::run_async(async {
                         let (link, _gw) = $make;
                         c::cleartext_to_public_ip_is_refused(&link).await
+                    })
+                }
+                #[test]
+                fn route_selects_the_path() {
+                    $crate::run_async(async {
+                        let (link, gw) = $make;
+                        c::route_selects_the_path(&link, &gw, &gw.addr()).await
                     })
                 }
                 #[test]

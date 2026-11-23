@@ -304,8 +304,9 @@ mod contract_catches_lossy_recv {
         async fn connect(
             &self,
             addr: &fogar_ports::gateway::GatewayAddr,
+            route: fogar_ports::gateway::WsRoute,
         ) -> Result<LossySess, LinkError> {
-            Ok(LossySess(self.0.connect(addr).await?))
+            Ok(LossySess(self.0.connect(addr, route).await?))
         }
     }
 

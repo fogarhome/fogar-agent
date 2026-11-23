@@ -6,7 +6,7 @@
 
 use fogar_host::{HttpConfig, HttpGateway, Resolver, WsConfig, WsGatewayLink};
 use fogar_ports::{
-    gateway::{GatewayAddr, GatewayLink, LinkError},
+    gateway::{GatewayAddr, GatewayLink, LinkError, WsRoute},
     gateway_http::{GatewayHttp, HttpCall, HttpError},
 };
 use fogar_testkit::{HttpRoutes, MockConfig, MockGateway, MockHttpServer, run_async};
@@ -132,6 +132,12 @@ impl WssGateway {
     }
 }
 
+impl fogar_testkit::gateway::RouteLog for WssGateway {
+    fn routes_used(&self) -> Vec<WsRoute> {
+        self.inner.routes_used()
+    }
+}
+
 fogar_testkit::gateway_http_contract!({
     let s = HttpsServer::start().await;
     let h = HttpGateway::new(HttpConfig::default()).with_tls(client(CA));
@@ -177,7 +183,7 @@ fn unknown_ca_fails_the_handshake() {
         let gw = WssGateway::start().await;
         let link = WsGatewayLink::new(WsConfig::default()).with_tls(client(OTHER_CA));
         assert!(matches!(
-            link.connect(&gw.addr()).await,
+            link.connect(&gw.addr(), WsRoute::Stream).await,
             Err(LinkError::Transport(_))
         ));
     }))
@@ -210,7 +216,7 @@ fn name_not_in_the_certificate_fails_the_handshake() {
             GatewayAddr::parse(&format!("wss://green-house.example:{}", gw.proxy.port)).unwrap();
         let link = WsGatewayLink::with_resolver(WsConfig::default(), Loopback).with_tls(client(CA));
         assert!(matches!(
-            link.connect(&wrong).await,
+            link.connect(&wrong, WsRoute::Stream).await,
             Err(LinkError::Transport(_))
         ));
     }))
