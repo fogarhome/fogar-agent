@@ -1,8 +1,9 @@
+import AppKit
 import FogarWire
 import SwiftUI
 
 /// Conversación: today's conversation with Fogar, like Claude or Gemini. A text box with a
-/// microphone (click to record and review, or hold and release to send), the reply as it arrives,
+/// microphone (click to talk and watch the transcript; send it, or stop and edit it), the reply as it arrives,
 /// what Fogar is doing meanwhile, and a way to cancel. Everything on screen is the agent's view; the
 /// app keeps nothing of its own and logs nothing of it.
 struct ConversacionView: View {
@@ -46,6 +47,11 @@ struct ConversacionView: View {
         }
         .onChange(of: ventanaVisible) { _, v in conv.aLaVista = aparecida && v }
         .onChange(of: conv.borradorNuevo) { cajaEnfocada = true }
+        // Esc and Return in a take only count in this window (`Conversacion.admiteTeclasDeToma`).
+        .background(VentanaAccesor { conv.ventana = $0 })
+        .onChange(of: conv.grabando) { _, g in
+            if g { AccessibilityNotification.Announcement("Grabando").post() }
+        }
         // Heard as well as seen: an automatic cut, a lost phrase, a refusal.
         .onChange(of: conv.vista?.notice) { _, n in
             if let n { AccessibilityNotification.Announcement(Textos.aviso(n)).post() }
@@ -129,7 +135,7 @@ private struct Vacio: View {
                 .frame(width: 150)
                 .accessibilityHidden(true)
             Text("¿En qué te ayudo?").titularFogar(26)
-            Text("Escribe, o pulsa el micrófono para hablar y revisar el texto. Si lo mantienes pulsado, al soltarlo se envía.")
+            Text("Escribe, o pulsa el micrófono y habla: verás el texto mientras hablas.")
                 .font(Tipo.sub).suave()
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 440)
@@ -226,16 +232,19 @@ private struct TurnoVista: View {
 
 /// The text box and everything around it: the line about what went wrong, the box itself (the
 /// field, or the take while recording) and the permission action when the microphone needs one.
-/// The microphone button stays in the same place in every state, so a held press keeps its
-/// gesture from press to release.
+/// Like Claude's box: the microphone starts a take; the take shows what Fogar hears and has two
+/// buttons only, stop (the text stays in the box to edit) and send.
 private struct Composicion: View {
     let listo: Bool
     var cajaEnfocada: FocusState<Bool>.Binding
     @Environment(Conversacion.self) private var conv
     @Environment(\.accessibilityReduceMotion) private var reduce
+    /// The send button of an open take has the focus (keyboard, VoiceOver).
+    @FocusState private var enviarEnfocado: Bool
 
     var body: some View {
         let micro = conv.estadoMicro(listo: listo)
+        let enToma = conv.enToma
         VStack(alignment: .leading, spacing: 10) {
             if let linea = lineaArriba {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -247,17 +256,15 @@ private struct Composicion: View {
                 .transition(.opacity)
                 .accessibilityElement(children: .combine)
             }
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(alignment: .bottom, spacing: 8) {
-                    contenido
-                        .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(alignment: .bottom, spacing: 8) {
+                contenido
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if enToma {
+                    SalidasDeLaToma(enviarEnfocado: $enviarEnfocado)
+                        .transition(cambio)
+                } else {
                     BotonMicro(estado: micro)
-                    if !enToma {
-                        BotonDerecho()
-                    }
-                }
-                if enToma, !mantener {
-                    SalidasDeLaToma(abierta: conv.grabando)
+                    BotonDerecho()
                 }
             }
             .padding(12)
@@ -266,6 +273,7 @@ private struct Composicion: View {
                 RoundedRectangle(cornerRadius: Medida.radioVidrio)
                     .strokeBorder(conv.grabando ? Color.llama.opacity(0.55) : Color.veta, lineWidth: 1)
             }
+            .animation(reduce ? .easeOut(duration: Medida.rapido) : .spring(response: 0.32, dampingFraction: 0.86), value: enToma)
             .animation(.easeOut(duration: Medida.base), value: conv.grabando)
             if micro == .pedirPermiso || micro == .denegado {
                 HStack(spacing: 10) {
@@ -287,18 +295,20 @@ private struct Composicion: View {
         .frame(maxWidth: 760)
         .frame(maxWidth: .infinity)
         .animation(reduce ? nil : .easeOut(duration: Medida.base), value: lineaArriba?.texto)
+        // The focus follows the box: to Send when the take opens, back to the field when it ends.
+        .onChange(of: enToma) { _, t in
+            if t { enviarEnfocado = true } else { cajaEnfocada.wrappedValue = true }
+        }
     }
 
-    /// The person's hands are in a take (opening, open or closing) or the agent records.
-    private var enToma: Bool { conv.grabando || conv.toma != .ninguna }
-
-    private var mantener: Bool {
-        if case .abierta(true, _, _) = conv.toma { true } else { false }
+    /// Field ⇄ take: a crossfade with a short rise; only the fade under reduce motion.
+    private var cambio: AnyTransition {
+        reduce ? .opacity : .opacity.combined(with: .offset(y: 4))
     }
 
     @ViewBuilder private var contenido: some View {
-        if enToma {
-            TomaVista(mantener: mantener)
+        if conv.enToma {
+            TomaVista().transition(cambio)
         } else if conv.vista?.activity == .transcribing && conv.vivo {
             HStack(spacing: 10) {
                 Giro().frame(width: 14, height: 14).foregroundStyle(Color.huesoSuave)
@@ -306,7 +316,7 @@ private struct Composicion: View {
             }
             .frame(minHeight: 34)
         } else {
-            CampoTexto(cajaEnfocada: cajaEnfocada)
+            CampoTexto(cajaEnfocada: cajaEnfocada).transition(cambio)
         }
     }
 
@@ -353,7 +363,7 @@ private struct BotonDerecho: View {
                 BotonRedondo(icono: "stop.fill", etiqueta: "Cancelar", principal: true) {
                     conv.cancelarAhora()
                 }
-                .keyboardShortcut(".", modifiers: .command)
+                // ⌘. is handled by the app itself (`Conversacion.tecla`), wherever the focus is.
                 .help("Cancelar la respuesta (⌘.)")
                 .transition(.scale(scale: 0.8).combined(with: .opacity))
             } else {
@@ -370,30 +380,25 @@ private struct BotonDerecho: View {
 }
 
 /// The take: «Grabando» only once the agent says the microphone is open (before that, «Abriendo
-/// el micrófono…»), and what Fogar understands so far.
+/// el micrófono…»), and what Fogar understands so far, as it arrives.
 private struct TomaVista: View {
-    let mantener: Bool
     @Environment(Conversacion.self) private var conv
 
     var body: some View {
         let grabando = conv.grabando
         let parcial = grabando ? conv.vista?.live ?? "" : ""
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
                 if grabando {
-                    Brasa(tam: 10)
-                    Text("Grabando").font(Tipo.texto(14, peso: 600)).foregroundStyle(Color.hueso)
+                    Brasa(tam: 8)
+                    Text("Grabando").meta()
                 } else {
                     Giro().frame(width: 12, height: 12).foregroundStyle(Color.huesoSuave)
-                    Text("Abriendo el micrófono…").font(Tipo.texto(14, peso: 550)).suave()
-                }
-                Spacer(minLength: 0)
-                if mantener {
-                    Text("Suelta para enviar").meta()
+                    Text("Abriendo el micrófono…").meta()
                 }
             }
             .accessibilityElement(children: .combine)
-            .accessibilityLabel(grabando ? (mantener ? "Grabando. Suelta para enviar." : "Grabando") : "Abriendo el micrófono")
+            .accessibilityLabel(grabando ? "Grabando" : "Abriendo el micrófono")
             if grabando {
                 Text(parcial.isEmpty ? "Te escucho…" : parcial)
                     .font(Tipo.texto(16))
@@ -410,96 +415,57 @@ private struct TomaVista: View {
     }
 }
 
-/// The three ways out of a clicked take. Esc discards and Return sends, also while the take is
-/// still opening (it ends as soon as the agent opens it).
+/// The two ways out of a take, where the microphone and Send were: stop (the text stays in the
+/// box to edit or send, `review`) and send (`send`). Both also work while the take is still
+/// opening: it ends as soon as the agent opens it. Esc discards and Return sends (`Conversacion.tecla`).
 private struct SalidasDeLaToma: View {
-    let abierta: Bool
+    var enviarEnfocado: FocusState<Bool>.Binding
     @Environment(Conversacion.self) private var conv
 
     var body: some View {
+        let cerrando = conv.toma == .cerrando
         HStack(spacing: 8) {
-            Button { conv.descartar() } label: { Text("Descartar") }
-                .buttonStyle(Pildora(pequena: true))
-                .keyboardShortcut(.cancelAction)
-                .help("Descartar (Esc)")
-            Spacer(minLength: 0)
-            Button { conv.parar() } label: { Text("Parar y revisar") }
-                .buttonStyle(Pildora(pequena: true))
-                .disabled(!abierta)
-            Button { conv.enviarYa() } label: { Text("Enviar ya") }
-                .buttonStyle(Pildora(variante: .principal, pequena: true))
-                .keyboardShortcut(.defaultAction)
-                .help("Enviar sin revisar (Intro)")
-                .disabled(!abierta)
+            BotonRedondo(icono: "stop.fill", etiqueta: "Parar y revisar") { conv.parar() }
+                .help("Parar: el texto se queda en la caja")
+            BotonRedondo(icono: "arrow.up", etiqueta: "Enviar", principal: true) { conv.enviarToma() }
+                .focused(enviarEnfocado)
+                .help("Enviar (Intro)")
         }
+        .disabled(cerrando)
     }
 }
 
-/// The microphone: press to record. A short click leaves the take open (review or send); held
-/// past 300 ms, releasing sends. A cancelled gesture counts as a release. Clicking it again on an
-/// open clicked take stops it to review. Space or VoiceOver's action start a clicked take.
+/// The microphone: click (or Space, or VoiceOver's action) to start a take. Without permission it
+/// asks for it, or opens System Settings when it was denied.
 private struct BotonMicro: View {
     let estado: EstadoMicro
     @Environment(Conversacion.self) private var conv
-    /// Reset by SwiftUI when the gesture ends OR is cancelled: the release always arrives.
-    @GestureState private var pulsando = false
     @State private var hover = false
-    @FocusState private var enfocado: Bool
 
     var body: some View {
         let usable = estado == .listo || estado == .pedirPermiso || estado == .denegado
-        let activo = conv.grabando
-        Image(systemName: activo ? "mic.fill" : estado == .listo || estado == .pedirPermiso ? "mic" : "mic.slash")
-            .font(.system(size: 15, weight: .medium))
-            .foregroundStyle(activo ? Color.llama : Color.hueso)
-            .frame(width: 34, height: 34)
-            .background(Circle().fill(pulsando ? Color.veloAlto : (hover && usable) || activo ? Color.velo : .clear))
-            .overlay { Circle().strokeBorder(Color.hueso, lineWidth: 2).padding(-3).opacity(enfocado ? 1 : 0) }
-            .contentShape(Circle())
-            .opacity(usable || activo ? 1 : 0.42)
-            .scaleEffect(pulsando ? 0.94 : 1)
-            .animation(.timingCurve(0.23, 1, 0.32, 1, duration: Medida.pulsar), value: pulsando)
-            .onHover { hover = $0 }
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .updating($pulsando) { _, estadoGesto, _ in estadoGesto = true }
-            )
-            .onChange(of: pulsando) { _, ahora in
-                if ahora {
-                    if usable { presionar() }
-                } else {
-                    // Ended or cancelled: always reaches the take (a no-op without one).
-                    conv.soltar()
-                }
-            }
-            .focusable(usable)
-            .focused($enfocado)
-            .focusEffectDisabled()
-            .onKeyPress(.space) { accion(); return .handled }
-            .help(Textos.micro(estado))
-            .accessibilityElement()
-            .accessibilityAddTraits(.isButton)
-            .accessibilityLabel(estado == .pedirPermiso ? "Permitir el micrófono" : activo ? "Parar de grabar" : "Micrófono")
-            .accessibilityHint(Textos.micro(estado))
-            .accessibilityAction { accion() }
-    }
-
-    private func presionar() {
-        switch estado {
-        case .listo:
-            conv.pulsar()
-            // Only a press still held is promoted (the release clears it in the model).
-            conv.vigilarMantener()
-        case .pedirPermiso: conv.pedirPermisoAhora()
-        case .denegado: conv.abrirAjustesMicro()
-        default: break
+        Button(action: accion) {
+            Image(systemName: estado == .listo || estado == .pedirPermiso ? "mic" : "mic.slash")
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(Color.hueso)
+                .frame(width: 34, height: 34)
+                .background(Circle().fill(hover && usable ? Color.velo : .clear))
+                .contentShape(Circle())
+                .opacity(usable ? 1 : 0.42)
         }
+        .buttonStyle(Pulsable())
+        .disabled(!usable)
+        .onHover { hover = $0 }
+        .animation(.easeOut(duration: Medida.rapido), value: hover)
+        .help(Textos.micro(estado))
+        .accessibilityLabel(estado == .pedirPermiso ? "Permitir el micrófono"
+                            : estado == .denegado ? "Micrófono denegado: abrir Ajustes del Sistema" : "Hablar")
+        .accessibilityHint(Textos.micro(estado))
     }
 
-    /// Keyboard and VoiceOver: no hold, so a clicked take (or stop it to review).
     private func accion() {
         switch estado {
-        case .listo: conv.alternar()
+        case .listo: conv.grabar()
         case .pedirPermiso: conv.pedirPermisoAhora()
         case .denegado: conv.abrirAjustesMicro()
         default: break
@@ -507,7 +473,7 @@ private struct BotonMicro: View {
     }
 }
 
-/// A round icon button for the box (send, cancel).
+/// A round icon button for the box (send, cancel, stop).
 private struct BotonRedondo: View {
     let icono: String
     let etiqueta: String
@@ -594,5 +560,26 @@ private struct Ondas: View {
             .frame(height: 12)
         }
         .accessibilityHidden(true)
+    }
+}
+
+/// Reports the window this view lives in (and nil when it leaves it).
+private struct VentanaAccesor: NSViewRepresentable {
+    let alCambiar: (NSWindow?) -> Void
+
+    func makeNSView(context: Context) -> Vista {
+        let v = Vista()
+        v.alCambiar = alCambiar
+        return v
+    }
+
+    func updateNSView(_ v: Vista, context: Context) { v.alCambiar = alCambiar }
+
+    final class Vista: NSView {
+        var alCambiar: (NSWindow?) -> Void = { _ in }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            alCambiar(window)
+        }
     }
 }

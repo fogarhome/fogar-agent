@@ -21,7 +21,10 @@ struct FogarDesktopApp: App {
         _link = State(initialValue: l)
         let c = ConversationLink()
         c.start()
-        _conversacion = State(initialValue: Conversacion(link: c))
+        let conv = Conversacion(link: c)
+        // ⌘. (and Esc / Return in a take) handled by the app itself, not by a button (#33).
+        conv.escucharTeclado()
+        _conversacion = State(initialValue: conv)
     }
 
     var body: some Scene {

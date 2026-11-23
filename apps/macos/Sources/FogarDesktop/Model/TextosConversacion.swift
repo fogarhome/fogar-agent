@@ -55,7 +55,7 @@ extension Textos {
     /// The microphone button's help and VoiceOver hint.
     static func micro(_ e: EstadoMicro) -> String {
         switch e {
-        case .listo: "Pulsa para grabar y revisar, o mantén pulsado y suelta para enviar."
+        case .listo: "Pulsa para hablar: verás el texto mientras hablas."
         case .sinConexion: "Sin conexión con Fogar: ahora no se puede grabar."
         case .soloAppFirmada: "La conversación solo funciona con la app de Fogar firmada como el agente."
         case .sinTranscriptor: "El gateway no tiene transcriptor ahora. Puedes escribir."

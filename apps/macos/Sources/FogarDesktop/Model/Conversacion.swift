@@ -21,24 +21,45 @@ enum EstadoMicro: Equatable {
 }
 
 /// The take as this app drives it. The agent's `activity` is the truth about the microphone; this
-/// only remembers what the person's hands are doing.
+/// only remembers what the person asked for.
 enum Toma: Equatable {
     case ninguna
-    /// `capture_start` sent, no answer yet. `pulsado`: the pointer is still down. `fin`: how to end
-    /// it as soon as the agent says it opened (a hold already released, Esc, «Enviar ya»).
-    case abriendo(desde: Date, pulsado: Bool, fin: WireThen?)
-    /// Open. `mantener`: the button is held (release sends); otherwise clicked (three buttons).
-    case abierta(mantener: Bool, desde: Date, pulsado: Bool)
+    /// `capture_start` sent, no answer yet. `fin`: how to end it as soon as the agent says it
+    /// opened (send, stop or Esc pressed meanwhile).
+    case abriendo(fin: WireThen?)
+    /// Open: the box shows the live transcript and the two ways out (send, stop).
+    case abierta
     /// `capture_end` sent.
     case cerrando
 }
 
-/// The conversation section's model: the text box, the take's gestures, the visible-turn
+/// A key the app handles itself, before any view or menu: SwiftUI shortcuts on in-window buttons
+/// depend on that button being in the key window's live view tree (#33).
+nonisolated enum Tecla: Equatable, Sendable {
+    /// ⌘. — cancel Fogar's reply.
+    case cancelar
+    /// Esc — discard the open take.
+    case escape
+    /// Return — send the open take.
+    case intro
+
+    /// The plain ⌘., Esc or Return of a key-down event (no other modifier, no repeat).
+    static func de(_ e: NSEvent) -> Tecla? {
+        guard e.type == .keyDown, !e.isARepeat else { return nil }
+        let mods = e.modifierFlags.intersection([.command, .option, .control, .shift])
+        switch mods {
+        case [.command] where e.charactersIgnoringModifiers == ".": return .cancelar
+        case [] where e.keyCode == 53: return .escape // kVK_Escape
+        case [] where e.keyCode == 36 || e.keyCode == 76: return .intro // kVK_Return, kVK_ANSI_KeypadEnter
+        default: return nil
+        }
+    }
+}
+
+/// The conversation section's model: the text box, the take, the visible-turn
 /// confirmations and the one-line feedback. Everything it shows comes from the agent's view.
 @Observable
 final class Conversacion {
-    /// A press held this long is «mantener» (release sends); shorter is a click.
-    static let umbralMantener: TimeInterval = 0.3
     /// `fogar_ports::ipc::SEND_TEXT_MAX_BYTES`.
     static let textoMaxBytes = 8 * 1024
 
@@ -272,53 +293,33 @@ final class Conversacion {
 
     // MARK: The take
 
-    /// The pointer went down on the microphone button: the take opens at once (no speech lost);
-    /// the release decides whether it was a click or a hold. On an open clicked take, the button
-    /// stops it to review.
-    func pulsar(ahora: Date = Date()) {
-        switch toma {
-        case .ninguna where !grabando: empezar(ahora: ahora)
-        case .abierta(false, _, false): terminar(.review)
-        default: break
+    /// The microphone button (click, Space or VoiceOver): start a take. Like Claude's box, the take
+    /// then ends with one of its two buttons: send, or stop and leave the text in the box.
+    func grabar() {
+        guard toma == .ninguna, !grabando else { return }
+        aviso = nil
+        toma = .abriendo(fin: nil)
+        lanzar { [weak self] in
+            guard let self else { return }
+            do {
+                let r = try await self.link.pedir(.captureStart(WireCaptureStart(gesture: .toggle)))
+                self.alAbrir(r)
+            } catch {
+                self.toma = .ninguna
+                self.aviso = Textos.fallo(error)
+            }
         }
     }
 
-    /// The pointer came up (or the gesture was cancelled). Held past the threshold: send. A click
-    /// leaves the take open.
-    func soltar(ahora: Date = Date()) {
-        switch toma {
-        case .abriendo(let desde, true, let fin):
-            let mantenido = ahora.timeIntervalSince(desde) >= Self.umbralMantener
-            toma = .abriendo(desde: desde, pulsado: false, fin: mantenido ? .send : fin)
-        case .abierta(_, let desde, true) where ahora.timeIntervalSince(desde) >= Self.umbralMantener:
-            terminar(.send)
-        case .abierta(_, let desde, true):
-            toma = .abierta(mantener: false, desde: desde, pulsado: false)
-        default:
-            break
-        }
-    }
-
-    /// Called while the pointer is still down: past the threshold the take shows «suelta para
-    /// enviar». Only a live press is promoted (the release clears `pulsado`).
-    func comprobarMantener(ahora: Date = Date()) {
-        if case .abierta(false, let desde, true) = toma, ahora.timeIntervalSince(desde) >= Self.umbralMantener {
-            toma = .abierta(mantener: true, desde: desde, pulsado: true)
-        }
-    }
-
-    /// Keyboard, VoiceOver or the accessibility action: start a clicked take, or stop one to review.
-    func alternar() {
-        switch toma {
-        case .ninguna where !grabando: empezar(ahora: Date(), pulsado: false)
-        case .abierta: terminar(.review)
-        default: break
-        }
-    }
-
+    /// Stop: the transcript stays in the box to edit or send (`review`).
     func parar() { terminar(.review) }
-    func enviarYa() { terminar(.send) }
+    /// Send the take as it is (`send`).
+    func enviarToma() { terminar(.send) }
+    /// Esc: throw the take away (`discard`).
     func descartar() { terminar(.discard) }
+
+    /// The person's hands are in a take (opening, open or closing) or the agent records.
+    var enToma: Bool { grabando || toma != .ninguna }
 
     /// The conversation left the screen with a take open: never keep listening unseen, and never
     /// send what nobody reviewed. The transcript goes to the box.
@@ -329,35 +330,17 @@ final class Conversacion {
         }
     }
 
-    private func empezar(ahora: Date, pulsado: Bool = true) {
-        aviso = nil
-        toma = .abriendo(desde: ahora, pulsado: pulsado, fin: nil)
-        lanzar { [weak self] in
-            guard let self else { return }
-            do {
-                // GUESSED: the gesture only feeds the agent's metrics and is not known before the
-                // release (the take opens on press so no speech is lost): reported `toggle`.
-                let r = try await self.link.pedir(.captureStart(WireCaptureStart(gesture: .toggle)))
-                self.alAbrir(r)
-            } catch {
-                self.toma = .ninguna
-                self.aviso = Textos.fallo(error)
-            }
-        }
-    }
-
     /// The answer to `capture_start`.
     private func alAbrir(_ r: WireResponse) {
         switch r {
         case .captureStarted:
             // Not opening any more: the link dropped meanwhile (the agent discarded it with it).
-            guard case .abriendo(let desde, let pulsado, let fin) = toma else { return }
+            guard case .abriendo(let fin) = toma else { return }
             if let fin {
                 toma = .cerrando
                 enviarFin(fin)
             } else {
-                toma = .abierta(mantener: false, desde: desde, pulsado: pulsado)
-                comprobarMantener()
+                toma = .abierta
             }
         case .captureRefused(let c):
             toma = .ninguna
@@ -376,12 +359,39 @@ final class Conversacion {
         case .abierta:
             toma = .cerrando
             enviarFin(then)
-        case .abriendo(let desde, let pulsado, _):
-            toma = .abriendo(desde: desde, pulsado: pulsado, fin: then)
+        case .abriendo(fin: .none):
+            toma = .abriendo(fin: then)
+        case .abriendo:
+            break // the first way out wins, as with an open take
         case .ninguna where grabando:
             enviarFin(then)
         default:
             break
+        }
+    }
+
+    // MARK: Keys
+
+    /// A key the app saw before any view: `true` if it was used (the event then goes no further).
+    /// ⌘. cancels wherever the app has focus (window, menu bar panel, any field) when there is
+    /// something to cancel. Esc and Return only end a take while the conversation is on screen.
+    /// `enLaConversacion`: the event belongs to the conversation's window, which is key, with no
+    /// sheet and no text being composed (IME) (`admiteTeclasDeToma`).
+    func tecla(_ t: Tecla, enLaConversacion: Bool = true) -> Bool {
+        let tomaViva = aLaVista && enLaConversacion && enToma && toma != .cerrando
+        switch t {
+        case .cancelar:
+            guard cancelable else { return false }
+            cancelarAhora()
+            return true
+        case .escape where tomaViva:
+            descartar()
+            return true
+        case .intro where tomaViva:
+            enviarToma()
+            return true
+        default:
+            return false
         }
     }
 
@@ -438,12 +448,40 @@ final class Conversacion {
     func cancelarAhora() { lanzar { [weak self] in await self?.cancelar() } }
     func pedirPermisoAhora() { lanzar { [weak self] in await self?.pedirPermiso() } }
 
-    /// After a press: past the threshold, if the press is still held, the take becomes «mantener».
-    func vigilarMantener() {
-        lanzar { [weak self] in
-            try? await Task.sleep(for: .milliseconds(Int(Conversacion.umbralMantener * 1000) + 20))
-            self?.comprobarMantener()
+    // MARK: The keyboard
+
+    /// Installed once (idempotent), removed with the model: every key-down of every window of
+    /// the app (main window, menu bar panel, Settings) passes here first, whatever has focus.
+    /// Written only on the main actor; read in `deinit`, when nothing else holds the model.
+    @ObservationIgnored nonisolated(unsafe) private(set) var monitor: Any?
+    /// The conversation's window, set by the view (Esc and Return only count there).
+    @ObservationIgnored weak var ventana: NSWindow?
+
+    func escucharTeclado() {
+        guard monitor == nil else { return }
+        // AppKit calls this on the main thread, as it dispatches the event.
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            guard let t = Tecla.de(e) else { return e }
+            let n = e.windowNumber
+            let usada = MainActor.assumeIsolated {
+                guard let self else { return false }
+                return self.tecla(t, enLaConversacion: self.admiteTeclasDeToma(ventanaDelEvento: n))
+            }
+            return usada ? nil : e
         }
+    }
+
+    deinit {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+    }
+
+    /// Esc and Return end a take only from the conversation's window, while it is the key window,
+    /// has no sheet open and no field is composing text (IME): never from the menu bar panel,
+    /// Settings or a dialog.
+    func admiteTeclasDeToma(ventanaDelEvento n: Int) -> Bool {
+        guard let w = ventana, w.windowNumber == n, w.isKeyWindow, w.attachedSheet == nil else { return false }
+        if let campo = w.firstResponder as? NSTextView, campo.hasMarkedText() { return false }
+        return true
     }
 
     // MARK: Tasks
