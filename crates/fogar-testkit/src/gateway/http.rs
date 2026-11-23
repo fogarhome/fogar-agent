@@ -1,4 +1,5 @@
-//! The gateway's pre-session REST surface (`/.well-known/fogar-gateway`, `POST /pair`):
+//! The gateway's REST surface (well-known, `POST /pair`, the 5.0 calls; routes are keyed by
+//! method and path WITH query, as `HttpCall::path` renders it):
 //! - [`HttpRoutes`]: scripted replies + a log of what was asked;
 //! - [`FakeGatewayHttp`]: an in-memory `GatewayHttp` over those routes (paused-time tests);
 //! - [`MockHttpServer`]: the same routes over a real local HTTP/1.1 socket, for adapter
@@ -6,9 +7,9 @@
 
 use fogar_ports::{
     gateway::GatewayAddr,
-    gateway_http::{GatewayHttp, HttpCall, HttpError, HttpReply, MAX_BODY_BYTES},
+    gateway_http::{GatewayHttp, HttpCall, HttpError, HttpReply, request_allowed},
 };
-use secrecy::zeroize::Zeroizing;
+use secrecy::{ExposeSecret, SecretString, zeroize::Zeroizing};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -25,6 +26,8 @@ pub struct SeenRequest {
     pub method: String,
     pub path: String,
     pub content_type: Option<String>,
+    /// The `Authorization` header as received. Test-only: this is where a test sees the token.
+    pub authorization: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -36,6 +39,8 @@ struct Reply {
     delay: Option<std::time::Duration>,
     /// Declares a huge Content-Length and streams forever.
     endless: bool,
+    /// Sent as `Transfer-Encoding: chunked`, one wire chunk per entry (`body` is unused).
+    chunks: Option<Vec<Vec<u8>>>,
 }
 
 /// Scripted routes shared by the fake and the real-socket mock. Unknown routes answer 404.
@@ -74,6 +79,17 @@ impl HttpRoutes {
                 status,
                 body: body.into(),
                 delay: Some(delay),
+                ..Reply::default()
+            },
+        );
+    }
+    /// Replies with `Transfer-Encoding: chunked`, one chunk per entry (empty ones are skipped).
+    pub fn set_chunked(&self, method: &str, path: &str, status: u16, chunks: Vec<Vec<u8>>) {
+        self.routes.lock().unwrap().insert(
+            (method.into(), path.into()),
+            Reply {
+                status,
+                chunks: Some(chunks.into_iter().filter(|c| !c.is_empty()).collect()),
                 ..Reply::default()
             },
         );
@@ -161,14 +177,17 @@ impl FakeGatewayHttp {
     pub fn routes(&self) -> HttpRoutes {
         self.routes.clone()
     }
-    async fn call(
+}
+
+impl GatewayHttp for FakeGatewayHttp {
+    async fn request(
         &self,
         addr: &GatewayAddr,
-        method: &str,
-        call: HttpCall,
-        body: Vec<u8>,
+        call: &HttpCall,
+        token: Option<&SecretString>,
+        body: Option<Zeroizing<Vec<u8>>>,
     ) -> Result<HttpReply, HttpError> {
-        if !policy_allows(addr) {
+        if !request_allowed(call, token) || !policy_allows(addr) {
             return Err(HttpError::Refused);
         }
         // Yield once so a dropped in-flight call is a real cancellation point.
@@ -177,37 +196,25 @@ impl FakeGatewayHttp {
             return Err(HttpError::Unreachable);
         }
         let r = self.routes.answer(SeenRequest {
-            method: method.into(),
+            method: call.method().into(),
             path: call.path(),
-            content_type: (method == "POST").then(|| "application/json".into()),
-            body,
+            content_type: body.is_some().then(|| "application/json".into()),
+            authorization: token.map(|t| format!("Bearer {}", t.expose_secret())),
+            body: body.map(|b| b.to_vec()).unwrap_or_default(),
         });
         if let Some(d) = r.delay {
             tokio::time::sleep(d).await;
         }
-        if r.endless || r.body.len() > MAX_BODY_BYTES {
-            return Err(HttpError::TooLarge {
-                max: MAX_BODY_BYTES,
-            });
+        let max = call.max_body();
+        let len = r
+            .chunks
+            .as_ref()
+            .map_or(r.body.len(), |c| c.iter().map(Vec::len).sum());
+        if r.endless || len > max {
+            return Err(HttpError::TooLarge { max });
         }
-        Ok(HttpReply::new(r.status, r.body))
-    }
-}
-
-impl GatewayHttp for FakeGatewayHttp {
-    async fn get(&self, addr: &GatewayAddr, call: HttpCall) -> Result<HttpReply, HttpError> {
-        if matches!(call, HttpCall::Pair) {
-            return Err(HttpError::Refused);
-        }
-        self.call(addr, "GET", call, Vec::new()).await
-    }
-    async fn post_json(
-        &self,
-        addr: &GatewayAddr,
-        call: HttpCall,
-        body: Zeroizing<Vec<u8>>,
-    ) -> Result<HttpReply, HttpError> {
-        self.call(addr, "POST", call, body.to_vec()).await
+        let body = r.chunks.map_or(r.body, |c| c.concat());
+        Ok(HttpReply::new(r.status, body))
     }
 }
 
@@ -276,17 +283,31 @@ pub(crate) async fn serve_http(mut sock: TcpStream, routes: HttpRoutes) {
         while sock.write_all(&chunk).await.is_ok() {}
         return;
     }
+    let framing = match &rep.chunks {
+        Some(_) => "Transfer-Encoding: chunked".to_owned(),
+        None => format!("Content-Length: {}", rep.body.len()),
+    };
     let mut head = format!(
-        "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-        rep.status,
-        rep.body.len()
+        "HTTP/1.1 {} X\r\nContent-Type: application/json\r\n{framing}\r\nConnection: close\r\n",
+        rep.status
     );
     if let Some(l) = rep.location {
         head.push_str(&format!("Location: {l}\r\n"));
     }
     head.push_str("\r\n");
     let _ = sock.write_all(head.as_bytes()).await;
-    let _ = sock.write_all(&rep.body).await;
+    if let Some(chunks) = &rep.chunks {
+        for c in chunks {
+            let _ = sock
+                .write_all(format!("{:x}\r\n", c.len()).as_bytes())
+                .await;
+            let _ = sock.write_all(c).await;
+            let _ = sock.write_all(b"\r\n").await;
+        }
+        let _ = sock.write_all(b"0\r\n\r\n").await;
+    } else {
+        let _ = sock.write_all(&rep.body).await;
+    }
     let _ = sock.shutdown().await;
 }
 
@@ -306,11 +327,13 @@ async fn read_request(sock: &mut TcpStream) -> Option<SeenRequest> {
     let (method, path) = (first.next()?.to_owned(), first.next()?.to_owned());
     let mut len = 0usize;
     let mut content_type = None;
+    let mut authorization = None;
     for l in lines {
         if let Some((k, v)) = l.split_once(':') {
             match k.trim().to_ascii_lowercase().as_str() {
                 "content-length" => len = v.trim().parse().ok()?,
                 "content-type" => content_type = Some(v.trim().to_owned()),
+                "authorization" => authorization = Some(v.trim().to_owned()),
                 _ => {}
             }
         }
@@ -326,6 +349,7 @@ async fn read_request(sock: &mut TcpStream) -> Option<SeenRequest> {
         method,
         path,
         content_type,
+        authorization,
         body,
     })
 }

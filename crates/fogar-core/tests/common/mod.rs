@@ -95,16 +95,14 @@ impl MultiHttp {
 }
 
 impl GatewayHttp for MultiHttp {
-    async fn get(&self, addr: &GatewayAddr, call: HttpCall) -> Result<HttpReply, HttpError> {
-        self.pick(addr).get(addr, call).await
-    }
-    async fn post_json(
+    async fn request(
         &self,
         addr: &GatewayAddr,
-        call: HttpCall,
-        body: secrecy::zeroize::Zeroizing<Vec<u8>>,
+        call: &HttpCall,
+        token: Option<&secrecy::SecretString>,
+        body: Option<secrecy::zeroize::Zeroizing<Vec<u8>>>,
     ) -> Result<HttpReply, HttpError> {
-        self.pick(addr).post_json(addr, call, body).await
+        self.pick(addr).request(addr, call, token, body).await
     }
 }
 

@@ -391,14 +391,12 @@ impl TailnetPeers for NoTailnet {
 pub struct NoHttp;
 
 impl GatewayHttp for NoHttp {
-    async fn get(&self, _addr: &GatewayAddr, _call: HttpCall) -> Result<HttpReply, HttpError> {
-        Err(HttpError::Unreachable)
-    }
-    async fn post_json(
+    async fn request(
         &self,
         _addr: &GatewayAddr,
-        _call: HttpCall,
-        _body: secrecy::zeroize::Zeroizing<Vec<u8>>,
+        _call: &HttpCall,
+        _token: Option<&secrecy::SecretString>,
+        _body: Option<secrecy::zeroize::Zeroizing<Vec<u8>>>,
     ) -> Result<HttpReply, HttpError> {
         Err(HttpError::Unreachable)
     }

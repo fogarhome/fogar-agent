@@ -1,23 +1,25 @@
 //! `GatewayHttp` over a tiny hand-written HTTP/1.1 client (fogar-secure-rust NET, port doc in
 //! `fogar_ports::gateway_http`).
 //!
-//! Why not hyper/reqwest: the port needs exactly two fixed requests, one per connection, no
+//! Why not hyper/reqwest: the port needs a closed set of fixed requests, one per connection, no
 //! redirects, no pooling, no compression, and a body read into ONE pre-sized wiped buffer.
 //! hyper would add ~10 crates, its own buffering (copies of the `/pair` reply we cannot wipe)
-//! and connection reuse we would have to switch off. ~150 lines here are easier to review.
+//! and connection reuse we would have to switch off. A small client here is easier to review.
 //! shortcut: over https the decrypted `/pair` reply (client_key) also passes through rustls'
 //! internal plaintext buffers, which are not zeroized; only our own copies are wiped. Upgrade
 //! if a rustls release offers zeroizing buffers.
 //!
-//! Bounds: response head <= `MAX_HEAD_BYTES`, body <= `MAX_BODY_BYTES` (checked from
-//! `Content-Length` before reading, and while reading when the length is unknown); every await
-//! sits under `HttpConfig::call_timeout`, each connect attempt under `connect_timeout`.
+//! Bounds: response head <= `MAX_HEAD_BYTES`, body <= the call's `max_body()` (checked from
+//! `Content-Length` before reading, and while reading when the length is unknown or `chunked`);
+//! every await sits under `HttpConfig::call_timeout`, each connect attempt under
+//! `connect_timeout`. The bearer token is written from its secret buffer straight to the socket
+//! (never formatted into a `String`).
 
 use crate::net::{DialError, Resolver, SystemResolver, dial, platform_tls};
 use fogar_ports::gateway::GatewayAddr;
-use fogar_ports::gateway_http::{GatewayHttp, HttpCall, HttpError, HttpReply, MAX_BODY_BYTES};
+use fogar_ports::gateway_http::{GatewayHttp, HttpCall, HttpError, HttpReply, request_allowed};
 use rustls::ClientConfig;
-use secrecy::zeroize::Zeroizing;
+use secrecy::{ExposeSecret, SecretString, zeroize::Zeroizing};
 use std::{io, sync::Arc, time::Duration};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
@@ -79,8 +81,8 @@ impl<R: Resolver> HttpGateway<R> {
     async fn call(
         &self,
         addr: &GatewayAddr,
-        method: &str,
-        call: HttpCall,
+        call: &HttpCall,
+        token: Option<&SecretString>,
         body: Option<Zeroizing<Vec<u8>>>,
     ) -> Result<HttpReply, HttpError> {
         let exchange = async {
@@ -97,7 +99,8 @@ impl<R: Resolver> HttpGateway<R> {
                 DialError::Tls(e) => transport(e),
             })?;
             let mut head = format!(
-                "{method} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: fogar-agent\r\nAccept: application/json\r\nConnection: close\r\n",
+                "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: fogar-agent\r\nAccept: application/json\r\nConnection: close\r\n",
+                call.method(),
                 call.path(),
                 addr.authority()
             );
@@ -107,16 +110,25 @@ impl<R: Resolver> HttpGateway<R> {
                     b.len()
                 ));
             }
-            head.push_str("\r\n");
-            // Head and body are separate writes: the body (pairing code) is never copied into
-            // a String we cannot wipe.
+            // Head, token and body are separate writes: neither the token nor the body (pairing
+            // code) is ever copied into a String we cannot wipe.
             s.write_all(head.as_bytes()).await.map_err(transport)?;
+            if let Some(t) = token {
+                s.write_all(b"Authorization: Bearer ")
+                    .await
+                    .map_err(transport)?;
+                s.write_all(t.expose_secret().as_bytes())
+                    .await
+                    .map_err(transport)?;
+                s.write_all(b"\r\n").await.map_err(transport)?;
+            }
+            s.write_all(b"\r\n").await.map_err(transport)?;
             if let Some(b) = &body {
                 s.write_all(b).await.map_err(transport)?;
             }
             s.flush().await.map_err(transport)?;
             drop(body);
-            read_response(&mut s).await
+            read_response(&mut s, call.max_body()).await
         };
         tokio::time::timeout(self.cfg.call_timeout, exchange)
             .await
@@ -133,28 +145,26 @@ fn malformed(what: &'static str) -> HttpError {
 }
 
 impl<R: Resolver> GatewayHttp for HttpGateway<R> {
-    async fn get(&self, addr: &GatewayAddr, call: HttpCall) -> Result<HttpReply, HttpError> {
-        if matches!(call, HttpCall::Pair) {
-            return Err(HttpError::Refused);
-        }
-        self.call(addr, "GET", call, None).await
-    }
-
-    async fn post_json(
+    async fn request(
         &self,
         addr: &GatewayAddr,
-        call: HttpCall,
-        body: Zeroizing<Vec<u8>>,
+        call: &HttpCall,
+        token: Option<&SecretString>,
+        body: Option<Zeroizing<Vec<u8>>>,
     ) -> Result<HttpReply, HttpError> {
-        if !matches!(call, HttpCall::Pair) {
+        if !request_allowed(call, token) {
             return Err(HttpError::Refused);
         }
-        self.call(addr, "POST", call, Some(body)).await
+        self.call(addr, call, token, body).await
     }
 }
 
 /// Reads one response from a `Connection: close` stream into one pre-sized, wiped buffer.
-pub(crate) async fn read_response<S: AsyncRead + Unpin>(s: &mut S) -> Result<HttpReply, HttpError> {
+/// `max` is the body cap, enforced while reading.
+pub(crate) async fn read_response<S: AsyncRead + Unpin>(
+    s: &mut S,
+    max: usize,
+) -> Result<HttpReply, HttpError> {
     // The head buffer may also hold the first body bytes: wiped on drop.
     let mut head = Zeroizing::new(vec![0u8; MAX_HEAD_BYTES]);
     let (mut filled, mut scanned) = (0usize, 0usize);
@@ -174,41 +184,51 @@ pub(crate) async fn read_response<S: AsyncRead + Unpin>(s: &mut S) -> Result<Htt
         }
         filled += n;
     };
-    let (status, content_length) = parse_head(&head[..head_end])?;
+    let (status, framing) = parse_head(&head[..head_end])?;
     let early = &head[head_end + 4..filled];
 
-    let mut body = match content_length {
-        Some(len) if len > MAX_BODY_BYTES => {
-            return Err(HttpError::TooLarge {
-                max: MAX_BODY_BYTES,
-            });
-        }
-        Some(len) => {
+    let mut body = match framing {
+        Framing::Length(len) if len > max => return Err(HttpError::TooLarge { max }),
+        Framing::Length(len) => {
             let mut body = Zeroizing::new(vec![0u8; len]);
             let n = early.len().min(len);
             body[..n].copy_from_slice(&early[..n]);
             s.read_exact(&mut body[n..]).await.map_err(transport)?;
             return Ok(HttpReply { status, body });
         }
+        Framing::Chunked => {
+            let mut dec = Chunked::new(max);
+            // Reserved once up to the cap and never grown (the decoder refuses past it), so no
+            // stray copy is left behind.
+            let mut body = Zeroizing::new(Vec::with_capacity(max));
+            let mut input = early;
+            let mut buf = Zeroizing::new(vec![0u8; 4096]);
+            loop {
+                if dec.feed(input, &mut body)?.done {
+                    return Ok(HttpReply { status, body });
+                }
+                let n = s.read(&mut buf[..]).await.map_err(transport)?;
+                if n == 0 {
+                    return Err(malformed("connection closed inside a chunked body"));
+                }
+                input = &buf[..n];
+            }
+        }
         // shortcut: over TLS a server that closes without close_notify makes this a Transport
         // error (truncation guard); fine for uvicorn (always Content-Length), revisit if a
         // TLS proxy drops the length.
         // Length unknown: read to EOF (we sent `Connection: close`), one byte past the cap is
         // TooLarge.
-        None => Zeroizing::new(vec![0u8; MAX_BODY_BYTES + 1]),
+        Framing::ToEof => Zeroizing::new(vec![0u8; max + 1]),
     };
-    if early.len() > MAX_BODY_BYTES {
-        return Err(HttpError::TooLarge {
-            max: MAX_BODY_BYTES,
-        });
+    if early.len() > max {
+        return Err(HttpError::TooLarge { max });
     }
     body[..early.len()].copy_from_slice(early);
     let mut len = early.len();
     loop {
-        if len > MAX_BODY_BYTES {
-            return Err(HttpError::TooLarge {
-                max: MAX_BODY_BYTES,
-            });
+        if len > max {
+            return Err(HttpError::TooLarge { max });
         }
         let n = s.read(&mut body[len..]).await.map_err(transport)?;
         if n == 0 {
@@ -221,8 +241,161 @@ pub(crate) async fn read_response<S: AsyncRead + Unpin>(s: &mut S) -> Result<Htt
     Ok(HttpReply { status, body })
 }
 
-/// Status code and `Content-Length` of a response head (without the final CRLFCRLF).
-fn parse_head(head: &[u8]) -> Result<(u16, Option<usize>), HttpError> {
+/// How the response body is delimited.
+#[derive(Debug, PartialEq, Eq)]
+enum Framing {
+    Length(usize),
+    Chunked,
+    ToEof,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum St {
+    /// Chunk-size line: hex digits, then an optional `;extension` up to the CR.
+    Size {
+        val: usize,
+        digits: u8,
+        ext: bool,
+    },
+    SizeLf {
+        val: usize,
+    },
+    Data {
+        left: usize,
+    },
+    DataCr,
+    DataLf,
+    /// After the last chunk: trailer lines until an empty one.
+    TrailerStart,
+    TrailerLine,
+    TrailerLineLf,
+    TrailerEndLf,
+    Done,
+}
+
+/// Incremental `Transfer-Encoding: chunked` decoder (RFC 9112 §7.1), sans-I/O, with every bound
+/// enforced as bytes arrive: chunk sizes of at most 8 hex digits, the decoded total against
+/// `max` (a chunk that would cross it is refused before its data is read), each chunk-size line
+/// and the trailers (together) against `MAX_HEAD_BYTES`.
+#[derive(Debug)]
+pub(crate) struct Chunked {
+    st: St,
+    max: usize,
+    total: usize,
+    /// Bytes of the current chunk-size line.
+    line: usize,
+    /// Trailer bytes seen so far.
+    trailer: usize,
+}
+
+/// Result of one `feed`.
+pub(crate) struct Fed {
+    /// The terminating chunk and trailers were fully read.
+    pub done: bool,
+}
+
+impl Chunked {
+    pub(crate) fn new(max: usize) -> Self {
+        Self {
+            st: St::Size {
+                val: 0,
+                digits: 0,
+                ext: false,
+            },
+            max,
+            total: 0,
+            line: 0,
+            trailer: 0,
+        }
+    }
+
+    /// Decodes `input`, appending chunk data to `out`. Bytes after the end are ignored.
+    pub(crate) fn feed(&mut self, mut input: &[u8], out: &mut Vec<u8>) -> Result<Fed, HttpError> {
+        while let Some((&b, rest)) = input.split_first() {
+            if let St::Data { left } = self.st {
+                let n = left.min(input.len());
+                out.extend_from_slice(&input[..n]);
+                self.st = if n == left {
+                    St::DataCr
+                } else {
+                    St::Data { left: left - n }
+                };
+                input = &input[n..];
+                continue;
+            }
+            input = rest;
+            self.st = match self.st {
+                St::Size { val, digits, ext } => {
+                    self.line += 1;
+                    if self.line > MAX_HEAD_BYTES {
+                        return Err(malformed("chunk-size line too long"));
+                    }
+                    match b {
+                        b'\r' if digits > 0 => St::SizeLf { val },
+                        b';' if digits > 0 && !ext => St::Size {
+                            val,
+                            digits,
+                            ext: true,
+                        },
+                        _ if ext && b != b'\r' && b != b'\n' => St::Size { val, digits, ext },
+                        _ if !ext && b.is_ascii_hexdigit() && digits < 8 => St::Size {
+                            val: val * 16 + (b as char).to_digit(16).unwrap_or(0) as usize,
+                            digits: digits + 1,
+                            ext,
+                        },
+                        _ => return Err(malformed("bad chunk size")),
+                    }
+                }
+                St::SizeLf { val } => {
+                    if b != b'\n' {
+                        return Err(malformed("bad chunk-size line ending"));
+                    }
+                    self.line = 0;
+                    if val == 0 {
+                        St::TrailerStart
+                    } else if val > self.max - self.total {
+                        return Err(HttpError::TooLarge { max: self.max });
+                    } else {
+                        self.total += val;
+                        St::Data { left: val }
+                    }
+                }
+                St::DataCr if b == b'\r' => St::DataLf,
+                St::DataLf if b == b'\n' => St::Size {
+                    val: 0,
+                    digits: 0,
+                    ext: false,
+                },
+                St::DataCr | St::DataLf => return Err(malformed("bad chunk terminator")),
+                St::TrailerStart | St::TrailerLine | St::TrailerLineLf | St::TrailerEndLf => {
+                    self.trailer += 1;
+                    if self.trailer > MAX_HEAD_BYTES {
+                        return Err(malformed("chunked trailers too long"));
+                    }
+                    match (self.st, b) {
+                        (St::TrailerStart, b'\r') => St::TrailerEndLf,
+                        (St::TrailerLine, b'\r') => St::TrailerLineLf,
+                        (St::TrailerStart | St::TrailerLine, _) => St::TrailerLine,
+                        (St::TrailerLineLf, b'\n') => St::TrailerStart,
+                        (St::TrailerEndLf, b'\n') => St::Done,
+                        _ => return Err(malformed("bad chunked trailer")),
+                    }
+                }
+                St::Done => break,
+                St::Data { .. } => unreachable!("handled above"),
+            };
+            if matches!(self.st, St::Done) {
+                break;
+            }
+        }
+        Ok(Fed {
+            done: matches!(self.st, St::Done),
+        })
+    }
+}
+
+/// Status code and body framing of a response head (without the final CRLFCRLF).
+fn parse_head(head: &[u8]) -> Result<(u16, Framing), HttpError> {
     let head = std::str::from_utf8(head).map_err(|_| malformed("response head is not UTF-8"))?;
     let mut lines = head.split("\r\n");
     let status_line = lines.next().unwrap_or_default();
@@ -237,6 +410,7 @@ fn parse_head(head: &[u8]) -> Result<(u16, Option<usize>), HttpError> {
         .filter(|c| (200..600).contains(c))
         .ok_or_else(|| malformed("bad status line"))?;
     let mut content_length: Option<usize> = None;
+    let mut chunked = false;
     for line in lines {
         let (name, value) = line
             .split_once(':')
@@ -261,21 +435,31 @@ fn parse_head(head: &[u8]) -> Result<(u16, Option<usize>), HttpError> {
             }
             content_length = Some(n);
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            // shortcut: chunked replies are refused (uvicorn sends Content-Length for both
-            // calls); add a bounded chunked decoder if a TLS proxy turns out to re-chunk them.
-            return Err(malformed("Transfer-Encoding is not supported"));
+            // Only a lone `chunked` (no gzip & co: we never ask for them); repeated = ambiguous.
+            if chunked || !value.eq_ignore_ascii_case("chunked") {
+                return Err(malformed("unsupported Transfer-Encoding"));
+            }
+            chunked = true;
         }
     }
-    Ok((status, content_length))
+    // Both framings at once is the request-smuggling shape: refuse.
+    let framing = match (chunked, content_length) {
+        (true, Some(_)) => return Err(malformed("Content-Length with Transfer-Encoding")),
+        (true, None) => Framing::Chunked,
+        (false, Some(n)) => Framing::Length(n),
+        (false, None) => Framing::ToEof,
+    };
+    Ok((status, framing))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fogar_ports::gateway_http::MAX_BODY_BYTES;
 
     async fn parse(raw: &[u8]) -> Result<HttpReply, HttpError> {
         let mut r = raw;
-        read_response(&mut r).await
+        read_response(&mut r, MAX_BODY_BYTES).await
     }
 
     #[test]
@@ -304,7 +488,9 @@ mod tests {
             &b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\n{}"[..],
             b"HTTP/1.1 201 Created\r\n\r\n{}",
         ] {
-            let r = read_response(&mut Trickle(raw)).await.unwrap();
+            let r = read_response(&mut Trickle(raw), MAX_BODY_BYTES)
+                .await
+                .unwrap();
             assert_eq!((r.status, &r.body[..]), (201, &b"{}"[..]));
         }
         let r = parse(b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\n{}")
@@ -336,7 +522,18 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n{}",
             b"HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\n",
             b"HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\n{}",
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+            // Unsupported / ambiguous framing.
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 2\r\n\r\n0\r\n\r\n",
+            // Bad chunked bodies.
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}X\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\n{}\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n000000002\r\n{}\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: 1\r\n",
             b"HTTP/1.1 100 Continue\r\n\r\n",
             b"HTTP/2 200\r\n\r\n",
             b"HTTP/1.1 2000 OK\r\n\r\n",
@@ -359,5 +556,59 @@ mod tests {
             parse(&endless_head).await,
             Err(HttpError::Transport(_))
         ));
+    }
+
+    #[test]
+    fn decodes_and_bounds_chunked() {
+        fogar_testkit::run_async(chunked());
+    }
+
+    async fn chunked() {
+        let ok = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked\r\n\r\n";
+        let with = |tail: &[u8]| [&ok[..], tail].concat();
+        let r = parse(&with(
+            b"3\r\nabc\r\n2;ext=1\r\nde\r\n0\r\nX-T: 1\r\n\r\nignored",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(&r.body[..], b"abcde");
+        // Same bytes, one at a time: every state crosses a read boundary.
+        let raw = with(b"3\r\nabc\r\n2\r\nde\r\n0\r\nX-T: 1\r\n\r\n");
+        let r = read_response(&mut Trickle(&raw), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(&r.body[..], b"abcde");
+        assert!(parse(&with(b"0\r\n\r\n")).await.unwrap().body.is_empty());
+
+        // Exactly the cap is fine, one byte more is TooLarge before its data is read.
+        let sized = |n: usize| with(format!("{n:x}\r\n").as_bytes());
+        let mut exact = sized(MAX_BODY_BYTES);
+        exact.extend(vec![b' '; MAX_BODY_BYTES]);
+        exact.extend(b"\r\n0\r\n\r\n");
+        assert_eq!(parse(&exact).await.unwrap().body.len(), MAX_BODY_BYTES);
+        assert!(matches!(
+            parse(&sized(MAX_BODY_BYTES + 1)).await,
+            Err(HttpError::TooLarge { .. })
+        ));
+        // Two chunks crossing the cap together.
+        let mut two = sized(MAX_BODY_BYTES);
+        two.extend(vec![b' '; MAX_BODY_BYTES]);
+        two.extend(b"\r\n1\r\n");
+        assert!(matches!(parse(&two).await, Err(HttpError::TooLarge { .. })));
+        // An absurd 8-digit size is TooLarge; 9 digits is malformed.
+        assert!(matches!(
+            parse(&with(b"ffffffff\r\n")).await,
+            Err(HttpError::TooLarge { .. })
+        ));
+        // Endless trailers / endless chunk-size line are cut at MAX_HEAD_BYTES.
+        let mut trailers = with(b"0\r\n");
+        trailers.extend(b"X: ".iter().chain(&vec![b'y'; 2 * MAX_HEAD_BYTES]));
+        assert!(matches!(
+            parse(&trailers).await,
+            Err(HttpError::Transport(_))
+        ));
+        let mut ext = with(b"1;");
+        ext.extend(vec![b'e'; 2 * MAX_HEAD_BYTES]);
+        assert!(matches!(parse(&ext).await, Err(HttpError::Transport(_))));
     }
 }

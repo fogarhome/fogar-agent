@@ -1,13 +1,19 @@
-//! GatewayHttp port: the gateway's two unauthenticated REST calls used before a session exists
-//! (client-protocol §0): `GET /.well-known/fogar-gateway` (is this a Fogar?) and `POST /pair`
-//! (redeem a 6-digit code for the `client_key`).
+//! GatewayHttp port: the gateway's closed REST call set (client-protocol §0 and JGW Spec 5.0):
+//! discovery (`/.well-known/*`), pairing (`POST /pair`), login/session and the conversation
+//! calls. [`HttpCall`] is the whole set: fixed method and path per variant, so the port cannot
+//! be used as a generic HTTP client.
 //!
-//! TRANSPORT ONLY, like `GatewayLink`: status code + body bytes. Paths, request bodies and
-//! response parsing live in fogar-proto (`pairing`) + fogar-core, so the adapter cannot drift
-//! from the protocol and the fake exercises the real codec.
+//! TRANSPORT ONLY, like `GatewayLink`: status code + body bytes. Request bodies and response
+//! parsing live in fogar-proto + fogar-core, so the adapter cannot drift from the protocol and
+//! the fake exercises the real codec.
 //!
 //! - ASYNC (real network latency), desugared `fn -> impl Future + Send`. Not dyn-compatible: the
 //!   core is generic over `H: GatewayHttp`.
+//! - Bearer token: authenticated calls (`HttpCall::authenticated`) carry
+//!   `Authorization: Bearer <token>`. A missing, empty or non-printable-ASCII token is `Refused`
+//!   before a byte is sent. The adapter writes the token straight from its secret buffer into
+//!   the socket; it is never copied into a `String`, a log or an error.
+//! - Streaming calls (`HttpCall::is_stream`) are refused by `request`: they have their own entry.
 //! - NOT select branches: the core wraps each call in its own deadline (1–2 s per probe, spec §0)
 //!   and drops it on expiry. Dropping an in-flight call must not leak a socket or poison the
 //!   adapter: the next call works.
@@ -16,22 +22,23 @@
 //!   verifies the certificate against the platform roots; no "accept invalid" switch.
 //! - One request per connection (`Connection: close`), no pooling: a cancelled call can never
 //!   hand a half-read connection to the next one.
-//! - The adapter bounds the response body (`MAX_BODY_BYTES`) WHILE reading: a larger or endless
-//!   body (lying `Content-Length`, chunked) is `TooLarge` as soon as the limit is crossed, never
-//!   buffered first. It never follows redirects (a redirect could move the key exchange to
-//!   another host).
+//! - Per-call body cap (`HttpCall::max_body`: `MAX_BODY_BYTES`, or `MAX_LIST_BODY_BYTES` for
+//!   list replies) enforced WHILE reading: a larger or endless body (lying `Content-Length`,
+//!   `chunked`) is `TooLarge` as soon as the limit is crossed, never buffered first. `chunked`
+//!   replies are decoded; the cap counts decoded bytes. It never follows redirects (a redirect
+//!   could move the key exchange to another host).
 //! - Bodies are wiped from memory on drop and never printed: the `/pair` reply carries the
 //!   `client_key` exactly once. Adapters read the body into ONE buffer pre-sized from
-//!   `Content-Length` (capped at `MAX_BODY_BYTES`), so growth never leaves stray copies.
+//!   `Content-Length` (capped at the call's limit), so growth never leaves stray copies.
 //!
 //! How Windows/Linux would do this: the same portable HTTP/1.1 client (fogar-host); nothing OS
 //! specific, so no capabilities.
 
 use crate::gateway::GatewayAddr;
-use secrecy::zeroize::Zeroizing;
+use secrecy::{ExposeSecret, SecretString, zeroize::Zeroizing};
 use std::{fmt, future::Future};
 
-/// Largest response body an adapter accepts. Both replies are tiny JSON objects.
+/// Default response body cap (`HttpCall::max_body`): replies are small JSON objects.
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
 
 /// Largest response body for list-shaped replies (conversations, messages, agents).
@@ -222,20 +229,32 @@ pub enum HttpError {
 }
 
 pub trait GatewayHttp: Send + Sync + 'static {
-    /// `call` must be a well-known call; `Pair` with a GET is a core bug and returns `Refused`
-    /// without touching the network.
-    fn get(
+    /// One request/response exchange. Method, path and `Content-Type: application/json` (only
+    /// when there is a body) come from `call`; the body is wiped after sending. The token goes
+    /// out as `Authorization: Bearer <token>`.
+    ///
+    /// `Refused`, without touching the network, when `call.is_stream()` (streams have their own
+    /// entry point), when `call.authenticated()` and `token` is `None`, or when the token is
+    /// empty or has a byte outside `0x21..=0x7E` (it could break the header line). A token on
+    /// an unauthenticated call is still sent when given.
+    fn request(
         &self,
         addr: &GatewayAddr,
-        call: HttpCall,
+        call: &HttpCall,
+        token: Option<&SecretString>,
+        body: Option<Zeroizing<Vec<u8>>>,
     ) -> impl Future<Output = Result<HttpReply, HttpError>> + Send;
-    /// `POST` with `Content-Type: application/json`. The request body is wiped after sending.
-    fn post_json(
-        &self,
-        addr: &GatewayAddr,
-        call: HttpCall,
-        body: Zeroizing<Vec<u8>>,
-    ) -> impl Future<Output = Result<HttpReply, HttpError>> + Send;
+}
+
+/// Whether `token` may be written into a header line (and so be sent at all).
+pub fn token_is_sendable(token: &SecretString) -> bool {
+    let t = token.expose_secret().as_bytes();
+    !t.is_empty() && t.iter().all(|b| (0x21..=0x7E).contains(b))
+}
+
+/// The checks every adapter and fake applies before touching the network.
+pub fn request_allowed(call: &HttpCall, token: Option<&SecretString>) -> bool {
+    !call.is_stream() && token.map_or(!call.authenticated(), token_is_sendable)
 }
 
 #[cfg(test)]

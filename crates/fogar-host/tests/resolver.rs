@@ -64,9 +64,10 @@ fn http_refuses_a_lan_name_that_resolves_public() {
         let addr = GatewayAddr::parse("green-house:8004").unwrap();
         for ips in HOSTILE {
             let h = HttpGateway::with_resolver(HttpConfig::default(), Fixed::new(ips));
-            let r = bounded(h.get(&addr, HttpCall::WellKnown)).await;
+            let r = bounded(h.request(&addr, &HttpCall::WellKnown, None, None)).await;
             assert!(matches!(r, Err(HttpError::Refused)), "{ips:?}");
-            let r = bounded(h.post_json(&addr, HttpCall::Pair, b"{}".to_vec().into())).await;
+            let r =
+                bounded(h.request(&addr, &HttpCall::Pair, None, Some(b"{}".to_vec().into()))).await;
             assert!(matches!(r, Err(HttpError::Refused)), "{ips:?}");
         }
     })
@@ -93,7 +94,10 @@ fn http_connects_to_the_resolved_private_address() {
         let addr = GatewayAddr::parse(&format!("green-house:{}", s.addr().port())).unwrap();
         let res = Fixed::new(&["127.0.0.1"]);
         let h = HttpGateway::with_resolver(HttpConfig::default(), res.clone());
-        let r = h.get(&addr, HttpCall::WellKnown).await.unwrap();
+        let r = h
+            .request(&addr, &HttpCall::WellKnown, None, None)
+            .await
+            .unwrap();
         assert_eq!(r.status, 200);
         assert_eq!(res.lookups.load(Ordering::SeqCst), 1);
         let seen = s.routes().seen();
@@ -101,7 +105,7 @@ fn http_connects_to_the_resolved_private_address() {
         // Unresolvable name: Unreachable, not a panic or a hang.
         let none = HttpGateway::with_resolver(HttpConfig::default(), Fixed::new(&[]));
         assert!(matches!(
-            none.get(&addr, HttpCall::WellKnown).await,
+            none.request(&addr, &HttpCall::WellKnown, None, None).await,
             Err(HttpError::Unreachable)
         ));
     })
@@ -134,10 +138,13 @@ fn http_falls_back_to_the_next_resolved_address() {
         // The mock listens on 127.0.0.1 only: ::1 refuses, then 127.0.0.1 answers.
         let h =
             HttpGateway::with_resolver(HttpConfig::default(), Fixed::new(&["::1", "127.0.0.1"]));
-        let r = tokio::time::timeout(Duration::from_secs(2), h.get(&addr, HttpCall::WellKnown))
-            .await
-            .expect("fallback within the probe deadline")
-            .unwrap();
+        let r = tokio::time::timeout(
+            Duration::from_secs(2),
+            h.request(&addr, &HttpCall::WellKnown, None, None),
+        )
+        .await
+        .expect("fallback within the probe deadline")
+        .unwrap();
         assert_eq!(r.status, 200);
     })
 }

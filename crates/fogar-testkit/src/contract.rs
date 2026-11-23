@@ -1359,9 +1359,11 @@ pub mod gateway_http {
     use crate::gateway::HttpRoutes;
     use fogar_ports::{
         gateway::GatewayAddr,
-        gateway_http::{GatewayHttp, HttpCall, HttpError, MAX_BODY_BYTES},
+        gateway_http::{
+            GatewayHttp, HttpCall, HttpError, MAX_BODY_BYTES, MAX_LIST_BODY_BYTES, PathId,
+        },
     };
-    use secrecy::zeroize::Zeroizing;
+    use secrecy::{SecretString, zeroize::Zeroizing};
     use std::time::Duration;
 
     const WK: HttpCall = HttpCall::WellKnown;
@@ -1378,7 +1380,9 @@ pub mod gateway_http {
         routes: &HttpRoutes,
     ) {
         routes.set("GET", &WK.path(), 200, r#"{"service":"fogar-gateway"}"#);
-        let r = bounded(h.get(addr, WK)).await.expect("get");
+        let r = bounded(h.request(addr, &WK, None, None))
+            .await
+            .expect("get");
         assert_eq!(r.status, 200);
         assert_eq!(&r.body[..], br#"{"service":"fogar-gateway"}"#);
         assert!(
@@ -1399,9 +1403,14 @@ pub mod gateway_http {
     ) {
         routes.set("POST", "/pair", 201, r#"{"client_key":"k"}"#);
         let body = br#"{"code":"482913"}"#.to_vec();
-        let r = bounded(h.post_json(addr, HttpCall::Pair, Zeroizing::new(body.clone())))
-            .await
-            .expect("post");
+        let r = bounded(h.request(
+            addr,
+            &HttpCall::Pair,
+            None,
+            Some(Zeroizing::new(body.clone())),
+        ))
+        .await
+        .expect("post");
         assert_eq!(
             (r.status, &r.body[..]),
             (201, &br#"{"client_key":"k"}"#[..])
@@ -1420,8 +1429,7 @@ pub mod gateway_http {
         );
     }
 
-    /// 4xx/5xx are replies (the core reads `detail`), not transport errors; a GET of `/pair`
-    /// is refused locally.
+    /// 4xx/5xx are replies (the core reads `detail`), not transport errors.
     pub async fn error_statuses_are_replies<H: GatewayHttp>(
         h: &H,
         addr: &GatewayAddr,
@@ -1433,18 +1441,19 @@ pub mod gateway_http {
             400,
             r#"{"detail":"invalid or expired code"}"#,
         );
-        let r = bounded(h.post_json(addr, HttpCall::Pair, Zeroizing::new(b"{}".to_vec())))
-            .await
-            .expect("400 is a reply");
+        let r = bounded(h.request(
+            addr,
+            &HttpCall::Pair,
+            None,
+            Some(Zeroizing::new(b"{}".to_vec())),
+        ))
+        .await
+        .expect("400 is a reply");
         assert_eq!(r.status, 400);
-        let r = bounded(h.get(addr, HttpCall::WellKnownLegacy))
+        let r = bounded(h.request(addr, &HttpCall::WellKnownLegacy, None, None))
             .await
             .expect("404 reply");
         assert_eq!(r.status, 404);
-        assert!(matches!(
-            bounded(h.get(addr, HttpCall::Pair)).await,
-            Err(HttpError::Refused)
-        ));
     }
 
     pub async fn oversized_body_is_refused<H: GatewayHttp>(
@@ -1454,14 +1463,14 @@ pub mod gateway_http {
     ) {
         routes.set("GET", &WK.path(), 200, vec![b' '; MAX_BODY_BYTES + 1]);
         assert!(matches!(
-            bounded(h.get(addr, WK)).await,
+            bounded(h.request(addr, &WK, None, None)).await,
             Err(HttpError::TooLarge { .. })
         ));
         // A lying Content-Length + an endless body: refused once the limit is crossed, not
         // after buffering it all (the 5 s bound would fire first).
         routes.set_endless("GET", WK.path().as_str());
         assert!(matches!(
-            bounded(h.get(addr, WK)).await,
+            bounded(h.request(addr, &WK, None, None)).await,
             Err(HttpError::TooLarge { .. })
         ));
     }
@@ -1469,14 +1478,20 @@ pub mod gateway_http {
     /// NET-1: clear text to a public address is refused before any byte is sent.
     pub async fn cleartext_to_public_ip_is_refused<H: GatewayHttp>(h: &H) {
         let public = GatewayAddr::parse("203.0.113.7:8004").expect("addr");
-        let t = tokio::time::timeout(Duration::from_secs(1), h.get(&public, WK)).await;
+        let t =
+            tokio::time::timeout(Duration::from_secs(1), h.request(&public, &WK, None, None)).await;
         assert!(
             matches!(t, Ok(Err(HttpError::Refused))),
             "plain http to a public IP must be Refused at once"
         );
         let t = tokio::time::timeout(
             Duration::from_secs(1),
-            h.post_json(&public, HttpCall::Pair, Zeroizing::new(b"{}".to_vec())),
+            h.request(
+                &public,
+                &HttpCall::Pair,
+                None,
+                Some(Zeroizing::new(b"{}".to_vec())),
+            ),
         )
         .await;
         assert!(matches!(t, Ok(Err(HttpError::Refused))));
@@ -1489,16 +1504,21 @@ pub mod gateway_http {
         routes: &HttpRoutes,
     ) {
         routes.set_redirect("POST", "/pair", "http://evil.example/pair");
-        let r = bounded(h.post_json(addr, HttpCall::Pair, Zeroizing::new(b"{}".to_vec())))
-            .await
-            .expect("redirect reply");
+        let r = bounded(h.request(
+            addr,
+            &HttpCall::Pair,
+            None,
+            Some(Zeroizing::new(b"{}".to_vec())),
+        ))
+        .await
+        .expect("redirect reply");
         assert_eq!(r.status, 302);
         assert_eq!(routes.seen().len(), 1);
     }
 
     pub async fn unreachable_is_reported<H: GatewayHttp>(h: &H, dead: &GatewayAddr) {
         assert!(matches!(
-            bounded(h.get(dead, WK)).await,
+            bounded(h.request(dead, &WK, None, None)).await,
             Err(HttpError::Unreachable)
         ));
     }
@@ -1512,7 +1532,8 @@ pub mod gateway_http {
     ) {
         routes.set("GET", &WK.path(), 200, "{}");
         for _ in 0..5 {
-            let mut f = std::pin::pin!(h.get(addr, WK));
+            let wk = WK;
+            let mut f = std::pin::pin!(h.request(addr, &wk, None, None));
             std::future::poll_fn(|cx| {
                 let _ = f.as_mut().poll(cx);
                 std::task::Poll::Ready(())
@@ -1522,7 +1543,8 @@ pub mod gateway_http {
         routes.set_delayed("POST", "/pair", 201, "{}", Duration::from_millis(500));
         let before = routes.seen().len();
         {
-            let call = h.post_json(addr, HttpCall::Pair, Zeroizing::new(b"{}".to_vec()));
+            let pair = HttpCall::Pair;
+            let call = h.request(addr, &pair, None, Some(Zeroizing::new(b"{}".to_vec())));
             let wait_seen = async {
                 while routes.seen().len() == before {
                     tokio::time::sleep(Duration::from_millis(2)).await;
@@ -1533,8 +1555,119 @@ pub mod gateway_http {
                 () = bounded(wait_seen) => {}
             }
         }
-        let r = bounded(h.get(addr, WK)).await.expect("get after cancels");
+        let r = bounded(h.request(addr, &WK, None, None))
+            .await
+            .expect("get after cancels");
         assert_eq!((r.status, &r.body[..]), (200, &b"{}"[..]));
+    }
+
+    pub async fn bearer_and_method_reach_the_server<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        routes.set("DELETE", "/conversations/c1/messages/m9", 204, "");
+        let tok = SecretString::from("tok-123");
+        let call = HttpCall::Withdraw {
+            id: PathId::new("c1").unwrap(),
+            message: PathId::new("m9").unwrap(),
+        };
+        let r = bounded(h.request(addr, &call, Some(&tok), None))
+            .await
+            .expect("delete");
+        assert_eq!(r.status, 204);
+        let last = routes.seen().pop().unwrap();
+        assert_eq!(
+            (last.method.as_str(), last.path.as_str()),
+            ("DELETE", "/conversations/c1/messages/m9")
+        );
+        assert_eq!(last.authorization.as_deref(), Some("Bearer tok-123"));
+    }
+
+    pub async fn bad_token_is_refused<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        for t in ["a\r\nX-Evil: 1", "a b", ""] {
+            let r =
+                bounded(h.request(addr, &HttpCall::Me, Some(&SecretString::from(t)), None)).await;
+            assert!(matches!(r, Err(HttpError::Refused)), "{t:?}");
+        }
+        assert!(matches!(
+            bounded(h.request(addr, &HttpCall::Me, None, None)).await,
+            Err(HttpError::Refused)
+        ));
+        assert!(routes.seen().is_empty(), "nothing reached the wire");
+    }
+
+    pub async fn list_body_limit_is_larger<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        let tok = SecretString::from("t");
+        let list = HttpCall::ListConversations;
+        routes.set(
+            "GET",
+            "/conversations",
+            200,
+            vec![b' '; MAX_LIST_BODY_BYTES],
+        );
+        assert!(
+            bounded(h.request(addr, &list, Some(&tok), None))
+                .await
+                .is_ok()
+        );
+        routes.set(
+            "GET",
+            "/conversations",
+            200,
+            vec![b' '; MAX_LIST_BODY_BYTES + 1],
+        );
+        assert!(matches!(
+            bounded(h.request(addr, &list, Some(&tok), None)).await,
+            Err(HttpError::TooLarge { .. })
+        ));
+        routes.set("GET", "/auth/me", 200, vec![b' '; MAX_BODY_BYTES + 1]);
+        assert!(matches!(
+            bounded(h.request(addr, &HttpCall::Me, Some(&tok), None)).await,
+            Err(HttpError::TooLarge { .. })
+        ));
+    }
+
+    pub async fn chunked_reply_is_decoded_and_bounded<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        let tok = SecretString::from("t");
+        routes.set_chunked(
+            "GET",
+            "/auth/me",
+            200,
+            vec![b"{\"a\":".to_vec(), b"1}".to_vec()],
+        );
+        let r = bounded(h.request(addr, &HttpCall::Me, Some(&tok), None))
+            .await
+            .expect("chunked");
+        assert_eq!(&r.body[..], b"{\"a\":1}");
+        routes.set_chunked("GET", "/auth/me", 200, vec![vec![b' '; MAX_BODY_BYTES]; 2]);
+        assert!(matches!(
+            bounded(h.request(addr, &HttpCall::Me, Some(&tok), None)).await,
+            Err(HttpError::TooLarge { .. })
+        ));
+    }
+
+    pub async fn stream_calls_are_refused_here<H: GatewayHttp>(h: &H, addr: &GatewayAddr) {
+        let r = bounded(h.request(
+            addr,
+            &HttpCall::Events { audio: false },
+            Some(&SecretString::from("t")),
+            None,
+        ))
+        .await;
+        assert!(matches!(r, Err(HttpError::Refused)));
     }
 
     #[macro_export]
@@ -1598,6 +1731,41 @@ pub mod gateway_http {
                     $crate::run_async(async {
                         let (h, s) = $make;
                         c::cancelled_call_leaves_adapter_usable(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn bearer_and_method_reach_the_server() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::bearer_and_method_reach_the_server(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn bad_token_is_refused() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::bad_token_is_refused(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn list_body_limit_is_larger() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::list_body_limit_is_larger(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn chunked_reply_is_decoded_and_bounded() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::chunked_reply_is_decoded_and_bounded(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn stream_calls_are_refused_here() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::stream_calls_are_refused_here(&h, &s.addr()).await
                     })
                 }
             }

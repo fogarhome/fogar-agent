@@ -167,7 +167,7 @@ fn unknown_ca_fails_the_handshake() {
         let s = HttpsServer::start().await;
         let h = HttpGateway::new(HttpConfig::default()).with_tls(client(OTHER_CA));
         assert!(matches!(
-            h.get(&s.addr(), HttpCall::WellKnown).await,
+            h.request(&s.addr(), &HttpCall::WellKnown, None, None).await,
             Err(HttpError::Transport(_))
         ));
         assert!(
@@ -192,14 +192,17 @@ fn name_not_in_the_certificate_fails_the_handshake() {
         let wrong = GatewayAddr::parse(&format!("https://green-house.example:{port}")).unwrap();
         let h = HttpGateway::with_resolver(HttpConfig::default(), Loopback).with_tls(client(CA));
         assert!(matches!(
-            h.get(&wrong, HttpCall::WellKnown).await,
+            h.request(&wrong, &HttpCall::WellKnown, None, None).await,
             Err(HttpError::Transport(_))
         ));
         // ...and by the name it does cover, through the same resolver path.
         let right = GatewayAddr::parse(&format!("https://localhost:{port}")).unwrap();
         s.routes()
             .set("GET", "/.well-known/fogar-gateway", 200, "{}");
-        let r = h.get(&right, HttpCall::WellKnown).await.unwrap();
+        let r = h
+            .request(&right, &HttpCall::WellKnown, None, None)
+            .await
+            .unwrap();
         assert_eq!(r.status, 200);
 
         let gw = WssGateway::start().await;
@@ -224,7 +227,7 @@ fn tls_to_a_plain_server_is_not_downgraded() {
         let addr = GatewayAddr::parse(&format!("https://{}", plain.addr().authority())).unwrap();
         let h = HttpGateway::new(HttpConfig::default()).with_tls(client(CA));
         assert!(matches!(
-            h.get(&addr, HttpCall::WellKnown).await,
+            h.request(&addr, &HttpCall::WellKnown, None, None).await,
             Err(HttpError::Transport(_))
         ));
     }))
@@ -241,7 +244,7 @@ fn platform_verifier_is_available() {
         let addr = GatewayAddr::parse(&format!("https://{}", dead.local_addr().unwrap())).unwrap();
         drop(dead);
         assert!(matches!(
-            h.get(&addr, HttpCall::WellKnown).await,
+            h.request(&addr, &HttpCall::WellKnown, None, None).await,
             Err(HttpError::Unreachable)
         ));
     }))
