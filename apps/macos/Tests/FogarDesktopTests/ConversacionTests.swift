@@ -380,16 +380,20 @@ nonisolated func agenteConversacion(_ registro: Registro, inicial: WireConversat
     @Test(arguments: [WireNotice.silenceCut, .safetyCut])
     func trasUnCorteNuncaEnviaSola(corte: WireNotice) async throws {
         let registro = Registro()
-        let agent = try FakeAgent(agenteConversacion(registro))
+        let base = agenteConversacion(registro)
+        // The agent opens the take and cuts it at once: a view without `recording`, the
+        // transcript as draft, over the real socket (the link's view and the model's agree).
+        let agent = try FakeAgent { req in
+            guard case .captureStart = req else { return base(req) }
+            registro.anotar(req)
+            return [.captureStarted, .conversation(vista(activity: .recording, live: "me quedé pensando")),
+                    .conversation(vista(draft: "me quedé pensando", notice: corte))]
+        }
         let (link, conv) = try await conectar(agent)
         defer { link.stop() }
         conv.aLaVista = true
         conv.grabar()
-        #expect(await esperar { conv.toma == .abierta })
-        // The agent cut the take: the next view has no `recording`, and the transcript as draft.
-        link.alCambiar(vista(draft: "me quedé pensando", notice: corte))
-        #expect(conv.toma == .ninguna)
-        #expect(conv.texto == "me quedé pensando")
+        #expect(await esperar { conv.texto == "me quedé pensando" && conv.toma == .ninguna && !conv.grabando })
         #expect(!conv.tecla(.intro))
         try await Task.sleep(for: .milliseconds(300))
         #expect(!registro.pedidos.contains { if case .sendText = $0 { true } else { false } })
