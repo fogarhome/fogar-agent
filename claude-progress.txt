@@ -333,3 +333,10 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
 - NOT done: latencies (3d); E2E over the real WebSocket with the app confirming; anything on
   macOS/M2 (real output adapter, energy). The app must send TurnVisible (apps/macos, PR 6 /
   later): until it does, Fogar is silent by design.
+- Gates (Linux): all PASS except `test --workspace`: two fogar-agentd E2E tests in
+  slice0_e2e.rs (text_to_gateway_to_player_over_a_real_websocket,
+  new_text_replaces_the_turn_over_websocket) expect audio with no app confirming, which 3c
+  forbids by design. The fix is test-only (an app client that subscribes and confirms, like
+  RigBuilder::app_on_screen) but fogar-agentd is the orchestrator's and off limits while PR 6
+  (#28) is open: left to the orchestrator. audit/geiger/miri NOT RUN (tools not installable
+  here); loom PASS (heartbeat untouched).
