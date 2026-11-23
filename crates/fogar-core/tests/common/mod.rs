@@ -28,6 +28,8 @@ pub(crate) struct Rig<L: GatewayLink = FakeGatewayLink> {
     pub(crate) secrets: Arc<MemorySecretStore>,
     pub(crate) ipc: Option<FakeIpc>,
     pub(crate) routes: HttpRoutes,
+    /// The app with its conversation on screen (`RigBuilder::app_on_screen`).
+    pub(crate) app: tokio::task::JoinSet<()>,
 }
 
 /// Address of the paired test gateway (the in-memory link ignores it; `FakeGatewayHttp`
@@ -67,6 +69,10 @@ pub(crate) struct RigBuilder<L: GatewayLink> {
     pub(crate) with_ipc: bool,
     /// IPC peers are verified as the same signer (else uid only).
     pub(crate) signed_peer: bool,
+    /// The signed app is open with the conversation on screen: it confirms every turn it is
+    /// shown (`TurnVisible`), so its audio may play (spec S2, single output point). Without
+    /// it nothing sounds.
+    pub(crate) app_on_screen: bool,
     pub(crate) routes: HttpRoutes,
     /// Addresses where a gateway answers `routes` (all share them).
     pub(crate) http_addrs: Vec<&'static str>,
@@ -119,6 +125,7 @@ impl<L: GatewayLink + Clone> RigBuilder<L> {
             secrets: Arc::new(paired_store(key)),
             with_ipc: false,
             signed_peer: true,
+            app_on_screen: false,
             routes: HttpRoutes::fogar("green-house"),
             http_addrs: vec![GW_ADDR],
             tailnet: FakeTailnet::unsupported(),
@@ -155,6 +162,12 @@ impl<L: GatewayLink + Clone> RigBuilder<L> {
             probe: Some(Arc::new(FakeSystemProbe::healthy())),
         };
         let agent = Agent::start(ports, self.cfg, BootMode::Normal);
+        let mut app = tokio::task::JoinSet::new();
+        if self.app_on_screen {
+            let ipc = ipc.clone().expect("app_on_screen needs with_ipc");
+            assert!(signed, "only the signed app may confirm a turn");
+            app.spawn(async move { app_confirming_turns(ipc.client().await).await });
+        }
         Rig {
             health: agent.health(),
             agent,
@@ -165,6 +178,42 @@ impl<L: GatewayLink + Clone> RigBuilder<L> {
             secrets: self.secrets,
             ipc,
             routes: self.routes,
+            app,
+        }
+    }
+}
+
+impl<L: GatewayLink> RigBuilder<L> {
+    /// `with_ipc` + the app showing the conversation (it confirms every turn).
+    pub(crate) fn app_on_screen(mut self) -> Self {
+        self.with_ipc = true;
+        self.app_on_screen = true;
+        self
+    }
+}
+
+/// What the real app does with its conversation on screen: subscribe, and confirm each turn
+/// the agent says waits for it (`awaiting_visible`). Ends when the agent closes the connection.
+async fn app_confirming_turns(mut c: fogar_testkit::FakeIpcClient) {
+    async fn send(c: &mut fogar_testkit::FakeIpcClient, r: IpcRequest) {
+        c.send_half(&r, true).await;
+        c.send_half(&r, false).await;
+    }
+    send(&mut c, IpcRequest::SubscribeConversation).await;
+    let mut confirmed = String::new();
+    while let Some(m) = c.next().await {
+        if let IpcResponse::Conversation(v) = m
+            && let Some(id) = v.awaiting_visible
+            && id != confirmed
+        {
+            send(
+                &mut c,
+                IpcRequest::TurnVisible {
+                    turn_id: id.clone(),
+                },
+            )
+            .await;
+            confirmed = id;
         }
     }
 }

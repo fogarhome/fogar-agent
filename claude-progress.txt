@@ -326,3 +326,58 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
 - NOT here: E2E against the real gateway with fake STT/TTS (needs 3b/3c), anything verified on the
   M2 (registration, approval, launchd start, TCC prompt to the app's name, same-signer connection
   with the Personal Team, Keychain without a dialog: GUESSED).
+
+## S2 — PR 3c: the single output point in core (2026-11-23, core-async)
+- playback.rs: PlaybackGate, the only holder of the speaker (agent.rs hands it the AudioSink;
+  the engine no longer names it, so archtest R12 tightened by itself). The engine keeps the gate
+  in its task state, polls it before `in_rx` (its timers and device jobs are not starved).
+- Rule «nunca suena sin algo visible»: a turn's audio plays only after IpcRequest::TurnVisible
+  for that turn (id as the view shows it), from a same-signer connection subscribed to the
+  conversation (ipc.rs: otherwise Refused "not subscribed to the conversation"; an id longer
+  than ID_MAX_BYTES is noted and matches nothing). Until then its audio waits in a 3 s buffer;
+  2 s after turn_start without confirmation, or with the buffer full, the turn is muted (audio
+  discarded, tts_turns_muted / tts_samples_muted, TurnAudio::Muted) and a late confirmation
+  changes nothing. The device is never opened for unconfirmed audio. The view carries
+  awaiting_visible and speaking.
+- Issue #24 (playback part): open and drop of ActivePlayback run on the blocking pool through
+  the existing capture::spawn_device_job (made generic; still the single #[allow], clippy.toml
+  untouched); one open in flight, core-side OPEN_DEADLINE, late handle released, no open while
+  a release runs; stop waits 0.5 s then detaches.
+- Issue #25: is_alive() checked before every write; a dead output is released off the runtime
+  and reopened lazily (when there is confirmed audio) with backoff 0.5 s doubling to 8 s,
+  without waiting for SessionDown. tts_frames_played counts only frames a live output accepted
+  (>= 1 sample); the rest goes to tts_samples_dropped. Accepted risk of #27 resolved in core.
+- Energy: the output is released 2 s after it drained with no turn open (drain check at the
+  estimated end of what is queued, never more often than 100 ms) and on SessionDown.
+- Tests (Linux, paused time unless noted): engine output suite (property over 48 seeds of
+  random gateway traffic with valid TTS frames, link drops, texts and cancels: FakeSpeaker never
+  opened, then a confirmed turn does sound as control; ordered flush; late confirmation; 1.9 s
+  confirmation plays; push without window; full buffer; wrong id; cancel; dead output; backoff;
+  idle close; link down), playback unit tests (open/drop off a current_thread runtime; late
+  open released), IPC test over FakeIpc. Mutation-checked: making turns start as Seen fails 7
+  tests; ignoring is_alive fails the two #25 tests. Integration rigs that expect audio now run
+  the app on screen (RigBuilder::app_on_screen: subscribes and confirms every awaiting turn);
+  backpressure: tts_frames_played 20 -> 3 (new meaning).
+- NOT done: latencies (3d); E2E over the real WebSocket with the app confirming; anything on
+  macOS/M2 (real output adapter, energy). The app must send TurnVisible (apps/macos, PR 6 /
+  later): until it does, Fogar is silent by design.
+- Gates (Linux): all PASS except `test --workspace`: two fogar-agentd E2E tests in
+  slice0_e2e.rs (text_to_gateway_to_player_over_a_real_websocket,
+  new_text_replaces_the_turn_over_websocket) expect audio with no app confirming, which 3c
+  forbids by design. The fix is test-only (an app client that subscribes and confirms, like
+  RigBuilder::app_on_screen) but fogar-agentd is the orchestrator's and off limits while PR 6
+  (#28) is open: left to the orchestrator. audit/geiger/miri NOT RUN (tools not installable
+  here); loom PASS (heartbeat untouched).
+- Review round 1 of #32 (2026-11-23, same branch): H1 no retry timer while a release runs
+  (busy loop; test counts next() turns, 307k with the bug); H2 empty TTS frames ignored; H3 a
+  waiting or muted turn does not keep the output open; H4 confirmed audio lost without an
+  output marks the turn Muted (tts_turns_unplayed); H5 property asserts frames reached the gate,
+  timeouts in the off-runtime test. F1 a turn_start repeating the (id, seq) of an ended turn is
+  a new turn (own 2 s wait, no inherited confirmation); F2 TurnVisible naming more than one view
+  entry is refused ("ambiguous turn", turn_visible_refused); F3 an unsolicited origin "user" is a
+  push; F4 discarded audio is zeroed before reuse (not testable without unsafe). Follow-up: a
+  per-entry nonce in TurnView/TurnVisible (app <-> agent protocol change).
+- E2E fix (authorized by Sito, 2026-11-23 11:25; only crates/fogar-agentd/tests/slice0_e2e.rs):
+  a test model of the app on screen subscribes (waits for ConversationSubscribed before any
+  `say`), confirms each awaiting entry keyed by id + number of entries with that id (the view has
+  no seq), retries "engine busy". The two E2E tests pass again; `test --workspace` green.

@@ -18,7 +18,7 @@ async fn graceful_shutdown_returns_to_the_task_baseline() {
         ..MockConfig::default()
     });
     b.with_ipc = true;
-    let mut rig = b.start();
+    let mut rig = b.app_on_screen().start();
     wait_ready(&mut rig.health).await;
     assert!(alive_tasks() > baseline);
     assert_eq!(rig.mic.opens(), 0, "S2 Decision 1: no microphone at start");

@@ -332,10 +332,12 @@ impl TurnMachine {
             ServerMsg::TurnStart(ts) => {
                 let awaiting = matches!(self.phase, UserPhase::AwaitTurn { .. });
                 // M19 says who started the turn; older gateways do not, so infer it from
-                // whether we were waiting for an answer.
+                // whether we were waiting for an answer. Review F3 of #32: a `user` turn with no
+                // send of ours waiting is not "mine" (nothing here asked for it): a push.
                 let origin = match ts.origin {
                     Some(TurnOrigin::Push) => Origin::Push,
-                    Some(TurnOrigin::User) => Origin::User,
+                    Some(TurnOrigin::User) if awaiting => Origin::User,
+                    Some(TurnOrigin::User) => Origin::Push,
                     None if awaiting => Origin::User,
                     None => Origin::Push,
                 };
@@ -556,6 +558,7 @@ mod tests {
         assert!(matches!(m.phase(), UserPhase::AwaitTurn { .. }));
         let fx = m.on_server(&te("t-1", Some(TurnEndReason::Interrupted)), T0);
         assert!(fx.turn_completed && fx.stop_playback);
+        // Still waiting for "hola": this `user` turn is its answer.
         m.on_server(&ts("t-2", 2, Some(TurnOrigin::User)), T0);
         assert_eq!(m.turn().map(|t| t.origin), Some(Origin::User));
         let replaced = te("t-2", Some(TurnEndReason::Replaced));
@@ -570,6 +573,17 @@ mod tests {
         m.on_server(&ts("t-4", 4, Some(TurnOrigin::User)), T0);
         let closed = te("t-4", Some(TurnEndReason::Closed));
         assert!(m.on_server(&closed, T0).stop_playback);
+    }
+
+    /// Review F3 of #32: a `user` turn with no send of ours waiting is not "mine": a push.
+    #[test]
+    fn an_unsolicited_user_turn_is_a_push() {
+        let mut m = online();
+        m.on_server(&ts("t-1", 1, Some(TurnOrigin::User)), T0);
+        assert_eq!(m.turn().map(|t| t.origin), Some(Origin::Push));
+        m.send_text("hola".into(), false, T0);
+        m.on_server(&ts("t-2", 2, Some(TurnOrigin::User)), T0);
+        assert_eq!(m.turn().map(|t| t.origin), Some(Origin::User));
     }
 
     #[test]

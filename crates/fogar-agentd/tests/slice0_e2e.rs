@@ -2,6 +2,7 @@
 //! WebSocket (fogar-host, tokio-tungstenite) -> protocol-v1 mock gateway (fogar-testkit) ->
 //! TTS frames 0xA1 + turn_seq + PCM16 -> fake player. Real time, loopback, a few seconds total.
 //! (S2 3a: no microphone at start; the voice path returns with the capture gate in 3b.)
+//! (S2 3c: nothing sounds unless the app confirms the turn is on screen; see `app_on_screen`.)
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use fogar_core::{
@@ -30,6 +31,63 @@ struct E2e {
     mic: FakeMic,
     speaker: FakeSpeaker,
     ipc: FakeIpc,
+    /// The app with the conversation on screen (ends when the agent closes its connection).
+    _app: tokio::task::JoinSet<()>,
+}
+
+/// A TEST MODEL of the app with its conversation window on screen, NOT the app's behaviour
+/// (the real app confirms its own turns at `turn_start` and a push only while the window is
+/// visible). It subscribes to the conversation, reports when the subscription is answered, and
+/// confirms with `TurnVisible` each entry the agent says waits for it (`awaiting_visible`).
+/// - The view carries no `turn_seq`, so an entry is keyed by its id plus how many entries carry
+///   that id: a new turn reusing the previous id is a new key and is not skipped.
+/// - "engine busy" is retried, not taken as a confirmation; any other refusal is final.
+async fn app_on_screen(ipc: FakeIpc, subscribed: tokio::sync::oneshot::Sender<()>) {
+    async fn send(c: &mut fogar_testkit::FakeIpcClient, r: IpcRequest) {
+        c.send_half(&r, true).await;
+        c.send_half(&r, false).await;
+    }
+    let mut c = ipc.client().await;
+    send(&mut c, IpcRequest::SubscribeConversation).await;
+    if c.next().await != Some(IpcResponse::ConversationSubscribed) {
+        return;
+    }
+    let _ = subscribed.send(());
+    let mut latest: Option<(String, usize)> = None;
+    let mut asked: Option<(String, usize)> = None;
+    let mut done: Option<(String, usize)> = None;
+    while let Some(m) = c.next().await {
+        match m {
+            IpcResponse::Conversation(v) => {
+                latest = v.awaiting_visible.map(|id| {
+                    let n = v.turns.iter().filter(|t| t.turn_id == id).count();
+                    (id, n)
+                });
+            }
+            IpcResponse::TurnVisibleNoted => done = asked.take(),
+            IpcResponse::Refused {
+                reason: "engine busy",
+            } => {
+                asked = None;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            IpcResponse::Refused { .. } => done = asked.take(),
+            _ => {}
+        }
+        if asked.is_none()
+            && let Some(k) = latest.clone()
+            && done.as_ref() != Some(&k)
+        {
+            send(
+                &mut c,
+                IpcRequest::TurnVisible {
+                    turn_id: k.0.clone(),
+                },
+            )
+            .await;
+            asked = Some(k);
+        }
+    }
 }
 
 /// A store paired with the gateway at `addr`.
@@ -75,6 +133,13 @@ async fn start(mock: MockConfig, cfg: Config, key: &str) -> E2e {
     };
     let agent = Agent::start(ports, cfg, BootMode::Normal);
     let health = agent.health();
+    // The app is subscribed before any test says anything.
+    let mut app = tokio::task::JoinSet::new();
+    let (subscribed_tx, subscribed) = tokio::sync::oneshot::channel();
+    app.spawn(app_on_screen(ipc.clone(), subscribed_tx));
+    within(Duration::from_secs(10), subscribed)
+        .await
+        .expect("the app subscribed to the conversation");
     E2e {
         baseline,
         gw,
@@ -83,6 +148,7 @@ async fn start(mock: MockConfig, cfg: Config, key: &str) -> E2e {
         mic,
         speaker,
         ipc,
+        _app: app,
     }
 }
 

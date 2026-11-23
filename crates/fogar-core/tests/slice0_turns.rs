@@ -10,9 +10,9 @@ use std::time::Duration;
 
 #[tokio::test(start_paused = true)]
 async fn text_becomes_a_turn_and_audio_is_played() {
-    let mut b = RigBuilder::fake(MockConfig::default());
-    b.with_ipc = true;
-    let mut rig = b.start();
+    let mut rig = RigBuilder::fake(MockConfig::default())
+        .app_on_screen()
+        .start();
     wait_ready(&mut rig.health).await;
     say(&rig, "pon la serie").await;
     eventually(Duration::from_secs(30), || {
@@ -57,9 +57,7 @@ async fn new_text_replaces_the_streaming_turn() {
         frame_interval: Duration::from_millis(20),
         ..MockConfig::default()
     };
-    let mut b = RigBuilder::fake(mock);
-    b.with_ipc = true;
-    let mut rig = b.start();
+    let mut rig = RigBuilder::fake(mock).app_on_screen().start();
     wait_ready(&mut rig.health).await;
     say(&rig, "pon la serie").await;
     eventually(Duration::from_secs(30), || {
@@ -96,7 +94,9 @@ async fn new_text_replaces_the_streaming_turn() {
 
 #[tokio::test(start_paused = true)]
 async fn push_turn_is_played_without_a_request() {
-    let mut rig = RigBuilder::fake(MockConfig::default()).start();
+    let mut rig = RigBuilder::fake(MockConfig::default())
+        .app_on_screen()
+        .start();
     wait_ready(&mut rig.health).await;
     assert_eq!(rig.link.control(Ctl::Push), 1);
     eventually(Duration::from_secs(10), || {
@@ -115,9 +115,7 @@ async fn push_during_a_turn_waits_for_it_instead_of_replacing_it() {
         frame_interval: Duration::from_millis(20),
         ..MockConfig::default()
     };
-    let mut b = RigBuilder::fake(mock);
-    b.with_ipc = true;
-    let mut rig = b.start();
+    let mut rig = RigBuilder::fake(mock).app_on_screen().start();
     wait_ready(&mut rig.health).await;
     say(&rig, "pon la serie").await;
     eventually(Duration::from_secs(30), || {
@@ -148,7 +146,9 @@ async fn push_during_a_turn_waits_for_it_instead_of_replacing_it() {
 
 #[tokio::test(start_paused = true)]
 async fn push_while_a_push_is_open_is_dropped() {
-    let mut rig = RigBuilder::fake(MockConfig::default()).start();
+    let mut rig = RigBuilder::fake(MockConfig::default())
+        .app_on_screen()
+        .start();
     wait_ready(&mut rig.health).await;
     assert_eq!(rig.link.control(Ctl::Push), 1);
     assert_eq!(rig.link.control(Ctl::Push), 1);
@@ -187,7 +187,7 @@ async fn closed_mid_answer(code: u16, reason: &str, action: CloseAction) {
         frame_interval: Duration::from_millis(20),
         ..MockConfig::default()
     };
-    let mut rig = RigBuilder::fake(mock).start();
+    let mut rig = RigBuilder::fake(mock).app_on_screen().start();
     wait_ready(&mut rig.health).await;
     assert_eq!(rig.link.control(Ctl::Push), 1);
     eventually(Duration::from_secs(30), || {

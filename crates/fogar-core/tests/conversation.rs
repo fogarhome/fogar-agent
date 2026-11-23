@@ -67,7 +67,8 @@ fn paced(frames: u32) -> MockConfig {
 
 #[tokio::test(start_paused = true)]
 async fn typed_text_shows_as_a_turn_with_reply_then_done() {
-    let mut rig = rig_with(paced(50)).start();
+    // The app shows the conversation: it confirms the turn, so its audio plays.
+    let mut rig = rig_with(paced(50)).app_on_screen().start();
     wait_ready(&mut rig.health).await;
     let (mut sub, first) = subscribe(&rig).await;
     assert!(first.turns.is_empty());
@@ -159,7 +160,7 @@ async fn progress_and_tool_show_while_no_text_arrives() {
 
 #[tokio::test(start_paused = true)]
 async fn cancel_mid_turn_sends_cancel_and_ends_cancelled() {
-    let mut rig = rig_with(paced(400)).start();
+    let mut rig = rig_with(paced(400)).app_on_screen().start();
     wait_ready(&mut rig.health).await;
     let (mut sub, _) = subscribe(&rig).await;
     let mut ui = rig.ipc.as_ref().unwrap().client().await;
@@ -289,7 +290,8 @@ async fn text_refusals_and_later_requests_never_touch_the_mic() {
         c.request(text(&long)).await,
         Some(IpcResponse::TextRefused(TextRefusal::TooLong))
     );
-    // 3b: a connection that does not show the conversation cannot open a take.
+    // 3b/3c: a connection that does not show the conversation cannot open a take, nor
+    // confirm a turn as visible.
     assert_eq!(
         c.request(IpcRequest::CaptureStart {
             gesture: CaptureGesture::Toggle,
@@ -303,7 +305,7 @@ async fn text_refusals_and_later_requests_never_touch_the_mic() {
         })
         .await,
         Some(IpcResponse::Refused {
-            reason: "unsupported request"
+            reason: "not subscribed to the conversation"
         })
     );
     assert!(rig.link.log().sends.is_empty());
@@ -472,15 +474,71 @@ async fn uid_only_status_subscriber_never_gets_the_conversation() {
     );
     assert!(matches!(c.next().await, Some(IpcResponse::Event(_))));
     assert_eq!(rig.link.control(Ctl::Push), 1);
+    // Nobody can confirm the push as visible (no signed app): it never sounds.
     eventually(Duration::from_secs(30), || {
-        rig.health.snapshot().stats.tts_frames_played == 50
+        rig.health.snapshot().stats.tts_samples_muted == 50 * 480
     })
     .await;
+    assert_eq!(rig.speaker.snapshot().opens, 0);
     let drain = async {
         while let Some(m) = c.next().await {
             assert!(matches!(m, IpcResponse::Event(_)), "{m:?}");
         }
     };
     let _ = tokio::time::timeout(Duration::from_secs(5), drain).await;
+    assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
+}
+
+/// S2 3c (single output point): only a connection that shows the conversation can confirm a
+/// turn, and its confirmation is what lets the turn sound. The view shows the wait, then that
+/// the turn played.
+#[tokio::test(start_paused = true)]
+async fn turn_visible_from_the_subscribed_app_lets_the_turn_sound() {
+    let mut rig = rig_with(paced(20)).start();
+    wait_ready(&mut rig.health).await;
+    // A signed connection that does not show the conversation cannot confirm anything.
+    let mut other = rig.ipc.as_ref().unwrap().client().await;
+    let r = other
+        .request(IpcRequest::TurnVisible {
+            turn_id: "x".into(),
+        })
+        .await;
+    assert!(matches!(r, Some(IpcResponse::Refused { .. })), "{r:?}");
+    let (mut sub, _) = subscribe(&rig).await;
+    assert_eq!(rig.link.control(Ctl::Push), 1);
+    let v = until(&mut sub, |v| v.awaiting_visible.is_some()).await;
+    let id = v.awaiting_visible.unwrap();
+    assert_eq!(
+        rig.speaker.snapshot().opens,
+        0,
+        "nothing opened before the confirmation"
+    );
+    let confirm = IpcRequest::TurnVisible {
+        turn_id: id.clone(),
+    };
+    sub.send_half(&confirm, true).await;
+    sub.send_half(&confirm, false).await;
+    within(Duration::from_secs(10), async {
+        loop {
+            match sub.next().await {
+                Some(IpcResponse::TurnVisibleNoted) => break,
+                Some(IpcResponse::Conversation(_)) => {}
+                other => panic!("{other:?}"),
+            }
+        }
+    })
+    .await;
+    let v = until(&mut sub, |v| {
+        v.turns
+            .iter()
+            .any(|t| t.turn_id == id && t.audio == TurnAudio::Played)
+    })
+    .await;
+    assert_eq!(v.awaiting_visible, None);
+    eventually(Duration::from_secs(10), || {
+        rig.speaker.snapshot().accepted == 20 * 480
+    })
+    .await;
+    assert_eq!(rig.health.snapshot().stats.tts_turns_seen, 1);
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
