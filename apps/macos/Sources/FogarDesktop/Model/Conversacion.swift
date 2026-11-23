@@ -359,8 +359,10 @@ final class Conversacion {
         case .abierta:
             toma = .cerrando
             enviarFin(then)
-        case .abriendo:
+        case .abriendo(fin: .none):
             toma = .abriendo(fin: then)
+        case .abriendo:
+            break // the first way out wins, as with an open take
         case .ninguna where grabando:
             enviarFin(then)
         default:
@@ -373,16 +375,19 @@ final class Conversacion {
     /// A key the app saw before any view: `true` if it was used (the event then goes no further).
     /// ⌘. cancels wherever the app has focus (window, menu bar panel, any field) when there is
     /// something to cancel. Esc and Return only end a take while the conversation is on screen.
-    func tecla(_ t: Tecla) -> Bool {
+    /// `enLaConversacion`: the event belongs to the conversation's window, which is key, with no
+    /// sheet and no text being composed (IME) (`admiteTeclasDeToma`).
+    func tecla(_ t: Tecla, enLaConversacion: Bool = true) -> Bool {
+        let tomaViva = aLaVista && enLaConversacion && enToma && toma != .cerrando
         switch t {
         case .cancelar:
             guard cancelable else { return false }
             cancelarAhora()
             return true
-        case .escape where aLaVista && enToma:
+        case .escape where tomaViva:
             descartar()
             return true
-        case .intro where aLaVista && enToma:
+        case .intro where tomaViva:
             enviarToma()
             return true
         default:
@@ -445,18 +450,38 @@ final class Conversacion {
 
     // MARK: The keyboard
 
-    /// Installed once, for the life of the app: every key-down of every window of the app (main
-    /// window, menu bar panel, Settings) passes here first, whatever has focus.
-    @ObservationIgnored private var monitor: Any?
+    /// Installed once (idempotent), removed with the model: every key-down of every window of
+    /// the app (main window, menu bar panel, Settings) passes here first, whatever has focus.
+    /// Written only on the main actor; read in `deinit`, when nothing else holds the model.
+    @ObservationIgnored nonisolated(unsafe) private(set) var monitor: Any?
+    /// The conversation's window, set by the view (Esc and Return only count there).
+    @ObservationIgnored weak var ventana: NSWindow?
 
     func escucharTeclado() {
         guard monitor == nil else { return }
         // AppKit calls this on the main thread, as it dispatches the event.
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             guard let t = Tecla.de(e) else { return e }
-            let usada = MainActor.assumeIsolated { self?.tecla(t) ?? false }
+            let n = e.windowNumber
+            let usada = MainActor.assumeIsolated {
+                guard let self else { return false }
+                return self.tecla(t, enLaConversacion: self.admiteTeclasDeToma(ventanaDelEvento: n))
+            }
             return usada ? nil : e
         }
+    }
+
+    deinit {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+    }
+
+    /// Esc and Return end a take only from the conversation's window, while it is the key window,
+    /// has no sheet open and no field is composing text (IME): never from the menu bar panel,
+    /// Settings or a dialog.
+    func admiteTeclasDeToma(ventanaDelEvento n: Int) -> Bool {
+        guard let w = ventana, w.windowNumber == n, w.isKeyWindow, w.attachedSheet == nil else { return false }
+        if let campo = w.firstResponder as? NSTextView, campo.hasMarkedText() { return false }
+        return true
     }
 
     // MARK: Tasks

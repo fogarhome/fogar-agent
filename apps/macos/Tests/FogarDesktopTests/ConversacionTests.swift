@@ -338,6 +338,89 @@ nonisolated func agenteConversacion(_ registro: Registro, inicial: WireConversat
         #expect(conv.aviso == nil)
     }
 
+    /// M2: while opening, the first way out wins: Esc then Return discards, never sends.
+    @Test func escYLuegoIntroMientrasAbreDescarta() async throws {
+        let registro = Registro()
+        let agent = try FakeAgent(pausa: { if case .captureStart = $0 { .milliseconds(600) } else { nil } }, agenteConversacion(registro))
+        let (link, conv) = try await conectar(agent)
+        defer { link.stop() }
+        conv.aLaVista = true
+        conv.grabar()
+        #expect(conv.tecla(.escape))
+        _ = conv.tecla(.intro)
+        conv.enviarToma()
+        #expect(conv.toma == .abriendo(fin: .discard))
+        #expect(await esperar { registro.pedidos.contains(.captureEnd(WireCaptureEnd(then: .discard))) && conv.toma == .ninguna })
+        #expect(!registro.pedidos.contains(.captureEnd(WireCaptureEnd(then: .send))))
+    }
+
+    /// T2: a slow opening with nothing pressed stays open: no `capture_end` of its own.
+    @Test func aperturaLentaSinGestoNoTermina() async throws {
+        let registro = Registro()
+        let agent = try FakeAgent(pausa: { if case .captureStart = $0 { .milliseconds(600) } else { nil } }, agenteConversacion(registro))
+        let (link, conv) = try await conectar(agent)
+        defer { link.stop() }
+        conv.grabar()
+        #expect(await esperar { conv.toma == .abierta && conv.grabando })
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(conv.toma == .abierta)
+        #expect(!registro.pedidos.contains { if case .captureEnd = $0 { true } else { false } })
+    }
+
+    /// T1: with the conversation out of sight, or the key event from another window, Esc and
+    /// Return are not the take's: they return false and leave it open.
+    @Test func escEIntroFueraDeLaConversacionNoTocanLaToma() async throws {
+        let registro = Registro()
+        let agent = try FakeAgent(agenteConversacion(registro))
+        let (link, conv) = try await conectar(agent)
+        defer { link.stop() }
+        conv.grabar()
+        #expect(await esperar { conv.toma == .abierta })
+        conv.aLaVista = false
+        #expect(!conv.tecla(.escape))
+        #expect(!conv.tecla(.intro))
+        conv.aLaVista = true
+        #expect(!conv.tecla(.escape, enLaConversacion: false))
+        #expect(!conv.tecla(.intro, enLaConversacion: false))
+        // No conversation window known: nothing counts as coming from it.
+        #expect(!conv.admiteTeclasDeToma(ventanaDelEvento: 0))
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(conv.toma == .abierta)
+        #expect(!registro.pedidos.contains { if case .captureEnd = $0 { true } else { false } })
+    }
+
+    /// B3: while the take is closing, Esc and Return are not swallowed.
+    @Test func escEIntroNoSeTraganAlCerrar() async throws {
+        let registro = Registro()
+        let agent = try FakeAgent(pausa: { if case .captureEnd = $0 { .milliseconds(600) } else { nil } }, agenteConversacion(registro))
+        let (link, conv) = try await conectar(agent)
+        defer { link.stop() }
+        conv.aLaVista = true
+        conv.grabar()
+        #expect(await esperar { conv.toma == .abierta })
+        conv.parar()
+        #expect(conv.toma == .cerrando)
+        #expect(!conv.tecla(.escape))
+        #expect(!conv.tecla(.intro))
+        #expect(await esperar { conv.toma == .ninguna })
+        #expect(registro.cuantos(.captureEnd(WireCaptureEnd(then: .review))) == 1)
+        #expect(!registro.pedidos.contains(.captureEnd(WireCaptureEnd(then: .discard))))
+    }
+
+    /// B4: installing the keyboard monitor twice keeps the first one.
+    @Test func escucharTecladoEsIdempotente() async throws {
+        _ = NSApplication.shared
+        let registro = Registro()
+        let agent = try FakeAgent(agenteConversacion(registro))
+        let (link, conv) = try await conectar(agent)
+        defer { link.stop() }
+        #expect(conv.monitor == nil)
+        conv.escucharTeclado()
+        let primero = try #require(conv.monitor) as AnyObject
+        conv.escucharTeclado()
+        #expect(try #require(conv.monitor) as AnyObject === primero)
+    }
+
     /// Return in an open take sends it, like the send button.
     @Test func introEnLaTomaEnvia() async throws {
         let registro = Registro()
@@ -519,6 +602,7 @@ nonisolated func agenteConversacion(_ registro: Registro, inicial: WireConversat
     @Test func soloEsasTeclas() throws {
         #expect(Tecla.de(try #require(evento("\u{1b}", [], keyCode: 53))) == .escape)
         #expect(Tecla.de(try #require(evento("\r", [], keyCode: 36))) == .intro)
+        #expect(Tecla.de(try #require(evento("\u{3}", .numericPad, keyCode: 76))) == .intro) // keypad Enter
         #expect(Tecla.de(try #require(evento(".", [], keyCode: 47))) == nil)
         #expect(Tecla.de(try #require(evento(".", [.command, .shift], keyCode: 47))) == nil)
         #expect(Tecla.de(try #require(evento("\r", .option, keyCode: 36))) == nil) // Option-Return: a new line

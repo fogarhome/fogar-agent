@@ -1,3 +1,4 @@
+import AppKit
 import FogarWire
 import SwiftUI
 
@@ -46,6 +47,11 @@ struct ConversacionView: View {
         }
         .onChange(of: ventanaVisible) { _, v in conv.aLaVista = aparecida && v }
         .onChange(of: conv.borradorNuevo) { cajaEnfocada = true }
+        // Esc and Return in a take only count in this window (`Conversacion.admiteTeclasDeToma`).
+        .background(VentanaAccesor { conv.ventana = $0 })
+        .onChange(of: conv.grabando) { _, g in
+            if g { AccessibilityNotification.Announcement("Grabando").post() }
+        }
         // Heard as well as seen: an automatic cut, a lost phrase, a refusal.
         .onChange(of: conv.vista?.notice) { _, n in
             if let n { AccessibilityNotification.Announcement(Textos.aviso(n)).post() }
@@ -233,6 +239,8 @@ private struct Composicion: View {
     var cajaEnfocada: FocusState<Bool>.Binding
     @Environment(Conversacion.self) private var conv
     @Environment(\.accessibilityReduceMotion) private var reduce
+    /// The send button of an open take has the focus (keyboard, VoiceOver).
+    @FocusState private var enviarEnfocado: Bool
 
     var body: some View {
         let micro = conv.estadoMicro(listo: listo)
@@ -252,7 +260,7 @@ private struct Composicion: View {
                 contenido
                     .frame(maxWidth: .infinity, alignment: .leading)
                 if enToma {
-                    SalidasDeLaToma()
+                    SalidasDeLaToma(enviarEnfocado: $enviarEnfocado)
                         .transition(cambio)
                 } else {
                     BotonMicro(estado: micro)
@@ -287,6 +295,10 @@ private struct Composicion: View {
         .frame(maxWidth: 760)
         .frame(maxWidth: .infinity)
         .animation(reduce ? nil : .easeOut(duration: Medida.base), value: lineaArriba?.texto)
+        // The focus follows the box: to Send when the take opens, back to the field when it ends.
+        .onChange(of: enToma) { _, t in
+            if t { enviarEnfocado = true } else { cajaEnfocada.wrappedValue = true }
+        }
     }
 
     /// Field ⇄ take: a crossfade with a short rise; only the fade under reduce motion.
@@ -387,14 +399,16 @@ private struct TomaVista: View {
             }
             .accessibilityElement(children: .combine)
             .accessibilityLabel(grabando ? "Grabando" : "Abriendo el micrófono")
-            Text(parcial.isEmpty ? "Te escucho…" : parcial)
-                .font(Tipo.texto(16))
-                .foregroundStyle(parcial.isEmpty ? Color.huesoTenue : Color.hueso)
-                .lineSpacing(3)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentTransition(.opacity)
-                .animation(.easeOut(duration: Medida.rapido), value: parcial)
-                .accessibilityAddTraits(.updatesFrequently)
+            if grabando {
+                Text(parcial.isEmpty ? "Te escucho…" : parcial)
+                    .font(Tipo.texto(16))
+                    .foregroundStyle(parcial.isEmpty ? Color.huesoTenue : Color.hueso)
+                    .lineSpacing(3)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentTransition(.opacity)
+                    .animation(.easeOut(duration: Medida.rapido), value: parcial)
+                    .accessibilityAddTraits(.updatesFrequently)
+            }
         }
         .padding(.horizontal, 6)
         .padding(.vertical, 4)
@@ -405,6 +419,7 @@ private struct TomaVista: View {
 /// box to edit or send, `review`) and send (`send`). Both also work while the take is still
 /// opening: it ends as soon as the agent opens it. Esc discards and Return sends (`Conversacion.tecla`).
 private struct SalidasDeLaToma: View {
+    var enviarEnfocado: FocusState<Bool>.Binding
     @Environment(Conversacion.self) private var conv
 
     var body: some View {
@@ -413,6 +428,7 @@ private struct SalidasDeLaToma: View {
             BotonRedondo(icono: "stop.fill", etiqueta: "Parar y revisar") { conv.parar() }
                 .help("Parar: el texto se queda en la caja")
             BotonRedondo(icono: "arrow.up", etiqueta: "Enviar", principal: true) { conv.enviarToma() }
+                .focused(enviarEnfocado)
                 .help("Enviar (Intro)")
         }
         .disabled(cerrando)
@@ -438,10 +454,12 @@ private struct BotonMicro: View {
                 .opacity(usable ? 1 : 0.42)
         }
         .buttonStyle(Pulsable())
+        .disabled(!usable)
         .onHover { hover = $0 }
         .animation(.easeOut(duration: Medida.rapido), value: hover)
         .help(Textos.micro(estado))
-        .accessibilityLabel(estado == .pedirPermiso ? "Permitir el micrófono" : "Hablar")
+        .accessibilityLabel(estado == .pedirPermiso ? "Permitir el micrófono"
+                            : estado == .denegado ? "Micrófono denegado: abrir Ajustes del Sistema" : "Hablar")
         .accessibilityHint(Textos.micro(estado))
     }
 
@@ -542,5 +560,26 @@ private struct Ondas: View {
             .frame(height: 12)
         }
         .accessibilityHidden(true)
+    }
+}
+
+/// Reports the window this view lives in (and nil when it leaves it).
+private struct VentanaAccesor: NSViewRepresentable {
+    let alCambiar: (NSWindow?) -> Void
+
+    func makeNSView(context: Context) -> Vista {
+        let v = Vista()
+        v.alCambiar = alCambiar
+        return v
+    }
+
+    func updateNSView(_ v: Vista, context: Context) { v.alCambiar = alCambiar }
+
+    final class Vista: NSView {
+        var alCambiar: (NSWindow?) -> Void = { _ in }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            alCambiar(window)
+        }
     }
 }
