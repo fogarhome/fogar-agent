@@ -16,6 +16,51 @@ Signing uses the first "Apple Development" identity in the keychain (free Person
 hardened runtime the agent's "same signer" check needs. Without one the app is signed ad hoc and the
 agent treats it as `uid_only`: status works, pair/unpair are refused.
 
+## The agent inside the app (S2 PR 6)
+
+The release build carries the Rust agent:
+
+```
+Fogar Desktop.app/Contents/
+  MacOS/FogarDesktop                         the app
+  MacOS/fogar-agentd                         the agent (Info.plist embedded in __TEXT,__info_plist)
+  Library/LaunchAgents/com.fogar.agent.plist LaunchAgent, BundleProgram = Contents/MacOS/fogar-agentd
+```
+
+`scripts/build-app.sh` builds the agent (`cargo rustc --release -p fogar-agentd`), signs it first
+(identifier `com.fogar.agent`, hardened runtime, `Packaging/Agent/fogar-agentd.entitlements`: only
+the microphone, never `get-task-allow`), then the app (`Packaging/FogarDesktop.entitlements`:
+the microphone too, because macOS attributes the agent's microphone to the app), same identity,
+inside out, no `--deep`; then it checks what it signed and fails on any mismatch.
+
+**Runbook (on the Mac)**
+
+- Install: build, copy `build/Fogar Desktop.app` to `/Applications`, open it. The first launch
+  registers the agent (`SMAppService.agent(plistName: "com.fogar.agent.plist")`); launchd starts it
+  at once and at every login. Ajustes → Agente shows the state: active, waiting for approval
+  (button to System Settings → General → Login Items), or not registered (button to register).
+- State from Terminal: `launchctl print gui/$(id -u)/com.fogar.agent` (state, pid, last exit) and
+  `sfltool dumpbtm | grep -B2 -A8 com.fogar.agent` (the login item record).
+- Remove the registration: Ajustes → Agente → «Quitar el registro» (launchd stops it and will not
+  start it again); or switch it off in Login Items. The app never re-registers by itself after the
+  first launch.
+- From the S1 hand-run agent to the bundled one: stop the hand-run agent first (Ctrl-C, or
+  `launchctl bootout gui/$(id -u)/<label>` if you loaded a plist of your own, then delete that
+  plist); otherwise the bundled agent finds the socket in use and exits. The state directory
+  (`~/Library/Application Support/com.fogar.agent`) and the Keychain item (`com.fogar.agent` /
+  `gateway_pairing`) are the same, so the pairing carries over. **GUESSED:** that the bundled
+  agent reads that Keychain item without a dialog (the item was created by another binary);
+  if macOS asks, «Permitir siempre» once, or unpair and pair again from the app.
+- After rebuilding: macOS keeps the microphone permission while the signer stays the same (spike,
+  step 0). If the plist changes, remove the registration and register again.
+- Agents started by hand with `--state-dir` other than the default use their own Keychain service
+  (`com.fogar.agent.dir-<hash of the path>`), so measurement runs never touch the real pairing.
+
+`build-app.sh` is **for development only**: Apple Development identity (Personal Team), no
+secure timestamp (`--timestamp=none`), no notarization. A build to give to anyone else needs
+Developer ID, timestamp, notarization and updates: S8. Out of scope here: all of that and an
+installer.
+
 ## Without the Rust agent: the stand-in
 
 `fogar-standin` speaks the same frames and plays scripted states (synthetic data). It listens on
@@ -74,4 +119,10 @@ swift test
 
 Golden JSON from the Rust tests, framing, the pairing code check, the app's links to the agent
 (status and conversation) against a scripted agent on a real Unix socket, the conversation model
-(take gestures, visible-turn rule, microphone states), and the stand-in's conversation rules.
+(take gestures, visible-turn rule, microphone states), the agent's registration (`ServicioAgente`
+against a fake registry), and the stand-in's conversation rules. In CI (`macos` job),
+`scripts/ci-signed-agents.sh` first signs a small test server six ways with a temporary
+self-signed certificate, and `SignedAgentTests` runs the app's real peer check against each:
+`com.fogar.agent` with the hardened runtime is accepted; another identifier, no hardened runtime,
+`get-task-allow`, `allow-dyld-environment-variables` or `disable-library-validation` are refused (the certificate's hash stands in for Apple's anchor, and the real
+anchor is checked to refuse it). Without those variables that suite is skipped.

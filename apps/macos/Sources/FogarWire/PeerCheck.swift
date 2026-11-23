@@ -17,8 +17,8 @@ public enum VerificacionPar: Sendable, Equatable {
     case rutaYUsuario
 }
 
-/// The agent's code-signing identifier (GUESSED: the identifier the agent inside the `.app` is
-/// signed with, set by the packaging of S2 PR 6; the agent's ADR-0002 note names it).
+/// The agent's code-signing identifier: `scripts/build-app.sh` signs `Contents/MacOS/fogar-agentd`
+/// with it (and embeds it as the agent's `CFBundleIdentifier`). Frozen identity.
 public let identificadorAgente = "com.fogar.agent"
 
 public enum PeerCheck {
@@ -35,17 +35,30 @@ public enum PeerCheck {
 
     /// The process behind the connected socket `fd` is our agent (see `VerificacionPar`).
     public static func servidorValido(fd: Int32, verificacion: VerificacionPar) -> Bool {
+        servidorValido(fd: fd, verificacion: verificacion, equipo: equipoPropio, ancla: anclaApple)
+    }
+
+    /// Apple-issued certificates only. Tests replace it with their temporary certificate's hash
+    /// (CI signs test agents with a self-signed certificate: `scripts/ci-signed-agents.sh`).
+    static let anclaApple = "anchor apple generic"
+
+    static func servidorValido(fd: Int32, verificacion: VerificacionPar, equipo: String?, ancla: String) -> Bool {
         // uid gate (`getpeereid` reads LOCAL_PEERCRED).
         var uid: uid_t = 0
         var gid: gid_t = 0
         guard getpeereid(fd, &uid, &gid) == 0, uid == getuid() else { return false }
         if verificacion == .rutaYUsuario { return true }
-        guard let equipo = equipoPropio, let token = tokenDelPar(fd) else { return false }
-        let requisito = "anchor apple generic and certificate leaf[subject.OU] = \"\(equipo)\" and identifier \"\(identificadorAgente)\""
+        guard let equipo, let token = tokenDelPar(fd) else { return false }
+        return cumple(token: token, requisito: requisitoAgente(equipo: equipo, ancla: ancla))
+    }
+
+    /// The agent's designated requirement for Team `equipo` (already validated: ten upper-case
+    /// letters and digits).
+    static func requisitoAgente(equipo: String, ancla: String) -> String {
+        "\(ancla) and certificate leaf[subject.OU] = \"\(equipo)\" and identifier \"\(identificadorAgente)\""
             + " and !(entitlement[\"com.apple.security.cs.allow-dyld-environment-variables\"] exists)"
             + " and !(entitlement[\"com.apple.security.cs.disable-library-validation\"] exists)"
             + " and !(entitlement[\"com.apple.security.get-task-allow\"] exists)"
-        return cumple(token: token, requisito: requisito)
     }
 
     /// `LOCAL_PEERTOKEN`: the audit token of the process that last did I/O on the peer socket.

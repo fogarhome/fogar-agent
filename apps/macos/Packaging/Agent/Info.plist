@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Embedded in the fogar-agentd binary (__TEXT,__info_plist, linked by scripts/build-app.sh): a
+     bare binary has no bundle to carry it. Its identifier is the agent's frozen code-signing
+     identifier (fogar-macos-daemon hard rule 2), the one the app's peer check requires. -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.fogar.agent</string>
+	<key>CFBundleName</key>
+	<string>fogar-agentd</string>
+	<key>CFBundleDisplayName</key>
+	<string>Fogar</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Fogar escucha solo mientras grabas un mensaje para el asistente de tu casa.</string>
+</dict>
+</plist>

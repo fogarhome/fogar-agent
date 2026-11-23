@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Fogar Desktop (signed by scripts/build-app.sh, hardened runtime). The microphone entitlement
+     belongs here too, not only in the agent: macOS attributes the agent's microphone use to this
+     app (its responsible process), and without it TCC denies without asking (S2 step 0 spike).
+     Nothing else: never get-task-allow, disable-library-validation or allow-dyld-environment-variables. -->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>
