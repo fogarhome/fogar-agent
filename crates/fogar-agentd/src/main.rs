@@ -18,6 +18,8 @@ compile_error!("the dev-uid-pairing feature is for development builds only");
 
 mod cli;
 mod crash;
+#[cfg(any(target_os = "macos", test))]
+mod instance;
 mod ledger;
 mod state_dir;
 mod status_log;

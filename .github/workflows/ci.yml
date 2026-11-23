@@ -66,7 +66,7 @@ jobs:
   macos:
     # The FIRST compiler that sees fogar-agent-macos and platform_macos.rs (untested in slice 0).
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 60 # S2 PR 6: + the release agent build (LTO) for the packaged app
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - name: Toolchain
@@ -87,6 +87,10 @@ jobs:
           swift --version
       - name: typeshare-cli (pinned)
         run: cargo install --locked typeshare-cli --version 1.13.4
+      # Test agents signed with a temporary self-signed certificate, so the app's peer check is
+      # tested against real signed processes (accept com.fogar.agent, refuse the rest).
+      - name: Signed test agents (temporary certificate)
+        run: apps/macos/scripts/ci-signed-agents.sh "$RUNNER_TEMP/signed-agents"
       - name: Fogar Desktop tests and Wire.swift check
         run: cd apps/macos && swift test && scripts/gen-wire.sh --check
       # The unsigned-agent override exists only in debug builds: the release binary must not even
@@ -97,6 +101,23 @@ jobs:
           swift build -c release --product FogarDesktop
           bin="$(swift build -c release --show-bin-path)/FogarDesktop"
           if grep -q FOGAR_AGENT_UNSIGNED "$bin"; then echo "release binary contains FOGAR_AGENT_UNSIGNED"; exit 1; fi
+      # S2 PR 6: the app with the agent inside, signed with the temporary certificate of the
+      # signed-agents step, so the "same certificate" check compares real signatures. The
+      # script itself checks the layout, the signatures and the entitlements; then the packaged
+      # agent must start under the hardened runtime, create run/ (0700) and its socket, and stop
+      # cleanly on SIGTERM.
+      - name: Package Fogar Desktop.app with the agent (temporary certificate) and check it
+        run: |
+          cd apps/macos
+          FOGAR_SIGN_IDENTITY="$FOGAR_CI_TEST_CERT_SHA1" scripts/build-app.sh
+          agent="build/Fogar Desktop.app/Contents/MacOS/fogar-agentd"
+          state="$RUNNER_TEMP/agent-state"
+          "$agent" run --state-dir "$state" & pid=$!
+          for _ in $(seq 1 50); do [ -S "$state/run/agent.sock" ] && break; sleep 0.2; done
+          test -S "$state/run/agent.sock" || { echo "the packaged agent did not bind its socket"; kill $pid; exit 1; }
+          test "$(stat -f %Lp "$state/run")" = 700 || { echo "run/ is not 0700"; kill $pid; exit 1; }
+          kill -TERM $pid
+          wait $pid
 
   supply-chain:
     # cargo vet + the unsafe-count baseline (scripts/geiger.sh) on both OSes: the macOS adapter and its

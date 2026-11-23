@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- LaunchAgent registered by Fogar Desktop with SMAppService.agent(plistName: "com.fogar.agent.plist").
+     Lives in Fogar Desktop.app/Contents/Library/LaunchAgents/. Label and program path are frozen
+     identity (fogar-macos-daemon hard rule 2): changing them between versions needs
+     unregister + register. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.fogar.agent</string>
+	<!-- Relative to the app bundle: the agent moves with the app. -->
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/fogar-agentd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>fogar-agentd</string>
+		<string>run</string>
+	</array>
+	<!-- Shown under Fogar Desktop in System Settings → Login Items. -->
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>com.fogar.desktop</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<!-- Restarted after a crash (panic = abort) or exit 75 (update), not after a clean exit. -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<!-- Above the agent's 4 s shutdown budget. -->
+	<key>ExitTimeOut</key>
+	<integer>10</integer>
+	<!-- Standard, not Background: Background throttles CPU and timers, and the agent records and
+	     plays audio in real time. To be measured on the M2 (fogar-energy-budget). -->
+	<key>ProcessType</key>
+	<string>Standard</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+</dict>
+</plist>
