@@ -45,9 +45,21 @@ pub struct Config {
     pub ipc_idle_timeout: Duration,
     pub vad: VadConfig,
     pub turn: TurnTimeouts,
-    /// Capture rate the engine streams as-is (f32le 16 kHz mono is all v1 accepts). Captures at
-    /// another rate are refused in slice 0 (resampling arrives with S2).
+    /// Capture rate the engine streams as-is (f32le 16 kHz mono is all v1 accepts). The adapter
+    /// resamples; a capture delivered at another format is closed and the take refused.
     pub upload_rate_hz: u32,
+    /// A take is cut (outcome `Review`, never sent) when no new non-empty
+    /// `transcription_partial` arrived for this long. 5 s: before the gateway's silence
+    /// watchdog closes the session (third warning after ~6 s with its default
+    /// `silence_timeout_s` 2 s x `max_silence_turns` 3; spec S2 «Límites de una toma»).
+    pub capture_silence_cut: Duration,
+    /// Privacy net for a forgotten take that keeps hearing something (a TV): cut with `Review`.
+    pub capture_safety_cut: Duration,
+    /// A take shorter than this is discarded whatever the person asked (a slip of the finger).
+    pub capture_min: Duration,
+    /// How long an IPC `RequestMicPermission` waits for the person to answer the system prompt
+    /// before it is answered with the current status.
+    pub mic_permission_wait: Duration,
     /// Liveness heartbeat period (OS-thread watchdog reads it). Coarse on purpose: energy budget.
     pub heartbeat_every: Duration,
 }
@@ -78,6 +90,10 @@ impl Default for Config {
             turn: TurnTimeouts::default(),
             upload_rate_hz: fogar_proto::audio::UPLOAD_RATE_HZ,
             heartbeat_every: Duration::from_secs(10),
+            capture_silence_cut: Duration::from_secs(5),
+            capture_safety_cut: Duration::from_secs(5 * 60),
+            capture_min: Duration::from_millis(250),
+            mic_permission_wait: Duration::from_secs(60),
         }
     }
 }

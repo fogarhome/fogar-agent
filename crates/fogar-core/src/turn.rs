@@ -2,8 +2,8 @@
 //! source (callers pass `Mono`). The engine executes the returned [`Effects`].
 //!
 //! Two independent halves:
-//! - **user side** ([`UserPhase`]): what the local user is doing (waiting for the turn our
-//!   `send` opened; S2 sub-PR 3b adds the microphone take);
+//! - **user side** ([`UserPhase`]): what the local user is doing (recording a take, waiting for
+//!   its final transcript, waiting for the turn our `send` opened);
 //! - **server side** (`turn`): the turn the gateway is streaming (normal or push; v1 cannot tell
 //!   them apart, so "push" is our heuristic: a `turn_start` we did not ask for).
 //!
@@ -11,7 +11,10 @@
 //! `turn_start` (compare by equality; it wraps) and was not cancelled locally (a new text or
 //! the cancel button).
 
-use fogar_ports::clock::Mono;
+use fogar_ports::{
+    clock::Mono,
+    ipc::{CaptureThen, UserText},
+};
 use fogar_proto::server::{ErrorMsg, ServerMsg, TurnOrigin};
 use std::time::Duration;
 
@@ -20,6 +23,13 @@ pub enum UserPhase {
     /// No gateway session: text is refused.
     Offline,
     Idle,
+    /// A take is open (the capture gate holds the microphone): its audio streams to the gateway.
+    Recording,
+    /// Sent `end`; waiting for the final `transcription`, then `then` decides what happens to it.
+    AwaitTranscription {
+        since: Mono,
+        then: CaptureThen,
+    },
     /// Sent `send`; waiting for its `turn_start`.
     AwaitTurn {
         since: Mono,
@@ -48,6 +58,8 @@ pub struct ActiveTurn {
 pub enum ClientCmd {
     Send(String),
     Cancel,
+    /// End of the take's audio (a final `transcription` follows).
+    End,
 }
 
 /// Redacting `Debug`: `Send` carries the user's transcript (review sec#7, LOG-1).
@@ -56,6 +68,7 @@ impl std::fmt::Debug for ClientCmd {
         match self {
             ClientCmd::Send(t) => write!(f, "Send(<redacted {} bytes>)", t.len()),
             ClientCmd::Cancel => f.write_str("Cancel"),
+            ClientCmd::End => f.write_str("End"),
         }
     }
 }
@@ -71,12 +84,17 @@ pub struct Effects {
     /// A streaming turn was cut locally (new text or cancel). If the control message then fails
     /// to go out, no `turn_end` will close it: the engine ends its view entry itself.
     pub turn_cut: bool,
+    /// The final transcript of a take ended with `Review`: it goes to the text box, never sent.
+    pub review: Option<UserText>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TurnTimeouts {
     /// Max wait for `turn_start` after `send` (the server's own turn timeout is 120 s).
     pub turn_start: Duration,
+    /// Max wait for the final `transcription` after `end` (GUESSED: the gateway answers every
+    /// `end` with exactly one, usually within a second).
+    pub transcription: Duration,
 }
 
 /// How long an abandoned `send` may still produce its `turn_start` (the gateway's own turn
@@ -87,6 +105,7 @@ impl Default for TurnTimeouts {
     fn default() -> Self {
         Self {
             turn_start: Duration::from_secs(30),
+            transcription: Duration::from_secs(15),
         }
     }
 }
@@ -106,6 +125,10 @@ pub struct TurnMachine {
     abandoned: u8,
     /// When `abandoned` was last bumped; the count expires `ABANDONED_SEND_TTL` after it.
     abandoned_at: Mono,
+    /// Final transcripts still owed by the gateway for takes we no longer wait on (a new take,
+    /// a text or the cancel button while transcribing): skipped when they arrive. Saturating;
+    /// reset with the session and when a transcription wait times out.
+    finals_to_skip: u8,
     timeouts: TurnTimeouts,
 }
 
@@ -117,6 +140,7 @@ impl TurnMachine {
             suppressed_seq: None,
             abandoned: 0,
             abandoned_at: Mono::ZERO,
+            finals_to_skip: 0,
             timeouts,
         }
     }
@@ -135,6 +159,7 @@ impl TurnMachine {
         self.turn = None;
         self.suppressed_seq = None;
         self.abandoned = 0;
+        self.finals_to_skip = 0;
     }
 
     /// The session ended. Turn ids restart on the next connection, so nothing carries over.
@@ -144,6 +169,7 @@ impl TurnMachine {
         self.turn = None;
         self.suppressed_seq = None;
         self.abandoned = 0;
+        self.finals_to_skip = 0;
         Effects {
             stop_playback: had_audio,
             ..Effects::default()
@@ -153,19 +179,52 @@ impl TurnMachine {
     /// The person sent text. `playing` = playback still has queued audio. A new `send`
     /// replaces any running turn server-side (`turn_end{replaced}`), so no `cancel` is sent; the
     /// running turn's late frames are suppressed and what is queued stops at once. `None` when
-    /// offline (the caller answers `NotReady`).
+    /// offline or while a take is open (the caller answers `NotReady` / `Recording`).
     pub fn send_text(&mut self, text: String, playing: bool, now: Mono) -> Option<Effects> {
-        if self.phase == UserPhase::Offline {
-            return None;
-        }
-        if matches!(self.phase, UserPhase::AwaitTurn { .. }) {
+        match self.phase {
+            UserPhase::Offline | UserPhase::Recording => return None,
             // The earlier send's turn_start may still come (then replaced by this one).
-            self.abandon(now);
+            UserPhase::AwaitTurn { .. } => self.abandon(now),
+            // The take's final transcript still comes: it must not be sent or reviewed now.
+            UserPhase::AwaitTranscription { .. } => self.skip_final(),
+            UserPhase::Idle => {}
         }
         let mut fx = self.cut(playing);
         fx.send = Some(ClientCmd::Send(text));
         self.phase = UserPhase::AwaitTurn { since: now };
         Some(fx)
+    }
+
+    fn skip_final(&mut self) {
+        self.finals_to_skip = self.finals_to_skip.saturating_add(1);
+    }
+
+    /// A take opened (the capture gate already holds the microphone; S2 «toma»). Like the cancel
+    /// button for what plays: playback stops, and `cancel` goes out if a turn streams or our
+    /// `send` still waits. A previous take's final transcript still owed is skipped. `None` when
+    /// offline or already recording (the caller closes the take).
+    pub fn utterance_start(&mut self, playing: bool, now: Mono) -> Option<Effects> {
+        match self.phase {
+            UserPhase::Offline | UserPhase::Recording => return None,
+            UserPhase::AwaitTranscription { .. } => self.skip_final(),
+            UserPhase::Idle | UserPhase::AwaitTurn { .. } => {}
+        }
+        let fx = self.cancel(playing, now);
+        self.phase = UserPhase::Recording;
+        Some(fx)
+    }
+
+    /// The take ended: `end` goes out and `then` decides what happens to the final transcript.
+    /// Nothing when no take was recording (offline: the session that heard it is gone).
+    pub fn utterance_end(&mut self, then: CaptureThen, now: Mono) -> Effects {
+        if self.phase != UserPhase::Recording {
+            return Effects::default();
+        }
+        self.phase = UserPhase::AwaitTranscription { since: now, then };
+        Effects {
+            send: Some(ClientCmd::End),
+            ..Effects::default()
+        }
     }
 
     fn abandon(&mut self, now: Mono) {
@@ -185,6 +244,11 @@ impl TurnMachine {
         if waiting {
             self.phase = UserPhase::Idle;
             self.abandon(now);
+        }
+        if let UserPhase::AwaitTranscription { .. } = self.phase {
+            // The person cancelled: the transcript must not turn into a `send` afterwards.
+            self.phase = UserPhase::Idle;
+            self.skip_final();
         }
         fx
     }
@@ -207,8 +271,14 @@ impl TurnMachine {
 
     /// The uplink could not deliver a control message: give up on the current user action.
     pub fn uplink_failed(&mut self) {
-        if self.phase != UserPhase::Offline {
-            self.phase = UserPhase::Idle;
+        match self.phase {
+            // The take itself goes on: its audio is best effort anyway.
+            UserPhase::Offline | UserPhase::Recording => {}
+            UserPhase::Idle
+            | UserPhase::AwaitTurn { .. }
+            | UserPhase::AwaitTranscription { .. } => {
+                self.phase = UserPhase::Idle;
+            }
         }
     }
 
@@ -216,14 +286,23 @@ impl TurnMachine {
     pub fn next_deadline(&self) -> Option<Mono> {
         match self.phase {
             UserPhase::AwaitTurn { since } => Some(since.saturating_add(self.timeouts.turn_start)),
-            UserPhase::Offline | UserPhase::Idle => None,
+            UserPhase::AwaitTranscription { since, .. } => {
+                Some(since.saturating_add(self.timeouts.transcription))
+            }
+            UserPhase::Offline | UserPhase::Idle | UserPhase::Recording => None,
         }
     }
 
-    /// `Some` if the user-side wait timed out: it is abandoned and `cancel` goes out so the
-    /// gateway (whose own limit is 120 s) does not answer it later.
+    /// `Some` if the user-side wait timed out: a turn wait is abandoned and `cancel` goes out so
+    /// the gateway (whose own limit is 120 s) does not answer it later; a transcription wait just
+    /// ends (nothing to cancel; a late final is then ignored as long as no new take waits).
     pub fn on_tick(&mut self, now: Mono) -> Option<Effects> {
         match self.next_deadline() {
+            Some(d) if now >= d && matches!(self.phase, UserPhase::AwaitTranscription { .. }) => {
+                self.phase = UserPhase::Idle;
+                self.finals_to_skip = 0;
+                Some(Effects::default())
+            }
             Some(d) if now >= d => {
                 self.phase = UserPhase::Idle;
                 self.abandon(now);
@@ -292,8 +371,26 @@ impl TurnMachine {
                 fx.stop_playback = true;
             }
             ServerMsg::Error(e) => self.on_error(e),
+            ServerMsg::Transcription(_) if self.finals_to_skip > 0 => self.finals_to_skip -= 1,
+            ServerMsg::Transcription(t) => {
+                if let UserPhase::AwaitTranscription { then, .. } = self.phase {
+                    self.phase = UserPhase::Idle;
+                    let text = t.text.trim();
+                    match then {
+                        _ if text.is_empty() => {}
+                        CaptureThen::Send => {
+                            // Like a typed text: it replaces whatever turn streams now.
+                            fx = self.cut(false);
+                            fx.send = Some(ClientCmd::Send(text.to_owned()));
+                            self.phase = UserPhase::AwaitTurn { since: now };
+                        }
+                        CaptureThen::Review => fx.review = Some(UserText(text.to_owned())),
+                        // Discard, and any outcome a newer contract adds: never sent on its own.
+                        _ => {}
+                    }
+                }
+            }
             ServerMsg::Ready(_)
-            | ServerMsg::Transcription(_)
             | ServerMsg::TranscriptionPartial(_)
             | ServerMsg::ToolCall(_)
             | ServerMsg::Status(_)

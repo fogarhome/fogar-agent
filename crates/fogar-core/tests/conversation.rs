@@ -6,9 +6,9 @@
 mod common;
 use common::*;
 use fogar_ports::ipc::{
-    CaptureGesture, CaptureThen, ConversationView, IpcRequest, IpcResponse, ProgressKind,
-    SEND_TEXT_MAX_BYTES, ServiceState, TextRefusal, TurnAudio, TurnOutcome, TurnSource,
-    UserActivity, UserText,
+    CaptureGesture, CaptureRefusal, CaptureThen, ConversationView, IpcRequest, IpcResponse,
+    ProgressKind, SEND_TEXT_MAX_BYTES, ServiceState, TextRefusal, TurnAudio, TurnOutcome,
+    TurnSource, UserActivity, UserText,
 };
 use fogar_ports::{audio::MicPermission, gateway::GatewayLink};
 use fogar_proto::{OutputMode, server::ProgressPhase};
@@ -289,22 +289,23 @@ async fn text_refusals_and_later_requests_never_touch_the_mic() {
         c.request(text(&long)).await,
         Some(IpcResponse::TextRefused(TextRefusal::TooLong))
     );
-    for req in [
-        IpcRequest::CaptureStart {
+    // 3b: a connection that does not show the conversation cannot open a take.
+    assert_eq!(
+        c.request(IpcRequest::CaptureStart {
             gesture: CaptureGesture::Toggle,
-        },
-        IpcRequest::RequestMicPermission,
-        IpcRequest::TurnVisible {
+        })
+        .await,
+        Some(IpcResponse::CaptureRefused(CaptureRefusal::NotSubscribed))
+    );
+    assert_eq!(
+        c.request(IpcRequest::TurnVisible {
             turn_id: "t-1".into(),
-        },
-    ] {
-        assert_eq!(
-            c.request(req).await,
-            Some(IpcResponse::Refused {
-                reason: "unsupported request"
-            })
-        );
-    }
+        })
+        .await,
+        Some(IpcResponse::Refused {
+            reason: "unsupported request"
+        })
+    );
     assert!(rig.link.log().sends.is_empty());
     assert_eq!((rig.mic.opens(), rig.mic.permission_requests()), (0, 0));
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);

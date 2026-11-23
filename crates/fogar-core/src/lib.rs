@@ -20,6 +20,7 @@ pub mod stats;
 pub mod turn;
 pub mod vad;
 
+mod capture;
 mod engine;
 mod ipc;
 mod link;

@@ -245,6 +245,60 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
   test (no packaged agent until PR 6). Review fixes: fake queue owned by the newest live handle
   (M2), compile-time deadline <= port budget asserts in the macOS adapter (B1), health=Native
   obligation documented on dead_playback_is_inert (B2).
+
+## S2 — PR 3b: takes and the single consent point in core (2026-11-22, core-async)
+- capture.rs: CaptureGate is the only holder of AudioSource (engine.rs no longer names it, so
+  archtest R11/R13 tightened by themselves). Start::UserAct is the only Start; UserAct has a
+  field private to ipc.rs, built only for a CaptureStart from a SameSigner connection that is
+  subscribed to the conversation (a cfg(test) constructor exists for the gate's unit tests).
+  decide(): capture supported and not backing off -> permission Granted (Unknown only without a
+  permission model) -> link ready -> transcriber Up/Degraded -> not busy. Refusals counted per
+  reason in Stats.
+- Issue #24 (capture part): open and drop of ActiveCapture run on the blocking pool through the
+  gate's own JoinSet (JoinSet::spawn_blocking; tokio::task::spawn_blocking stays banned by
+  clippy.toml, which was not touched — the architecture owner should confirm this reading of
+  "no blocking work in core"). One open in flight (queues::CAPTURE_JOBS = 1; a start meanwhile
+  is Busy); a start during the previous take's release waits for it (CI caught the race), core-side OPEN_DEADLINE = OPEN_BLOCK_MAX + 0.5 s (late handle released), failed opens
+  back off 0.5 s doubling to 8 s; stop waits 0.5 s for the release then detaches. Playback
+  open/drop is still synchronous on the runtime (3c).
+- Issue #26: the engine starts the utterance and publishes activity=Recording before it answers
+  the CaptureStart oneshot; tested over FakeIpc with a push streaming.
+- The take belongs to its connection: the IPC task keeps the sender of an owner oneshot; closing
+  the connection or losing the conversation subscription ends the take with Discard.
+- turn.rs: Recording / AwaitTranscription{then}; utterance_start = cancel semantics + Recording;
+  utterance_end sends `end`; the final transcript becomes `send` (Send), the draft (Review) or
+  nothing (Discard); finals still owed by an abandoned take are skipped; 15 s transcription wait.
+  send_text while recording -> TextRefused(Recording).
+- Cuts (always Review, never send): 5 s without a NEW non-empty partial (GUESSED rule, repeats do
+  not count), 2nd gateway silence warning (status transcriber degraded without code), 5 min
+  safety, device stream ended (no notice), link down (closed, no `end`), agent stop.
+- RequestMicPermission: the gate is the only caller of request_mic_permission; the IPC waits up
+  to Config::mic_permission_wait (60 s) and otherwise answers the current status.
+- Tests: tests/capture.rs (15, paused time), capture unit tests (7), engine property test (64
+  seeds of random gateway/IPC traffic without capture_start: opens == 0). scripts/gates.sh green
+  on Linux (audit/geiger/miri NOT RUN: tools not installable here); loom PASS (heartbeat untouched).
+- NOT done / for 3c+: playback gate (playback.rs, turn_visible, 3 s buffer, 2 s deadline), #24
+  playback part and #25 reopen with backoff; latencies (3d); E2E over the real WebSocket with a
+  take; anything on macOS/M2. Open/close are counted, not logged (core has no logger).
+- Review round 1 of #30 (2026-11-22, same branch): M1 CaptureEnd only from the connection whose
+  take is open (another one gets Refused "no take on this connection"; the owner's repeat after
+  the take ended stays CaptureEnded). M3 the take's branch is polled before `in_rx` in the
+  engine's biased select (test: a flooding gateway still gets the safety cut; it fails with the
+  old order). M2 (architecture owner's decision): TEMPORARY exception — the only blocking spawn
+  in core is `capture::spawn_device_job` with one justified `#[allow(clippy::disallowed_methods)]`;
+  `tokio::task::JoinSet::spawn_blocking` added to crates/fogar-core/clippy.toml disallowed-methods
+  on the orchestrator's instruction (the agent-config hash check goes red; Sito accepts it). To be
+  removed with issue #31 (async audio adapter). F1 while waiting for its CaptureStart answer the
+  IPC connection also watches the peer: if it leaves, the owner is dropped at once (a request
+  read meanwhile is served next). B1 owner channel is oneshot<Infallible>. B2 closes during the
+  open are counted (discarded / refused unavailable); no backoff unless the device was being
+  opened. B3 OwnerGone or close while opening aborts an open that has not started. B4 SendText
+  refused (Recording) while the take is opening. F3 permission re-read before an open that waited
+  for the previous release. Tests: property test now runs texts/cancels for real, seeds 1-3
+  legitimate takes (with partials and a silence warning) before the random traffic, counts
+  permission requests (== permission_requests()), adds malformed JSON; owner-gone tests pin each
+  branch; partial test asserts the device is released.
+
 ## S2 — PR 6: integration and minimal packaging, the part without the Mac (2026-11-22)
 - Fogar Desktop.app (release) carries fogar-agentd in Contents/MacOS and the LaunchAgent plist
   com.fogar.agent.plist in Contents/Library/LaunchAgents (BundleProgram, RunAtLoad, KeepAlive
