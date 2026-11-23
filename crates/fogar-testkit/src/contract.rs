@@ -1772,3 +1772,323 @@ pub mod gateway_http {
         };
     }
 }
+
+pub mod gateway_stream {
+    //! `GatewayHttp::open_stream` (SSE `/events` and the `…/speech` PCM). Same `$make` as
+    //! `gateway_http`. Streams carry bytes only; nothing is lost under backpressure or
+    //! cancellation, and dropping the body closes the connection.
+    use crate::gateway::{HttpRoutes, StreamStep};
+    use fogar_ports::{
+        gateway::GatewayAddr,
+        gateway_http::{GatewayHttp, HttpCall, HttpError, MAX_CHUNK_BYTES, PathId, ResponseBody},
+    };
+    use secrecy::SecretString;
+    use std::time::Duration;
+
+    const EVENTS: HttpCall = HttpCall::Events { audio: false };
+
+    async fn bounded<F: std::future::Future>(f: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(5), f)
+            .await
+            .expect("stream clause timed out")
+    }
+
+    /// For the 1 MiB clauses.
+    async fn bounded_long<F: std::future::Future>(f: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(10), f)
+            .await
+            .expect("stream clause timed out")
+    }
+
+    fn tok() -> SecretString {
+        SecretString::from("t")
+    }
+
+    /// Non-uniform bytes: a reordering or a duplicate changes the content, not just the length.
+    fn pattern(len: usize, seed: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i + seed) % 251) as u8).collect()
+    }
+
+    async fn drain<B: ResponseBody>(b: &mut B) -> Vec<u8> {
+        let mut all = Vec::new();
+        while let Some(c) = bounded(b.chunk()).await.expect("chunk") {
+            assert!(c.len() <= MAX_CHUNK_BYTES, "chunk of {} bytes", c.len());
+            assert!(!c.is_empty(), "an empty chunk is not the end");
+            all.extend(c);
+        }
+        all
+    }
+
+    pub async fn stream_delivers_headers_and_body<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        routes.set_stream(
+            "GET",
+            "/events",
+            200,
+            vec![StreamStep::Bytes(b"event: ready\n\n".to_vec())],
+        );
+        let mut s = bounded(h.open_stream(addr, &EVENTS, &tok(), Some("41"), None))
+            .await
+            .expect("open");
+        assert_eq!(s.status, 200);
+        assert_eq!(format!("{s:?}"), "StreamReply(200)");
+        assert_eq!(drain(&mut s.body).await, b"event: ready\n\n");
+        let req = routes.seen().pop().expect("request seen");
+        assert_eq!((req.method.as_str(), req.path.as_str()), ("GET", "/events"));
+        assert_eq!(req.authorization.as_deref(), Some("Bearer t"));
+        assert_eq!(req.last_event_id.as_deref(), Some("41"));
+    }
+
+    /// One 100 KiB write: every chunk is at most `MAX_CHUNK_BYTES`, the total is intact.
+    pub async fn chunks_are_bounded<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        let sent = pattern(100 * 1024, 0);
+        routes.set_stream("GET", "/events", 200, vec![StreamStep::Bytes(sent.clone())]);
+        let mut s = bounded(h.open_stream(addr, &EVENTS, &tok(), None, None))
+            .await
+            .expect("open");
+        assert!(
+            bounded_long(drain(&mut s.body)).await == sent,
+            "100 KiB altered"
+        );
+    }
+
+    /// 1 MiB in 4 KiB steps, read slowly (1 ms per chunk): backpressure, never loss.
+    pub async fn slow_reader_gets_every_byte<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        let steps: Vec<Vec<u8>> = (0..256).map(|i| pattern(4096, i)).collect();
+        let sent = steps.concat();
+        routes.set_stream(
+            "GET",
+            "/events",
+            200,
+            steps.into_iter().map(StreamStep::Bytes).collect(),
+        );
+        let mut s = bounded(h.open_stream(addr, &EVENTS, &tok(), None, None))
+            .await
+            .expect("open");
+        let got = bounded_long(async {
+            let mut all = Vec::new();
+            while let Some(c) = s.body.chunk().await.expect("chunk") {
+                assert!(c.len() <= MAX_CHUNK_BYTES);
+                all.extend(c);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            all
+        })
+        .await;
+        assert_eq!(got.len(), sent.len());
+        assert!(got == sent, "1 MiB altered under a slow reader");
+    }
+
+    /// Dropping a pending `chunk()` loses nothing: 50 poll-once-and-drop rounds spread over the
+    /// 200 ms gap between the two parts, then a drain; both parts arrive whole and in order.
+    pub async fn chunk_is_cancel_safe<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        let (a, b) = (pattern(3000, 1), pattern(5000, 7));
+        routes.set_stream(
+            "GET",
+            "/events",
+            200,
+            vec![
+                StreamStep::Bytes(a.clone()),
+                StreamStep::Wait(Duration::from_millis(200)),
+                StreamStep::Bytes(b.clone()),
+            ],
+        );
+        let mut s = bounded(h.open_stream(addr, &EVENTS, &tok(), None, None))
+            .await
+            .expect("open");
+        let mut got = Vec::new();
+        for _ in 0..50 {
+            {
+                let mut f = std::pin::pin!(s.body.chunk());
+                let ready =
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(f.as_mut().poll(cx))).await;
+                // A ready chunk belongs to the reader: keep it.
+                if let std::task::Poll::Ready(r) = ready {
+                    got.extend(r.expect("chunk").unwrap_or_default());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        got.extend(drain(&mut s.body).await);
+        assert!(
+            got == [a, b].concat(),
+            "cancel-safety: bytes lost or reordered"
+        );
+    }
+
+    /// `HoldOpen`: the server keeps the stream open; dropping the reply closes the socket.
+    pub async fn drop_closes_the_socket<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        routes.set_stream(
+            "GET",
+            "/events",
+            200,
+            vec![
+                StreamStep::Bytes(b": hi\n\n".to_vec()),
+                StreamStep::HoldOpen,
+            ],
+        );
+        let mut s = bounded(h.open_stream(addr, &EVENTS, &tok(), None, None))
+            .await
+            .expect("open");
+        assert_eq!(
+            bounded(s.body.chunk()).await.expect("chunk").as_deref(),
+            Some(&b": hi\n\n"[..])
+        );
+        assert_eq!(routes.disconnects(), 0);
+        drop(s);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while routes.disconnects() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("dropping the body must close the socket within 1 s");
+    }
+
+    /// A non-2xx stream still has a readable body (the core caps it at `MAX_BODY_BYTES`).
+    pub async fn error_status_body_is_readable<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        let body = br#"{"code":"tts_unavailable"}"#.to_vec();
+        routes.set_stream(
+            "POST",
+            "/conversations/c1/messages/m9/speech",
+            503,
+            vec![StreamStep::Bytes(body.clone())],
+        );
+        let speech = HttpCall::Speech {
+            id: PathId::new("c1").expect("id"),
+            message: PathId::new("m9").expect("id"),
+        };
+        let mut s = bounded(h.open_stream(addr, &speech, &tok(), None, None))
+            .await
+            .expect("open");
+        assert_eq!(s.status, 503);
+        assert_eq!(drain(&mut s.body).await, body);
+        let req = routes.seen().pop().expect("request seen");
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.last_event_id, None);
+    }
+
+    pub async fn non_stream_calls_and_bad_ids_are_refused<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        let r = bounded(h.open_stream(addr, &HttpCall::Me, &tok(), None, None)).await;
+        assert!(matches!(r, Err(HttpError::Refused)), "non-stream call");
+        let long = "x".repeat(129);
+        for id in ["a\nb", "a b", "ñ", long.as_str()] {
+            let r = bounded(h.open_stream(addr, &EVENTS, &tok(), Some(id), None)).await;
+            assert!(matches!(r, Err(HttpError::Refused)), "last_event_id {id:?}");
+        }
+        for t in ["a\r\nX-Evil: 1", "a b", ""] {
+            let r = bounded(h.open_stream(addr, &EVENTS, &SecretString::from(t), None, None)).await;
+            assert!(matches!(r, Err(HttpError::Refused)), "token {t:?}");
+        }
+        assert!(routes.seen().is_empty(), "nothing reached the wire");
+    }
+
+    /// NET-1, as for `request`: clear text to a public address is refused before any byte.
+    pub async fn cleartext_to_public_ip_is_refused<H: GatewayHttp>(h: &H) {
+        let public = GatewayAddr::parse("203.0.113.7:8004").expect("addr");
+        let t = tokio::time::timeout(
+            Duration::from_secs(1),
+            h.open_stream(&public, &EVENTS, &tok(), None, None),
+        )
+        .await;
+        assert!(
+            matches!(t, Ok(Err(HttpError::Refused))),
+            "plain http to a public IP must be Refused at once"
+        );
+    }
+
+    #[macro_export]
+    macro_rules! gateway_stream_contract {
+        ($make:expr) => {
+            mod gateway_stream_contract {
+                #[allow(unused_imports)]
+                use super::*;
+                use $crate::contract::gateway_stream as c;
+                #[test]
+                fn stream_delivers_headers_and_body() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::stream_delivers_headers_and_body(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn chunks_are_bounded() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::chunks_are_bounded(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn slow_reader_gets_every_byte() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::slow_reader_gets_every_byte(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn chunk_is_cancel_safe() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::chunk_is_cancel_safe(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn drop_closes_the_socket() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::drop_closes_the_socket(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn error_status_body_is_readable() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::error_status_body_is_readable(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn non_stream_calls_and_bad_ids_are_refused() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::non_stream_calls_and_bad_ids_are_refused(&h, &s.addr(), &s.routes())
+                            .await
+                    })
+                }
+                #[test]
+                fn cleartext_to_public_ip_is_refused() {
+                    $crate::run_async(async {
+                        let (h, _s) = $make;
+                        c::cleartext_to_public_ip_is_refused(&h).await
+                    })
+                }
+            }
+        };
+    }
+}

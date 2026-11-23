@@ -21,6 +21,10 @@ mod healthy {
         let h = FakeGatewayHttp::new(HttpRoutes::new());
         (h.clone(), h)
     });
+    fogar_testkit::gateway_stream_contract!({
+        let h = FakeGatewayHttp::new(HttpRoutes::new());
+        (h.clone(), h)
+    });
     fogar_testkit::ipc_server_contract!({
         let server = FakeIpc::new();
         let handle = server.clone();
@@ -111,6 +115,23 @@ mod mock_http_server_matches_the_fake {
                 return Err(fogar_ports::gateway_http::HttpError::Refused);
             }
             mini(addr, call, token, body.as_deref().map(Vec::as_slice)).await
+        }
+
+        // Streams are not part of this self-test.
+        type Body = std::convert::Infallible;
+
+        async fn open_stream(
+            &self,
+            _addr: &fogar_ports::gateway::GatewayAddr,
+            _call: &fogar_ports::gateway_http::HttpCall,
+            _token: &secrecy::SecretString,
+            _last_event_id: Option<&str>,
+            _body: Option<secrecy::zeroize::Zeroizing<Vec<u8>>>,
+        ) -> Result<
+            fogar_ports::gateway_http::StreamReply<Self::Body>,
+            fogar_ports::gateway_http::HttpError,
+        > {
+            Err(fogar_ports::gateway_http::HttpError::Unreachable)
         }
     }
 
@@ -346,5 +367,73 @@ mod fake_speaker_dead_output {
         spk.set_open_dead(false);
         assert!(spk.open(F).unwrap().is_alive());
         assert_eq!(spk.snapshot().opens, 2);
+    }
+}
+
+/// The stream cancel-safety clause must catch a body whose `chunk` takes bytes and then yields
+/// before returning them (dropped there, the bytes are lost).
+mod contract_catches_lossy_chunk {
+    use fogar_ports::gateway::GatewayAddr;
+    use fogar_ports::gateway_http::{
+        GatewayHttp, HttpCall, HttpError, HttpReply, ResponseBody, StreamReply,
+    };
+    use fogar_testkit::{FakeGatewayHttp, FakeStreamBody, HttpRoutes};
+    use secrecy::{SecretString, zeroize::Zeroizing};
+
+    struct Lossy(FakeGatewayHttp);
+    struct LossyBody(FakeStreamBody);
+
+    impl ResponseBody for LossyBody {
+        async fn chunk(&mut self) -> Result<Option<Vec<u8>>, HttpError> {
+            let c = self.0.chunk().await;
+            // NOT cancel-safe: dropping the future here loses `c`.
+            tokio::task::yield_now().await;
+            c
+        }
+    }
+
+    impl GatewayHttp for Lossy {
+        async fn request(
+            &self,
+            addr: &GatewayAddr,
+            call: &HttpCall,
+            token: Option<&SecretString>,
+            body: Option<Zeroizing<Vec<u8>>>,
+        ) -> Result<HttpReply, HttpError> {
+            self.0.request(addr, call, token, body).await
+        }
+        type Body = LossyBody;
+        async fn open_stream(
+            &self,
+            addr: &GatewayAddr,
+            call: &HttpCall,
+            token: &SecretString,
+            last_event_id: Option<&str>,
+            body: Option<Zeroizing<Vec<u8>>>,
+        ) -> Result<StreamReply<LossyBody>, HttpError> {
+            let r = self
+                .0
+                .open_stream(addr, call, token, last_event_id, body)
+                .await?;
+            Ok(StreamReply {
+                status: r.status,
+                body: LossyBody(r.body),
+            })
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "cancel-safety")]
+    fn lossy_chunk_fails_the_contract() {
+        fogar_testkit::run_async(async {
+            let inner = FakeGatewayHttp::new(HttpRoutes::new());
+            let (addr, routes) = (inner.addr(), inner.routes());
+            fogar_testkit::contract::gateway_stream::chunk_is_cancel_safe(
+                &Lossy(inner),
+                &addr,
+                &routes,
+            )
+            .await
+        })
     }
 }

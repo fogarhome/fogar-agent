@@ -14,10 +14,19 @@
 //! every await sits under `HttpConfig::call_timeout`, each connect attempt under
 //! `connect_timeout`. The bearer token is written from its secret buffer straight to the socket
 //! (never formatted into a `String`).
+//!
+//! Streams (`open_stream`): dial, request and response head under `call_timeout`; the
+//! [`HttpStreamBody`] then has no deadline and no total cap (the core wraps each `chunk()`).
+//! It owns the socket, the decoder state and one `MAX_CHUNK_BYTES` read buffer; `chunk()`
+//! awaits only the socket read and decodes synchronously after it, so dropping it mid-read
+//! loses nothing. Dropping the body closes the socket.
 
-use crate::net::{DialError, Resolver, SystemResolver, dial, platform_tls};
+use crate::net::{Conn, DialError, Resolver, SystemResolver, dial, platform_tls};
 use fogar_ports::gateway::GatewayAddr;
-use fogar_ports::gateway_http::{GatewayHttp, HttpCall, HttpError, HttpReply, request_allowed};
+use fogar_ports::gateway_http::{
+    GatewayHttp, HttpCall, HttpError, HttpReply, MAX_CHUNK_BYTES, ResponseBody, StreamReply,
+    request_allowed, stream_allowed,
+};
 use rustls::ClientConfig;
 use secrecy::{ExposeSecret, SecretString, zeroize::Zeroizing};
 use std::{io, sync::Arc, time::Duration};
@@ -86,53 +95,72 @@ impl<R: Resolver> HttpGateway<R> {
         body: Option<Zeroizing<Vec<u8>>>,
     ) -> Result<HttpReply, HttpError> {
         let exchange = async {
-            let mut s = dial(
-                &self.resolver,
-                self.tls.as_ref(),
-                addr,
-                self.cfg.connect_timeout,
-            )
-            .await
-            .map_err(|e| match e {
-                DialError::Refused => HttpError::Refused,
-                DialError::Unreachable(_) => HttpError::Unreachable,
-                DialError::Tls(e) => transport(e),
-            })?;
-            let mut head = format!(
-                "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: fogar-agent\r\nAccept: application/json\r\nConnection: close\r\n",
-                call.method(),
-                call.path(),
-                addr.authority()
-            );
-            if let Some(b) = &body {
-                head.push_str(&format!(
-                    "Content-Type: application/json\r\nContent-Length: {}\r\n",
-                    b.len()
-                ));
-            }
-            // Head, token and body are separate writes: neither the token nor the body (pairing
-            // code) is ever copied into a String we cannot wipe.
-            s.write_all(head.as_bytes()).await.map_err(transport)?;
-            if let Some(t) = token {
-                s.write_all(b"Authorization: Bearer ")
-                    .await
-                    .map_err(transport)?;
-                s.write_all(t.expose_secret().as_bytes())
-                    .await
-                    .map_err(transport)?;
-                s.write_all(b"\r\n").await.map_err(transport)?;
-            }
-            s.write_all(b"\r\n").await.map_err(transport)?;
-            if let Some(b) = &body {
-                s.write_all(b).await.map_err(transport)?;
-            }
-            s.flush().await.map_err(transport)?;
-            drop(body);
+            let mut s = self
+                .send(addr, call, "application/json", token, None, body)
+                .await?;
             read_response(&mut s, call.max_body()).await
         };
         tokio::time::timeout(self.cfg.call_timeout, exchange)
             .await
             .map_err(|_| transport(io::ErrorKind::TimedOut.into()))?
+    }
+
+    /// Dials `addr` and writes the request; returns the connection for the response.
+    async fn send(
+        &self,
+        addr: &GatewayAddr,
+        call: &HttpCall,
+        accept: &str,
+        token: Option<&SecretString>,
+        last_event_id: Option<&str>,
+        body: Option<Zeroizing<Vec<u8>>>,
+    ) -> Result<Conn, HttpError> {
+        let mut s = dial(
+            &self.resolver,
+            self.tls.as_ref(),
+            addr,
+            self.cfg.connect_timeout,
+        )
+        .await
+        .map_err(|e| match e {
+            DialError::Refused => HttpError::Refused,
+            DialError::Unreachable(_) => HttpError::Unreachable,
+            DialError::Tls(e) => transport(e),
+        })?;
+        let mut head = format!(
+            "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: fogar-agent\r\nAccept: {accept}\r\nConnection: close\r\n",
+            call.method(),
+            call.path(),
+            addr.authority()
+        );
+        // Not a secret; checked printable ASCII by `stream_allowed`.
+        if let Some(id) = last_event_id {
+            head.push_str(&format!("Last-Event-ID: {id}\r\n"));
+        }
+        if let Some(b) = &body {
+            head.push_str(&format!(
+                "Content-Type: application/json\r\nContent-Length: {}\r\n",
+                b.len()
+            ));
+        }
+        // Head, token and body are separate writes: neither the token nor the body (pairing
+        // code) is ever copied into a String we cannot wipe.
+        s.write_all(head.as_bytes()).await.map_err(transport)?;
+        if let Some(t) = token {
+            s.write_all(b"Authorization: Bearer ")
+                .await
+                .map_err(transport)?;
+            s.write_all(t.expose_secret().as_bytes())
+                .await
+                .map_err(transport)?;
+            s.write_all(b"\r\n").await.map_err(transport)?;
+        }
+        s.write_all(b"\r\n").await.map_err(transport)?;
+        if let Some(b) = &body {
+            s.write_all(b).await.map_err(transport)?;
+        }
+        s.flush().await.map_err(transport)?;
+        Ok(s)
     }
 }
 
@@ -157,6 +185,134 @@ impl<R: Resolver> GatewayHttp for HttpGateway<R> {
         }
         self.call(addr, call, token, body).await
     }
+
+    type Body = HttpStreamBody;
+
+    async fn open_stream(
+        &self,
+        addr: &GatewayAddr,
+        call: &HttpCall,
+        token: &SecretString,
+        last_event_id: Option<&str>,
+        body: Option<Zeroizing<Vec<u8>>>,
+    ) -> Result<StreamReply<HttpStreamBody>, HttpError> {
+        if !stream_allowed(call, token, last_event_id) {
+            return Err(HttpError::Refused);
+        }
+        let accept = match call {
+            HttpCall::Events { .. } => "text/event-stream",
+            _ => "application/octet-stream",
+        };
+        let open = async {
+            let mut s = self
+                .send(addr, call, accept, Some(token), last_event_id, body)
+                .await?;
+            let (status, framing, early) = read_head(&mut s).await?;
+            Ok(StreamReply {
+                status,
+                body: HttpStreamBody::new(s, framing, early),
+            })
+        };
+        tokio::time::timeout(self.cfg.call_timeout, open)
+            .await
+            .map_err(|_| transport(io::ErrorKind::TimedOut.into()))?
+    }
+}
+
+/// Body of an `open_stream` reply (see the module doc). Dropping it closes the connection.
+pub struct HttpStreamBody {
+    conn: Conn,
+    state: BodyState,
+    /// Body bytes that arrived with the response head; decoded before the next read.
+    early: Zeroizing<Vec<u8>>,
+    buf: Vec<u8>,
+}
+
+enum BodyState {
+    Length(usize),
+    Chunked(Chunked),
+    ToEof,
+    Done,
+}
+
+impl std::fmt::Debug for HttpStreamBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HttpStreamBody")
+    }
+}
+
+impl HttpStreamBody {
+    fn new(conn: Conn, framing: Framing, early: Zeroizing<Vec<u8>>) -> Self {
+        let state = match framing {
+            Framing::Length(0) => BodyState::Done,
+            Framing::Length(n) => BodyState::Length(n),
+            // No total cap on a stream.
+            Framing::Chunked => BodyState::Chunked(Chunked::new(usize::MAX)),
+            Framing::ToEof => BodyState::ToEof,
+        };
+        Self {
+            conn,
+            state,
+            early,
+            buf: vec![0u8; MAX_CHUNK_BYTES],
+        }
+    }
+}
+
+/// Decodes raw wire bytes into body bytes. The output is never longer than `input`.
+fn decode(state: &mut BodyState, input: &[u8]) -> Result<Vec<u8>, HttpError> {
+    Ok(match state {
+        BodyState::Length(left) => {
+            let n = (*left).min(input.len());
+            *left -= n;
+            let out = input[..n].to_vec();
+            if *left == 0 {
+                *state = BodyState::Done;
+            }
+            out
+        }
+        BodyState::Chunked(dec) => {
+            let mut out = Vec::new();
+            if dec.feed(input, &mut out)?.done {
+                *state = BodyState::Done;
+            }
+            out
+        }
+        BodyState::ToEof => input.to_vec(),
+        BodyState::Done => Vec::new(),
+    })
+}
+
+impl ResponseBody for HttpStreamBody {
+    async fn chunk(&mut self) -> Result<Option<Vec<u8>>, HttpError> {
+        // `early` is at most MAX_HEAD_BYTES (< MAX_CHUNK_BYTES).
+        let early = std::mem::take(&mut self.early);
+        let out = decode(&mut self.state, &early)?;
+        if !out.is_empty() {
+            return Ok(Some(out));
+        }
+        loop {
+            if matches!(self.state, BodyState::Done) {
+                return Ok(None);
+            }
+            // The only await: a socket read is cancel-safe, and everything after it is
+            // synchronous, so a dropped `chunk()` never holds read bytes.
+            let n = self.conn.read(&mut self.buf).await.map_err(transport)?;
+            if n == 0 {
+                return match self.state {
+                    BodyState::ToEof => {
+                        self.state = BodyState::Done;
+                        Ok(None)
+                    }
+                    _ => Err(malformed("connection closed inside a streamed body")),
+                };
+            }
+            let out = decode(&mut self.state, &self.buf[..n])?;
+            if !out.is_empty() {
+                return Ok(Some(out));
+            }
+        }
+    }
 }
 
 /// Reads one response from a `Connection: close` stream into one pre-sized, wiped buffer.
@@ -165,27 +321,8 @@ pub(crate) async fn read_response<S: AsyncRead + Unpin>(
     s: &mut S,
     max: usize,
 ) -> Result<HttpReply, HttpError> {
-    // The head buffer may also hold the first body bytes: wiped on drop.
-    let mut head = Zeroizing::new(vec![0u8; MAX_HEAD_BYTES]);
-    let (mut filled, mut scanned) = (0usize, 0usize);
-    let head_end = loop {
-        // Only the newly read bytes (plus 3 of overlap) can complete the terminator.
-        let from = scanned.saturating_sub(3);
-        if let Some(i) = head[from..filled].windows(4).position(|w| w == b"\r\n\r\n") {
-            break from + i;
-        }
-        scanned = filled;
-        if filled == head.len() {
-            return Err(malformed("response head too large"));
-        }
-        let n = s.read(&mut head[filled..]).await.map_err(transport)?;
-        if n == 0 {
-            return Err(malformed("connection closed inside the response head"));
-        }
-        filled += n;
-    };
-    let (status, framing) = parse_head(&head[..head_end])?;
-    let early = &head[head_end + 4..filled];
+    let (status, framing, early) = read_head(s).await?;
+    let early = &early[..];
 
     let mut body = match framing {
         Framing::Length(len) if len > max => return Err(HttpError::TooLarge { max }),
@@ -239,6 +376,37 @@ pub(crate) async fn read_response<S: AsyncRead + Unpin>(
     // Shrinks in place (no reallocation, so no stray copy); the tail stays zero.
     body.truncate(len);
     Ok(HttpReply { status, body })
+}
+
+/// Reads the response head; returns the status, the framing and the body bytes that arrived
+/// with the head (wiped on drop).
+async fn read_head<S: AsyncRead + Unpin>(
+    s: &mut S,
+) -> Result<(u16, Framing, Zeroizing<Vec<u8>>), HttpError> {
+    // The head buffer may also hold the first body bytes: wiped on drop.
+    let mut head = Zeroizing::new(vec![0u8; MAX_HEAD_BYTES]);
+    let (mut filled, mut scanned) = (0usize, 0usize);
+    let head_end = loop {
+        // Only the newly read bytes (plus 3 of overlap) can complete the terminator.
+        let from = scanned.saturating_sub(3);
+        if let Some(i) = head[from..filled].windows(4).position(|w| w == b"\r\n\r\n") {
+            break from + i;
+        }
+        scanned = filled;
+        if filled == head.len() {
+            return Err(malformed("response head too large"));
+        }
+        let n = s.read(&mut head[filled..]).await.map_err(transport)?;
+        if n == 0 {
+            return Err(malformed("connection closed inside the response head"));
+        }
+        filled += n;
+    };
+    let (status, framing) = parse_head(&head[..head_end])?;
+    // In place (no reallocation): the early body bytes move to the front of the same buffer.
+    head.truncate(filled);
+    head.drain(..head_end + 4);
+    Ok((status, framing, head))
 }
 
 /// How the response body is delimited.
@@ -556,6 +724,59 @@ mod tests {
             parse(&endless_head).await,
             Err(HttpError::Transport(_))
         ));
+    }
+
+    /// A stream body over an in-memory pipe: the server side writes `wire` then closes.
+    async fn stream_of(wire: &[u8]) -> Result<(u16, Vec<Vec<u8>>), HttpError> {
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        server.write_all(wire).await.map_err(transport)?;
+        drop(server);
+        let mut conn: Conn = Box::new(client);
+        let (status, framing, early) = read_head(&mut conn).await?;
+        let mut body = HttpStreamBody::new(conn, framing, early);
+        let mut chunks = Vec::new();
+        while let Some(c) = body.chunk().await? {
+            assert!(!c.is_empty() && c.len() <= MAX_CHUNK_BYTES);
+            chunks.push(c);
+        }
+        Ok((status, chunks))
+    }
+
+    #[test]
+    fn stream_body_handles_every_framing() {
+        fogar_testkit::run_async(async {
+            // Content-Length: stops at the length (extra bytes ignored), even mid-read.
+            let (st, c) = stream_of(b"HTTP/1.1 503 X\r\nContent-Length: 3\r\n\r\nabcdef")
+                .await
+                .unwrap();
+            assert_eq!((st, c.concat()), (503, b"abc".to_vec()));
+            let (_, c) = stream_of(b"HTTP/1.1 204 X\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            assert!(c.is_empty());
+            // A large Content-Length body arrives in bounded chunks.
+            let mut big = b"HTTP/1.1 200 X\r\nContent-Length: 40000\r\n\r\n".to_vec();
+            big.extend((0..40_000).map(|i| (i % 251) as u8));
+            let (_, c) = stream_of(&big).await.unwrap();
+            assert_eq!(c.concat(), big[big.len() - 40_000..]);
+            // No framing: to EOF.
+            let (_, c) = stream_of(b"HTTP/1.1 200 X\r\n\r\nxyz").await.unwrap();
+            assert_eq!(c.concat(), b"xyz");
+            // Chunked, partly inside the head read, then the rest.
+            let (_, c) = stream_of(
+                b"HTTP/1.1 200 X\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            assert_eq!(c.concat(), b"abcde");
+            // Truncated bodies are errors, not a clean end.
+            for cut in [
+                &b"HTTP/1.1 200 X\r\nContent-Length: 5\r\n\r\nab"[..],
+                b"HTTP/1.1 200 X\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nab",
+            ] {
+                assert!(matches!(stream_of(cut).await, Err(HttpError::Transport(_))));
+            }
+        });
     }
 
     #[test]

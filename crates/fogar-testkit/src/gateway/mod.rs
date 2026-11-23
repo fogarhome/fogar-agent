@@ -36,6 +36,8 @@ pub use driver::{
     Ctl, GatewayLog, MockConfig, REASON_BAD_JSON, REASON_BAD_KEY, REASON_NOT_TEXT, REASON_TIMEOUT,
     REASON_TOO_LARGE,
 };
-pub use http::{FakeGatewayHttp, HttpRoutes, MockHttpServer, SeenRequest};
+pub use http::{
+    FakeGatewayHttp, FakeStreamBody, HttpRoutes, MockHttpServer, SeenRequest, StreamStep,
+};
 pub use memory::{FAKE_MAX_FRAME, FakeGatewayLink, FakeSession};
 pub use ws::MockGateway;

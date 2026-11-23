@@ -13,7 +13,13 @@
 //!   `Authorization: Bearer <token>`. A missing, empty or non-printable-ASCII token is `Refused`
 //!   before a byte is sent. The adapter writes the token straight from its secret buffer into
 //!   the socket; it is never copied into a `String`, a log or an error.
-//! - Streaming calls (`HttpCall::is_stream`) are refused by `request`: they have their own entry.
+//! - Streaming calls (`HttpCall::is_stream`) are refused by `request`: they go through
+//!   `open_stream`, which returns the status once the response head arrived and a
+//!   [`ResponseBody`] read chunk by chunk (at most `MAX_CHUNK_BYTES` each). Dial, request and
+//!   response head run under the adapter's call deadline; the body has none (the core wraps
+//!   every `chunk()`), no total cap (on a non-2xx status the core caps it at `MAX_BODY_BYTES`),
+//!   and dropping it closes the connection. `chunk()` is cancel-safe: the adapter keeps read
+//!   bytes and decoder state in the body, never in the future.
 //! - NOT select branches: the core wraps each call in its own deadline (1–2 s per probe, spec §0)
 //!   and drops it on expiry. Dropping an in-flight call must not leak a socket or poison the
 //!   adapter: the next call works.
@@ -40,6 +46,12 @@ use std::{fmt, future::Future};
 
 /// Default response body cap (`HttpCall::max_body`): replies are small JSON objects.
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
+
+/// Largest piece `ResponseBody::chunk` returns.
+pub const MAX_CHUNK_BYTES: usize = 16 * 1024;
+
+/// Longest `Last-Event-ID` accepted by `open_stream`.
+pub const MAX_LAST_EVENT_ID: usize = 128;
 
 /// Largest response body for list-shaped replies (conversations, messages, agents).
 pub const MAX_LIST_BODY_BYTES: usize = 256 * 1024;
@@ -228,7 +240,36 @@ pub enum HttpError {
     Transport(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
+/// The body of a streamed response.
+pub trait ResponseBody: Send + 'static {
+    /// Next bytes of the body (1..=`MAX_CHUNK_BYTES`), `Ok(None)` at the end. Cancel-safe: a
+    /// dropped call loses no bytes. No deadline of its own: the core wraps it.
+    fn chunk(&mut self) -> impl Future<Output = Result<Option<Vec<u8>>, HttpError>> + Send;
+}
+
+/// A body that is never produced, for `GatewayHttp` doubles without streams.
+impl ResponseBody for std::convert::Infallible {
+    async fn chunk(&mut self) -> Result<Option<Vec<u8>>, HttpError> {
+        match *self {}
+    }
+}
+
+/// Status + streamed body of an `open_stream` call.
+pub struct StreamReply<B> {
+    pub status: u16,
+    pub body: B,
+}
+
+/// Status only: the body is a live connection.
+impl<B> fmt::Debug for StreamReply<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "StreamReply({})", self.status)
+    }
+}
+
 pub trait GatewayHttp: Send + Sync + 'static {
+    type Body: ResponseBody;
+
     /// One request/response exchange. Method, path and `Content-Type: application/json` (only
     /// when there is a body) come from `call`; the body is wiped after sending. The token goes
     /// out as `Authorization: Bearer <token>`.
@@ -244,6 +285,19 @@ pub trait GatewayHttp: Send + Sync + 'static {
         token: Option<&SecretString>,
         body: Option<Zeroizing<Vec<u8>>>,
     ) -> impl Future<Output = Result<HttpReply, HttpError>> + Send;
+
+    /// Opens a streamed response (`call.is_stream()`): returns once the response head arrived.
+    /// Sends `Accept: text/event-stream` for `Events`, `application/octet-stream` for `Speech`,
+    /// and `Last-Event-ID` when given. `Refused`, without touching the network, unless
+    /// [`stream_allowed`] holds, or when the transport policy refuses `addr`.
+    fn open_stream(
+        &self,
+        addr: &GatewayAddr,
+        call: &HttpCall,
+        token: &SecretString,
+        last_event_id: Option<&str>,
+        body: Option<Zeroizing<Vec<u8>>>,
+    ) -> impl Future<Output = Result<StreamReply<Self::Body>, HttpError>> + Send;
 }
 
 /// Whether `token` may be written into a header line (and so be sent at all).
@@ -257,9 +311,56 @@ pub fn request_allowed(call: &HttpCall, token: Option<&SecretString>) -> bool {
     !call.is_stream() && token.map_or(!call.authenticated(), token_is_sendable)
 }
 
+/// The checks every adapter and fake applies before opening a stream: a stream call, a
+/// sendable token and a `Last-Event-ID` of at most `MAX_LAST_EVENT_ID` bytes in `0x21..=0x7E`.
+pub fn stream_allowed(call: &HttpCall, token: &SecretString, last_event_id: Option<&str>) -> bool {
+    call.is_stream()
+        && token_is_sendable(token)
+        && last_event_id.is_none_or(|id| {
+            id.len() <= MAX_LAST_EVENT_ID && id.bytes().all(|b| (0x21..=0x7E).contains(&b))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_checks() {
+        let ev = HttpCall::Events { audio: true };
+        let t = SecretString::from("t");
+        let ok = "x".repeat(MAX_LAST_EVENT_ID);
+        let long = "x".repeat(MAX_LAST_EVENT_ID + 1);
+        for (call, tok, id, want) in [
+            (&ev, "t", None, true),
+            (&ev, "t", Some(ok.as_str()), true),
+            (&ev, "t", Some("41"), true),
+            (&ev, "t", Some(long.as_str()), false),
+            (&ev, "t", Some("a\nb"), false),
+            (&ev, "t", Some("a b"), false),
+            (&ev, "t", Some("ñ"), false),
+            (&ev, "a b", None, false),
+            (&ev, "", None, false),
+            (&HttpCall::Me, "t", None, false),
+        ] {
+            assert_eq!(
+                stream_allowed(call, &SecretString::from(tok), id),
+                want,
+                "{call:?} {id:?}"
+            );
+        }
+        assert!(!request_allowed(&ev, Some(&t)));
+        assert_eq!(
+            format!(
+                "{:?}",
+                StreamReply {
+                    status: 503,
+                    body: ()
+                }
+            ),
+            "StreamReply(503)"
+        );
+    }
 
     #[test]
     fn path_id_accepts_only_the_safe_charset() {

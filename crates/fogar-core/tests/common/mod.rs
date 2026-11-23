@@ -104,6 +104,21 @@ impl GatewayHttp for MultiHttp {
     ) -> Result<HttpReply, HttpError> {
         self.pick(addr).request(addr, call, token, body).await
     }
+
+    type Body = <FakeGatewayHttp as GatewayHttp>::Body;
+
+    async fn open_stream(
+        &self,
+        addr: &GatewayAddr,
+        call: &HttpCall,
+        token: &secrecy::SecretString,
+        last_event_id: Option<&str>,
+        body: Option<secrecy::zeroize::Zeroizing<Vec<u8>>>,
+    ) -> Result<fogar_ports::gateway_http::StreamReply<Self::Body>, HttpError> {
+        self.pick(addr)
+            .open_stream(addr, call, token, last_event_id, body)
+            .await
+    }
 }
 
 impl RigBuilder<FakeGatewayLink> {

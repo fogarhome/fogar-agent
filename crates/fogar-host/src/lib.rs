@@ -10,7 +10,7 @@ mod random;
 mod ws;
 
 pub use clock::TokioClock;
-pub use http::{HttpConfig, HttpGateway};
+pub use http::{HttpConfig, HttpGateway, HttpStreamBody};
 pub use net::{Resolver, SystemResolver};
 pub use random::PrngRandom;
 pub use ws::{WsConfig, WsConfigError, WsGatewayLink, WsSession};
