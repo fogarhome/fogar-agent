@@ -178,7 +178,7 @@ impl FakeGatewayHttp {
         }
         let r = self.routes.answer(SeenRequest {
             method: method.into(),
-            path: call.path().into(),
+            path: call.path(),
             content_type: (method == "POST").then(|| "application/json".into()),
             body,
         });

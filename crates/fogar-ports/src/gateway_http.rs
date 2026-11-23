@@ -34,10 +34,30 @@ use std::{fmt, future::Future};
 /// Largest response body an adapter accepts. Both replies are tiny JSON objects.
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
 
-/// The calls the core may make. Closed set with fixed paths: the port cannot be used as a
-/// generic HTTP client. Paths equal `fogar_proto::pairing::WELL_KNOWN_PATHS` (checked by a
-/// fogar-core test; ports do not depend on proto).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Largest response body for list-shaped replies (conversations, messages, agents).
+pub const MAX_LIST_BODY_BYTES: usize = 256 * 1024;
+
+/// An id that is safe to put in a URL path as-is: `[A-Za-z0-9_.:-]{1,128}`. Not a secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathId(String);
+
+impl PathId {
+    pub fn new(s: &str) -> Option<PathId> {
+        let ok = (1..=128).contains(&s.len())
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'));
+        ok.then(|| PathId(s.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The calls the core may make. Closed set with fixed routes: the port cannot be used as a
+/// generic HTTP client. The well-known paths equal `fogar_proto::pairing::WELL_KNOWN_PATHS`
+/// (checked by a fogar-core test; ports do not depend on proto).
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum HttpCall {
     /// `GET /.well-known/fogar-gateway`.
@@ -46,15 +66,119 @@ pub enum HttpCall {
     WellKnownLegacy,
     /// `POST /pair` with a JSON body.
     Pair,
+    /// `POST /auth/login`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    Login,
+    /// `POST /auth/logout`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    Logout,
+    /// `GET /auth/me`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    Me,
+    /// `PATCH /auth/me`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    UpdateMe,
+    /// `GET /conversations`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    ListConversations,
+    /// `GET /conversations/agents`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    ListAgents,
+    /// `GET /conversations/{id}`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    GetConversation { id: PathId },
+    /// `GET /conversations/{id}/messages[?before=]`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    GetMessages { id: PathId, before: Option<PathId> },
+    /// `POST /conversations`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    CreateConversation,
+    /// `POST /conversations/{id}/messages`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    PostMessage { id: PathId },
+    /// `DELETE /conversations/{id}/messages/{message}`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    Withdraw { id: PathId, message: PathId },
+    /// `POST /conversations/{id}/cancel`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    Cancel { id: PathId },
+    /// `GET /events[?audio=1]` (stream). GUESSED (JGW Spec 5.0, Mapa de la API)
+    Events { audio: bool },
+    /// `POST /conversations/{id}/messages/{message}/speech` (stream).
+    /// GUESSED (JGW Spec 5.0, Mapa de la API)
+    Speech { id: PathId, message: PathId },
 }
 
 impl HttpCall {
-    pub fn path(self) -> &'static str {
+    pub fn method(&self) -> &'static str {
+        use HttpCall::*;
         match self {
-            HttpCall::WellKnown => "/.well-known/fogar-gateway",
-            HttpCall::WellKnownLegacy => "/.well-known/jota-gateway",
-            HttpCall::Pair => "/pair",
+            WellKnown
+            | WellKnownLegacy
+            | Me
+            | ListConversations
+            | ListAgents
+            | GetConversation { .. }
+            | GetMessages { .. }
+            | Events { .. } => "GET",
+            UpdateMe => "PATCH",
+            Withdraw { .. } => "DELETE",
+            Pair
+            | Login
+            | Logout
+            | CreateConversation
+            | PostMessage { .. }
+            | Cancel { .. }
+            | Speech { .. } => "POST",
         }
+    }
+
+    pub fn path(&self) -> String {
+        use HttpCall::*;
+        match self {
+            WellKnown => "/.well-known/fogar-gateway".into(),
+            WellKnownLegacy => "/.well-known/jota-gateway".into(),
+            Pair => "/pair".into(),
+            Login => "/auth/login".into(),
+            Logout => "/auth/logout".into(),
+            Me | UpdateMe => "/auth/me".into(),
+            ListConversations | CreateConversation => "/conversations".into(),
+            ListAgents => "/conversations/agents".into(),
+            GetConversation { id } => format!("/conversations/{}", id.as_str()),
+            GetMessages { id, before: None } => format!("/conversations/{}/messages", id.as_str()),
+            GetMessages {
+                id,
+                before: Some(b),
+            } => format!(
+                "/conversations/{}/messages?before={}",
+                id.as_str(),
+                b.as_str()
+            ),
+            PostMessage { id } => format!("/conversations/{}/messages", id.as_str()),
+            Withdraw { id, message } => {
+                format!(
+                    "/conversations/{}/messages/{}",
+                    id.as_str(),
+                    message.as_str()
+                )
+            }
+            Cancel { id } => format!("/conversations/{}/cancel", id.as_str()),
+            Events { audio: false } => "/events".into(),
+            Events { audio: true } => "/events?audio=1".into(),
+            Speech { id, message } => format!(
+                "/conversations/{}/messages/{}/speech",
+                id.as_str(),
+                message.as_str()
+            ),
+        }
+    }
+
+    pub fn max_body(&self) -> usize {
+        use HttpCall::*;
+        match self {
+            ListConversations | ListAgents | GetMessages { .. } => MAX_LIST_BODY_BYTES,
+            _ => MAX_BODY_BYTES,
+        }
+    }
+
+    pub fn is_stream(&self) -> bool {
+        matches!(self, HttpCall::Events { .. } | HttpCall::Speech { .. })
+    }
+
+    /// Needs the session credential (everything except discovery, pairing and login).
+    pub fn authenticated(&self) -> bool {
+        !matches!(
+            self,
+            HttpCall::WellKnown | HttpCall::WellKnownLegacy | HttpCall::Pair | HttpCall::Login
+        )
     }
 }
 
@@ -111,4 +235,85 @@ pub trait GatewayHttp: Send + Sync + 'static {
         call: HttpCall,
         body: Zeroizing<Vec<u8>>,
     ) -> impl Future<Output = Result<HttpReply, HttpError>> + Send;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_id_accepts_only_the_safe_charset() {
+        for ok in ["c-1", "agent:main:abc", "A_b.9", &"x".repeat(128)] {
+            assert!(PathId::new(ok).is_some(), "{ok}");
+        }
+        for bad in [
+            "",
+            "../x",
+            "a/b",
+            "a b",
+            "%2F",
+            "a?b",
+            "a#b",
+            "ñ",
+            &"x".repeat(129),
+            "a\r\nb",
+        ] {
+            assert!(PathId::new(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn calls_map_to_method_path_and_limits() {
+        let id = PathId::new("c1").unwrap();
+        let m = PathId::new("m9").unwrap();
+        let cases = [
+            (HttpCall::Login, "POST", "/auth/login".to_string(), false),
+            (HttpCall::UpdateMe, "PATCH", "/auth/me".into(), true),
+            (
+                HttpCall::ListConversations,
+                "GET",
+                "/conversations".into(),
+                true,
+            ),
+            (
+                HttpCall::GetMessages {
+                    id: id.clone(),
+                    before: Some(m.clone()),
+                },
+                "GET",
+                "/conversations/c1/messages?before=m9".into(),
+                true,
+            ),
+            (
+                HttpCall::Withdraw {
+                    id: id.clone(),
+                    message: m.clone(),
+                },
+                "DELETE",
+                "/conversations/c1/messages/m9".into(),
+                true,
+            ),
+            (
+                HttpCall::Events { audio: true },
+                "GET",
+                "/events?audio=1".into(),
+                true,
+            ),
+            (
+                HttpCall::Speech { id, message: m },
+                "POST",
+                "/conversations/c1/messages/m9/speech".into(),
+                true,
+            ),
+        ];
+        for (call, method, path, auth) in cases {
+            assert_eq!(
+                (call.method(), call.path(), call.authenticated()),
+                (method, path, auth)
+            );
+        }
+        assert_eq!(HttpCall::ListConversations.max_body(), MAX_LIST_BODY_BYTES);
+        assert_eq!(HttpCall::Me.max_body(), MAX_BODY_BYTES);
+        assert!(HttpCall::Events { audio: false }.is_stream() && !HttpCall::Me.is_stream());
+    }
 }

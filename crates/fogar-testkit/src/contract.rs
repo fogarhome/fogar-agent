@@ -1377,7 +1377,7 @@ pub mod gateway_http {
         addr: &GatewayAddr,
         routes: &HttpRoutes,
     ) {
-        routes.set("GET", WK.path(), 200, r#"{"service":"fogar-gateway"}"#);
+        routes.set("GET", &WK.path(), 200, r#"{"service":"fogar-gateway"}"#);
         let r = bounded(h.get(addr, WK)).await.expect("get");
         assert_eq!(r.status, 200);
         assert_eq!(&r.body[..], br#"{"service":"fogar-gateway"}"#);
@@ -1388,7 +1388,7 @@ pub mod gateway_http {
         let seen = routes.seen();
         assert_eq!(
             (seen[0].method.as_str(), seen[0].path.as_str()),
-            ("GET", WK.path())
+            ("GET", WK.path().as_str())
         );
     }
 
@@ -1452,14 +1452,14 @@ pub mod gateway_http {
         addr: &GatewayAddr,
         routes: &HttpRoutes,
     ) {
-        routes.set("GET", WK.path(), 200, vec![b' '; MAX_BODY_BYTES + 1]);
+        routes.set("GET", &WK.path(), 200, vec![b' '; MAX_BODY_BYTES + 1]);
         assert!(matches!(
             bounded(h.get(addr, WK)).await,
             Err(HttpError::TooLarge { .. })
         ));
         // A lying Content-Length + an endless body: refused once the limit is crossed, not
         // after buffering it all (the 5 s bound would fire first).
-        routes.set_endless("GET", WK.path());
+        routes.set_endless("GET", WK.path().as_str());
         assert!(matches!(
             bounded(h.get(addr, WK)).await,
             Err(HttpError::TooLarge { .. })
@@ -1510,7 +1510,7 @@ pub mod gateway_http {
         addr: &GatewayAddr,
         routes: &HttpRoutes,
     ) {
-        routes.set("GET", WK.path(), 200, "{}");
+        routes.set("GET", &WK.path(), 200, "{}");
         for _ in 0..5 {
             let mut f = std::pin::pin!(h.get(addr, WK));
             std::future::poll_fn(|cx| {

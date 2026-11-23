@@ -108,7 +108,7 @@ mod mock_http_server_matches_the_fake {
             if matches!(call, fogar_ports::gateway_http::HttpCall::Pair) {
                 return Err(fogar_ports::gateway_http::HttpError::Refused);
             }
-            mini(addr, "GET", call.path(), &[]).await
+            mini(addr, "GET", &call.path(), &[]).await
         }
         async fn post_json(
             &self,
@@ -117,7 +117,7 @@ mod mock_http_server_matches_the_fake {
             body: secrecy::zeroize::Zeroizing<Vec<u8>>,
         ) -> Result<fogar_ports::gateway_http::HttpReply, fogar_ports::gateway_http::HttpError>
         {
-            mini(addr, "POST", call.path(), &body).await
+            mini(addr, "POST", &call.path(), &body).await
         }
     }
 
