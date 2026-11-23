@@ -377,3 +377,7 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
   entry is refused ("ambiguous turn", turn_visible_refused); F3 an unsolicited origin "user" is a
   push; F4 discarded audio is zeroed before reuse (not testable without unsafe). Follow-up: a
   per-entry nonce in TurnView/TurnVisible (app <-> agent protocol change).
+- E2E fix (authorized by Sito, 2026-11-23 11:25; only crates/fogar-agentd/tests/slice0_e2e.rs):
+  a test model of the app on screen subscribes (waits for ConversationSubscribed before any
+  `say`), confirms each awaiting entry keyed by id + number of entries with that id (the view has
+  no seq), retries "engine busy". The two E2E tests pass again; `test --workspace` green.
