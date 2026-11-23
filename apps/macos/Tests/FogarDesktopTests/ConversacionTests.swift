@@ -1,3 +1,4 @@
+import AppKit
 import FogarWire
 import Foundation
 import Testing
@@ -157,8 +158,6 @@ nonisolated func agenteConversacion(_ registro: Registro, inicial: WireConversat
     return (link, conv)
 }
 
-func abierta(_ t: Toma) -> Bool { if case .abierta = t { true } else { false } }
-
 @Suite(.serialized) struct ConversacionPorElSocket {
     @Test(arguments: [true, false])
     func lasRespuestasNoSeConfundenConLaVista(vistaDespues: Bool) async throws {
@@ -275,75 +274,81 @@ func abierta(_ t: Toma) -> Bool { if case .abierta = t { true } else { false } }
         #expect(registro.pedidos.contains(.sendText(WireSendText(text: "enciende la luz"))))
     }
 
+    /// Click the microphone, then stop: the transcript waits in the box (`review`), never sent.
     @Test(arguments: [true, false])
     func clicGrabaYPararDejaElTextoEnLaCaja(vistaDespues: Bool) async throws {
         let registro = Registro()
         let agent = try FakeAgent(agenteConversacion(registro, vistaDespues: vistaDespues))
         let (link, conv) = try await conectar(agent)
         defer { link.stop() }
-        let t0 = Date()
-        conv.pulsar(ahora: t0)
-        conv.soltar(ahora: t0.addingTimeInterval(0.1)) // a click: the take stays open
-        #expect(await esperar { conv.toma == .abierta(mantener: false, desde: t0, pulsado: false) && conv.grabando })
+        conv.grabar()
+        #expect(await esperar { conv.toma == .abierta && conv.grabando })
+        #expect(registro.pedidos.contains(.captureStart(WireCaptureStart(gesture: .toggle))))
         conv.parar()
         #expect(await esperar { conv.toma == .ninguna && conv.texto == "enciende la luz" })
         #expect(registro.pedidos.contains(.captureEnd(WireCaptureEnd(then: .review))))
+        #expect(!registro.pedidos.contains { if case .sendText = $0 { true } else { false } })
         #expect(conv.borradorNuevo == 1)
     }
 
-    /// A click whose `capture_started` arrives late is still a click: nothing is sent.
-    @Test func clicConCaptureStartedLento() async throws {
-        let registro = Registro()
-        let agent = try FakeAgent(pausa: { if case .captureStart = $0 { .milliseconds(600) } else { nil } }, agenteConversacion(registro))
-        let (link, conv) = try await conectar(agent)
-        defer { link.stop() }
-        let t0 = Date()
-        conv.pulsar(ahora: t0)
-        conv.soltar(ahora: t0.addingTimeInterval(0.1))
-        #expect(await esperar { conv.toma == .abierta(mantener: false, desde: t0, pulsado: false) })
-        conv.comprobarMantener(ahora: t0.addingTimeInterval(5)) // released: never promoted
-        #expect(conv.toma == .abierta(mantener: false, desde: t0, pulsado: false))
-        #expect(!registro.pedidos.contains { if case .captureEnd = $0 { true } else { false } })
-    }
-
+    /// Click the microphone, then send: the take ends with `send` and nothing waits in the box.
     @Test(arguments: [true, false])
-    func mantenerYSoltarEnvia(vistaDespues: Bool) async throws {
+    func clicGrabaYEnviar(vistaDespues: Bool) async throws {
         let registro = Registro()
         let agent = try FakeAgent(agenteConversacion(registro, vistaDespues: vistaDespues))
         let (link, conv) = try await conectar(agent)
         defer { link.stop() }
-        let t0 = Date()
-        conv.pulsar(ahora: t0)
-        #expect(await esperar { abierta(conv.toma) })
-        conv.comprobarMantener(ahora: t0.addingTimeInterval(0.4))
-        #expect(conv.toma == .abierta(mantener: true, desde: t0, pulsado: true))
-        conv.soltar(ahora: t0.addingTimeInterval(0.8))
+        conv.grabar()
+        #expect(await esperar { conv.toma == .abierta })
+        conv.grabar() // a second click while recording opens nothing
+        conv.enviarToma()
         #expect(await esperar { registro.pedidos.contains(.captureEnd(WireCaptureEnd(then: .send))) && conv.toma == .ninguna })
+        #expect(registro.cuantos(.captureStart(WireCaptureStart(gesture: .toggle))) == 1)
         #expect(conv.texto.isEmpty)
     }
 
-    /// Released after the threshold while the take was still opening: it sends once open.
-    @Test func soltarMientrasAbreEnvia() async throws {
+    /// Stop or send pressed while the take is still opening: it ends that way as soon as it opens.
+    @Test(arguments: [WireThen.review, .send])
+    func terminarMientrasAbre(then: WireThen) async throws {
         let registro = Registro()
         let agent = try FakeAgent(pausa: { if case .captureStart = $0 { .milliseconds(600) } else { nil } }, agenteConversacion(registro))
         let (link, conv) = try await conectar(agent)
         defer { link.stop() }
-        let t0 = Date()
-        conv.pulsar(ahora: t0)
-        conv.soltar(ahora: t0.addingTimeInterval(0.5))
-        #expect(await esperar { registro.pedidos.contains(.captureEnd(WireCaptureEnd(then: .send))) && conv.toma == .ninguna })
+        conv.grabar()
+        #expect(conv.toma == .abriendo(fin: nil))
+        if then == .send { conv.enviarToma() } else { conv.parar() }
+        #expect(conv.toma == .abriendo(fin: then))
+        #expect(await esperar { registro.pedidos.contains(.captureEnd(WireCaptureEnd(then: then))) && conv.toma == .ninguna })
+        #expect(registro.cuantos(.captureEnd(WireCaptureEnd(then: then))) == 1)
     }
 
-    /// Esc while opening: the take is discarded as soon as the agent opens it.
+    /// Esc while opening, with the conversation on screen: discarded as soon as the agent opens it.
+    /// Without a take, Esc and Return are left to the text field.
     @Test func escMientrasAbreDescarta() async throws {
         let registro = Registro()
         let agent = try FakeAgent(pausa: { if case .captureStart = $0 { .milliseconds(600) } else { nil } }, agenteConversacion(registro))
         let (link, conv) = try await conectar(agent)
         defer { link.stop() }
-        conv.alternar()
-        conv.descartar()
+        conv.aLaVista = true
+        #expect(!conv.tecla(.escape))
+        #expect(!conv.tecla(.intro))
+        conv.grabar()
+        #expect(conv.tecla(.escape))
         #expect(await esperar { registro.pedidos.contains(.captureEnd(WireCaptureEnd(then: .discard))) && conv.toma == .ninguna })
         #expect(conv.aviso == nil)
+    }
+
+    /// Return in an open take sends it, like the send button.
+    @Test func introEnLaTomaEnvia() async throws {
+        let registro = Registro()
+        let agent = try FakeAgent(agenteConversacion(registro))
+        let (link, conv) = try await conectar(agent)
+        defer { link.stop() }
+        conv.aLaVista = true
+        conv.grabar()
+        #expect(await esperar { conv.toma == .abierta })
+        #expect(conv.tecla(.intro))
+        #expect(await esperar { registro.pedidos.contains(.captureEnd(WireCaptureEnd(then: .send))) && conv.toma == .ninguna })
     }
 
     /// The connection drops with a take open: the agent discarded it; the app forgets it quietly
@@ -353,8 +358,8 @@ func abierta(_ t: Toma) -> Bool { if case .abierta = t { true } else { false } }
         let agent = try FakeAgent(cerrarTras: { if case .captureStart = $0 { true } else { false } }, agenteConversacion(registro))
         let (link, conv) = try await conectar(agent)
         defer { link.stop() }
-        conv.alternar()
-        #expect(await esperar { abierta(conv.toma) })
+        conv.grabar()
+        #expect(await esperar { conv.toma == .abierta })
         #expect(await esperar { conv.toma == .ninguna && !conv.grabando })
         #expect(conv.aviso == nil)
         #expect(await esperar { conv.vivo && agent.accepted >= 2 })
@@ -365,30 +370,57 @@ func abierta(_ t: Toma) -> Bool { if case .abierta = t { true } else { false } }
         let agent = try FakeAgent(agenteConversacion(registro, captura: .captureRefused(WireCaptureRefused(reason: .noTranscriber))))
         let (link, conv) = try await conectar(agent)
         defer { link.stop() }
-        conv.alternar()
+        conv.grabar()
         #expect(await esperar { conv.aviso == Textos.rechazoToma(.noTranscriber) })
         #expect(conv.toma == .ninguna)
     }
 
-    /// An automatic cut (silence) ends the take in the app and leaves the text in the box: the app
-    /// never sends it on its own.
-    @Test func trasUnCorteNuncaEnviaSola() async throws {
+    /// An automatic cut (silence, safety) ends the take in the app and leaves the text in the box:
+    /// the app never sends it on its own, and a Return pressed late does not either.
+    @Test(arguments: [WireNotice.silenceCut, .safetyCut])
+    func trasUnCorteNuncaEnviaSola(corte: WireNotice) async throws {
         let registro = Registro()
         let agent = try FakeAgent(agenteConversacion(registro))
         let (link, conv) = try await conectar(agent)
         defer { link.stop() }
-        let t0 = Date()
-        conv.pulsar(ahora: t0)
-        #expect(await esperar { abierta(conv.toma) })
+        conv.aLaVista = true
+        conv.grabar()
+        #expect(await esperar { conv.toma == .abierta })
         // The agent cut the take: the next view has no `recording`, and the transcript as draft.
-        link.alCambiar(vista(draft: "me quedé pensando", notice: .silenceCut))
+        link.alCambiar(vista(draft: "me quedé pensando", notice: corte))
         #expect(conv.toma == .ninguna)
         #expect(conv.texto == "me quedé pensando")
-        // The release of the press that started it arrives late: it must not send anything.
-        conv.soltar(ahora: t0.addingTimeInterval(2))
+        #expect(!conv.tecla(.intro))
         try await Task.sleep(for: .milliseconds(300))
         #expect(!registro.pedidos.contains { if case .sendText = $0 { true } else { false } })
-        #expect(!registro.pedidos.contains(.captureEnd(WireCaptureEnd(then: .send))))
+        #expect(!registro.pedidos.contains { if case .captureEnd = $0 { true } else { false } })
+    }
+
+    /// #33: ⌘. cancels while Fogar speaks, whatever has focus and even with the conversation out of
+    /// sight (menu bar panel, another section): the app itself sends `cancel_turn`. Before, ⌘.
+    /// lived only on an in-window button and nothing in the app reached the agent.
+    @Test func comandoPuntoCancelaMientrasHabla() async throws {
+        let registro = Registro()
+        let agent = try FakeAgent(agenteConversacion(registro, inicial: vista([turno("t1", outcome: .done)], speaking: true)))
+        let (link, conv) = try await conectar(agent)
+        defer { link.stop() }
+        #expect(await esperar { conv.cancelable })
+        #expect(!conv.aLaVista)
+        #expect(conv.tecla(.cancelar))
+        #expect(await esperar { registro.cuantos(.cancelTurn) == 1 })
+        #expect(conv.aviso == nil)
+    }
+
+    /// Nothing to cancel: ⌘. is left alone (to the field or the system) and nothing is sent.
+    @Test func comandoPuntoSinNadaQueCancelar() async throws {
+        let registro = Registro()
+        let agent = try FakeAgent(agenteConversacion(registro, inicial: vista([turno("t1", outcome: .done)])))
+        let (link, conv) = try await conectar(agent)
+        defer { link.stop() }
+        #expect(await esperar { link.vista?.turns.count == 1 })
+        #expect(!conv.tecla(.cancelar))
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(registro.cuantos(.cancelTurn) == 0)
     }
 
     @Test func miTurnoSeConfirmaSinVentanaYUnPushNo() async throws {
@@ -464,5 +496,28 @@ func abierta(_ t: Toma) -> Bool { if case .abierta = t { true } else { false } }
         await conv.cancelar()
         try await Task.sleep(for: .milliseconds(300))
         #expect(registro.cuantos(visible) == 2)
+    }
+}
+
+/// #33: which key events the app keeps for itself.
+@Suite struct Teclas {
+    func evento(_ c: String, _ mods: NSEvent.ModifierFlags, keyCode: UInt16, repetido: Bool = false) -> NSEvent? {
+        NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: mods, timestamp: 0, windowNumber: 0,
+                         context: nil, characters: c, charactersIgnoringModifiers: c, isARepeat: repetido, keyCode: keyCode)
+    }
+
+    @Test func comandoPuntoEsCancelar() throws {
+        #expect(Tecla.de(try #require(evento(".", .command, keyCode: 47))) == .cancelar)
+        // Caps Lock or the function key do not change it.
+        #expect(Tecla.de(try #require(evento(".", [.command, .capsLock], keyCode: 47))) == .cancelar)
+    }
+
+    @Test func soloEsasTeclas() throws {
+        #expect(Tecla.de(try #require(evento("\u{1b}", [], keyCode: 53))) == .escape)
+        #expect(Tecla.de(try #require(evento("\r", [], keyCode: 36))) == .intro)
+        #expect(Tecla.de(try #require(evento(".", [], keyCode: 47))) == nil)
+        #expect(Tecla.de(try #require(evento(".", [.command, .shift], keyCode: 47))) == nil)
+        #expect(Tecla.de(try #require(evento("\r", .option, keyCode: 36))) == nil) // Option-Return: a new line
+        #expect(Tecla.de(try #require(evento(".", .command, keyCode: 47, repetido: true))) == nil)
     }
 }

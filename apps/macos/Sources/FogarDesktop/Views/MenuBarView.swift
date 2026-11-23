@@ -39,7 +39,8 @@ struct MenuBarView: View {
                         Button { conversacion.cancelarAhora() } label: { Text("Cancelar") }
                             .buttonStyle(Pildora(pequena: true))
                     } else if conversacion.grabando {
-                        Button { conversacion.descartar() } label: { Text("Descartar") }
+                        // Like the box: stop, and the text waits in the box.
+                        Button { conversacion.parar() } label: { Text("Parar") }
                             .buttonStyle(Pildora(pequena: true))
                     }
                 }
