@@ -23,6 +23,7 @@
 use crate::{
     agent::HealthProbe,
     capture::{OPEN_DEADLINE, Start},
+    conversation::ID_MAX_BYTES,
     engine::Command,
     link::LinkView,
     pairing::Pairing,
@@ -486,7 +487,21 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
                     None => IpcResponse::MicPermission(conv.borrow().mic),
                 }
             }
-            // TurnVisible arrives with S2 3c (the playback gate).
+            // Spec S2 «Punto único de salida»: only a connection that shows the conversation can
+            // say a turn is on screen.
+            IpcRequest::TurnVisible { .. } if !conv_subscribed => IpcResponse::Refused {
+                reason: "not subscribed to the conversation",
+            },
+            // An id longer than the view ever shows matches no turn: noted, nothing to do.
+            IpcRequest::TurnVisible { turn_id } if turn_id.len() > ID_MAX_BYTES => {
+                IpcResponse::TurnVisibleNoted
+            }
+            IpcRequest::TurnVisible { turn_id } => {
+                match c.ask(|reply| Command::TurnVisible(turn_id, reply)).await {
+                    Some(()) => IpcResponse::TurnVisibleNoted,
+                    None => BUSY,
+                }
+            }
             _ => IpcResponse::Refused {
                 reason: "unsupported request",
             },

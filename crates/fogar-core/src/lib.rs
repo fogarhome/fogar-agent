@@ -24,6 +24,7 @@ mod capture;
 mod engine;
 mod ipc;
 mod link;
+mod playback;
 mod time;
 
 pub use agent::{Agent, AgentPorts, HealthProbe, NoHttp, NoIpc, NoTailnet, ShutdownReport};

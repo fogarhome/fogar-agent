@@ -7,18 +7,23 @@
 //! microphone at all: it owns the consent gate (`capture.rs`), the single point that can open a
 //! take, and only on a `Command::CaptureStart` carrying the person's `UserAct`. Gateway events
 //! can end a take (silence warnings, a dropped link) but never start one.
+//!
+//! S2 3c: the engine does not hold the speaker either. TTS goes through the playback gate
+//! (`playback.rs`), the single output point: a turn's audio plays only once the app confirmed
+//! the turn is on screen (`Command::TurnVisible`), within 2 s of its `turn_start`.
 
 use crate::{
     capture::{CaptureGate, Cut, GateEvent, Owner, Readiness, Reply, Start},
     config::Config,
     conversation,
     link::Inbound,
+    playback::PlaybackGate,
     stats::Stats,
     time::{deadline, sleep_until_opt},
     turn::{ClientCmd, Effects, TurnMachine, UserPhase},
 };
 use fogar_ports::{
-    audio::{ActivePlayback, AudioFormat, AudioSink, MicPermission},
+    audio::MicPermission,
     clock::Clock,
     gateway::Frame,
     ipc::{
@@ -27,9 +32,7 @@ use fogar_ports::{
     },
 };
 use fogar_proto::{
-    ClientMsg,
-    audio::TTS_RATE_HZ,
-    encode_client, encode_upload_f32le, parse_tts_frame,
+    ClientMsg, encode_client, encode_upload_f32le, parse_tts_frame,
     server::{ServerMsg, Service, ServiceState as WireServiceState},
 };
 use std::{borrow::Cow, sync::Arc};
@@ -51,6 +54,8 @@ pub(crate) enum Command {
     },
     CaptureEnd(CaptureThen, oneshot::Sender<()>),
     RequestMicPermission(oneshot::Sender<MicPermission>),
+    /// The app shows this turn (its id as the view carries it): its audio may play.
+    TurnVisible(String, oneshot::Sender<()>),
 }
 
 /// Redacting `Debug`: the text is the user's.
@@ -62,6 +67,7 @@ impl std::fmt::Debug for Command {
             Command::CaptureStart { start, .. } => write!(f, "CaptureStart({start:?})"),
             Command::CaptureEnd(then, _) => write!(f, "CaptureEnd({then:?})"),
             Command::RequestMicPermission(_) => f.write_str("RequestMicPermission"),
+            Command::TurnVisible(id, _) => write!(f, "TurnVisible({} bytes)", id.len()),
         }
     }
 }
@@ -70,7 +76,6 @@ pub(crate) struct Engine<C> {
     pub(crate) clock: Arc<C>,
     pub(crate) cfg: Arc<Config>,
     pub(crate) stats: Arc<Stats>,
-    pub(crate) audio_out: Arc<dyn AudioSink>,
     pub(crate) out_tx: mpsc::Sender<Frame>,
     pub(crate) in_rx: mpsc::Receiver<Inbound>,
     pub(crate) cmd_rx: mpsc::Receiver<Command>,
@@ -80,28 +85,29 @@ pub(crate) struct Engine<C> {
 struct State {
     turns: TurnMachine,
     capture: CaptureGate,
-    playback: Option<Box<dyn ActivePlayback>>,
-    /// Reused for TTS sample conversion: no allocation per frame after warm-up.
-    pcm: Vec<i16>,
+    playback: PlaybackGate,
 }
 
 impl State {
     fn playing(&self) -> bool {
-        self.playback
-            .as_ref()
-            .is_some_and(|p| p.queued_samples() > 0)
+        self.playback.playing()
     }
 }
 
 impl<C: Clock> Engine<C> {
-    /// `capture` is the single consent point, the only holder of the microphone; it lives in
-    /// the task's state (not in `Engine`, which `&self` methods share across awaits).
-    pub(crate) async fn run(mut self, capture: CaptureGate, ingress: CancellationToken) {
+    /// `capture` is the single consent point, the only holder of the microphone; `playback`
+    /// the single output point, the only holder of the speaker. Both live in the task's state
+    /// (not in `Engine`, which `&self` methods share across awaits).
+    pub(crate) async fn run(
+        mut self,
+        capture: CaptureGate,
+        playback: PlaybackGate,
+        ingress: CancellationToken,
+    ) {
         let mut st = State {
             turns: TurnMachine::new(self.cfg.turn),
             capture,
-            playback: None,
-            pcm: Vec::with_capacity(fogar_proto::audio::TTS_MAX_FRAME_HINT_BYTES / 2),
+            playback,
         };
         self.refresh_mic(&st);
         // No IPC (or it stopped): the closed channel must not turn the branch into a hot loop.
@@ -115,6 +121,9 @@ impl<C: Clock> Engine<C> {
                 // never starve the take's cuts (safety, silence, owner gone) or its device jobs;
                 // the take's own events are bounded by the device (50 chunks/s) and its timers.
                 ev = st.capture.next(&*self.clock) => self.on_capture(&mut st, ev).await,
+                // The output's own timers and device jobs (visibility deadline, open, release,
+                // drain, idle close) are not starved by a busy gateway either.
+                () = st.playback.next(&*self.clock) => {}
                 ev = self.in_rx.recv() => match ev {
                     None => break,
                     Some(ev) => self.on_inbound(&mut st, ev).await,
@@ -137,13 +146,31 @@ impl<C: Clock> Engine<C> {
                     }
                 }
             }
+            self.follow_turn(&mut st);
         }
-        // Agent stop (`ingress`): the take closes and the device is released off the runtime.
-        st.capture.shutdown(&*self.clock).await;
-        if let Some(pb) = st.playback.as_mut() {
-            pb.stop();
-        }
-        // Dropping playback closes the output.
+        // Agent stop (`ingress`): the take closes, the output goes silent, and both devices are
+        // released off the runtime.
+        let clock = &*self.clock;
+        tokio::join!(st.capture.shutdown(clock), st.playback.shutdown(clock));
+    }
+
+    /// The playback gate follows the turn machine's turn (a new turn starts its 2 s wait for
+    /// `TurnVisible`), and the view follows the gate.
+    fn follow_turn(&self, st: &mut State) {
+        let now = self.clock.now();
+        st.playback.follow(
+            st.turns.turn().map(|t| (t.turn_id.as_str(), t.turn_seq)),
+            now,
+        );
+        let mark = st.playback.take_mark();
+        let speaking = st.playback.speaking();
+        let awaiting = st.playback.awaiting_visible();
+        self.conv.send_if_modified(|v| {
+            let m = mark
+                .as_ref()
+                .is_some_and(|(id, a)| conversation::turn_audio(v, id, *a));
+            conversation::playback(v, speaking, awaiting) | m
+        });
     }
 
     /// Applies `f` to the view and publishes it if anything changed (activity follows the turn
@@ -231,6 +258,14 @@ impl<C: Clock> Engine<C> {
                 if !reply.is_closed() {
                     st.capture.ask_permission(reply);
                 }
+            }
+            Command::TurnVisible(id, reply) => {
+                // The IPC gave up (and counted it as busy): never act on it late.
+                if reply.is_closed() {
+                    return;
+                }
+                let _ = reply.send(());
+                st.playback.visible(&id, self.clock.now());
             }
         }
     }
@@ -342,8 +377,8 @@ impl<C: Clock> Engine<C> {
                     conversation::link_down(v) | t
                 });
                 self.apply(st, fx).await;
-                // Release the output device while offline (energy).
-                st.playback = None;
+                // Silence, and release the output device while offline (energy).
+                st.playback.link_down(self.clock.now());
             }
             Inbound::Server(msg, _charge) => {
                 let now = self.clock.now();
@@ -410,36 +445,16 @@ impl<C: Clock> Engine<C> {
                     Stats::inc(&self.stats.tts_frames_stale);
                     return;
                 }
-                if st.playback.is_none() {
-                    st.playback = self.audio_out.open(AudioFormat::mono(TTS_RATE_HZ)).ok();
-                }
-                st.pcm.clear();
-                st.pcm.extend(frame.samples());
-                match st.playback.as_mut() {
-                    Some(pb) => {
-                        let accepted = pb.write(&st.pcm);
-                        Stats::add(
-                            &self.stats.tts_samples_dropped,
-                            (st.pcm.len() - accepted.min(st.pcm.len())) as u64,
-                        );
-                        Stats::inc(&self.stats.tts_frames_played);
-                        if let Some(t) = st.turns.turn() {
-                            let id = t.turn_id.as_str();
-                            self.conv
-                                .send_if_modified(|v| conversation::audio_played(v, id));
-                        }
-                    }
-                    None => Stats::add(&self.stats.tts_samples_dropped, st.pcm.len() as u64),
-                }
+                // The gate learns about a turn_start handled in this same loop turn first.
+                self.follow_turn(st);
+                st.playback.on_frame(&frame, self.clock.now());
             }
         }
     }
 
     async fn apply(&self, st: &mut State, fx: Effects) {
-        if fx.stop_playback
-            && let Some(pb) = st.playback.as_mut()
-        {
-            pb.stop();
+        if fx.stop_playback {
+            st.playback.stop(self.clock.now());
         }
         if fx.barge_in {
             Stats::inc(&self.stats.barge_ins);
@@ -566,6 +581,7 @@ mod tests {
     /// The engine wired to fakes, driven directly (no link, no IPC adapter).
     struct Harness {
         mic: FakeMic,
+        speaker: FakeSpeaker,
         stats: Arc<Stats>,
         conv: watch::Receiver<ConversationView>,
         in_tx: mpsc::Sender<Inbound>,
@@ -577,6 +593,10 @@ mod tests {
     }
 
     fn harness(mic: FakeMic, cfg: Config) -> Harness {
+        harness_with(mic, FakeSpeaker::healthy(), cfg)
+    }
+
+    fn harness_with(mic: FakeMic, speaker: FakeSpeaker, cfg: Config) -> Harness {
         let clock = Arc::new(TestClock::new());
         let cfg = Arc::new(cfg);
         let stats = Arc::new(Stats::default());
@@ -588,18 +608,19 @@ mod tests {
             clock,
             cfg: cfg.clone(),
             stats: stats.clone(),
-            audio_out: Arc::new(FakeSpeaker::healthy()),
             out_tx,
             in_rx,
             cmd_rx,
             conv: conv_tx,
         };
         let capture = CaptureGate::new(Arc::new(mic.clone()), &cfg, stats.clone());
+        let playback = PlaybackGate::new(Arc::new(speaker.clone()), stats.clone());
         let stop = CancellationToken::new();
         let mut tasks = JoinSet::new();
-        tasks.spawn(engine.run(capture, stop.clone()));
+        tasks.spawn(engine.run(capture, playback, stop.clone()));
         Harness {
             mic,
+            speaker,
             stats,
             conv,
             in_tx,
@@ -655,6 +676,48 @@ mod tests {
         }
         fn drain(&mut self) {
             while self.out_rx.try_recv().is_ok() {}
+        }
+        /// One TTS frame for `turn_seq`, as the link would hand it over.
+        async fn audio(&self, turn_seq: u16, pcm: &[i16]) {
+            let mut b = Vec::new();
+            fogar_proto::audio::encode_tts_frame(turn_seq, pcm, &mut b);
+            let charge = self.budget.try_charge(1).unwrap();
+            self.in_tx.send(Inbound::Audio(b, charge)).await.unwrap();
+        }
+        async fn turn_start(&self, id: &str, seq: u16, origin: &str) {
+            self.server(&format!(
+                r#"{{"type":"turn_start","turn_id":"{id}","turn_seq":{seq},"origin":"{origin}"}}"#
+            ))
+            .await;
+        }
+        async fn turn_end(&self, id: &str) {
+            self.server(&format!(
+                r#"{{"type":"turn_end","turn_id":"{id}","reason":"done"}}"#
+            ))
+            .await;
+        }
+        /// The app says it shows `id` (as only the IPC module would ask).
+        async fn visible(&self, id: &str) {
+            let (tx, rx) = oneshot::channel();
+            self.cmd_tx
+                .send(Command::TurnVisible(id.into(), tx))
+                .await
+                .unwrap();
+            rx.await.unwrap();
+        }
+        async fn cancel(&self) {
+            let (tx, rx) = oneshot::channel();
+            self.cmd_tx.send(Command::Cancel(tx)).await.unwrap();
+            rx.await.unwrap();
+        }
+        fn audio_of(&self, id: &str) -> Option<fogar_ports::ipc::TurnAudio> {
+            self.conv
+                .borrow()
+                .turns
+                .iter()
+                .rev()
+                .find(|t| t.turn_id == id)
+                .map(|t| t.audio)
         }
         async fn stop(mut self) {
             self.stop.cancel();
@@ -841,6 +904,340 @@ mod tests {
         }
         assert_eq!(h.stats.snapshot().captures_safety_cut, 1);
         h.drain();
+        h.stop().await;
+    }
+
+    // ---- the output suite (spec S2 «Punto único de salida de audio», S2 3c) -------------
+
+    use fogar_ports::ipc::TurnAudio;
+
+    /// Lets the engine handle what was sent (paused time only advances when all are idle).
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    fn pcm(base: i16, n: usize) -> Vec<i16> {
+        (0..n).map(|i| base.wrapping_add(i as i16)).collect()
+    }
+
+    /// «Ninguna secuencia de mensajes del gateway sin turn_visible hace sonar FakeSpeaker»: random
+    /// gateway traffic with VALID audio frames for the turns it starts, link drops, texts and
+    /// cancels never open the output. Then, as a control that the rig can sound, a confirmed
+    /// turn does.
+    #[tokio::test(start_paused = true)]
+    async fn no_gateway_sequence_sounds_without_turn_visible() {
+        for seed in 1..=48u64 {
+            let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut h = harness(FakeMic::healthy(), Config::default());
+            h.up().await;
+            for _ in 0..80 {
+                match r.next() % 8 {
+                    0 => {
+                        let _ = h.in_tx.send(Inbound::SessionDown).await;
+                        h.up().await;
+                    }
+                    1..=3 => {
+                        let seq = (r.next() % 4) as u16;
+                        let n = 1 + (r.next() % 2000) as usize;
+                        h.audio(seq, &pcm(7, n)).await;
+                    }
+                    4 => {
+                        let (tx, _rx) = oneshot::channel();
+                        let _ = h.cmd_tx.try_send(Command::SendText("hola".into(), tx));
+                    }
+                    5 => {
+                        let (tx, _rx) = oneshot::channel();
+                        let _ = h.cmd_tx.try_send(Command::Cancel(tx));
+                    }
+                    _ => h.server(&random_server_json(&mut r)).await,
+                }
+                if r.next().is_multiple_of(5) {
+                    tokio::time::sleep(Duration::from_millis(r.next() % 3_000)).await;
+                }
+                h.drain();
+                settle().await;
+                let sp = h.speaker.snapshot();
+                assert_eq!((sp.opens, sp.accepted), (0, 0), "seed {seed}");
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let s = h.stats.snapshot();
+            assert_eq!(
+                (s.tts_frames_played, s.playback_opens),
+                (0, 0),
+                "seed {seed}"
+            );
+            assert_eq!(h.speaker.snapshot().opens, 0, "seed {seed}");
+            // Control: the same rig sounds once the app confirms a turn.
+            h.turn_start("ok", 9, "user").await;
+            h.visible("ok").await;
+            h.audio(9, &pcm(1, 480)).await;
+            settle().await;
+            assert_eq!(h.speaker.snapshot().accepted, 480, "seed {seed}");
+            h.stop().await;
+        }
+    }
+
+    /// A confirmed turn plays the audio that waited for the confirmation, in order, then the
+    /// rest directly; the view says it played.
+    #[tokio::test(start_paused = true)]
+    async fn confirmed_turn_plays_what_waited_in_order() {
+        let h = harness(FakeMic::healthy(), Config::default());
+        h.up().await;
+        h.turn_start("t-1", 1, "user").await;
+        settle().await;
+        assert_eq!(h.conv.borrow().awaiting_visible.as_deref(), Some("t-1"));
+        h.audio(1, &pcm(100, 480)).await;
+        h.audio(1, &pcm(2000, 480)).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            h.speaker.snapshot().opens,
+            0,
+            "nothing opened before the confirmation"
+        );
+        h.visible("t-1").await;
+        settle().await;
+        h.audio(1, &pcm(5000, 240)).await;
+        settle().await;
+        let want: Vec<i16> = [pcm(100, 480), pcm(2000, 480), pcm(5000, 240)].concat();
+        assert_eq!(h.speaker.played_samples(), want);
+        let s = h.stats.snapshot();
+        assert_eq!(
+            (s.tts_frames_played, s.tts_turns_seen, s.tts_turns_muted),
+            (3, 1, 0)
+        );
+        assert_eq!(h.audio_of("t-1"), Some(TurnAudio::Played));
+        let v = h.conv.borrow().clone();
+        assert!(v.speaking && v.awaiting_visible.is_none());
+        h.stop().await;
+    }
+
+    /// «Una confirmación tardía (más de 2 s) hace que se tire el audio».
+    #[tokio::test(start_paused = true)]
+    async fn late_confirmation_discards_the_audio() {
+        let h = harness(FakeMic::healthy(), Config::default());
+        h.up().await;
+        h.turn_start("t-1", 1, "user").await;
+        h.audio(1, &pcm(1, 480)).await;
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        h.visible("t-1").await;
+        h.audio(1, &pcm(1, 480)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let sp = h.speaker.snapshot();
+        assert_eq!((sp.opens, sp.accepted), (0, 0));
+        let s = h.stats.snapshot();
+        assert_eq!((s.tts_turns_muted, s.tts_samples_muted), (1, 960));
+        assert_eq!((s.tts_turns_seen, s.tts_frames_played), (0, 0));
+        assert_eq!(h.audio_of("t-1"), Some(TurnAudio::Muted));
+        assert_eq!(h.conv.borrow().awaiting_visible, None);
+        h.stop().await;
+    }
+
+    /// The 2 s run from the `turn_start`, not from the first audio: a confirmation at 1.9 s
+    /// still plays.
+    #[tokio::test(start_paused = true)]
+    async fn confirmation_just_in_time_plays() {
+        let h = harness(FakeMic::healthy(), Config::default());
+        h.up().await;
+        h.turn_start("t-1", 1, "user").await;
+        tokio::time::sleep(Duration::from_millis(1900)).await;
+        h.audio(1, &pcm(1, 480)).await;
+        h.visible("t-1").await;
+        settle().await;
+        assert_eq!(h.speaker.snapshot().accepted, 480);
+        h.stop().await;
+    }
+
+    /// «Un push sin la ventana a la vista no suena»: the app never confirms it.
+    #[tokio::test(start_paused = true)]
+    async fn push_without_the_window_on_screen_never_sounds() {
+        let h = harness(FakeMic::healthy(), Config::default());
+        h.up().await;
+        h.turn_start("p-1", 2, "push").await;
+        for _ in 0..20 {
+            h.audio(2, &pcm(1, 480)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        h.turn_end("p-1").await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(h.speaker.snapshot().opens, 0);
+        assert_eq!(h.stats.snapshot().tts_samples_muted, 20 * 480);
+        assert_eq!(h.audio_of("p-1"), Some(TurnAudio::Muted));
+        h.stop().await;
+    }
+
+    /// More than 3 s of audio before the confirmation: the turn is muted at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_full_unseen_buffer_mutes_the_turn() {
+        let h = harness(FakeMic::healthy(), Config::default());
+        h.up().await;
+        h.turn_start("t-1", 1, "user").await;
+        for _ in 0..151 {
+            h.audio(1, &pcm(1, 480)).await;
+        }
+        settle().await;
+        assert_eq!(h.audio_of("t-1"), Some(TurnAudio::Muted));
+        h.visible("t-1").await;
+        h.audio(1, &pcm(1, 480)).await;
+        settle().await;
+        assert_eq!(h.speaker.snapshot().opens, 0);
+        let s = h.stats.snapshot();
+        assert_eq!((s.tts_turns_muted, s.tts_samples_muted), (1, 152 * 480));
+        h.stop().await;
+    }
+
+    /// A confirmation for another turn (or for nothing) unlocks nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_confirmation_for_another_turn_unlocks_nothing() {
+        let h = harness(FakeMic::healthy(), Config::default());
+        h.up().await;
+        h.turn_start("t-1", 1, "user").await;
+        h.visible("t-0").await;
+        h.visible("").await;
+        h.audio(1, &pcm(1, 480)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(h.speaker.snapshot().opens, 0);
+        assert_eq!(h.audio_of("t-1"), Some(TurnAudio::Muted));
+        h.stop().await;
+    }
+
+    /// «Cancelar en mitad de una respuesta»: silence at once, and the turn's later frames do
+    /// not play.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_mid_answer_silences_at_once() {
+        let h = harness(FakeMic::healthy(), Config::default());
+        h.up().await;
+        h.turn_start("t-1", 1, "user").await;
+        h.visible("t-1").await;
+        for _ in 0..5 {
+            h.audio(1, &pcm(1, 480)).await;
+        }
+        settle().await;
+        assert_eq!(h.speaker.snapshot().queued, 5 * 480);
+        h.cancel().await;
+        settle().await;
+        let sp = h.speaker.snapshot();
+        assert_eq!(sp.queued, 0, "silence at once");
+        assert!(sp.stops >= 1);
+        h.audio(1, &pcm(1, 480)).await;
+        settle().await;
+        assert_eq!(h.speaker.snapshot().accepted, 5 * 480);
+        assert!(!h.conv.borrow().speaking);
+        assert_eq!(h.stats.snapshot().barge_ins, 1);
+        h.stop().await;
+    }
+
+    /// Issue #25: a dead output is released and reopened (with backoff) without waiting for
+    /// `SessionDown`, and audio refused by it is not counted as played.
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_output_is_released_and_reopened() {
+        let h = harness(FakeMic::healthy(), Config::default());
+        h.up().await;
+        h.turn_start("t-1", 1, "user").await;
+        h.visible("t-1").await;
+        h.audio(1, &pcm(1, 480)).await;
+        settle().await;
+        assert_eq!(h.speaker.snapshot().opens, 1);
+        h.speaker.kill();
+        h.audio(1, &pcm(1, 480)).await;
+        settle().await;
+        let s = h.stats.snapshot();
+        assert_eq!((s.playback_dead, s.tts_frames_played), (1, 1));
+        assert_eq!(
+            h.speaker.snapshot().open_now,
+            0,
+            "the dead output was released"
+        );
+        // The frame waits for the reopen, after the backoff.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let sp = h.speaker.snapshot();
+        assert_eq!((sp.opens, sp.open_now), (2, 1));
+        assert_eq!(
+            sp.accepted, 960,
+            "the waiting frame played on the new output"
+        );
+        h.audio(1, &pcm(1, 480)).await;
+        settle().await;
+        assert_eq!(h.stats.snapshot().tts_frames_played, 3);
+        assert_eq!(h.stats.snapshot().playback_opens, 2);
+        h.stop().await;
+    }
+
+    /// Issue #25: a device that stays broken is retried with growing backoff, never in a loop.
+    #[tokio::test(start_paused = true)]
+    async fn a_broken_output_backs_off() {
+        let h = harness(FakeMic::healthy(), Config::default());
+        h.up().await;
+        h.turn_start("t-1", 1, "user").await;
+        h.visible("t-1").await;
+        h.speaker.set_open_dead(true);
+        for _ in 0..1500 {
+            h.audio(1, &pcm(1, 480)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // 30 s: opens at ~0, then backoff 0.5, 1, 2, 4, 8, 8, 8 s.
+        let opens = h.speaker.snapshot().opens;
+        assert!((3..=9).contains(&opens), "opens {opens}");
+        let s = h.stats.snapshot();
+        assert_eq!(s.tts_frames_played, 0, "nothing reached a live output");
+        assert_eq!(s.playback_dead, u64::from(opens));
+        assert_eq!(h.speaker.snapshot().open_now, 0);
+        // The device comes back: the next frames play.
+        h.speaker.set_open_dead(false);
+        for _ in 0..500 {
+            h.audio(1, &pcm(1, 480)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(h.stats.snapshot().tts_frames_played > 0);
+        h.stop().await;
+    }
+
+    /// Energy (spec S2 B): the output closes 2 s after it drained with no turn open.
+    #[tokio::test(start_paused = true)]
+    async fn the_output_closes_two_seconds_after_draining_with_no_turn() {
+        let h = harness(FakeMic::healthy(), Config::default());
+        h.up().await;
+        h.turn_start("t-1", 1, "user").await;
+        h.visible("t-1").await;
+        h.audio(1, &pcm(1, 4800)).await;
+        h.turn_end("t-1").await;
+        settle().await;
+        assert_eq!(h.speaker.snapshot().open_now, 1);
+        // Still queued: never closed under the audio.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(h.speaker.snapshot().open_now, 1);
+        assert!(h.conv.borrow().speaking);
+        h.speaker.drain();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!h.conv.borrow().speaking);
+        assert_eq!(h.speaker.snapshot().open_now, 1, "not before 2 s");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(h.speaker.snapshot().open_now, 0);
+        assert_eq!(h.stats.snapshot().playback_idle_closes, 1);
+        h.stop().await;
+    }
+
+    /// The link going down silences and releases the output (energy), and the next session's
+    /// turns still need their own confirmation.
+    #[tokio::test(start_paused = true)]
+    async fn link_down_releases_the_output() {
+        let h = harness(FakeMic::healthy(), Config::default());
+        h.up().await;
+        h.turn_start("t-1", 1, "user").await;
+        h.visible("t-1").await;
+        h.audio(1, &pcm(1, 480)).await;
+        settle().await;
+        h.in_tx.send(Inbound::SessionDown).await.unwrap();
+        settle().await;
+        assert_eq!(h.speaker.snapshot().open_now, 0);
+        h.up().await;
+        h.turn_start("t-1", 1, "user").await;
+        h.audio(1, &pcm(1, 480)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(
+            h.speaker.snapshot().opens,
+            1,
+            "a new session's turn waits for its own"
+        );
         h.stop().await;
     }
 }

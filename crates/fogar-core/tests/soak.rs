@@ -37,7 +37,7 @@ async fn run_soak(hours: u32, planted_leak: bool) -> Outcome {
         ..MockConfig::default()
     });
     b.speaker = FakeSpeaker::healthy().without_recording();
-    b.with_ipc = true;
+    let b = b.app_on_screen();
     let mut rig = b.start();
     wait_ready(&mut rig.health).await;
 

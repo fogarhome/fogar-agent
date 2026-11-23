@@ -138,11 +138,12 @@ fn permission_allows(query: Support, p: MicPermission) -> Result<(), CaptureRefu
 /// The ONLY spawn of blocking work in fogar-core. Review M2 (architecture owner's decision): a
 /// TEMPORARY exception to "no blocking work in core" until the audio port becomes async in the
 /// adapter (issue #31); then this function and its `allow` go away. Every device call of the
-/// gate (open, drop of a capture) goes through here and nothing else may.
+/// two audio gates (open and drop of a capture here; open and drop of a playback in
+/// `playback.rs`, S2 3c) goes through here and nothing else may.
 #[allow(clippy::disallowed_methods)] // M2 exception, issue #31 (see above).
-fn spawn_device_job(
-    jobs: &mut JoinSet<Job>,
-    job: impl FnOnce() -> Job + Send + 'static,
+pub(crate) fn spawn_device_job<T: Send + 'static>(
+    jobs: &mut JoinSet<T>,
+    job: impl FnOnce() -> T + Send + 'static,
 ) -> AbortHandle {
     jobs.spawn_blocking(job)
 }

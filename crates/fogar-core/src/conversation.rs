@@ -34,6 +34,11 @@ fn bounded(s: &str) -> &str {
     cut(s, ID_MAX_BYTES)
 }
 
+/// A gateway id as the view shows it (and as the app sends it back in `TurnVisible`).
+pub(crate) fn bounded_id(s: &str) -> &str {
+    bounded(s)
+}
+
 /// `s` cut to `max` bytes at a char boundary.
 fn cut(s: &str, max: usize) -> &str {
     if s.len() <= max {
@@ -254,10 +259,26 @@ pub fn end_open(v: &mut ConversationView, o: TurnOutcome) -> bool {
     changed
 }
 
-/// TTS audio of this turn reached the speaker.
-pub fn audio_played(v: &mut ConversationView, turn_id: &str) -> bool {
-    match open_turn(v, turn_id) {
-        Some(t) => set(&mut t.audio, TurnAudio::Played),
+/// The playback gate's state: whether audio plays now and which turn waits for `TurnVisible`.
+pub fn playback(v: &mut ConversationView, speaking: bool, awaiting: Option<&str>) -> bool {
+    let mut changed = set(&mut v.speaking, speaking);
+    if v.awaiting_visible.as_deref() != awaiting {
+        v.awaiting_visible = awaiting.map(str::to_owned);
+        changed = true;
+    }
+    changed
+}
+
+/// The audio of turn `view_id` (as the view shows it) played, or was muted (nobody confirmed it
+/// on screen in time: it stays text only). Also for a turn that already ended (its audio may
+/// still play after `turn_end`); `Played` is never turned into `Muted`.
+pub fn turn_audio(v: &mut ConversationView, view_id: &str, audio: TurnAudio) -> bool {
+    if view_id.is_empty() {
+        return false;
+    }
+    match v.turns.iter_mut().rev().find(|t| t.turn_id == view_id) {
+        Some(t) if t.audio == TurnAudio::Played => false,
+        Some(t) => set(&mut t.audio, audio),
         None => false,
     }
 }
@@ -608,13 +629,33 @@ mod tests {
     }
 
     #[test]
-    fn audio_played_marks_the_open_turn_once() {
+    fn turn_audio_marks_once_and_never_unplays() {
         let mut v = ConversationView::default();
         on_server(&mut v, &start("t-1", None), PUSH);
-        assert!(audio_played(&mut v, "t-1"));
-        assert!(!audio_played(&mut v, "t-1"));
-        assert!(!audio_played(&mut v, ""));
+        assert!(turn_audio(&mut v, "t-1", TurnAudio::Played));
+        assert!(!turn_audio(&mut v, "t-1", TurnAudio::Played));
+        assert!(!turn_audio(&mut v, "", TurnAudio::Played));
+        assert!(
+            !turn_audio(&mut v, "t-1", TurnAudio::Muted),
+            "Played stays Played"
+        );
         assert_eq!(v.turns[0].audio, TurnAudio::Played);
+        // A turn that already ended can still be marked (its audio outlives turn_end).
+        on_server(&mut v, &start("t-2", None), PUSH);
+        end_open(&mut v, TurnOutcome::Done);
+        assert!(turn_audio(&mut v, "t-2", TurnAudio::Muted));
+        assert_eq!(v.turns[1].audio, TurnAudio::Muted);
+    }
+
+    #[test]
+    fn playback_state_shows_speaking_and_the_turn_awaiting_visibility() {
+        let mut v = ConversationView::default();
+        assert!(!playback(&mut v, false, None));
+        assert!(playback(&mut v, false, Some("t-1")));
+        assert_eq!(v.awaiting_visible.as_deref(), Some("t-1"));
+        assert!(!playback(&mut v, false, Some("t-1")));
+        assert!(playback(&mut v, true, None));
+        assert!(v.speaking && v.awaiting_visible.is_none());
     }
 
     #[test]

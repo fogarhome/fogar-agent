@@ -111,7 +111,7 @@ async fn full_speaker_buffer_drops_and_counts_without_stalling_the_session() {
     b.speaker = FakeSpeaker::healthy()
         .with_capacity(1000)
         .without_recording();
-    b.with_ipc = true;
+    let b = b.app_on_screen();
     let mut rig = b.start();
     wait_ready(&mut rig.health).await;
     say(&rig, "pon la serie").await;
@@ -120,7 +120,8 @@ async fn full_speaker_buffer_drops_and_counts_without_stalling_the_session() {
     })
     .await;
     let s = rig.health.snapshot().stats;
-    assert_eq!(s.tts_frames_played, 20);
+    // Issue #25: only frames the output accepted count as played (480 + 480 + 40 samples).
+    assert_eq!(s.tts_frames_played, 3);
     assert_eq!(s.tts_samples_dropped, 20 * 480 - 1000);
     assert_eq!(rig.speaker.snapshot().accepted, 1000);
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);

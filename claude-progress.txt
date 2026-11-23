@@ -298,3 +298,38 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
   legitimate takes (with partials and a silence warning) before the random traffic, counts
   permission requests (== permission_requests()), adds malformed JSON; owner-gone tests pin each
   branch; partial test asserts the device is released.
+
+## S2 — PR 3c: the single output point in core (2026-11-23, core-async)
+- playback.rs: PlaybackGate, the only holder of the speaker (agent.rs hands it the AudioSink;
+  the engine no longer names it, so archtest R12 tightened by itself). The engine keeps the gate
+  in its task state, polls it before `in_rx` (its timers and device jobs are not starved).
+- Rule «nunca suena sin algo visible»: a turn's audio plays only after IpcRequest::TurnVisible
+  for that turn (id as the view shows it), from a same-signer connection subscribed to the
+  conversation (ipc.rs: otherwise Refused "not subscribed to the conversation"; an id longer
+  than ID_MAX_BYTES is noted and matches nothing). Until then its audio waits in a 3 s buffer;
+  2 s after turn_start without confirmation, or with the buffer full, the turn is muted (audio
+  discarded, tts_turns_muted / tts_samples_muted, TurnAudio::Muted) and a late confirmation
+  changes nothing. The device is never opened for unconfirmed audio. The view carries
+  awaiting_visible and speaking.
+- Issue #24 (playback part): open and drop of ActivePlayback run on the blocking pool through
+  the existing capture::spawn_device_job (made generic; still the single #[allow], clippy.toml
+  untouched); one open in flight, core-side OPEN_DEADLINE, late handle released, no open while
+  a release runs; stop waits 0.5 s then detaches.
+- Issue #25: is_alive() checked before every write; a dead output is released off the runtime
+  and reopened lazily (when there is confirmed audio) with backoff 0.5 s doubling to 8 s,
+  without waiting for SessionDown. tts_frames_played counts only frames a live output accepted
+  (>= 1 sample); the rest goes to tts_samples_dropped. Accepted risk of #27 resolved in core.
+- Energy: the output is released 2 s after it drained with no turn open (drain check at the
+  estimated end of what is queued, never more often than 100 ms) and on SessionDown.
+- Tests (Linux, paused time unless noted): engine output suite (property over 48 seeds of
+  random gateway traffic with valid TTS frames, link drops, texts and cancels: FakeSpeaker never
+  opened, then a confirmed turn does sound as control; ordered flush; late confirmation; 1.9 s
+  confirmation plays; push without window; full buffer; wrong id; cancel; dead output; backoff;
+  idle close; link down), playback unit tests (open/drop off a current_thread runtime; late
+  open released), IPC test over FakeIpc. Mutation-checked: making turns start as Seen fails 7
+  tests; ignoring is_alive fails the two #25 tests. Integration rigs that expect audio now run
+  the app on screen (RigBuilder::app_on_screen: subscribes and confirms every awaiting turn);
+  backpressure: tts_frames_played 20 -> 3 (new meaning).
+- NOT done: latencies (3d); E2E over the real WebSocket with the app confirming; anything on
+  macOS/M2 (real output adapter, energy). The app must send TurnVisible (apps/macos, PR 6 /
+  later): until it does, Fogar is silent by design.

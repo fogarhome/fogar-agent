@@ -22,6 +22,7 @@ use crate::{
     heartbeat::Heartbeat,
     link::{Inbound, LinkCtx, LinkView},
     pairing::Pairing,
+    playback::PlaybackGate,
     queues,
     stats::{Health, LinkState, Stats},
     time::deadline,
@@ -194,7 +195,6 @@ impl<C: Clock> Agent<C> {
             clock: ports.clock.clone(),
             cfg: cfg.clone(),
             stats: stats.clone(),
-            audio_out: ports.audio_out,
             out_tx,
             in_rx,
             cmd_rx,
@@ -202,7 +202,9 @@ impl<C: Clock> Agent<C> {
         };
         // The microphone goes straight to the consent gate: the engine never holds it.
         let capture = CaptureGate::new(ports.audio_in, &cfg, stats.clone());
-        data.spawn(engine.run(capture, ingress.clone()));
+        // The speaker goes straight to the output gate: nothing sounds unseen (S2 3c).
+        let playback = PlaybackGate::new(ports.audio_out, stats.clone());
+        data.spawn(engine.run(capture, playback, ingress.clone()));
 
         let link = LinkCtx {
             clock: ports.clock.clone(),
