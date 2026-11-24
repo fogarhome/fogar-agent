@@ -1,11 +1,12 @@
-//! Protocol-v1 mock gateway. One connection driver (`driver.rs`) implements the server side of
+//! Mock gateway for protocol v1, at gateway 5.0. One connection driver (`driver.rs`) implements the server side of
 //! the protocol as PROTOCOL-SPEC.md describes it; two transports run it:
 //! - [`MockGateway`]: a real local WebSocket server (tokio-tungstenite) for end-to-end tests;
 //! - [`FakeGatewayLink`]: an in-memory `GatewayLink` for paused-time tests (reconnect/backoff,
 //!   72 h soak), where real sockets would race the auto-advancing clock.
 //!
 //! Server behaviour modelled (spec section in brackets): handshake without `type`, 5 s timeout,
-//! 4096-char limit, key check with the exact 1008 reasons [§4, §11]; optional `status` before
+//! 4096-char limit, `protocol: 5` (close 4003, checked before the key; `ready` repeats it, 5.0
+//! #417; `MockConfig::require_protocol = false` plays a 4.x gateway), key check with the exact 1008 reasons [§4, §11]; optional `status` before
 //! `ready` [§5]; `end` -> `transcription_partial` + `transcription` [§7]; `send` replaces the
 //! active turn [§9]; `turn_start`/`token`/paced `0xA1` audio/`turn_end` [§7, §12]; `cancel` ->
 //! `turn_end` [§6]; idle close 1000 after client silence [§13]; malformed JSON ->
@@ -21,11 +22,11 @@
 //! (`FOGAR_GATEWAY_DIR`) has a different `docs/client-protocol.md`: review the diff, update the
 //! mock, then bump both constants.
 
-/// fogar-gateway commit (main, release 3.0.1) whose `docs/client-protocol.md` this mock was last
+/// fogar-gateway commit (`origin/next/5.0`, gateway 5.0) whose `docs/client-protocol.md` this mock was last
 /// checked against.
-pub const SPEC_GATEWAY_COMMIT: &str = "d09ce82b9350eb42f6d14c087b00ec0c0104bc6b";
+pub const SPEC_GATEWAY_COMMIT: &str = "fb019b88769e53824d15c2bf6b86e8e940f3614a";
 /// `git hash-object docs/client-protocol.md` at [`SPEC_GATEWAY_COMMIT`].
-pub const SPEC_BLOB: &str = "2477564d47201206057e139a5b4aece5e3401b94";
+pub const SPEC_BLOB: &str = "b1f9d584b97f085faee428a6804355b174e28548";
 
 mod driver;
 mod http;
@@ -33,8 +34,8 @@ mod memory;
 mod ws;
 
 pub use driver::{
-    Ctl, GatewayLog, MockConfig, REASON_BAD_JSON, REASON_BAD_KEY, REASON_NOT_TEXT, REASON_TIMEOUT,
-    REASON_TOO_LARGE,
+    Ctl, GatewayLog, MockConfig, REASON_BAD_JSON, REASON_BAD_KEY, REASON_NOT_TEXT, REASON_PROTOCOL,
+    REASON_TIMEOUT, REASON_TOO_LARGE,
 };
 pub use http::{
     FakeGatewayHttp, FakeStreamBody, HttpRoutes, MockHttpServer, SeenRequest, StreamStep,

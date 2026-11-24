@@ -107,9 +107,7 @@ fn ws_refuses_a_lan_name_that_resolves_public() {
 #[test]
 fn http_connects_to_the_resolved_private_address() {
     run_async(async {
-        let s = MockHttpServer::start(HttpRoutes::fogar("green-house"))
-            .await
-            .unwrap();
+        let s = MockHttpServer::start(HttpRoutes::fogar()).await.unwrap();
         let addr = GatewayAddr::parse(&format!("green-house:{}", s.addr().port())).unwrap();
         let res = Fixed::new(&["127.0.0.1"]);
         let h = HttpGateway::with_resolver(HttpConfig::default(), res.clone());
@@ -150,9 +148,7 @@ fn ws_connects_to_the_resolved_private_address() {
 #[test]
 fn http_falls_back_to_the_next_resolved_address() {
     run_async(async {
-        let s = MockHttpServer::start(HttpRoutes::fogar("green-house"))
-            .await
-            .unwrap();
+        let s = MockHttpServer::start(HttpRoutes::fogar()).await.unwrap();
         let addr = GatewayAddr::parse(&format!("green-house:{}", s.addr().port())).unwrap();
         // The mock listens on 127.0.0.1 only: ::1 refuses, then 127.0.0.1 answers.
         let h =

@@ -22,7 +22,7 @@ async fn session(
     let link = FakeGatewayLink::new(cfg);
     let mut s = link.connect(&link.addr(), WsRoute::Stream).await.unwrap();
     s.send(Frame::Text(format!(
-        r#"{{"client_key":"test-client-key","input_mode":"audio","output_mode":{output_mode}}}"#
+        r#"{{"client_key":"test-client-key","protocol":5,"input_mode":"audio","output_mode":{output_mode}}}"#
     )))
     .await
     .unwrap();
