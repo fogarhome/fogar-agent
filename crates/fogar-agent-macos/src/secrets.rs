@@ -74,6 +74,7 @@ fn account(key: SecretKey) -> Result<&'static str, SecretError> {
     match key {
         SecretKey::GatewayClientKey => Ok("gateway_client_key"),
         SecretKey::GatewayPairing => Ok("gateway_pairing"),
+        SecretKey::GatewayAccount => Ok("gateway_account"),
         _ => Err(SecretError::Unsupported(
             "secret key without a keychain account",
         )),

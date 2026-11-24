@@ -232,7 +232,11 @@ pub mod secret_store {
     /// Round trip, overwrite, delete-missing is Ok. Adapters backed by a real user store must be
     /// constructed on a TEST location (temp dir / test keychain service name).
     pub fn put_get_delete(s: &dyn SecretStore) {
-        for k in [SecretKey::GatewayClientKey, SecretKey::GatewayPairing] {
+        for k in [
+            SecretKey::GatewayClientKey,
+            SecretKey::GatewayPairing,
+            SecretKey::GatewayAccount,
+        ] {
             put_get_delete_one(s, k);
         }
     }
@@ -252,6 +256,14 @@ pub mod secret_store {
             r#"{"json":"record"}"#
         );
         assert!(s.get(a).unwrap().is_none());
+        // The account never clobbers the pairing record (S4: both may coexist during migration).
+        let c = SecretKey::GatewayAccount;
+        s.put(b, SecretString::from("pairing".to_owned())).unwrap();
+        s.put(c, SecretString::from("account".to_owned())).unwrap();
+        assert_eq!(s.get(b).unwrap().unwrap().expose_secret(), "pairing");
+        assert_eq!(s.get(c).unwrap().unwrap().expose_secret(), "account");
+        s.delete(c).unwrap();
+        assert_eq!(s.get(b).unwrap().unwrap().expose_secret(), "pairing");
         s.delete(b).unwrap();
     }
 

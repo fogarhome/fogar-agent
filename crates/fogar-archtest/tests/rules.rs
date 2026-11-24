@@ -20,6 +20,7 @@
 //!     fogar-core: the single consent point of spec S2
 //!  R12 only `playback.rs` (and `agent.rs`) names the speaker port: nothing sounds unseen
 //!  R13 only `capture.rs` asks the OS for the microphone permission
+//!  R14 only `account.rs` names the gateway-account secret (S4: spec S4 B1)
 //!     (R11/R12 tolerate today's `engine.rs` until the owner file exists, then tighten alone)
 //!
 //! Every checker has a self-test (`selftest_*`) that plants the violation in a temporary
@@ -754,6 +755,17 @@ fn r13_only_the_capture_gate_asks_for_the_permission() {
     }
 }
 
+/// R14: the personal-account Keychain item holds the token; only `account.rs` may name it.
+/// (S4: solo `account.rs` maneja la cuenta, spec S4 B1.) Passes while that file is absent.
+#[test]
+fn r14_only_the_account_owner_names_the_account_secret() {
+    let bad = single_owner_violations(&core_sources(), &["GatewayAccount"], &["account.rs"]);
+    assert!(
+        bad.is_empty(),
+        "account secret named outside account.rs: {bad:#?}"
+    );
+}
+
 #[test]
 fn selftest_single_owner_rules_fire() {
     let src = |name: &str, text: &str| (PathBuf::from(name), text.to_owned());
@@ -781,6 +793,13 @@ fn selftest_single_owner_rules_fire() {
     assert!(bad[0].contains("link.rs:1: `AudioSource`"));
     let bad = single_owner_violations(&planted, &["request_mic_permission"], &["capture.rs"]);
     assert_eq!(bad.len(), 1, "{bad:#?}");
+    let acct = [
+        src("account.rs", "s.get(SecretKey::GatewayAccount)"),
+        src("link.rs", "s.get(SecretKey::GatewayAccount)"),
+    ];
+    let bad = single_owner_violations(&acct, &["GatewayAccount"], &["account.rs"]);
+    assert_eq!(bad.len(), 1, "{bad:#?}");
+    assert!(bad[0].contains("link.rs:1: `GatewayAccount`"));
     // Self-tightening: engine.rs is tolerated only until capture.rs exists.
     let before = [src("engine.rs", "")];
     assert_eq!(
