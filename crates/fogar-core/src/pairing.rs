@@ -312,7 +312,11 @@ impl<C: Clock, H: GatewayHttp, T: TailnetPeers> Pairing<C, H, T> {
             if let Ok((i, addr, Probe::Fogar(wk))) = r {
                 found.push((
                     i,
-                    GatewayCandidate::new(addr.to_string(), label(wk.name), label(wk.version)),
+                    GatewayCandidate::new(
+                        addr.to_string(),
+                        label(wk.name.unwrap_or_default()),
+                        label(wk.version),
+                    ),
                 ));
             }
         }

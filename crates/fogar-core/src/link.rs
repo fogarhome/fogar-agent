@@ -22,8 +22,9 @@ use fogar_ports::{
     secrets::{ExposeSecret, SecretError, SecretKey, SecretStore},
 };
 use fogar_proto::{
-    ClientMsg, CloseAction, Handshake, ServerMsg, classify_close, close::CLOSE_ABNORMAL,
-    close::CLOSE_NORMAL, decode_server, encode_client, encode_handshake, server::Capabilities,
+    ClientMsg, CloseAction, Handshake, ServerMsg, classify_close, client::PROTOCOL_VERSION,
+    close::CLOSE_ABNORMAL, close::CLOSE_NORMAL, decode_server, encode_client, encode_handshake,
+    server::Capabilities,
 };
 use std::{borrow::Cow, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, watch};
@@ -234,6 +235,8 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                         CloseAction::Repair
                         | CloseAction::AgentRefused
                         | CloseAction::FixClient
+                        // Task 3 gives 4003 its own behaviour; parked like FixClient for now.
+                        | CloseAction::UpgradeClient
                         | CloseAction::ConversationTaken => {
                             if self.park(action, &egress).await {
                                 attempt = 0;
@@ -335,6 +338,7 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
         };
         let hs = Handshake {
             client_key: Cow::Borrowed(record.client_key().expose_secret()),
+            protocol: PROTOCOL_VERSION,
             input_mode: self.cfg.input_mode,
             output_mode: self.cfg.output_mode.clone(),
             agent: self.cfg.agent.as_deref().map(Cow::Borrowed),

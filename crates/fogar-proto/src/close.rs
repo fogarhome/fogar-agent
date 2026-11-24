@@ -18,6 +18,9 @@ pub enum CloseAction {
     /// Bug on our side (bad handshake, oversize) or an application refusal we cannot fix by
     /// retrying (M19 4000–4899 we do not know): do not loop.
     FixClient,
+    /// 4003: this client speaks a protocol the gateway does not support; never auto-retry, the app
+    /// must be updated. CERTAIN (5.0, #417).
+    UpgradeClient,
     /// M19 4102: another session of this client opened our conversation. Reconnecting on our own
     /// would close it, and it would do the same: the two would evict each other forever. Park.
     ConversationTaken,
@@ -41,6 +44,7 @@ pub fn classify_close(code: u16, reason: &str) -> CloseAction {
         // M19 (gateway v3): the code is the contract.
         4010 | 4200 => CloseAction::Repair,
         4020 | 4021 => CloseAction::AgentRefused,
+        4003 => CloseAction::UpgradeClient,
         4102 => CloseAction::ConversationTaken,
         4000..=4899 => CloseAction::FixClient,
         4900..=4999 => CloseAction::RetryBackoff,

@@ -388,6 +388,7 @@ impl Conn {
             output_mode: hs.output_mode.clone(),
             requested_capabilities: caps,
             live_capabilities: live,
+            protocol: None,
         });
         matches!(self.send(t, &ready).await, Step::Continue)
     }

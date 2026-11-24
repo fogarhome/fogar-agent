@@ -72,6 +72,9 @@ pub struct Ready {
     pub requested_capabilities: Capabilities,
     #[serde(default, deserialize_with = "lenient_capabilities")]
     pub live_capabilities: Capabilities,
+    /// Protocol version the gateway speaks (5.0+). `None` if absent, `null` or not a `u32`.
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub protocol: Option<u32>,
 }
 
 // --- tolerant `ready` fields without an intermediate tree (round-2 review F5) ----------------
@@ -200,6 +203,52 @@ fn lenient_string<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
 
 fn lenient_opt_string<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
     d.deserialize_any(Lenient::<String>(PhantomData))
+}
+
+/// A JSON integer that fits `u32`; anything else is `None`.
+struct LenientU32;
+
+impl<'de> Visitor<'de> for LenientU32 {
+    type Value = Option<u32>;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+        Ok(u32::try_from(v).ok())
+    }
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+        Ok(u32::try_from(v).ok())
+    }
+    fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_any(self)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, a: A) -> Result<Self::Value, A::Error> {
+        drain_seq(a)?;
+        Ok(None)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, a: A) -> Result<Self::Value, A::Error> {
+        drain_map(a)?;
+        Ok(None)
+    }
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+}
+
+fn lenient_u32<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    d.deserialize_any(LenientU32)
 }
 
 fn lenient_input_mode<'de, D: Deserializer<'de>>(d: D) -> Result<Option<InputMode>, D::Error> {
@@ -674,6 +723,12 @@ pub enum TurnErrorReason {
     TurnOverflow,
     TurnInProgress,
     InternalError,
+    // CERTAIN (5.0, #417)
+    OrchestratorAuthFailed,
+    OrchestratorModelUnavailable,
+    OrchestratorRateLimited,
+    OrchestratorTimeout,
+    OrchestratorAgentUnavailable,
     Other,
 }
 
@@ -697,6 +752,11 @@ impl ErrorMsg {
             "turn_overflow" => TurnErrorReason::TurnOverflow,
             "turn_in_progress" => TurnErrorReason::TurnInProgress,
             "internal_error" => TurnErrorReason::InternalError,
+            "orchestrator_auth_failed" => TurnErrorReason::OrchestratorAuthFailed,
+            "orchestrator_model_unavailable" => TurnErrorReason::OrchestratorModelUnavailable,
+            "orchestrator_rate_limited" => TurnErrorReason::OrchestratorRateLimited,
+            "orchestrator_timeout" => TurnErrorReason::OrchestratorTimeout,
+            "orchestrator_agent_unavailable" => TurnErrorReason::OrchestratorAgentUnavailable,
             _ => TurnErrorReason::Other,
         })
     }
