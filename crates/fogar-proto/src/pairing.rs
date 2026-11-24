@@ -16,7 +16,7 @@ pub const WELL_KNOWN_PATHS: [&str; 2] = ["/.well-known/fogar-gateway", "/.well-k
 pub struct WellKnown {
     pub service: String,
     pub version: String,
-    /// Gone in 5.0 (the name arrives in `/pair` as `gateway.name`); a 4.x gateway still sends it.
+    /// CERTAIN (5.0, #417). Gone in 5.0 (the name arrives in `/pair` as `gateway.name`); a 4.x gateway still sends it.
     #[serde(default)]
     pub name: Option<String>,
 }

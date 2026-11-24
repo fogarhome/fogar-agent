@@ -91,9 +91,9 @@ enum Textos {
                            sub: "Algo más (otra pestaña del panel u otro cliente) abrió en \(gw) la conversación que usaba este Mac, así que este Mac se ha apartado. Pulsa Reconectar cuando quieras volver: la otra sesión se cerrará.",
                            tono: .bad)
         case "parked_upgrade_client":
-            // Gateway 5.0 close 4003: this client's protocol is not supported; retrying never helps.
+            // Gateway 5.0 close 4003: this client's protocol is not supported; retrying by itself never helps; the person may press Reconectar.
             return Titular(titulo: "Hay que actualizar Fogar Desktop",
-                           sub: "El gateway habla una versión nueva. Actualiza Fogar Desktop.",
+                           sub: "El gateway habla una versión nueva. Actualiza Fogar Desktop; si ya lo hiciste, pulsa Reconectar.",
                            tono: .bad)
         default:
             return Titular(titulo: "El agente se ha parado",

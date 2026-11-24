@@ -49,9 +49,11 @@ pub struct Config {
     /// resamples; a capture delivered at another format is closed and the take refused.
     pub upload_rate_hz: u32,
     /// A take is cut (outcome `Review`, never sent) when no new non-empty
-    /// `transcription_partial` arrived for this long. 5 s: before the gateway's silence
-    /// watchdog closes the session (third warning after ~6 s with its default
-    /// `silence_timeout_s` 2 s x `max_silence_turns` 3; spec S2 «Límites de una toma»).
+    /// `transcription_partial` arrived for this long. Gateway 5.0's silence watchdog only warns
+    /// and never closes, so this is the only guard there. A 4.x gateway still closes at ~6 s with
+    /// its defaults (`silence_timeout_s` 2 s x `max_silence_turns` 3); 5 s beats it by ~1 s, but an
+    /// admin's per-client value below 5 s on 4.x can make the gateway close first (spec S2
+    /// «Límites de una toma»).
     pub capture_silence_cut: Duration,
     /// Privacy net for a forgotten take that keeps hearing something (a TV): cut with `Review`.
     pub capture_safety_cut: Duration,

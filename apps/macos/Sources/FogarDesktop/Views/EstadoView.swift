@@ -73,7 +73,7 @@ private struct Cabecera: View {
         case .live(let s) where s.link == "parked_repair":
             Button("Ir a Ajustes") { nav.seccion = .ajustes }
                 .buttonStyle(Pildora(variante: .principal))
-        case .live(let s) where s.link == "parked_conversation_taken" || s.link == "parked_agent_refused":
+        case .live(let s) where s.link == "parked_conversation_taken" || s.link == "parked_agent_refused" || s.link == "parked_upgrade_client":
             Button("Reconectar", action: reconectar)
                 .buttonStyle(Pildora(variante: .principal))
                 .disabled(trabajando)

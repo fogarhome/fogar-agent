@@ -155,7 +155,7 @@ pub(crate) enum Cut {
     OwnerGone,
     /// The adapter ended the chunk stream (device lost, fatal error).
     DeviceEnded,
-    /// Nothing new heard for `capture_silence_cut`, or the gateway's second silence warning.
+    /// Nothing new heard for `capture_silence_cut`.
     Silence,
     /// `capture_safety_cut` reached.
     Safety,

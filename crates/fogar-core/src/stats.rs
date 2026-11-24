@@ -35,13 +35,16 @@ pub enum LinkState {
 
 impl LinkState {
     /// Parked for a reason only the person can settle, so their `Reconnect` gets one new attempt:
-    /// 4102 (spec §13: "reconecta solo si lo pide el usuario") and 4020/4021 (the admin may have
-    /// allowed the agent meanwhile). Not `Repair`/`FixClient`: the same request fails the same way.
+    /// 4102 (spec §13: "reconecta solo si lo pide el usuario") 4020/4021 (the admin may have
+    /// allowed the agent meanwhile) and 4003 (the person may have updated the gateway; one
+    /// attempt, and a second 4003 parks again). Not `Repair`/`FixClient`: the same request fails the same way.
     pub fn user_may_reconnect(&self) -> bool {
         matches!(
             self,
             LinkState::Parked {
-                reason: CloseAction::ConversationTaken | CloseAction::AgentRefused
+                reason: CloseAction::ConversationTaken
+                    | CloseAction::AgentRefused
+                    | CloseAction::UpgradeClient
             }
         )
     }

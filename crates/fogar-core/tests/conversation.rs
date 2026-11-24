@@ -464,6 +464,41 @@ async fn requests_are_read_under_a_dense_push_stream() {
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
 
+/// A gateway `TURN_ERROR` (here the 5.0 rate limit) reaches the app's view as `error_code`.
+#[tokio::test(start_paused = true)]
+async fn orchestrator_rate_limited_reaches_the_view_as_error_code() {
+    let mock = paced(100_000);
+    let inner = fogar_testkit::FakeGatewayLink::new(mock.clone());
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(4);
+    let link = flood::FloodLink {
+        inner: inner.clone(),
+        rx: Arc::new(std::sync::Mutex::new(Some(rx))),
+    };
+    let mut b = RigBuilder::with_link(link, &mock.client_key);
+    b.with_ipc = true;
+    let mut rig = b.start();
+    wait_ready(&mut rig.health).await;
+    let (mut sub, _) = subscribe(&rig).await;
+    assert_eq!(inner.control(Ctl::Push), 1);
+    until(&mut sub, |v| {
+        v.turns.last().is_some_and(|t| t.turn_id == "t-1")
+    })
+    .await;
+    tx.try_send(
+        r#"{"type":"error","code":"TURN_ERROR","message":"orchestrator_rate_limited","fatal":false,"turn_id":"t-1"}"#
+            .to_owned(),
+    )
+    .unwrap();
+    let v = until(&mut sub, |v| {
+        v.turns.last().is_some_and(|t| t.outcome.is_some())
+    })
+    .await;
+    let t = v.turns.last().unwrap();
+    assert_eq!(t.outcome, Some(TurnOutcome::Error));
+    assert_eq!(t.error_code.as_deref(), Some("orchestrator_rate_limited"));
+    assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
+}
+
 /// A uid-only status subscriber never sees the conversation, even while a turn streams.
 #[tokio::test(start_paused = true)]
 async fn uid_only_status_subscriber_never_gets_the_conversation() {
