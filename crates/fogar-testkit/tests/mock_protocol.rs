@@ -83,3 +83,35 @@ fn a_4x_gateway_does_not_check_nor_send_protocol() {
         assert_eq!(r.protocol, None);
     });
 }
+
+#[test]
+fn legacy_m19_off_does_not_require_protocol() {
+    fogar_testkit::run_async(async {
+        let mut cfg = MockConfig::default();
+        cfg.m19 = false;
+        let Ok(ServerMsg::Ready(r)) = first(cfg, NO_PROTOCOL).await else {
+            panic!("no ready")
+        };
+        assert_eq!(r.protocol, None);
+    });
+}
+
+async fn first_frame(frame: Frame) -> (u16, String) {
+    let link = FakeGatewayLink::new(MockConfig::default());
+    let mut s = link.connect(&link.addr(), WsRoute::Stream).await.unwrap();
+    s.send(frame).await.unwrap();
+    loop {
+        if let LinkEvent::Closed { code, reason } = s.recv().await.unwrap() {
+            return (code, reason);
+        }
+    }
+}
+
+#[test]
+fn binary_and_oversized_handshakes_win_over_4003() {
+    fogar_testkit::run_async(async {
+        assert_eq!(first_frame(Frame::Binary(vec![1, 2])).await.0, 4001);
+        let big = format!(r#"{{"pad":"{}"}}"#, "x".repeat(5000));
+        assert_eq!(first_frame(Frame::Text(big)).await.0, 4002);
+    });
+}

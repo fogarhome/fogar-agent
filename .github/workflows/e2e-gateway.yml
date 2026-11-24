@@ -1,3 +1,4 @@
+# This branch tracks the gateway's next/5.0 (GATEWAY_LATEST) until 5.0 ships.
 # E2E of fogar-agent against the REAL fogar-gateway (Python, its fake OpenClaw, no STT/TTS), and
 # the drift check of the Rust mock against the gateway spec (crates/fogar-testkit/tests/spec_pin.rs).
 # - push / pull_request: must be green before merge (a red check; NOT enforced: this plan has no
@@ -26,7 +27,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_TOOLCHAIN: "1.97.0"
   # The newest gateway development line ("latest").
-  GATEWAY_LATEST: main
+  GATEWAY_LATEST: next/5.0
   UV_PYTHON: "3.12"
 
 jobs:

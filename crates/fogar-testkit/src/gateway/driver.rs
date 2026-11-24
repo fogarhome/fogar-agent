@@ -56,7 +56,7 @@ pub struct MockConfig {
     /// `ready` and `live_capabilities` all false (3.0.1 §3). Text still works.
     pub voice: bool,
     /// 5.0: the handshake must carry `protocol: 5` (else close 4003) and `ready` repeats it.
-    /// `false` plays a 4.x gateway: no check, no `protocol` in `ready`. Default `true`.
+    /// Only in M19 mode. `false` plays a 4.x gateway: no check, no `protocol` in `ready`. Default `true`.
     pub require_protocol: bool,
 }
 
@@ -331,7 +331,8 @@ impl Conn {
         };
         let has_type = obj.contains_key("type");
         // 5.0 doc: 4003 comes before the rest of the handshake and the credential.
-        if self.cfg.require_protocol
+        if self.cfg.m19
+            && self.cfg.require_protocol
             && obj.get("protocol").and_then(serde_json::Value::as_u64)
                 != Some(u64::from(PROTOCOL_VERSION))
         {
@@ -407,7 +408,7 @@ impl Conn {
             output_mode: hs.output_mode.clone(),
             requested_capabilities: caps,
             live_capabilities: live,
-            protocol: self.cfg.require_protocol.then_some(PROTOCOL_VERSION),
+            protocol: (self.cfg.m19 && self.cfg.require_protocol).then_some(PROTOCOL_VERSION),
         });
         matches!(self.send(t, &ready).await, Step::Continue)
     }

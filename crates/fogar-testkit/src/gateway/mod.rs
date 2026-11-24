@@ -1,5 +1,5 @@
-//! Mock gateway for protocol v1, at gateway 5.0. One connection driver (`driver.rs`) implements the server side of
-//! the protocol as PROTOCOL-SPEC.md describes it; two transports run it:
+//! Mock gateway for protocol v1, at gateway 5.0. One connection driver (`driver.rs`) implements
+//! the server side of the protocol as PROTOCOL-SPEC.md describes it; two transports run it:
 //! - [`MockGateway`]: a real local WebSocket server (tokio-tungstenite) for end-to-end tests;
 //! - [`FakeGatewayLink`]: an in-memory `GatewayLink` for paused-time tests (reconnect/backoff,
 //!   72 h soak), where real sockets would race the auto-advancing clock.
