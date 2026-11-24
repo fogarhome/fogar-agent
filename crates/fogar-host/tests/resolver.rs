@@ -74,6 +74,20 @@ fn http_refuses_a_lan_name_that_resolves_public() {
 }
 
 #[test]
+fn stream_refuses_a_lan_name_that_resolves_public() {
+    run_async(async {
+        let addr = GatewayAddr::parse("green-house:8004").unwrap();
+        let tok = secrecy::SecretString::from("t");
+        for ips in HOSTILE {
+            let h = HttpGateway::with_resolver(HttpConfig::default(), Fixed::new(ips));
+            let call = HttpCall::Events { audio: false };
+            let r = bounded(h.open_stream(&addr, &call, &tok, None, None)).await;
+            assert!(matches!(r, Err(HttpError::Refused)), "{ips:?}");
+        }
+    })
+}
+
+#[test]
 fn ws_refuses_a_lan_name_that_resolves_public() {
     run_async(async {
         let addr = GatewayAddr::parse("green-house:8004").unwrap();
@@ -81,6 +95,11 @@ fn ws_refuses_a_lan_name_that_resolves_public() {
             let link = WsGatewayLink::with_resolver(WsConfig::default(), Fixed::new(ips));
             let r = bounded(link.connect(&addr, WsRoute::Stream)).await;
             assert!(matches!(r, Err(LinkError::NotConfigured)), "{ips:?}");
+            let r = bounded(link.connect(&addr, WsRoute::Dictation)).await;
+            assert!(
+                matches!(r, Err(LinkError::NotConfigured)),
+                "dictation {ips:?}"
+            );
         }
     })
 }

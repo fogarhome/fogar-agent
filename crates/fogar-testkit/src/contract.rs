@@ -263,6 +263,7 @@ pub mod secret_store {
         assert_eq!(s.get(b).unwrap().unwrap().expose_secret(), "pairing");
         assert_eq!(s.get(c).unwrap().unwrap().expose_secret(), "account");
         s.delete(c).unwrap();
+        assert!(s.get(c).unwrap().is_none());
         assert_eq!(s.get(b).unwrap().unwrap().expose_secret(), "pairing");
         s.delete(b).unwrap();
     }
@@ -676,6 +677,17 @@ pub mod gateway_link {
         s.close(1000, "").await.unwrap(); // idempotent
     }
 
+    /// `connect(addr, WsRoute::Stream)` reaches the stream route.
+    pub async fn stream_route_is_recorded<L: GatewayLink>(
+        link: &L,
+        addr: &GatewayAddr,
+        gw: &impl RouteLog,
+    ) {
+        let mut s = link.connect(addr, WsRoute::Stream).await.expect("connect");
+        assert_eq!(gw.routes_used().last(), Some(&WsRoute::Stream));
+        s.close(1000, "").await.unwrap();
+    }
+
     pub async fn oversized_frame_is_rejected_and_session_survives<L: GatewayLink>(
         link: &L,
         addr: &GatewayAddr,
@@ -871,6 +883,13 @@ pub mod gateway_link {
                     $crate::run_async(async {
                         let (link, gw) = $make;
                         c::connects_and_gets_ready(&link, &gw.addr()).await
+                    })
+                }
+                #[test]
+                fn stream_route_is_recorded() {
+                    $crate::run_async(async {
+                        let (link, gw) = $make;
+                        c::stream_route_is_recorded(&link, &gw.addr(), &gw).await
                     })
                 }
                 #[test]
@@ -1629,7 +1648,7 @@ pub mod gateway_http {
         addr: &GatewayAddr,
         routes: &HttpRoutes,
     ) {
-        for t in ["a\r\nX-Evil: 1", "a b", ""] {
+        for t in ["a\r\nX-Evil: 1", "a b", "", "a\x7fb", "tök", "\n"] {
             let r =
                 bounded(h.request(addr, &HttpCall::Me, Some(&SecretString::from(t)), None)).await;
             assert!(matches!(r, Err(HttpError::Refused)), "{t:?}");
@@ -1638,6 +1657,10 @@ pub mod gateway_http {
             bounded(h.request(addr, &HttpCall::Me, None, None)).await,
             Err(HttpError::Refused)
         ));
+        // A token never rides on an unauthenticated call (discovery would leak it).
+        let tok = SecretString::from("tok-123");
+        let r = bounded(h.request(addr, &HttpCall::WellKnown, Some(&tok), None)).await;
+        assert!(matches!(r, Err(HttpError::Refused)), "token on WellKnown");
         assert!(routes.seen().is_empty(), "nothing reached the wire");
     }
 
@@ -1699,7 +1722,11 @@ pub mod gateway_http {
         ));
     }
 
-    pub async fn stream_calls_are_refused_here<H: GatewayHttp>(h: &H, addr: &GatewayAddr) {
+    pub async fn stream_calls_are_refused_here<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
         let r = bounded(h.request(
             addr,
             &HttpCall::Events { audio: false },
@@ -1708,6 +1735,27 @@ pub mod gateway_http {
         ))
         .await;
         assert!(matches!(r, Err(HttpError::Refused)));
+        assert!(routes.seen().is_empty(), "nothing reached the wire");
+    }
+
+    /// A query string goes out with the path (`?before=`).
+    pub async fn query_reaches_the_server<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        let call = HttpCall::GetMessages {
+            id: PathId::new("c1").unwrap(),
+            before: Some(PathId::new("m5").unwrap()),
+        };
+        let tok = SecretString::from("t");
+        // Unrouted: a 404 is fine, only what the server saw matters.
+        bounded(h.request(addr, &call, Some(&tok), None))
+            .await
+            .expect("query");
+        let seen = routes.seen().pop().unwrap();
+        assert!(seen.path.contains("?before="), "{}", seen.path);
+        assert!(seen.path.starts_with("/conversations/c1/messages?"));
     }
 
     #[macro_export]
@@ -1805,7 +1853,14 @@ pub mod gateway_http {
                 fn stream_calls_are_refused_here() {
                     $crate::run_async(async {
                         let (h, s) = $make;
-                        c::stream_calls_are_refused_here(&h, &s.addr()).await
+                        c::stream_calls_are_refused_here(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn query_reaches_the_server() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::query_reaches_the_server(&h, &s.addr(), &s.routes()).await
                     })
                 }
             }
@@ -2039,7 +2094,7 @@ pub mod gateway_stream {
         let r = bounded(h.open_stream(addr, &HttpCall::Me, &tok(), None, None)).await;
         assert!(matches!(r, Err(HttpError::Refused)), "non-stream call");
         let long = "x".repeat(129);
-        for id in ["a\nb", "a b", "ñ", long.as_str()] {
+        for id in ["a\nb", "a b", "ñ", "", long.as_str()] {
             let r = bounded(h.open_stream(addr, &EVENTS, &tok(), Some(id), None)).await;
             assert!(matches!(r, Err(HttpError::Refused)), "last_event_id {id:?}");
         }

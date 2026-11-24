@@ -144,6 +144,12 @@ fogar_testkit::gateway_http_contract!({
     (h, s)
 });
 
+fogar_testkit::gateway_stream_contract!({
+    let s = HttpsServer::start().await;
+    let h = HttpGateway::new(HttpConfig::default()).with_tls(client(CA));
+    (h, s)
+});
+
 fogar_testkit::gateway_link_contract!({
     let gw = WssGateway::start().await;
     let link = WsGatewayLink::new(WsConfig::default()).with_tls(client(CA));

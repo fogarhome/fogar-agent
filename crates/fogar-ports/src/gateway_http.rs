@@ -11,7 +11,8 @@
 //!   core is generic over `H: GatewayHttp`.
 //! - Bearer token: authenticated calls (`HttpCall::authenticated`) carry
 //!   `Authorization: Bearer <token>`. A missing, empty or non-printable-ASCII token is `Refused`
-//!   before a byte is sent. The adapter writes the token straight from its secret buffer into
+//!   before a byte is sent, and so is a token on an unauthenticated call (discovery, pairing,
+//!   login): it would leak to a gateway that has not been authenticated. The adapter writes the token straight from its secret buffer into
 //!   the socket; it is never copied into a `String`, a log or an error.
 //! - Streaming calls (`HttpCall::is_stream`) are refused by `request`: they go through
 //!   `open_stream`, which returns the status once the response head arrived and a
@@ -275,9 +276,9 @@ pub trait GatewayHttp: Send + Sync + 'static {
     /// out as `Authorization: Bearer <token>`.
     ///
     /// `Refused`, without touching the network, when `call.is_stream()` (streams have their own
-    /// entry point), when `call.authenticated()` and `token` is `None`, or when the token is
-    /// empty or has a byte outside `0x21..=0x7E` (it could break the header line). A token on
-    /// an unauthenticated call is still sent when given.
+    /// entry point), when `call.authenticated()` and `token` is `None`, when `token` is given on
+    /// an unauthenticated call, or when the token is empty or has a byte outside `0x21..=0x7E`
+    /// (it could break the header line).
     fn request(
         &self,
         addr: &GatewayAddr,
@@ -308,16 +309,24 @@ pub fn token_is_sendable(token: &SecretString) -> bool {
 
 /// The checks every adapter and fake applies before touching the network.
 pub fn request_allowed(call: &HttpCall, token: Option<&SecretString>) -> bool {
-    !call.is_stream() && token.map_or(!call.authenticated(), token_is_sendable)
+    !call.is_stream()
+        && match token {
+            Some(t) => call.authenticated() && token_is_sendable(t),
+            None => !call.authenticated(),
+        }
 }
 
 /// The checks every adapter and fake applies before opening a stream: a stream call, a
-/// sendable token and a `Last-Event-ID` of at most `MAX_LAST_EVENT_ID` bytes in `0x21..=0x7E`.
+/// sendable token and, when given, a non-empty `Last-Event-ID` of at most `MAX_LAST_EVENT_ID`
+/// bytes in `0x21..=0x7E`.
 pub fn stream_allowed(call: &HttpCall, token: &SecretString, last_event_id: Option<&str>) -> bool {
     call.is_stream()
+        && call.authenticated()
         && token_is_sendable(token)
         && last_event_id.is_none_or(|id| {
-            id.len() <= MAX_LAST_EVENT_ID && id.bytes().all(|b| (0x21..=0x7E).contains(&b))
+            !id.is_empty()
+                && id.len() <= MAX_LAST_EVENT_ID
+                && id.bytes().all(|b| (0x21..=0x7E).contains(&b))
         })
 }
 
@@ -338,6 +347,7 @@ mod tests {
             (&ev, "t", Some(long.as_str()), false),
             (&ev, "t", Some("a\nb"), false),
             (&ev, "t", Some("a b"), false),
+            (&ev, "t", Some(""), false),
             (&ev, "t", Some("ñ"), false),
             (&ev, "a b", None, false),
             (&ev, "", None, false),

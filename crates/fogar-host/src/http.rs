@@ -5,8 +5,9 @@
 //! redirects, no pooling, no compression, and a body read into ONE pre-sized wiped buffer.
 //! hyper would add ~10 crates, its own buffering (copies of the `/pair` reply we cannot wipe)
 //! and connection reuse we would have to switch off. A small client here is easier to review.
-//! shortcut: over https the decrypted `/pair` reply (client_key) also passes through rustls'
-//! internal plaintext buffers, which are not zeroized; only our own copies are wiped. Upgrade
+//! shortcut: over https the decrypted `/pair` reply (client_key) and the bearer token written
+//! on every request also pass through rustls' internal plaintext buffers, which are not
+//! zeroized; only our own copies are wiped. Upgrade
 //! if a rustls release offers zeroizing buffers.
 //!
 //! Bounds: response head <= `MAX_HEAD_BYTES`, body <= the call's `max_body()` (checked from
@@ -142,6 +143,9 @@ impl<R: Resolver> HttpGateway<R> {
                 "Content-Type: application/json\r\nContent-Length: {}\r\n",
                 b.len()
             ));
+        } else if call.method() != "GET" {
+            // Some servers wait for a body (or answer 411) on a bodyless POST/PATCH/DELETE.
+            head.push_str("Content-Length: 0\r\n");
         }
         // Head, token and body are separate writes: neither the token nor the body (pairing
         // code) is ever copied into a String we cannot wipe.
@@ -273,7 +277,7 @@ fn decode(state: &mut BodyState, input: &[u8]) -> Result<Vec<u8>, HttpError> {
         }
         BodyState::Chunked(dec) => {
             let mut out = Vec::new();
-            if dec.feed(input, &mut out)?.done {
+            if dec.feed(input, &mut out)? {
                 *state = BodyState::Done;
             }
             out
@@ -341,7 +345,7 @@ pub(crate) async fn read_response<S: AsyncRead + Unpin>(
             let mut input = early;
             let mut buf = Zeroizing::new(vec![0u8; 4096]);
             loop {
-                if dec.feed(input, &mut body)?.done {
+                if dec.feed(input, &mut body)? {
                     return Ok(HttpReply { status, body });
                 }
                 let n = s.read(&mut buf[..]).await.map_err(transport)?;
@@ -456,12 +460,6 @@ pub(crate) struct Chunked {
     trailer: usize,
 }
 
-/// Result of one `feed`.
-pub(crate) struct Fed {
-    /// The terminating chunk and trailers were fully read.
-    pub done: bool,
-}
-
 impl Chunked {
     pub(crate) fn new(max: usize) -> Self {
         Self {
@@ -478,7 +476,7 @@ impl Chunked {
     }
 
     /// Decodes `input`, appending chunk data to `out`. Bytes after the end are ignored.
-    pub(crate) fn feed(&mut self, mut input: &[u8], out: &mut Vec<u8>) -> Result<Fed, HttpError> {
+    pub(crate) fn feed(&mut self, mut input: &[u8], out: &mut Vec<u8>) -> Result<bool, HttpError> {
         while let Some((&b, rest)) = input.split_first() {
             if let St::Data { left } = self.st {
                 let n = left.min(input.len());
@@ -550,15 +548,14 @@ impl Chunked {
                     }
                 }
                 St::Done => break,
-                St::Data { .. } => unreachable!("handled above"),
+                St::Data { .. } => return Err(malformed("decoder state")),
             };
             if matches!(self.st, St::Done) {
                 break;
             }
         }
-        Ok(Fed {
-            done: matches!(self.st, St::Done),
-        })
+        // true: the terminating chunk and trailers were fully read.
+        Ok(matches!(self.st, St::Done))
     }
 }
 

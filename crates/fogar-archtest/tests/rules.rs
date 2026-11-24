@@ -20,8 +20,8 @@
 //!     fogar-core: the single consent point of spec S2
 //!  R12 only `playback.rs` (and `agent.rs`) names the speaker port: nothing sounds unseen
 //!  R13 only `capture.rs` asks the OS for the microphone permission
-//!  R14 only `account.rs` names the gateway-account secret (S4: spec S4 B1)
 //!     (R11/R12 tolerate today's `engine.rs` until the owner file exists, then tighten alone)
+//!  R14 only `account.rs` names the gateway-account secret (S4: spec S4 B1)
 //!
 //! Every checker has a self-test (`selftest_*`) that plants the violation in a temporary
 //! fixture and asserts the rule fires (review code#4: a rule that cannot fail proves nothing).
