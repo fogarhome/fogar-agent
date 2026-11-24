@@ -6,7 +6,7 @@
     clippy::field_reassign_with_default
 )]
 
-use fogar_ports::gateway::{Frame, GatewayLink, LinkEvent, LinkSession};
+use fogar_ports::gateway::{Frame, GatewayLink, LinkEvent, LinkSession, WsRoute};
 use fogar_proto::{ServerMsg, decode_server, server::ProgressPhase};
 use fogar_testkit::{FakeGatewayLink, MockConfig};
 use std::time::Duration;
@@ -20,7 +20,7 @@ async fn session(
     stop: impl Fn(&ServerMsg) -> bool,
 ) -> Vec<ServerMsg> {
     let link = FakeGatewayLink::new(cfg);
-    let mut s = link.connect(&link.addr()).await.unwrap();
+    let mut s = link.connect(&link.addr(), WsRoute::Stream).await.unwrap();
     s.send(Frame::Text(format!(
         r#"{{"client_key":"test-client-key","input_mode":"audio","output_mode":{output_mode}}}"#
     )))

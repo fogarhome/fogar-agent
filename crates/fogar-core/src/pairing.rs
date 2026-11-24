@@ -235,8 +235,8 @@ impl<C: Clock, H: GatewayHttp, T: TailnetPeers> Pairing<C, H, T> {
     async fn probe(&self, addr: &GatewayAddr) -> Probe {
         let calls = async {
             let mut answered = false;
-            for call in [HttpCall::WellKnown, HttpCall::WellKnownLegacy] {
-                match self.http.get(addr, call).await {
+            for call in &[HttpCall::WellKnown, HttpCall::WellKnownLegacy] {
+                match self.http.request(addr, call, None, None).await {
                     Ok(r) if r.status == 200 => {
                         match serde_json::from_slice::<WellKnown>(&r.body) {
                             Ok(wk) if FOGAR_SERVICES.contains(&wk.service.as_str()) => {
@@ -358,7 +358,7 @@ impl<C: Clock, H: GatewayHttp, T: TailnetPeers> Pairing<C, H, T> {
         let reply = deadline(
             &*self.clock,
             self.cfg.pair_timeout,
-            self.http.post_json(&addr, HttpCall::Pair, body),
+            self.http.request(&addr, &HttpCall::Pair, None, Some(body)),
         )
         .await;
         let reply = match reply {

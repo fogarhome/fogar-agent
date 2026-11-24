@@ -16,8 +16,8 @@ pub use fakes::{
     MemorySecretStore, SeededRandom, TestClock, silence_chunks, tone_chunks,
 };
 pub use gateway::{
-    FakeGatewayHttp, FakeGatewayLink, GatewayLog, HttpRoutes, MockConfig, MockGateway,
-    MockHttpServer,
+    FakeGatewayHttp, FakeGatewayLink, FakeStreamBody, GatewayLog, HttpRoutes, MockConfig,
+    MockGateway, MockHttpServer, RouteLog, StreamStep,
 };
 
 /// Runs an async contract clause on a fresh current-thread runtime with time and I/O enabled.

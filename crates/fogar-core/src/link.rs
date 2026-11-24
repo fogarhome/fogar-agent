@@ -16,7 +16,7 @@ use crate::{
 };
 use fogar_ports::{
     clock::{Clock, Mono},
-    gateway::{Frame, GatewayLink, LinkEvent, LinkSession},
+    gateway::{Frame, GatewayLink, LinkEvent, LinkSession, WsRoute},
     ipc::GatewayInfo,
     random::Random,
     secrets::{ExposeSecret, SecretError, SecretKey, SecretStore},
@@ -328,7 +328,7 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
             biased;
             () = egress.cancelled() => return (Outcome::Shutdown, false),
             _ = pairing.changed() => return (Outcome::PairingChanged, false),
-            r = deadline(clock, self.cfg.connect_timeout, self.link.connect(record.address())) => r,
+            r = deadline(clock, self.cfg.connect_timeout, self.link.connect(record.address(), WsRoute::Stream)) => r,
         };
         let Some(Ok(mut sess)) = connect else {
             return (Outcome::ConnectFailed, false);
@@ -657,7 +657,11 @@ mod budget_tests {
 
     impl GatewayLink for Scripted {
         type Session = Sess;
-        async fn connect(&self, _: &fogar_ports::gateway::GatewayAddr) -> Result<Sess, LinkError> {
+        async fn connect(
+            &self,
+            _: &fogar_ports::gateway::GatewayAddr,
+            _: fogar_ports::gateway::WsRoute,
+        ) -> Result<Sess, LinkError> {
             let taken = self.0.lock().unwrap().take();
             match taken {
                 Some(frames) => Ok(Sess(frames)),

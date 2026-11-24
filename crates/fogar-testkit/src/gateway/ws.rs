@@ -6,6 +6,7 @@ use super::{
     },
     http::{HttpRoutes, serve_http},
 };
+use fogar_ports::gateway::WsRoute;
 use futures_util::{SinkExt, StreamExt};
 use std::{
     net::SocketAddr,
@@ -32,8 +33,15 @@ pub struct MockGateway {
     cfg: Arc<Mutex<MockConfig>>,
     ctls: Arc<Mutex<Vec<mpsc::Sender<Ctl>>>>,
     routes: HttpRoutes,
+    used: Arc<Mutex<Vec<WsRoute>>>,
     cancel: CancellationToken,
     tasks: TaskTracker,
+}
+
+impl super::RouteLog for MockGateway {
+    fn routes_used(&self) -> Vec<WsRoute> {
+        self.used.lock().unwrap().clone()
+    }
 }
 
 impl MockGateway {
@@ -50,14 +58,16 @@ impl MockGateway {
             cfg: Arc::new(Mutex::new(cfg)),
             ctls: Arc::default(),
             routes: HttpRoutes::fogar("mock"),
+            used: Arc::default(),
             cancel: CancellationToken::new(),
             tasks: TaskTracker::new(),
         };
-        let (log, cfg, ctls, routes, cancel, tasks) = (
+        let (log, cfg, ctls, routes, used, cancel, tasks) = (
             gw.log.clone(),
             gw.cfg.clone(),
             gw.ctls.clone(),
             gw.routes.clone(),
+            gw.used.clone(),
             gw.cancel.clone(),
             gw.tasks.clone(),
         );
@@ -68,21 +78,23 @@ impl MockGateway {
                     r = listener.accept() => match r { Ok(v) => v, Err(_) => continue },
                 };
                 let (log, cfg, cancel) = (log.clone(), cfg.lock().unwrap().clone(), cancel.clone());
-                let (ctls, routes) = (ctls.clone(), routes.clone());
+                let (ctls, routes, used) = (ctls.clone(), routes.clone(), used.clone());
                 tasks.spawn(async move {
                     let _ = sock.set_nodelay(true);
                     // Same port as the real gateway: `/ws/...` upgrades, anything else is REST.
-                    let ws = tokio::select! {
+                    let route = tokio::select! {
                         () = cancel.cancelled() => return,
-                        ws = is_websocket(&sock) => ws,
+                        r = ws_route(&sock) => r,
                     };
-                    if !ws {
+                    let Some(route) = route else {
                         tokio::select! {
                             () = cancel.cancelled() => {}
                             () = serve_http(sock, routes) => {}
                         }
                         return;
-                    }
+                    };
+                    // Recorded before the upgrade reply, so the client sees it once connected.
+                    used.lock().unwrap().push(route);
                     let (ctl_tx, ctl_rx) = mpsc::channel(8);
                     ctls.lock().unwrap().push(ctl_tx);
                     let Ok(ws) = tokio_tungstenite::accept_async(sock).await else {
@@ -137,21 +149,27 @@ impl MockGateway {
     }
 }
 
-/// Peeks (without consuming) until the request line is in: does it ask for `/ws/`? Bounded:
-/// a client that never finishes its request line counts as HTTP and gets dropped there.
-async fn is_websocket(sock: &TcpStream) -> bool {
+/// Peeks (without consuming) until the request line is in: which WebSocket route does it ask
+/// for (`None` = plain HTTP)? Bounded: a client that never finishes its request line counts as
+/// HTTP and gets dropped there. Both routes are served by the same protocol driver for now.
+async fn ws_route(sock: &TcpStream) -> Option<WsRoute> {
     let mut buf = [0u8; 64];
     for _ in 0..500 {
         let n = match sock.peek(&mut buf).await {
-            Ok(0) | Err(_) => return false,
+            Ok(0) | Err(_) => return None,
             Ok(n) => n,
         };
         if buf[..n].contains(&b'\n') || n == buf.len() {
-            return buf[..n].starts_with(b"GET /ws/");
+            let line = &buf[..n];
+            return [WsRoute::Stream, WsRoute::Dictation].into_iter().find(|r| {
+                line.strip_prefix(b"GET ")
+                    .and_then(|l| l.strip_prefix(r.path().as_bytes()))
+                    .is_some_and(|rest| rest.first().is_some_and(|c| matches!(c, b' ' | b'?')))
+            });
         }
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    false
+    None
 }
 
 struct WsTransport {

@@ -32,6 +32,7 @@ impl FileSecretStore {
         let name = match key {
             SecretKey::GatewayClientKey => "gateway_client_key",
             SecretKey::GatewayPairing => "gateway_pairing",
+            SecretKey::GatewayAccount => "gateway_account",
             _ => "unknown_key",
         };
         self.dir.join(name)

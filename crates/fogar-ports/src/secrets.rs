@@ -19,6 +19,9 @@ pub enum SecretKey {
     /// on the gateway that issued it). Encoded by fogar-core; opaque to adapters. Supersedes
     /// `GatewayClientKey` from S1 on.
     GatewayPairing,
+    /// The gateway address, token, device id and person name, stored as ONE item encoded by
+    /// fogar-core; opaque to adapters.
+    GatewayAccount,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

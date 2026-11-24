@@ -95,16 +95,29 @@ impl MultiHttp {
 }
 
 impl GatewayHttp for MultiHttp {
-    async fn get(&self, addr: &GatewayAddr, call: HttpCall) -> Result<HttpReply, HttpError> {
-        self.pick(addr).get(addr, call).await
-    }
-    async fn post_json(
+    async fn request(
         &self,
         addr: &GatewayAddr,
-        call: HttpCall,
-        body: secrecy::zeroize::Zeroizing<Vec<u8>>,
+        call: &HttpCall,
+        token: Option<&secrecy::SecretString>,
+        body: Option<secrecy::zeroize::Zeroizing<Vec<u8>>>,
     ) -> Result<HttpReply, HttpError> {
-        self.pick(addr).post_json(addr, call, body).await
+        self.pick(addr).request(addr, call, token, body).await
+    }
+
+    type Body = <FakeGatewayHttp as GatewayHttp>::Body;
+
+    async fn open_stream(
+        &self,
+        addr: &GatewayAddr,
+        call: &HttpCall,
+        token: &secrecy::SecretString,
+        last_event_id: Option<&str>,
+        body: Option<secrecy::zeroize::Zeroizing<Vec<u8>>>,
+    ) -> Result<fogar_ports::gateway_http::StreamReply<Self::Body>, HttpError> {
+        self.pick(addr)
+            .open_stream(addr, call, token, last_event_id, body)
+            .await
     }
 }
 

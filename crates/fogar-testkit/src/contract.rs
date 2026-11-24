@@ -232,7 +232,11 @@ pub mod secret_store {
     /// Round trip, overwrite, delete-missing is Ok. Adapters backed by a real user store must be
     /// constructed on a TEST location (temp dir / test keychain service name).
     pub fn put_get_delete(s: &dyn SecretStore) {
-        for k in [SecretKey::GatewayClientKey, SecretKey::GatewayPairing] {
+        for k in [
+            SecretKey::GatewayClientKey,
+            SecretKey::GatewayPairing,
+            SecretKey::GatewayAccount,
+        ] {
             put_get_delete_one(s, k);
         }
     }
@@ -252,6 +256,15 @@ pub mod secret_store {
             r#"{"json":"record"}"#
         );
         assert!(s.get(a).unwrap().is_none());
+        // The account never clobbers the pairing record (S4: both may coexist during migration).
+        let c = SecretKey::GatewayAccount;
+        s.put(b, SecretString::from("pairing".to_owned())).unwrap();
+        s.put(c, SecretString::from("account".to_owned())).unwrap();
+        assert_eq!(s.get(b).unwrap().unwrap().expose_secret(), "pairing");
+        assert_eq!(s.get(c).unwrap().unwrap().expose_secret(), "account");
+        s.delete(c).unwrap();
+        assert!(s.get(c).unwrap().is_none());
+        assert_eq!(s.get(b).unwrap().unwrap().expose_secret(), "pairing");
         s.delete(b).unwrap();
     }
 
@@ -621,9 +634,9 @@ pub mod gateway_link {
     //! Clauses run against a link and the address of a running mock gateway expecting
     //! `MockConfig::default().client_key`. `$make` builds `(link, mock_handle)` inside the
     //! runtime; the handle has `.addr() -> GatewayAddr` and `.control(Ctl) -> usize`.
-    use crate::gateway::{Ctl, MockConfig};
+    use crate::gateway::{Ctl, MockConfig, RouteLog};
     use fogar_ports::gateway::{
-        Frame, GatewayAddr, GatewayLink, LinkError, LinkEvent, LinkSession,
+        Frame, GatewayAddr, GatewayLink, LinkError, LinkEvent, LinkSession, WsRoute,
     };
     use fogar_proto::{ServerMsg, decode_server};
     use std::time::Duration;
@@ -651,7 +664,7 @@ pub mod gateway_link {
     }
 
     pub async fn connects_and_gets_ready<L: GatewayLink>(link: &L, addr: &GatewayAddr) {
-        let mut s = link.connect(addr).await.expect("connect");
+        let mut s = link.connect(addr, WsRoute::Stream).await.expect("connect");
         s.send(Frame::Text(handshake())).await.unwrap();
         loop {
             match next_msg(&mut s).await {
@@ -664,11 +677,22 @@ pub mod gateway_link {
         s.close(1000, "").await.unwrap(); // idempotent
     }
 
+    /// `connect(addr, WsRoute::Stream)` reaches the stream route.
+    pub async fn stream_route_is_recorded<L: GatewayLink>(
+        link: &L,
+        addr: &GatewayAddr,
+        gw: &impl RouteLog,
+    ) {
+        let mut s = link.connect(addr, WsRoute::Stream).await.expect("connect");
+        assert_eq!(gw.routes_used().last(), Some(&WsRoute::Stream));
+        s.close(1000, "").await.unwrap();
+    }
+
     pub async fn oversized_frame_is_rejected_and_session_survives<L: GatewayLink>(
         link: &L,
         addr: &GatewayAddr,
     ) {
-        let mut s = link.connect(addr).await.unwrap();
+        let mut s = link.connect(addr, WsRoute::Stream).await.unwrap();
         let big = Frame::Binary(vec![0; s.max_frame() + 1]);
         assert!(matches!(s.send(big).await, Err(LinkError::TooLarge { .. })));
         s.send(Frame::Text(handshake())).await.unwrap();
@@ -684,7 +708,7 @@ pub mod gateway_link {
     /// idle nor while frames are streaming in (review code#8: the first version only cancelled
     /// while nothing was in flight, so a `recv` that loses a frame it already took passed).
     pub async fn recv_is_cancel_safe<L: GatewayLink>(link: &L, addr: &GatewayAddr) {
-        let mut s = link.connect(addr).await.unwrap();
+        let mut s = link.connect(addr, WsRoute::Stream).await.unwrap();
         s.send(Frame::Text(handshake())).await.unwrap();
         loop {
             if let ServerMsg::Ready(_) = next_msg(&mut s).await {
@@ -757,7 +781,7 @@ pub mod gateway_link {
         addr: &GatewayAddr,
         control: impl Fn(Ctl) -> usize,
     ) {
-        let mut s = link.connect(addr).await.unwrap();
+        let mut s = link.connect(addr, WsRoute::Stream).await.unwrap();
         s.send(Frame::Text(handshake())).await.unwrap();
         loop {
             if let ServerMsg::Ready(_) = next_msg(&mut s).await {
@@ -788,7 +812,11 @@ pub mod gateway_link {
     /// NET-1: clear text to a public address is refused before any byte is sent.
     pub async fn cleartext_to_public_ip_is_refused<L: GatewayLink>(link: &L) {
         let public = GatewayAddr::parse("203.0.113.7:8004").expect("addr");
-        let r = tokio::time::timeout(Duration::from_secs(1), link.connect(&public)).await;
+        let r = tokio::time::timeout(
+            Duration::from_secs(1),
+            link.connect(&public, WsRoute::Stream),
+        )
+        .await;
         assert!(
             matches!(r, Ok(Err(LinkError::NotConfigured))),
             "plain ws to a public IP must be NotConfigured at once"
@@ -799,7 +827,7 @@ pub mod gateway_link {
     /// Whatever protocol generation the mock speaks (M19 4010, or 1008 + the old text), the
     /// close reaches the core intact and classifies as "re-pair".
     pub async fn bad_key_is_closed_as_repair<L: GatewayLink>(link: &L, addr: &GatewayAddr) {
-        let mut s = link.connect(addr).await.unwrap();
+        let mut s = link.connect(addr, WsRoute::Stream).await.unwrap();
         s.send(Frame::Text(
             r#"{"client_key":"wrong","input_mode":"audio","output_mode":["audio"]}"#.into(),
         ))
@@ -824,8 +852,25 @@ pub mod gateway_link {
         }
     }
 
+    /// A dictation connect reaches the gateway on `/speech/dictation`.
+    pub async fn route_selects_the_path<L: GatewayLink>(
+        link: &L,
+        gw: &impl RouteLog,
+        addr: &GatewayAddr,
+    ) {
+        let mut s = tokio::time::timeout(
+            Duration::from_secs(5),
+            link.connect(addr, WsRoute::Dictation),
+        )
+        .await
+        .expect("connect timed out")
+        .expect("connect");
+        assert_eq!(gw.routes_used().last(), Some(&WsRoute::Dictation));
+        s.close(1000, "").await.unwrap();
+    }
+
     /// `$make` must evaluate (inside the runtime) to `(link, gateway)` where `gateway` has
-    /// `.control(Ctl) -> usize`.
+    /// `.control(Ctl) -> usize` and implements `RouteLog`.
     #[macro_export]
     macro_rules! gateway_link_contract {
         ($make:expr) => {
@@ -838,6 +883,13 @@ pub mod gateway_link {
                     $crate::run_async(async {
                         let (link, gw) = $make;
                         c::connects_and_gets_ready(&link, &gw.addr()).await
+                    })
+                }
+                #[test]
+                fn stream_route_is_recorded() {
+                    $crate::run_async(async {
+                        let (link, gw) = $make;
+                        c::stream_route_is_recorded(&link, &gw.addr(), &gw).await
                     })
                 }
                 #[test]
@@ -866,6 +918,13 @@ pub mod gateway_link {
                     $crate::run_async(async {
                         let (link, _gw) = $make;
                         c::cleartext_to_public_ip_is_refused(&link).await
+                    })
+                }
+                #[test]
+                fn route_selects_the_path() {
+                    $crate::run_async(async {
+                        let (link, gw) = $make;
+                        c::route_selects_the_path(&link, &gw, &gw.addr()).await
                     })
                 }
                 #[test]
@@ -1359,9 +1418,11 @@ pub mod gateway_http {
     use crate::gateway::HttpRoutes;
     use fogar_ports::{
         gateway::GatewayAddr,
-        gateway_http::{GatewayHttp, HttpCall, HttpError, MAX_BODY_BYTES},
+        gateway_http::{
+            GatewayHttp, HttpCall, HttpError, MAX_BODY_BYTES, MAX_LIST_BODY_BYTES, PathId,
+        },
     };
-    use secrecy::zeroize::Zeroizing;
+    use secrecy::{SecretString, zeroize::Zeroizing};
     use std::time::Duration;
 
     const WK: HttpCall = HttpCall::WellKnown;
@@ -1377,8 +1438,10 @@ pub mod gateway_http {
         addr: &GatewayAddr,
         routes: &HttpRoutes,
     ) {
-        routes.set("GET", WK.path(), 200, r#"{"service":"fogar-gateway"}"#);
-        let r = bounded(h.get(addr, WK)).await.expect("get");
+        routes.set("GET", &WK.path(), 200, r#"{"service":"fogar-gateway"}"#);
+        let r = bounded(h.request(addr, &WK, None, None))
+            .await
+            .expect("get");
         assert_eq!(r.status, 200);
         assert_eq!(&r.body[..], br#"{"service":"fogar-gateway"}"#);
         assert!(
@@ -1388,7 +1451,7 @@ pub mod gateway_http {
         let seen = routes.seen();
         assert_eq!(
             (seen[0].method.as_str(), seen[0].path.as_str()),
-            ("GET", WK.path())
+            ("GET", WK.path().as_str())
         );
     }
 
@@ -1399,9 +1462,14 @@ pub mod gateway_http {
     ) {
         routes.set("POST", "/pair", 201, r#"{"client_key":"k"}"#);
         let body = br#"{"code":"482913"}"#.to_vec();
-        let r = bounded(h.post_json(addr, HttpCall::Pair, Zeroizing::new(body.clone())))
-            .await
-            .expect("post");
+        let r = bounded(h.request(
+            addr,
+            &HttpCall::Pair,
+            None,
+            Some(Zeroizing::new(body.clone())),
+        ))
+        .await
+        .expect("post");
         assert_eq!(
             (r.status, &r.body[..]),
             (201, &br#"{"client_key":"k"}"#[..])
@@ -1420,8 +1488,7 @@ pub mod gateway_http {
         );
     }
 
-    /// 4xx/5xx are replies (the core reads `detail`), not transport errors; a GET of `/pair`
-    /// is refused locally.
+    /// 4xx/5xx are replies (the core reads `detail`), not transport errors.
     pub async fn error_statuses_are_replies<H: GatewayHttp>(
         h: &H,
         addr: &GatewayAddr,
@@ -1433,18 +1500,19 @@ pub mod gateway_http {
             400,
             r#"{"detail":"invalid or expired code"}"#,
         );
-        let r = bounded(h.post_json(addr, HttpCall::Pair, Zeroizing::new(b"{}".to_vec())))
-            .await
-            .expect("400 is a reply");
+        let r = bounded(h.request(
+            addr,
+            &HttpCall::Pair,
+            None,
+            Some(Zeroizing::new(b"{}".to_vec())),
+        ))
+        .await
+        .expect("400 is a reply");
         assert_eq!(r.status, 400);
-        let r = bounded(h.get(addr, HttpCall::WellKnownLegacy))
+        let r = bounded(h.request(addr, &HttpCall::WellKnownLegacy, None, None))
             .await
             .expect("404 reply");
         assert_eq!(r.status, 404);
-        assert!(matches!(
-            bounded(h.get(addr, HttpCall::Pair)).await,
-            Err(HttpError::Refused)
-        ));
     }
 
     pub async fn oversized_body_is_refused<H: GatewayHttp>(
@@ -1452,16 +1520,16 @@ pub mod gateway_http {
         addr: &GatewayAddr,
         routes: &HttpRoutes,
     ) {
-        routes.set("GET", WK.path(), 200, vec![b' '; MAX_BODY_BYTES + 1]);
+        routes.set("GET", &WK.path(), 200, vec![b' '; MAX_BODY_BYTES + 1]);
         assert!(matches!(
-            bounded(h.get(addr, WK)).await,
+            bounded(h.request(addr, &WK, None, None)).await,
             Err(HttpError::TooLarge { .. })
         ));
         // A lying Content-Length + an endless body: refused once the limit is crossed, not
         // after buffering it all (the 5 s bound would fire first).
-        routes.set_endless("GET", WK.path());
+        routes.set_endless("GET", WK.path().as_str());
         assert!(matches!(
-            bounded(h.get(addr, WK)).await,
+            bounded(h.request(addr, &WK, None, None)).await,
             Err(HttpError::TooLarge { .. })
         ));
     }
@@ -1469,14 +1537,20 @@ pub mod gateway_http {
     /// NET-1: clear text to a public address is refused before any byte is sent.
     pub async fn cleartext_to_public_ip_is_refused<H: GatewayHttp>(h: &H) {
         let public = GatewayAddr::parse("203.0.113.7:8004").expect("addr");
-        let t = tokio::time::timeout(Duration::from_secs(1), h.get(&public, WK)).await;
+        let t =
+            tokio::time::timeout(Duration::from_secs(1), h.request(&public, &WK, None, None)).await;
         assert!(
             matches!(t, Ok(Err(HttpError::Refused))),
             "plain http to a public IP must be Refused at once"
         );
         let t = tokio::time::timeout(
             Duration::from_secs(1),
-            h.post_json(&public, HttpCall::Pair, Zeroizing::new(b"{}".to_vec())),
+            h.request(
+                &public,
+                &HttpCall::Pair,
+                None,
+                Some(Zeroizing::new(b"{}".to_vec())),
+            ),
         )
         .await;
         assert!(matches!(t, Ok(Err(HttpError::Refused))));
@@ -1489,16 +1563,21 @@ pub mod gateway_http {
         routes: &HttpRoutes,
     ) {
         routes.set_redirect("POST", "/pair", "http://evil.example/pair");
-        let r = bounded(h.post_json(addr, HttpCall::Pair, Zeroizing::new(b"{}".to_vec())))
-            .await
-            .expect("redirect reply");
+        let r = bounded(h.request(
+            addr,
+            &HttpCall::Pair,
+            None,
+            Some(Zeroizing::new(b"{}".to_vec())),
+        ))
+        .await
+        .expect("redirect reply");
         assert_eq!(r.status, 302);
         assert_eq!(routes.seen().len(), 1);
     }
 
     pub async fn unreachable_is_reported<H: GatewayHttp>(h: &H, dead: &GatewayAddr) {
         assert!(matches!(
-            bounded(h.get(dead, WK)).await,
+            bounded(h.request(dead, &WK, None, None)).await,
             Err(HttpError::Unreachable)
         ));
     }
@@ -1510,9 +1589,10 @@ pub mod gateway_http {
         addr: &GatewayAddr,
         routes: &HttpRoutes,
     ) {
-        routes.set("GET", WK.path(), 200, "{}");
+        routes.set("GET", &WK.path(), 200, "{}");
         for _ in 0..5 {
-            let mut f = std::pin::pin!(h.get(addr, WK));
+            let wk = WK;
+            let mut f = std::pin::pin!(h.request(addr, &wk, None, None));
             std::future::poll_fn(|cx| {
                 let _ = f.as_mut().poll(cx);
                 std::task::Poll::Ready(())
@@ -1522,7 +1602,8 @@ pub mod gateway_http {
         routes.set_delayed("POST", "/pair", 201, "{}", Duration::from_millis(500));
         let before = routes.seen().len();
         {
-            let call = h.post_json(addr, HttpCall::Pair, Zeroizing::new(b"{}".to_vec()));
+            let pair = HttpCall::Pair;
+            let call = h.request(addr, &pair, None, Some(Zeroizing::new(b"{}".to_vec())));
             let wait_seen = async {
                 while routes.seen().len() == before {
                     tokio::time::sleep(Duration::from_millis(2)).await;
@@ -1533,8 +1614,148 @@ pub mod gateway_http {
                 () = bounded(wait_seen) => {}
             }
         }
-        let r = bounded(h.get(addr, WK)).await.expect("get after cancels");
+        let r = bounded(h.request(addr, &WK, None, None))
+            .await
+            .expect("get after cancels");
         assert_eq!((r.status, &r.body[..]), (200, &b"{}"[..]));
+    }
+
+    pub async fn bearer_and_method_reach_the_server<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        routes.set("DELETE", "/conversations/c1/messages/m9", 204, "");
+        let tok = SecretString::from("tok-123");
+        let call = HttpCall::Withdraw {
+            id: PathId::new("c1").unwrap(),
+            message: PathId::new("m9").unwrap(),
+        };
+        let r = bounded(h.request(addr, &call, Some(&tok), None))
+            .await
+            .expect("delete");
+        assert_eq!(r.status, 204);
+        let last = routes.seen().pop().unwrap();
+        assert_eq!(
+            (last.method.as_str(), last.path.as_str()),
+            ("DELETE", "/conversations/c1/messages/m9")
+        );
+        assert_eq!(last.authorization.as_deref(), Some("Bearer tok-123"));
+    }
+
+    pub async fn bad_token_is_refused<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        for t in ["a\r\nX-Evil: 1", "a b", "", "a\x7fb", "tök", "\n"] {
+            let r =
+                bounded(h.request(addr, &HttpCall::Me, Some(&SecretString::from(t)), None)).await;
+            assert!(matches!(r, Err(HttpError::Refused)), "{t:?}");
+        }
+        assert!(matches!(
+            bounded(h.request(addr, &HttpCall::Me, None, None)).await,
+            Err(HttpError::Refused)
+        ));
+        // A token never rides on an unauthenticated call (discovery would leak it).
+        let tok = SecretString::from("tok-123");
+        let r = bounded(h.request(addr, &HttpCall::WellKnown, Some(&tok), None)).await;
+        assert!(matches!(r, Err(HttpError::Refused)), "token on WellKnown");
+        assert!(routes.seen().is_empty(), "nothing reached the wire");
+    }
+
+    pub async fn list_body_limit_is_larger<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        let tok = SecretString::from("t");
+        let list = HttpCall::ListConversations;
+        routes.set(
+            "GET",
+            "/conversations",
+            200,
+            vec![b' '; MAX_LIST_BODY_BYTES],
+        );
+        assert!(
+            bounded(h.request(addr, &list, Some(&tok), None))
+                .await
+                .is_ok()
+        );
+        routes.set(
+            "GET",
+            "/conversations",
+            200,
+            vec![b' '; MAX_LIST_BODY_BYTES + 1],
+        );
+        assert!(matches!(
+            bounded(h.request(addr, &list, Some(&tok), None)).await,
+            Err(HttpError::TooLarge { .. })
+        ));
+        routes.set("GET", "/auth/me", 200, vec![b' '; MAX_BODY_BYTES + 1]);
+        assert!(matches!(
+            bounded(h.request(addr, &HttpCall::Me, Some(&tok), None)).await,
+            Err(HttpError::TooLarge { .. })
+        ));
+    }
+
+    pub async fn chunked_reply_is_decoded_and_bounded<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        let tok = SecretString::from("t");
+        routes.set_chunked(
+            "GET",
+            "/auth/me",
+            200,
+            vec![b"{\"a\":".to_vec(), b"1}".to_vec()],
+        );
+        let r = bounded(h.request(addr, &HttpCall::Me, Some(&tok), None))
+            .await
+            .expect("chunked");
+        assert_eq!(&r.body[..], b"{\"a\":1}");
+        routes.set_chunked("GET", "/auth/me", 200, vec![vec![b' '; MAX_BODY_BYTES]; 2]);
+        assert!(matches!(
+            bounded(h.request(addr, &HttpCall::Me, Some(&tok), None)).await,
+            Err(HttpError::TooLarge { .. })
+        ));
+    }
+
+    pub async fn stream_calls_are_refused_here<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        let r = bounded(h.request(
+            addr,
+            &HttpCall::Events { audio: false },
+            Some(&SecretString::from("t")),
+            None,
+        ))
+        .await;
+        assert!(matches!(r, Err(HttpError::Refused)));
+        assert!(routes.seen().is_empty(), "nothing reached the wire");
+    }
+
+    /// A query string goes out with the path (`?before=`).
+    pub async fn query_reaches_the_server<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        let call = HttpCall::GetMessages {
+            id: PathId::new("c1").unwrap(),
+            before: Some(PathId::new("m5").unwrap()),
+        };
+        let tok = SecretString::from("t");
+        // Unrouted: a 404 is fine, only what the server saw matters.
+        bounded(h.request(addr, &call, Some(&tok), None))
+            .await
+            .expect("query");
+        let seen = routes.seen().pop().unwrap();
+        assert!(seen.path.contains("?before="), "{}", seen.path);
+        assert!(seen.path.starts_with("/conversations/c1/messages?"));
     }
 
     #[macro_export]
@@ -1598,6 +1819,368 @@ pub mod gateway_http {
                     $crate::run_async(async {
                         let (h, s) = $make;
                         c::cancelled_call_leaves_adapter_usable(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn bearer_and_method_reach_the_server() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::bearer_and_method_reach_the_server(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn bad_token_is_refused() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::bad_token_is_refused(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn list_body_limit_is_larger() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::list_body_limit_is_larger(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn chunked_reply_is_decoded_and_bounded() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::chunked_reply_is_decoded_and_bounded(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn stream_calls_are_refused_here() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::stream_calls_are_refused_here(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn query_reaches_the_server() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::query_reaches_the_server(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+            }
+        };
+    }
+}
+
+pub mod gateway_stream {
+    //! `GatewayHttp::open_stream` (SSE `/events` and the `…/speech` PCM). Same `$make` as
+    //! `gateway_http`. Streams carry bytes only; nothing is lost under backpressure or
+    //! cancellation, and dropping the body closes the connection.
+    use crate::gateway::{HttpRoutes, StreamStep};
+    use fogar_ports::{
+        gateway::GatewayAddr,
+        gateway_http::{GatewayHttp, HttpCall, HttpError, MAX_CHUNK_BYTES, PathId, ResponseBody},
+    };
+    use secrecy::SecretString;
+    use std::time::Duration;
+
+    const EVENTS: HttpCall = HttpCall::Events { audio: false };
+
+    async fn bounded<F: std::future::Future>(f: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(5), f)
+            .await
+            .expect("stream clause timed out")
+    }
+
+    /// For the 1 MiB clauses.
+    async fn bounded_long<F: std::future::Future>(f: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(10), f)
+            .await
+            .expect("stream clause timed out")
+    }
+
+    fn tok() -> SecretString {
+        SecretString::from("t")
+    }
+
+    /// Non-uniform bytes: a reordering or a duplicate changes the content, not just the length.
+    fn pattern(len: usize, seed: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i + seed) % 251) as u8).collect()
+    }
+
+    async fn drain<B: ResponseBody>(b: &mut B) -> Vec<u8> {
+        let mut all = Vec::new();
+        while let Some(c) = bounded(b.chunk()).await.expect("chunk") {
+            assert!(c.len() <= MAX_CHUNK_BYTES, "chunk of {} bytes", c.len());
+            assert!(!c.is_empty(), "an empty chunk is not the end");
+            all.extend(c);
+        }
+        all
+    }
+
+    pub async fn stream_delivers_headers_and_body<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        routes.set_stream(
+            "GET",
+            "/events",
+            200,
+            vec![StreamStep::Bytes(b"event: ready\n\n".to_vec())],
+        );
+        let mut s = bounded(h.open_stream(addr, &EVENTS, &tok(), Some("41"), None))
+            .await
+            .expect("open");
+        assert_eq!(s.status, 200);
+        assert_eq!(format!("{s:?}"), "StreamReply(200)");
+        assert_eq!(drain(&mut s.body).await, b"event: ready\n\n");
+        let req = routes.seen().pop().expect("request seen");
+        assert_eq!((req.method.as_str(), req.path.as_str()), ("GET", "/events"));
+        assert_eq!(req.authorization.as_deref(), Some("Bearer t"));
+        assert_eq!(req.last_event_id.as_deref(), Some("41"));
+    }
+
+    /// One 100 KiB write: every chunk is at most `MAX_CHUNK_BYTES`, the total is intact.
+    pub async fn chunks_are_bounded<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        let sent = pattern(100 * 1024, 0);
+        routes.set_stream("GET", "/events", 200, vec![StreamStep::Bytes(sent.clone())]);
+        let mut s = bounded(h.open_stream(addr, &EVENTS, &tok(), None, None))
+            .await
+            .expect("open");
+        assert!(
+            bounded_long(drain(&mut s.body)).await == sent,
+            "100 KiB altered"
+        );
+    }
+
+    /// 1 MiB in 4 KiB steps, read slowly (1 ms per chunk): backpressure, never loss.
+    pub async fn slow_reader_gets_every_byte<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        let steps: Vec<Vec<u8>> = (0..256).map(|i| pattern(4096, i)).collect();
+        let sent = steps.concat();
+        routes.set_stream(
+            "GET",
+            "/events",
+            200,
+            steps.into_iter().map(StreamStep::Bytes).collect(),
+        );
+        let mut s = bounded(h.open_stream(addr, &EVENTS, &tok(), None, None))
+            .await
+            .expect("open");
+        let got = bounded_long(async {
+            let mut all = Vec::new();
+            while let Some(c) = s.body.chunk().await.expect("chunk") {
+                assert!(c.len() <= MAX_CHUNK_BYTES);
+                all.extend(c);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            all
+        })
+        .await;
+        assert_eq!(got.len(), sent.len());
+        assert!(got == sent, "1 MiB altered under a slow reader");
+    }
+
+    /// Dropping a pending `chunk()` loses nothing: 50 poll-once-and-drop rounds spread over the
+    /// 200 ms gap between the two parts, then a drain; both parts arrive whole and in order.
+    pub async fn chunk_is_cancel_safe<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        let (a, b) = (pattern(3000, 1), pattern(5000, 7));
+        routes.set_stream(
+            "GET",
+            "/events",
+            200,
+            vec![
+                StreamStep::Bytes(a.clone()),
+                StreamStep::Wait(Duration::from_millis(200)),
+                StreamStep::Bytes(b.clone()),
+            ],
+        );
+        let mut s = bounded(h.open_stream(addr, &EVENTS, &tok(), None, None))
+            .await
+            .expect("open");
+        let mut got = Vec::new();
+        for _ in 0..50 {
+            {
+                let mut f = std::pin::pin!(s.body.chunk());
+                let ready =
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(f.as_mut().poll(cx))).await;
+                // A ready chunk belongs to the reader: keep it.
+                if let std::task::Poll::Ready(r) = ready {
+                    got.extend(r.expect("chunk").unwrap_or_default());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        got.extend(drain(&mut s.body).await);
+        assert!(
+            got == [a, b].concat(),
+            "cancel-safety: bytes lost or reordered"
+        );
+    }
+
+    /// `HoldOpen`: the server keeps the stream open; dropping the reply closes the socket.
+    pub async fn drop_closes_the_socket<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        routes.set_stream(
+            "GET",
+            "/events",
+            200,
+            vec![
+                StreamStep::Bytes(b": hi\n\n".to_vec()),
+                StreamStep::HoldOpen,
+            ],
+        );
+        let mut s = bounded(h.open_stream(addr, &EVENTS, &tok(), None, None))
+            .await
+            .expect("open");
+        assert_eq!(
+            bounded(s.body.chunk()).await.expect("chunk").as_deref(),
+            Some(&b": hi\n\n"[..])
+        );
+        assert_eq!(routes.disconnects(), 0);
+        drop(s);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while routes.disconnects() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("dropping the body must close the socket within 1 s");
+    }
+
+    /// A non-2xx stream still has a readable body (the core caps it at `MAX_BODY_BYTES`).
+    pub async fn error_status_body_is_readable<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        let body = br#"{"code":"tts_unavailable"}"#.to_vec();
+        routes.set_stream(
+            "POST",
+            "/conversations/c1/messages/m9/speech",
+            503,
+            vec![StreamStep::Bytes(body.clone())],
+        );
+        let speech = HttpCall::Speech {
+            id: PathId::new("c1").expect("id"),
+            message: PathId::new("m9").expect("id"),
+        };
+        let mut s = bounded(h.open_stream(addr, &speech, &tok(), None, None))
+            .await
+            .expect("open");
+        assert_eq!(s.status, 503);
+        assert_eq!(drain(&mut s.body).await, body);
+        let req = routes.seen().pop().expect("request seen");
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.last_event_id, None);
+    }
+
+    pub async fn non_stream_calls_and_bad_ids_are_refused<H: GatewayHttp>(
+        h: &H,
+        addr: &GatewayAddr,
+        routes: &HttpRoutes,
+    ) {
+        let r = bounded(h.open_stream(addr, &HttpCall::Me, &tok(), None, None)).await;
+        assert!(matches!(r, Err(HttpError::Refused)), "non-stream call");
+        let long = "x".repeat(129);
+        for id in ["a\nb", "a b", "ñ", "", long.as_str()] {
+            let r = bounded(h.open_stream(addr, &EVENTS, &tok(), Some(id), None)).await;
+            assert!(matches!(r, Err(HttpError::Refused)), "last_event_id {id:?}");
+        }
+        for t in ["a\r\nX-Evil: 1", "a b", ""] {
+            let r = bounded(h.open_stream(addr, &EVENTS, &SecretString::from(t), None, None)).await;
+            assert!(matches!(r, Err(HttpError::Refused)), "token {t:?}");
+        }
+        assert!(routes.seen().is_empty(), "nothing reached the wire");
+    }
+
+    /// NET-1, as for `request`: clear text to a public address is refused before any byte.
+    pub async fn cleartext_to_public_ip_is_refused<H: GatewayHttp>(h: &H) {
+        let public = GatewayAddr::parse("203.0.113.7:8004").expect("addr");
+        let t = tokio::time::timeout(
+            Duration::from_secs(1),
+            h.open_stream(&public, &EVENTS, &tok(), None, None),
+        )
+        .await;
+        assert!(
+            matches!(t, Ok(Err(HttpError::Refused))),
+            "plain http to a public IP must be Refused at once"
+        );
+    }
+
+    #[macro_export]
+    macro_rules! gateway_stream_contract {
+        ($make:expr) => {
+            mod gateway_stream_contract {
+                #[allow(unused_imports)]
+                use super::*;
+                use $crate::contract::gateway_stream as c;
+                #[test]
+                fn stream_delivers_headers_and_body() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::stream_delivers_headers_and_body(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn chunks_are_bounded() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::chunks_are_bounded(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn slow_reader_gets_every_byte() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::slow_reader_gets_every_byte(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn chunk_is_cancel_safe() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::chunk_is_cancel_safe(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn drop_closes_the_socket() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::drop_closes_the_socket(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn error_status_body_is_readable() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::error_status_body_is_readable(&h, &s.addr(), &s.routes()).await
+                    })
+                }
+                #[test]
+                fn non_stream_calls_and_bad_ids_are_refused() {
+                    $crate::run_async(async {
+                        let (h, s) = $make;
+                        c::non_stream_calls_and_bad_ids_are_refused(&h, &s.addr(), &s.routes())
+                            .await
+                    })
+                }
+                #[test]
+                fn cleartext_to_public_ip_is_refused() {
+                    $crate::run_async(async {
+                        let (h, _s) = $make;
+                        c::cleartext_to_public_ip_is_refused(&h).await
                     })
                 }
             }

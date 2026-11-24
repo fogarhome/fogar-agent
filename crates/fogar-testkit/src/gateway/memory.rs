@@ -1,9 +1,10 @@
 //! In-memory `GatewayLink` backed by the protocol-v1 driver. For paused-time tests.
 
+use super::RouteLog;
 use super::driver::{
     ClientIn, Ctl, GatewayLog, MockConfig, ServerOut, ServerTransport, SharedLog, run_conn,
 };
-use fogar_ports::gateway::{Frame, GatewayLink, LinkError, LinkEvent, LinkSession};
+use fogar_ports::gateway::{Frame, GatewayLink, LinkError, LinkEvent, LinkSession, WsRoute};
 use std::{
     sync::{
         Arc, Mutex,
@@ -24,6 +25,7 @@ pub struct FakeGatewayLink {
 struct Inner {
     cfg: Mutex<MockConfig>,
     log: SharedLog,
+    routes: Mutex<Vec<WsRoute>>,
     ctls: Mutex<Vec<mpsc::Sender<Ctl>>>,
     fail_connects: AtomicU32,
     uplink_delay: Arc<Mutex<Option<Duration>>>,
@@ -36,6 +38,7 @@ impl FakeGatewayLink {
             inner: Arc::new(Inner {
                 cfg: Mutex::new(cfg),
                 log: Arc::default(),
+                routes: Mutex::default(),
                 ctls: Mutex::default(),
                 fail_connects: AtomicU32::new(0),
                 uplink_delay: Arc::new(Mutex::new(None)),
@@ -155,11 +158,18 @@ impl LinkSession for FakeSession {
     }
 }
 
+impl RouteLog for FakeGatewayLink {
+    fn routes_used(&self) -> Vec<WsRoute> {
+        self.inner.routes.lock().unwrap().clone()
+    }
+}
+
 impl GatewayLink for FakeGatewayLink {
     type Session = FakeSession;
     async fn connect(
         &self,
         addr: &fogar_ports::gateway::GatewayAddr,
+        route: WsRoute,
     ) -> Result<FakeSession, LinkError> {
         if !super::http::policy_allows(addr) {
             return Err(LinkError::NotConfigured);
@@ -172,6 +182,7 @@ impl GatewayLink for FakeGatewayLink {
         if fail {
             return Err(LinkError::Transport("scripted connect failure".into()));
         }
+        self.inner.routes.lock().unwrap().push(route);
         let (c2s_tx, c2s_rx) = mpsc::channel(64);
         let (s2c_tx, s2c_rx) = mpsc::channel(256);
         let (ctl_tx, ctl_rx) = mpsc::channel(8);

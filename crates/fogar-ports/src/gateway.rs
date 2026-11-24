@@ -87,9 +87,28 @@ pub trait LinkSession: Send + 'static {
     ) -> impl Future<Output = Result<(), LinkError>> + Send;
 }
 
+/// Which WebSocket endpoint a session opens. The conversation core always uses `Stream`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WsRoute {
+    /// `/ws/stream`: the conversation socket (spec §1).
+    Stream,
+    /// `/speech/dictation`: GUESSED (JGW Spec 5.0, Voz sin el WebSocket de conversación)
+    Dictation,
+}
+
+impl WsRoute {
+    pub fn path(self) -> &'static str {
+        match self {
+            Self::Stream => "/ws/stream",
+            Self::Dictation => "/speech/dictation",
+        }
+    }
+}
+
 pub trait GatewayLink: Send + Sync + 'static {
     type Session: LinkSession;
-    /// Opens a new transport session to `addr` (TCP [+TLS] + WS upgrade on `/ws/stream` for the
+    /// Opens a new transport session to `addr` (TCP [+TLS] + WS upgrade on `route.path()` for the
     /// real adapter). The address comes from the pairing record, so it can change between calls.
     /// For `Scheme::Plain` the adapter applies [`cleartext_allowed`] to EVERY resolved socket
     /// address before sending a byte (not to the host string: a LAN name can resolve to a public
@@ -99,6 +118,7 @@ pub trait GatewayLink: Send + Sync + 'static {
     fn connect(
         &self,
         addr: &GatewayAddr,
+        route: WsRoute,
     ) -> impl Future<Output = Result<Self::Session, LinkError>> + Send;
 }
 

@@ -21,6 +21,10 @@ mod healthy {
         let h = FakeGatewayHttp::new(HttpRoutes::new());
         (h.clone(), h)
     });
+    fogar_testkit::gateway_stream_contract!({
+        let h = FakeGatewayHttp::new(HttpRoutes::new());
+        (h.clone(), h)
+    });
     fogar_testkit::ipc_server_contract!({
         let server = FakeIpc::new();
         let handle = server.clone();
@@ -99,25 +103,35 @@ mod mock_http_server_matches_the_fake {
     #[derive(Debug)]
     struct MiniClient;
     impl fogar_ports::gateway_http::GatewayHttp for MiniClient {
-        async fn get(
+        async fn request(
             &self,
             addr: &fogar_ports::gateway::GatewayAddr,
-            call: fogar_ports::gateway_http::HttpCall,
+            call: &fogar_ports::gateway_http::HttpCall,
+            token: Option<&secrecy::SecretString>,
+            body: Option<secrecy::zeroize::Zeroizing<Vec<u8>>>,
         ) -> Result<fogar_ports::gateway_http::HttpReply, fogar_ports::gateway_http::HttpError>
         {
-            if matches!(call, fogar_ports::gateway_http::HttpCall::Pair) {
+            if !fogar_ports::gateway_http::request_allowed(call, token) {
                 return Err(fogar_ports::gateway_http::HttpError::Refused);
             }
-            mini(addr, "GET", call.path(), &[]).await
+            mini(addr, call, token, body.as_deref().map(Vec::as_slice)).await
         }
-        async fn post_json(
+
+        // Streams are not part of this self-test.
+        type Body = std::convert::Infallible;
+
+        async fn open_stream(
             &self,
-            addr: &fogar_ports::gateway::GatewayAddr,
-            call: fogar_ports::gateway_http::HttpCall,
-            body: secrecy::zeroize::Zeroizing<Vec<u8>>,
-        ) -> Result<fogar_ports::gateway_http::HttpReply, fogar_ports::gateway_http::HttpError>
-        {
-            mini(addr, "POST", call.path(), &body).await
+            _addr: &fogar_ports::gateway::GatewayAddr,
+            _call: &fogar_ports::gateway_http::HttpCall,
+            _token: &secrecy::SecretString,
+            _last_event_id: Option<&str>,
+            _body: Option<secrecy::zeroize::Zeroizing<Vec<u8>>>,
+        ) -> Result<
+            fogar_ports::gateway_http::StreamReply<Self::Body>,
+            fogar_ports::gateway_http::HttpError,
+        > {
+            Err(fogar_ports::gateway_http::HttpError::Unreachable)
         }
     }
 
@@ -125,35 +139,46 @@ mod mock_http_server_matches_the_fake {
     #[allow(clippy::unwrap_used)]
     async fn mini(
         addr: &fogar_ports::gateway::GatewayAddr,
-        method: &str,
-        path: &str,
-        body: &[u8],
+        call: &fogar_ports::gateway_http::HttpCall,
+        token: Option<&secrecy::SecretString>,
+        body: Option<&[u8]>,
     ) -> Result<fogar_ports::gateway_http::HttpReply, fogar_ports::gateway_http::HttpError> {
         use fogar_ports::gateway::cleartext_allowed;
-        use fogar_ports::gateway_http::{HttpError, HttpReply, MAX_BODY_BYTES};
+        use fogar_ports::gateway_http::{HttpError, HttpReply};
+        use secrecy::ExposeSecret;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         if let Ok(ip) = addr.host().parse::<std::net::IpAddr>()
             && !cleartext_allowed(ip)
         {
             return Err(HttpError::Refused);
         }
+        let max = call.max_body();
         let mut s = tokio::net::TcpStream::connect(addr.authority())
             .await
             .map_err(|_| HttpError::Unreachable)?;
-        let req = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        let mut req = format!(
+            "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+            call.method(),
+            call.path(),
             addr.authority(),
-            body.len()
         );
+        if let Some(t) = token {
+            req += &format!("Authorization: Bearer {}\r\n", t.expose_secret());
+        }
+        if let Some(b) = body {
+            req += &format!(
+                "Content-Type: application/json\r\nContent-Length: {}\r\n",
+                b.len()
+            );
+        }
+        req += "\r\n";
         s.write_all(req.as_bytes()).await.unwrap();
-        s.write_all(body).await.unwrap();
+        s.write_all(body.unwrap_or_default()).await.unwrap();
         // Bounded WHILE reading (an endless body must not be buffered first).
         let mut out = Vec::new();
         loop {
-            if out.len() > MAX_BODY_BYTES + 1024 {
-                return Err(HttpError::TooLarge {
-                    max: MAX_BODY_BYTES,
-                });
+            if out.len() > max + 1024 {
+                return Err(HttpError::TooLarge { max });
             }
             if s.read_buf(&mut out).await.unwrap() == 0 {
                 break;
@@ -161,11 +186,28 @@ mod mock_http_server_matches_the_fake {
         }
         let i = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
         let status: u16 = String::from_utf8_lossy(&out[9..12]).parse().unwrap();
-        let body = out[i + 4..].to_vec();
-        if body.len() > MAX_BODY_BYTES {
-            return Err(HttpError::TooLarge {
-                max: MAX_BODY_BYTES,
-            });
+        let chunked = String::from_utf8_lossy(&out[..i])
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked");
+        let mut rest = &out[i + 4..];
+        let body = if chunked {
+            let mut dec = Vec::new();
+            loop {
+                let eol = rest.windows(2).position(|w| w == b"\r\n").unwrap();
+                let n =
+                    usize::from_str_radix(std::str::from_utf8(&rest[..eol]).unwrap(), 16).unwrap();
+                if n == 0 {
+                    break;
+                }
+                dec.extend_from_slice(&rest[eol + 2..eol + 2 + n]);
+                rest = &rest[eol + 2 + n + 2..];
+            }
+            dec
+        } else {
+            rest.to_vec()
+        };
+        if body.len() > max {
+            return Err(HttpError::TooLarge { max });
         }
         Ok(HttpReply::new(status, body))
     }
@@ -262,8 +304,9 @@ mod contract_catches_lossy_recv {
         async fn connect(
             &self,
             addr: &fogar_ports::gateway::GatewayAddr,
+            route: fogar_ports::gateway::WsRoute,
         ) -> Result<LossySess, LinkError> {
-            Ok(LossySess(self.0.connect(addr).await?))
+            Ok(LossySess(self.0.connect(addr, route).await?))
         }
     }
 
@@ -325,5 +368,73 @@ mod fake_speaker_dead_output {
         spk.set_open_dead(false);
         assert!(spk.open(F).unwrap().is_alive());
         assert_eq!(spk.snapshot().opens, 2);
+    }
+}
+
+/// The stream cancel-safety clause must catch a body whose `chunk` takes bytes and then yields
+/// before returning them (dropped there, the bytes are lost).
+mod contract_catches_lossy_chunk {
+    use fogar_ports::gateway::GatewayAddr;
+    use fogar_ports::gateway_http::{
+        GatewayHttp, HttpCall, HttpError, HttpReply, ResponseBody, StreamReply,
+    };
+    use fogar_testkit::{FakeGatewayHttp, FakeStreamBody, HttpRoutes};
+    use secrecy::{SecretString, zeroize::Zeroizing};
+
+    struct Lossy(FakeGatewayHttp);
+    struct LossyBody(FakeStreamBody);
+
+    impl ResponseBody for LossyBody {
+        async fn chunk(&mut self) -> Result<Option<Vec<u8>>, HttpError> {
+            let c = self.0.chunk().await;
+            // NOT cancel-safe: dropping the future here loses `c`.
+            tokio::task::yield_now().await;
+            c
+        }
+    }
+
+    impl GatewayHttp for Lossy {
+        async fn request(
+            &self,
+            addr: &GatewayAddr,
+            call: &HttpCall,
+            token: Option<&SecretString>,
+            body: Option<Zeroizing<Vec<u8>>>,
+        ) -> Result<HttpReply, HttpError> {
+            self.0.request(addr, call, token, body).await
+        }
+        type Body = LossyBody;
+        async fn open_stream(
+            &self,
+            addr: &GatewayAddr,
+            call: &HttpCall,
+            token: &SecretString,
+            last_event_id: Option<&str>,
+            body: Option<Zeroizing<Vec<u8>>>,
+        ) -> Result<StreamReply<LossyBody>, HttpError> {
+            let r = self
+                .0
+                .open_stream(addr, call, token, last_event_id, body)
+                .await?;
+            Ok(StreamReply {
+                status: r.status,
+                body: LossyBody(r.body),
+            })
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "cancel-safety")]
+    fn lossy_chunk_fails_the_contract() {
+        fogar_testkit::run_async(async {
+            let inner = FakeGatewayHttp::new(HttpRoutes::new());
+            let (addr, routes) = (inner.addr(), inner.routes());
+            fogar_testkit::contract::gateway_stream::chunk_is_cancel_safe(
+                &Lossy(inner),
+                &addr,
+                &routes,
+            )
+            .await
+        })
     }
 }

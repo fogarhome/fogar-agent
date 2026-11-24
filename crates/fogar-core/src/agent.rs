@@ -391,15 +391,26 @@ impl TailnetPeers for NoTailnet {
 pub struct NoHttp;
 
 impl GatewayHttp for NoHttp {
-    async fn get(&self, _addr: &GatewayAddr, _call: HttpCall) -> Result<HttpReply, HttpError> {
-        Err(HttpError::Unreachable)
-    }
-    async fn post_json(
+    async fn request(
         &self,
         _addr: &GatewayAddr,
-        _call: HttpCall,
-        _body: secrecy::zeroize::Zeroizing<Vec<u8>>,
+        _call: &HttpCall,
+        _token: Option<&secrecy::SecretString>,
+        _body: Option<secrecy::zeroize::Zeroizing<Vec<u8>>>,
     ) -> Result<HttpReply, HttpError> {
+        Err(HttpError::Unreachable)
+    }
+
+    type Body = std::convert::Infallible;
+
+    async fn open_stream(
+        &self,
+        _addr: &GatewayAddr,
+        _call: &HttpCall,
+        _token: &secrecy::SecretString,
+        _last_event_id: Option<&str>,
+        _body: Option<secrecy::zeroize::Zeroizing<Vec<u8>>>,
+    ) -> Result<fogar_ports::gateway_http::StreamReply<Self::Body>, HttpError> {
         Err(HttpError::Unreachable)
     }
 }
