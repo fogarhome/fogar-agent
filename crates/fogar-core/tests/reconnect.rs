@@ -153,3 +153,25 @@ async fn reconnect_does_not_retry_a_client_bug() {
     no_new_attempts(&rig, 1).await;
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
+
+#[tokio::test(start_paused = true)]
+async fn close_4003_parks_without_retry() {
+    let mut rig = rig(true);
+    wait_ready(&mut rig.health).await;
+    park(
+        &mut rig,
+        4003,
+        "protocol version not supported",
+        CloseAction::UpgradeClient,
+    )
+    .await;
+    assert_eq!(rig.health.snapshot().link.label(), "parked_upgrade_client");
+    let mut c = client(&rig).await;
+    assert!(matches!(
+        c.request(IpcRequest::Reconnect).await,
+        Some(IpcResponse::Refused { .. })
+    ));
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    no_new_attempts(&rig, 1).await;
+    assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
+}

@@ -230,8 +230,6 @@ struct OpenTake {
     heard_at: Mono,
     /// Last non-empty partial (only to tell a new one from a repeat).
     last_partial: String,
-    /// Gateway silence warnings (`status transcriber degraded` without a code) in this take.
-    silence_warnings: u8,
 }
 
 enum Take {
@@ -434,18 +432,6 @@ impl CaptureGate {
                 t.last_partial.push_str(text);
                 t.heard_at = now;
             }
-        }
-    }
-
-    /// A gateway silence warning (`status transcriber degraded`, no `code`) during the take.
-    /// `true` = the second one: cut now (the third makes the gateway close the session).
-    pub(crate) fn on_silence_warning(&mut self) -> bool {
-        match &mut self.take {
-            Take::Open(t) => {
-                t.silence_warnings = t.silence_warnings.saturating_add(1);
-                t.silence_warnings >= 2
-            }
-            _ => false,
         }
     }
 
@@ -708,7 +694,6 @@ impl CaptureGate {
             started: now,
             heard_at: now,
             last_partial: String::new(),
-            silence_warnings: 0,
         }));
         GateEvent::Opened { reply }
     }
@@ -1055,18 +1040,9 @@ mod tests {
         assert!(g.is_open() && mic.is_open());
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn the_second_silence_warning_cuts_and_cuts_never_send() {
-        let (mut g, _) = gate(Arc::new(FakeMic::healthy()));
-        let clock = TestClock::new();
-        assert!(!g.on_silence_warning(), "no take: nothing to cut");
-        let (_owner, _answer) = start(&mut g, &clock).await;
-        let GateEvent::Opened { reply } = g.next(&clock).await else {
-            panic!()
-        };
-        reply.send(Ok(())).unwrap();
-        assert!(!g.on_silence_warning());
-        assert!(g.on_silence_warning());
+    #[test]
+    fn automatic_cuts_never_send() {
+        // 5.0: the gateway's `degraded` no longer cuts; only the agent's own cuts remain.
         for cut in [Cut::Silence, Cut::Safety, Cut::DeviceEnded, Cut::OwnerGone] {
             assert_ne!(cut.then(), CaptureThen::Send, "{cut:?}");
         }

@@ -235,7 +235,7 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                         CloseAction::Repair
                         | CloseAction::AgentRefused
                         | CloseAction::FixClient
-                        // Task 3 gives 4003 its own behaviour; parked like FixClient for now.
+                        // 4003 (CERTAIN (5.0, #417)): never retried; the label tells the app to update.
                         | CloseAction::UpgradeClient
                         | CloseAction::ConversationTaken => {
                             if self.park(action, &egress).await {

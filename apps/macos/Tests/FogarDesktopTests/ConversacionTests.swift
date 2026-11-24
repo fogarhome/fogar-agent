@@ -75,6 +75,18 @@ nonisolated func vista(_ turns: [WireTurn] = [], activity: WireActivity = .idle,
         #expect(Textos.desenlace(raro) == "Algo falló en el gateway.")
     }
 
+    @Test func erroresDelOrquestadorConSuFrase() {
+        func turno(_ code: String) -> WireTurn {
+            WireTurn(turn_id: "t", conversation: nil, source: .mine, mine: "", reply: "", progress: nil, tool: nil,
+                     outcome: .error, error_code: code, audio: .none)
+        }
+        let codigos = ["orchestrator_auth_failed", "orchestrator_model_unavailable", "orchestrator_rate_limited",
+                       "orchestrator_timeout", "orchestrator_agent_unavailable"]
+        #expect(Set(codigos.compactMap { Textos.desenlace(turno($0)) }).count == codigos.count)
+        #expect(Textos.desenlace(turno("orchestrator_timeout")) == "Fogar tardó demasiado en responder.")
+        #expect(Textos.desenlace(turno("orchestrator_error")) == "Algo falló en el gateway (orchestrator_error).")
+    }
+
     @Test func cadaRechazoDelAgenteConSuFrase() {
         let motivos = ["engine busy", "needs the signed Fogar app", "unsupported request", "ipc version mismatch", "otra cosa"]
         #expect(Set(motivos.map(Textos.rechazo)).count == motivos.count)

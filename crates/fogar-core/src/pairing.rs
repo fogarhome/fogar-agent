@@ -314,7 +314,8 @@ impl<C: Clock, H: GatewayHttp, T: TailnetPeers> Pairing<C, H, T> {
                     i,
                     GatewayCandidate::new(
                         addr.to_string(),
-                        label(wk.name.unwrap_or_default()),
+                        // 5.0 dropped `name` from the well-known: show the host as probed.
+                        label(wk.name.unwrap_or_else(|| addr.host().to_owned())),
                         label(wk.version),
                     ),
                 ));

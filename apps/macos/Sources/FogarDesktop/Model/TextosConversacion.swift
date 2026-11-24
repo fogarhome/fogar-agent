@@ -95,7 +95,20 @@ extension Textos {
         case .replaced?: "Fogar pasó a tu siguiente mensaje."
         case .timeout?: "Fogar tardó demasiado y lo dejó."
         case .closed?: "Se cerró la conexión con el gateway."
-        case .error?: t.error_code.flatMap(nombreSeguro).map { "Algo falló en el gateway (\($0))." } ?? "Algo falló en el gateway."
+        case .error?: t.error_code.flatMap(fraseOrquestador)
+            ?? t.error_code.flatMap(nombreSeguro).map { "Algo falló en el gateway (\($0))." } ?? "Algo falló en el gateway."
+        }
+    }
+
+    /// Gateway 5.0 orchestrator errors, each with its own phrase; any other code keeps the generic one.
+    static func fraseOrquestador(_ code: String) -> String? {
+        switch code {
+        case "orchestrator_auth_failed": "El modelo de Fogar no tiene acceso ahora: lo tiene que arreglar quien administra Fogar."
+        case "orchestrator_model_unavailable": "El modelo de Fogar no está disponible ahora."
+        case "orchestrator_rate_limited": "El modelo está saturado o sin saldo. Prueba más tarde."
+        case "orchestrator_timeout": "Fogar tardó demasiado en responder."
+        case "orchestrator_agent_unavailable": "Este agente ya no está disponible para este Mac."
+        default: nil
         }
     }
 

@@ -75,6 +75,9 @@ impl LinkState {
             LinkState::Parked {
                 reason: CloseAction::ConversationTaken,
             } => "parked_conversation_taken",
+            LinkState::Parked {
+                reason: CloseAction::UpgradeClient,
+            } => "parked_upgrade_client",
             LinkState::Parked { .. } => "parked_client_error",
             LinkState::ShuttingDown => "shutting_down",
             LinkState::Stopped => "stopped",

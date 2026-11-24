@@ -139,8 +139,7 @@ impl<L: GatewayLink + Clone> RigBuilder<L> {
             with_ipc: false,
             signed_peer: true,
             app_on_screen: false,
-            // Task 3: discovery labels must come from the host once the well-known has no name.
-            routes: HttpRoutes::fogar_4x("green-house"),
+            routes: HttpRoutes::fogar(),
             http_addrs: vec![GW_ADDR],
             tailnet: FakeTailnet::unsupported(),
         }
