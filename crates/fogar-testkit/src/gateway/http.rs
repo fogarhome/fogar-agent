@@ -160,11 +160,18 @@ impl HttpRoutes {
             },
         );
     }
-    /// A Fogar gateway named `name` (well-known on both paths).
-    pub fn fogar(name: &str) -> Self {
+    /// A 5.0 Fogar gateway: the well-known has no `name` (it arrives in `/pair`).
+    pub fn fogar() -> Self {
+        let r = Self::new();
+        let wk = r#"{"service":"fogar-gateway","version":"5.0.0","instance_id":"mock-instance"}"#;
+        r.set("GET", "/.well-known/fogar-gateway", 200, wk);
+        r
+    }
+    /// A 4.x Fogar gateway named `name`: the well-known still carries `name`.
+    pub fn fogar_4x(name: &str) -> Self {
         let r = Self::new();
         let wk = format!(r#"{{"service":"fogar-gateway","version":"1.29.0","name":"{name}"}}"#);
-        r.set("GET", "/.well-known/fogar-gateway", 200, wk.clone());
+        r.set("GET", "/.well-known/fogar-gateway", 200, wk);
         r
     }
     pub fn seen(&self) -> Vec<SeenRequest> {

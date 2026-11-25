@@ -558,9 +558,10 @@ async fn discover_tries_the_saved_address_then_this_machine() {
         panic!("{r:?}")
     };
     assert_eq!(found.len(), 1);
+    // 5.0: the well-known has no name, so the label is the probed host.
     assert_eq!(
         (found[0].address.as_str(), found[0].name.as_str()),
-        ("http://127.0.0.1:8004", "green-house")
+        ("http://127.0.0.1:8004", "127.0.0.1")
     );
     assert_eq!(tailnet_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
@@ -690,5 +691,33 @@ async fn another_ipc_version_is_told_ours_then_refused() {
         );
     }
     assert!(rig.secrets.contains(SecretKey::GatewayPairing));
+    assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
+}
+
+#[tokio::test(start_paused = true)]
+async fn candidate_without_name_shows_the_host() {
+    // 5.0: no `name` in the well-known -> the host as probed (here a tailnet peer's IP).
+    let mut b = unpaired();
+    b.http_addrs = vec!["100.64.0.10:8004"];
+    b.tailnet = FakeTailnet::with_peers(&["100.64.0.10"]);
+    let rig = b.start();
+    let mut c = client(&rig).await;
+    let Some(IpcResponse::Discovered(found)) = c.request(IpcRequest::Discover).await else {
+        panic!()
+    };
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].name, "100.64.0.10");
+    assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
+
+    // 4.x: the name in the well-known wins.
+    let mut b = unpaired();
+    b.routes = fogar_testkit::HttpRoutes::fogar_4x("green-house");
+    b.routes.set("POST", "/pair", 201, PAIR_OK);
+    let rig = b.start();
+    let mut c = client(&rig).await;
+    let Some(IpcResponse::Discovered(found)) = c.request(IpcRequest::Discover).await else {
+        panic!()
+    };
+    assert_eq!(found[0].name, "green-house");
     assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
 }

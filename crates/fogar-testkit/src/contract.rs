@@ -643,7 +643,7 @@ pub mod gateway_link {
 
     pub fn handshake() -> String {
         format!(
-            r#"{{"client_key":"{}","input_mode":"audio","output_mode":["audio","text"]}}"#,
+            r#"{{"client_key":"{}","protocol":5,"input_mode":"audio","output_mode":["audio","text"]}}"#,
             MockConfig::default().client_key
         )
     }
@@ -829,7 +829,8 @@ pub mod gateway_link {
     pub async fn bad_key_is_closed_as_repair<L: GatewayLink>(link: &L, addr: &GatewayAddr) {
         let mut s = link.connect(addr, WsRoute::Stream).await.unwrap();
         s.send(Frame::Text(
-            r#"{"client_key":"wrong","input_mode":"audio","output_mode":["audio"]}"#.into(),
+            r#"{"client_key":"wrong","protocol":5,"input_mode":"audio","output_mode":["audio"]}"#
+                .into(),
         ))
         .await
         .unwrap();

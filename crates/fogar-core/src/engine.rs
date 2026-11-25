@@ -32,8 +32,7 @@ use fogar_ports::{
     },
 };
 use fogar_proto::{
-    ClientMsg, encode_client, encode_upload_f32le, parse_tts_frame,
-    server::{ServerMsg, Service, ServiceState as WireServiceState},
+    ClientMsg, encode_client, encode_upload_f32le, parse_tts_frame, server::ServerMsg,
 };
 use std::{borrow::Cow, sync::Arc};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -398,26 +397,13 @@ impl<C: Clock> Engine<C> {
             }
             Inbound::Server(msg, _charge) => {
                 let now = self.clock.now();
-                let mut cut = None;
-                if st.turns.phase() == UserPhase::Recording && st.capture.is_open() {
-                    match &msg {
-                        ServerMsg::TranscriptionPartial(p) => {
-                            st.capture.on_partial(&p.text, now);
-                            self.conv
-                                .send_if_modified(|v| conversation::partial(v, &p.text));
-                        }
-                        // The gateway's silence watchdog warning (spec S2 «Límites de una
-                        // toma»): `degraded` without a code; the second one cuts the take.
-                        ServerMsg::Status(s)
-                            if s.service() == Service::Transcriber
-                                && s.state() == WireServiceState::Degraded
-                                && s.code.is_none()
-                                && st.capture.on_silence_warning() =>
-                        {
-                            cut = Some(Cut::Silence);
-                        }
-                        _ => {}
-                    }
+                if st.turns.phase() == UserPhase::Recording
+                    && st.capture.is_open()
+                    && let ServerMsg::TranscriptionPartial(p) = &msg
+                {
+                    st.capture.on_partial(&p.text, now);
+                    self.conv
+                        .send_if_modified(|v| conversation::partial(v, &p.text));
                 }
                 let was_waiting = matches!(st.turns.phase(), UserPhase::AwaitTurn { .. });
                 let fx = st.turns.on_server(&msg, now);
@@ -447,10 +433,6 @@ impl<C: Clock> Engine<C> {
                     self.publish(st, |v| conversation::wait_ended(v, TurnOutcome::Error));
                 }
                 self.apply(st, fx).await;
-                if let Some(cut) = cut {
-                    Stats::inc(&self.stats.captures_silence_cut);
-                    self.end_take(st, cut.then(), cut.notice()).await;
-                }
             }
             Inbound::Audio(buf, _charge) => {
                 let Ok(frame) = parse_tts_frame(&buf) else {
@@ -919,6 +901,45 @@ mod tests {
             }
         }
         assert_eq!(h.stats.snapshot().captures_safety_cut, 1);
+        h.drain();
+        h.stop().await;
+    }
+
+    const DEGRADED: &str = r#"{"type":"status","service":"transcriber","state":"degraded"}"#;
+
+    /// 5.0 (#417): `degraded` is one notice per silent stretch and never closes the session, so
+    /// the client no longer cuts the take on the second one.
+    #[tokio::test(start_paused = true)]
+    async fn degraded_warnings_no_longer_cut_the_take() {
+        let mut h = harness(FakeMic::healthy(), Config::default());
+        h.up().await;
+        let (_owner, answer) = h.press().await;
+        assert_eq!(answer, Ok(()));
+        for i in 0..3 {
+            h.server(&format!(
+                r#"{{"type":"transcription_partial","text":"p{i}"}}"#
+            ))
+            .await;
+            h.server(DEGRADED).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert!(h.mic.is_open(), "three degraded did not cut the take");
+        assert_eq!(h.stats.snapshot().captures_silence_cut, 0);
+        h.drain();
+        h.stop().await;
+    }
+
+    /// The agent's own 5 s without partials still cuts the take (to review, never to send).
+    #[tokio::test(start_paused = true)]
+    async fn own_silence_cut_still_reviews() {
+        let mut h = harness(FakeMic::healthy(), Config::default());
+        h.up().await;
+        let (_owner, answer) = h.press().await;
+        assert_eq!(answer, Ok(()));
+        h.server(DEGRADED).await;
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(!h.mic.is_open());
+        assert_eq!(h.stats.snapshot().captures_silence_cut, 1);
         h.drain();
         h.stop().await;
     }

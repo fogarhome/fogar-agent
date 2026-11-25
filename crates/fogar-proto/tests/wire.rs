@@ -9,8 +9,119 @@ use fogar_proto::{
         Transcription, TurnEnd, TurnErrorReason, TurnProgress, TurnStart,
     },
 };
+use fogar_proto::{CloseAction, classify_close, client::PROTOCOL_VERSION, pairing::WellKnown};
 use proptest::prelude::*;
 use std::borrow::Cow;
+
+#[test]
+fn handshake_carries_protocol_5() {
+    let h = Handshake {
+        client_key: "k".into(),
+        protocol: PROTOCOL_VERSION,
+        input_mode: InputMode::Text,
+        output_mode: vec![OutputMode::Text],
+        agent: None,
+    };
+    assert_eq!(PROTOCOL_VERSION, 5);
+    assert!(encode_handshake(&h).unwrap().contains(r#""protocol":5"#));
+}
+
+fn ready_protocol(extra: &str) -> Option<u32> {
+    let j = format!(r#"{{"type":"ready","session_id":"s","agent":"main"{extra}}}"#);
+    match decode_server(&j) {
+        Ok(ServerMsg::Ready(r)) => {
+            assert_eq!(r.session_id, "s");
+            assert_eq!(r.agent.as_deref(), Some("main"));
+            r.protocol
+        }
+        other => panic!("not ready: {other:?}"),
+    }
+}
+
+#[test]
+fn ready_with_protocol_decodes() {
+    assert_eq!(ready_protocol(r#","protocol":5"#), Some(5));
+}
+
+#[test]
+fn ready_without_protocol_still_decodes() {
+    assert_eq!(ready_protocol(""), None);
+    assert_eq!(ready_protocol(r#","protocol":null"#), None);
+}
+
+#[test]
+fn ready_with_bad_protocol_is_none() {
+    for bad in [
+        r#""x""#,
+        "[5]",
+        r#"{"a":1}"#,
+        "-1",
+        "1.5",
+        "true",
+        "99999999999",
+    ] {
+        assert_eq!(
+            ready_protocol(&format!(r#","protocol":{bad}"#)),
+            None,
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn close_4003_is_upgrade_client() {
+    assert_eq!(
+        classify_close(4003, "protocol version not supported"),
+        CloseAction::UpgradeClient
+    );
+    assert_eq!(classify_close(4003, ""), CloseAction::UpgradeClient);
+}
+
+#[test]
+fn new_turn_error_reasons_are_known() {
+    let cases = [
+        (
+            "orchestrator_auth_failed",
+            TurnErrorReason::OrchestratorAuthFailed,
+        ),
+        (
+            "orchestrator_model_unavailable",
+            TurnErrorReason::OrchestratorModelUnavailable,
+        ),
+        (
+            "orchestrator_rate_limited",
+            TurnErrorReason::OrchestratorRateLimited,
+        ),
+        ("orchestrator_timeout", TurnErrorReason::OrchestratorTimeout),
+        (
+            "orchestrator_agent_unavailable",
+            TurnErrorReason::OrchestratorAgentUnavailable,
+        ),
+        ("made_up", TurnErrorReason::Other),
+    ];
+    for (m, want) in cases {
+        let e = ErrorMsg {
+            code: "TURN_ERROR".into(),
+            message: m.into(),
+            fatal: false,
+            turn_id: None,
+        };
+        assert_eq!(e.turn_reason(), Some(want), "{m}");
+    }
+}
+
+#[test]
+fn well_known_with_and_without_name() {
+    let old: WellKnown =
+        serde_json::from_str(r#"{"service":"fogar-gateway","version":"4.9","name":"Casa"}"#)
+            .unwrap();
+    assert_eq!(old.name.as_deref(), Some("Casa"));
+    let new: WellKnown =
+        serde_json::from_str(r#"{"service":"fogar-gateway","version":"5.0","instance_id":"i1"}"#)
+            .unwrap();
+    assert_eq!(new.name, None);
+    assert_eq!(new.version, "5.0");
+}
 
 #[test]
 fn spec_ready_vector_decodes() {
@@ -101,13 +212,14 @@ fn client_vectors_are_exact() {
     );
     let h = Handshake {
         client_key: "k".into(),
+        protocol: PROTOCOL_VERSION,
         input_mode: InputMode::Audio,
         output_mode: vec![OutputMode::Audio, OutputMode::Text],
         agent: None,
     };
     assert_eq!(
         encode_handshake(&h).unwrap(),
-        r#"{"client_key":"k","input_mode":"audio","output_mode":["audio","text"]}"#
+        r#"{"client_key":"k","protocol":5,"input_mode":"audio","output_mode":["audio","text"]}"#
     );
 }
 
@@ -116,6 +228,7 @@ fn handshake_limit_is_in_chars_and_debug_redacts_key() {
     let key = "ñ".repeat(4000); // 4000 chars, 8000 bytes
     let h = Handshake {
         client_key: Cow::Borrowed(&key),
+        protocol: PROTOCOL_VERSION,
         input_mode: InputMode::Text,
         output_mode: vec![OutputMode::Text],
         agent: None,
@@ -163,6 +276,7 @@ fn arb_server_msg() -> impl Strategy<Value = ServerMsg> {
                         tts: b,
                         transcriber: t,
                     },
+                    protocol: None,
                 })
             }),
         arb_text().prop_map(|text| ServerMsg::TranscriptionPartial(Transcription { text })),

@@ -8,12 +8,20 @@ use alloc::{borrow::Cow, vec::Vec};
 use core::fmt;
 use serde::{Deserialize, Serialize};
 
+/// Gateway protocol version this client speaks. CERTAIN (5.0, #417): the handshake must carry it
+/// or the gateway closes 4003.
+pub const PROTOCOL_VERSION: u32 = 5;
+
 /// First client frame. **No `type` tag.** CERTAIN (JAP §1.3; Doc-vs-code P02/P03).
 /// The gateway has `extra="allow"`, but we send only documented fields (strict writer).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Handshake<'a> {
     #[serde(borrow)]
     pub client_key: Cow<'a, str>,
+    /// Always serialized; writers set `PROTOCOL_VERSION`. CERTAIN (5.0, #417). A decoder (the
+    /// fake gateway) reads a missing one as 0, which a 5.0 gateway refuses with 4003.
+    #[serde(default)]
+    pub protocol: u32,
     pub input_mode: InputMode,
     /// At least one; governs the session. We never request `status` by default (spec §7).
     pub output_mode: Vec<OutputMode>,
@@ -26,6 +34,7 @@ impl fmt::Debug for Handshake<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Handshake")
             .field("client_key", &"<redacted>")
+            .field("protocol", &self.protocol)
             .field("input_mode", &self.input_mode)
             .field("output_mode", &self.output_mode)
             .field("agent", &self.agent)

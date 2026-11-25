@@ -139,7 +139,7 @@ impl<L: GatewayLink + Clone> RigBuilder<L> {
             with_ipc: false,
             signed_peer: true,
             app_on_screen: false,
-            routes: HttpRoutes::fogar("green-house"),
+            routes: HttpRoutes::fogar(),
             http_addrs: vec![GW_ADDR],
             tailnet: FakeTailnet::unsupported(),
         }

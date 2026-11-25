@@ -1,7 +1,9 @@
 //! Transport-independent server side of protocol v1 (one connection).
 
 use fogar_proto::{
-    ClientMsg, Handshake, InputMode, OutputMode, decode_client, encode_tts_frame,
+    ClientMsg, Handshake, InputMode, OutputMode,
+    client::PROTOCOL_VERSION,
+    decode_client, encode_tts_frame,
     limits::HANDSHAKE_MAX_CHARS,
     server::{
         Capabilities, ErrorMsg, ProgressPhase, Ready, ServerMsg, Status, Token, Transcription,
@@ -21,6 +23,7 @@ pub const REASON_NOT_TEXT: &str = "Handshake invalido. Se esperaba texto.";
 pub const REASON_BAD_JSON: &str = "Handshake invalido. Se esperaba JSON de configuración.";
 pub const REASON_TOO_LARGE: &str = "Handshake too large";
 pub const REASON_TIMEOUT: &str = "Handshake timeout";
+pub const REASON_PROTOCOL: &str = "protocol version not supported";
 
 #[derive(Debug, Clone)]
 pub struct MockConfig {
@@ -52,6 +55,9 @@ pub struct MockConfig {
     /// `false` plays a gateway without voice: `status transcriber/tts unavailable` before
     /// `ready` and `live_capabilities` all false (3.0.1 §3). Text still works.
     pub voice: bool,
+    /// 5.0: the handshake must carry `protocol: 5` (else close 4003) and `ready` repeats it.
+    /// Only in M19 mode. `false` plays a 4.x gateway: no check, no `protocol` in `ready`. Default `true`.
+    pub require_protocol: bool,
 }
 
 impl Default for MockConfig {
@@ -75,6 +81,7 @@ impl Default for MockConfig {
             ],
             partial_every_frames: None,
             voice: true,
+            require_protocol: true,
         }
     }
 }
@@ -315,10 +322,23 @@ impl Conn {
             self.reject(t, REASON_TOO_LARGE).await;
             return false;
         }
-        let has_type = serde_json::from_str::<serde_json::Value>(&text)
+        let Some(obj) = serde_json::from_str::<serde_json::Value>(&text)
             .ok()
-            .and_then(|v| v.as_object().map(|o| o.contains_key("type")))
-            .unwrap_or(false);
+            .and_then(|v| v.as_object().cloned())
+        else {
+            self.reject(t, REASON_BAD_JSON).await;
+            return false;
+        };
+        let has_type = obj.contains_key("type");
+        // 5.0 doc: 4003 comes before the rest of the handshake and the credential.
+        if self.cfg.m19
+            && self.cfg.require_protocol
+            && obj.get("protocol").and_then(serde_json::Value::as_u64)
+                != Some(u64::from(PROTOCOL_VERSION))
+        {
+            self.reject(t, REASON_PROTOCOL).await;
+            return false;
+        }
         let Ok(hs) = serde_json::from_str::<Handshake<'_>>(&text) else {
             self.reject(t, REASON_BAD_JSON).await;
             return false;
@@ -388,6 +408,7 @@ impl Conn {
             output_mode: hs.output_mode.clone(),
             requested_capabilities: caps,
             live_capabilities: live,
+            protocol: (self.cfg.m19 && self.cfg.require_protocol).then_some(PROTOCOL_VERSION),
         });
         matches!(self.send(t, &ready).await, Step::Continue)
     }
@@ -408,6 +429,7 @@ impl Conn {
             REASON_NOT_TEXT => (4001, "handshake must be a text frame"),
             REASON_TOO_LARGE => (4002, "handshake too large"),
             REASON_TIMEOUT => (4900, "handshake timeout"),
+            REASON_PROTOCOL => (4003, "protocol version not supported"),
             _ => (4000, "invalid handshake"),
         }
     }

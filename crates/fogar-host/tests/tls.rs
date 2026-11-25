@@ -233,9 +233,7 @@ fn name_not_in_the_certificate_fails_the_handshake() {
 #[test]
 fn tls_to_a_plain_server_is_not_downgraded() {
     run_async(bounded(async {
-        let plain = MockHttpServer::start(HttpRoutes::fogar("gw"))
-            .await
-            .unwrap();
+        let plain = MockHttpServer::start(HttpRoutes::fogar()).await.unwrap();
         let addr = GatewayAddr::parse(&format!("https://{}", plain.addr().authority())).unwrap();
         let h = HttpGateway::new(HttpConfig::default()).with_tls(client(CA));
         assert!(matches!(

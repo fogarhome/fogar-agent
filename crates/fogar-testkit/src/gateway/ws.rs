@@ -57,7 +57,7 @@ impl MockGateway {
             log: Arc::default(),
             cfg: Arc::new(Mutex::new(cfg)),
             ctls: Arc::default(),
-            routes: HttpRoutes::fogar("mock"),
+            routes: HttpRoutes::fogar(),
             used: Arc::default(),
             cancel: CancellationToken::new(),
             tasks: TaskTracker::new(),

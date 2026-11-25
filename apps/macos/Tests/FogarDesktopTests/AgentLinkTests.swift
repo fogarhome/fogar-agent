@@ -204,9 +204,15 @@ extension AgentLinkOverASocket {
         #expect(Textos.titular(.versionMismatch(agent: 1)).titulo == "Actualiza el agente de Fogar")
     }
 
+    @Test func upgradeParkSaysToUpdate() {
+        let s = WireStatus(link: "parked_upgrade_client", phase: .parked, gateway: ready.gateway, sessions: 0,
+                           turns_completed: 0, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown)
+        #expect(Textos.titular(.live(s)).sub == "El gateway habla una versión nueva. Actualiza Fogar Desktop; si ya lo hiciste, pulsa Reconectar.")
+    }
+
     /// The two pauses the person can lift say how, and no longer send them to restart the agent.
     @Test func pausesWithReconnectSayReconectar() {
-        for link in ["parked_conversation_taken", "parked_agent_refused"] {
+        for link in ["parked_conversation_taken", "parked_agent_refused", "parked_upgrade_client"] {
             let s = WireStatus(link: link, phase: .parked, gateway: ready.gateway, sessions: 0,
                                turns_completed: 0, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown)
             let sub = Textos.titular(.live(s)).sub
