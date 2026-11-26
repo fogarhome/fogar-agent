@@ -219,7 +219,7 @@ fn client_vectors_are_exact() {
     };
     assert_eq!(
         encode_handshake(&h).unwrap(),
-        r#"{"client_key":"k","protocol":5,"input_mode":"audio","output_mode":["audio","text"]}"#
+        r#"{"token":"k","protocol":5,"input_mode":"audio","output_mode":["audio","text"]}"#
     );
 }
 
@@ -571,4 +571,288 @@ fn m19_turn_vectors_decode() {
             ..
         })
     ));
+}
+
+// ---- 5.0 account protocol (gateway 290efa0, M22): CERTAIN (5.0, M22) ----
+
+use fogar_proto::account::{ApiError, LoginRequest, LoginResponse, Me, Scope, UpdateMe};
+use fogar_proto::conversations::{Agents, Conversation, CreateConversation, History, Role};
+use fogar_proto::pairing::{ClientType, PairResponse};
+
+#[test]
+fn handshake_sends_token_not_client_key() {
+    let h = Handshake {
+        client_key: "k".into(),
+        protocol: PROTOCOL_VERSION,
+        input_mode: InputMode::Text,
+        output_mode: vec![OutputMode::Text],
+        agent: None,
+    };
+    let j = encode_handshake(&h).unwrap();
+    assert!(j.contains(r#""token":"k""#), "{j}");
+    assert!(!j.contains("client_key"), "{j}");
+}
+
+#[test]
+fn pair_response_token_and_scopes() {
+    let r: PairResponse = serde_json::from_str(
+        r#"{"client_id":"c-1","name":"Mac","token":"sk-1","scopes":["conversations:write"],"gateway":{"name":"casa","version":"5.0.0"}}"#,
+    )
+    .unwrap();
+    assert_eq!(r.client_key, "sk-1");
+    assert_eq!(r.scopes, vec!["conversations:write".to_string()]);
+    let r: PairResponse = serde_json::from_str(
+        r#"{"client_id":"c-1","name":"Mac","token":"sk-1","gateway":{"name":"casa","version":"5.0.0"}}"#,
+    )
+    .unwrap();
+    assert!(r.scopes.is_empty());
+    // 4.x is dropped: the old field name is not a credential any more.
+    assert!(
+        serde_json::from_str::<PairResponse>(
+            r#"{"client_id":"c-1","name":"Mac","client_key":"sk-1","gateway":{"name":"casa","version":"1.29.0"}}"#
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn scope_other_is_never_sent() {
+    let s: Scope = serde_json::from_str(r#""home:future""#).unwrap();
+    assert_eq!(s, Scope::Other);
+    assert!(serde_json::to_string(&Scope::Other).is_err());
+    let req = LoginRequest {
+        username: "ana".into(),
+        password: "pw".into(),
+        device_name: "Mac".into(),
+        client_type: None,
+        capabilities: None,
+        scopes: Some(vec![Scope::ConversationsWrite, Scope::Other]),
+    };
+    assert!(serde_json::to_string(&req).is_err());
+    for (s, w) in [
+        (Scope::ConversationsRead, "conversations:read"),
+        (Scope::ConversationsWrite, "conversations:write"),
+        (Scope::HomeRead, "home:read"),
+        (Scope::HomeAdmin, "home:admin"),
+    ] {
+        assert_eq!(serde_json::to_string(&s).unwrap(), format!("\"{w}\""));
+        assert_eq!(
+            serde_json::from_str::<Scope>(&format!("\"{w}\"")).unwrap(),
+            s
+        );
+    }
+}
+
+#[test]
+fn close_4011_is_missing_scope() {
+    assert_eq!(
+        classify_close(4011, "missing scope"),
+        CloseAction::MissingScope
+    );
+    assert_eq!(classify_close(4011, ""), CloseAction::MissingScope);
+}
+
+#[test]
+fn close_4102_is_fix_client() {
+    assert_eq!(
+        classify_close(4102, "conversation opened elsewhere"),
+        CloseAction::FixClient
+    );
+}
+
+#[test]
+fn login_request_shape() {
+    let mut req = LoginRequest {
+        username: "ana".into(),
+        password: "pw".into(),
+        device_name: "Mac de Ana".into(),
+        client_type: None,
+        capabilities: None,
+        scopes: None,
+    };
+    assert_eq!(
+        serde_json::to_string(&req).unwrap(),
+        r#"{"username":"ana","password":"pw","device_name":"Mac de Ana"}"#
+    );
+    req.client_type = Some(ClientType::App);
+    req.capabilities = Some(vec!["mic".into(), "speaker".into()]);
+    req.scopes = Some(vec![Scope::ConversationsWrite]);
+    assert_eq!(
+        serde_json::to_string(&req).unwrap(),
+        r#"{"username":"ana","password":"pw","device_name":"Mac de Ana","client_type":"app","capabilities":["mic","speaker"],"scopes":["conversations:write"]}"#
+    );
+}
+
+#[test]
+fn login_response_decodes() {
+    let r: LoginResponse = serde_json::from_str(
+        r#"{"client_id":"c-7","token":"tok-1","scopes":["conversations:write","conversations:read","home:robots"],"user":{"id":"u-1","username":"ana","display_name":"Ana","role":"member"},"home":{"id":"h-1","name":"Casa"},"extra":1}"#,
+    )
+    .unwrap();
+    assert_eq!(r.client_id, "c-7");
+    assert_eq!(r.token, "tok-1");
+    assert_eq!(
+        r.scopes,
+        vec![
+            Scope::ConversationsWrite,
+            Scope::ConversationsRead,
+            Scope::Other
+        ]
+    );
+    assert_eq!(r.user.username, "ana");
+    assert_eq!(r.user.display_name, "Ana");
+    assert_eq!(r.user.role, "member");
+    assert_eq!(r.home.as_ref().map(|h| h.name.as_str()), Some("Casa"));
+    // The gateway code sends `"home": null` when the device has no home row.
+    let r: LoginResponse = serde_json::from_str(
+        r#"{"client_id":"c-7","token":"t","scopes":[],"user":{"id":"u","username":"a","display_name":"A","role":"owner"},"home":null}"#,
+    )
+    .unwrap();
+    assert!(r.home.is_none());
+}
+
+#[test]
+fn me_decodes_and_ignores_device() {
+    let m: Me = serde_json::from_str(
+        r#"{"user":{"id":"u-1","username":"ana","display_name":"Ana","role":"admin"},"home":{"id":"h-1","name":"Casa"},"device":{"id":"c-7","whatever":[1,2]},"scopes":["home:admin"],"notify_client_id":null}"#,
+    )
+    .unwrap();
+    assert_eq!(m.scopes, vec![Scope::HomeAdmin]);
+    assert_eq!(m.notify_client_id, None);
+    assert_eq!(m.user.role, "admin");
+    let m: Me = serde_json::from_str(
+        r#"{"user":{"id":"u","username":"a","display_name":"A","role":"member"},"home":null,"device":null,"scopes":[],"notify_client_id":"c-2"}"#,
+    )
+    .unwrap();
+    assert_eq!(m.notify_client_id.as_deref(), Some("c-2"));
+    assert_eq!(
+        serde_json::to_string(&UpdateMe {
+            notify_client_id: "c-2".into()
+        })
+        .unwrap(),
+        r#"{"notify_client_id":"c-2"}"#
+    );
+}
+
+#[test]
+fn conversation_list_decodes() {
+    let l: Vec<Conversation> = serde_json::from_str(
+        r#"[
+        {"id":"cv-1","client_id":"c-1","client_name":"Mac","agent":"main","kind":"default","day":"2026-11-26","created_at":"2026-11-26T08:00:00Z","last_turn_at":"2026-11-26T09:00:00Z","turn_count":3,"title":"Luces","owner_user_id":"u-1"},
+        {"id":"cv-2","client_id":"c-1","client_name":"Mac","agent":"main","kind":"pinned","day":null,"created_at":"2026-11-26T08:00:00Z","last_turn_at":null,"turn_count":0,"title":null,"owner_user_id":null,"new_field":true}
+    ]"#,
+    )
+    .unwrap();
+    assert_eq!(l.len(), 2);
+    assert_eq!(l[0].title.as_deref(), Some("Luces"));
+    assert_eq!(l[0].turn_count, 3);
+    assert_eq!(l[0].message_id, None);
+    assert_eq!(l[1].kind, "pinned");
+    assert!(l[1].day.is_none() && l[1].last_turn_at.is_none() && l[1].owner_user_id.is_none());
+    // Created with a message: the reply carries its `message_id`.
+    let c: Conversation = serde_json::from_str(
+        r#"{"id":"cv-3","agent":"main","created_at":"2026-11-26T08:00:00Z","message_id":"m-1"}"#,
+    )
+    .unwrap();
+    assert_eq!(c.message_id.as_deref(), Some("m-1"));
+    assert_eq!((c.client_id.as_str(), c.turn_count), ("", 0));
+}
+
+#[test]
+fn create_conversation_omits_absent_fields() {
+    assert_eq!(
+        serde_json::to_string(&CreateConversation {
+            agent: None,
+            message: None
+        })
+        .unwrap(),
+        "{}"
+    );
+    let c = CreateConversation {
+        agent: None,
+        message: Some("hola".into()),
+    };
+    assert_eq!(serde_json::to_string(&c).unwrap(), r#"{"message":"hola"}"#);
+    let dbg = format!("{c:?}");
+    assert!(!dbg.contains("hola"), "{dbg}");
+}
+
+#[test]
+fn agents_decodes() {
+    let a: Agents = serde_json::from_str(r#"{"agents":["main","cocina"],"default":null}"#).unwrap();
+    assert_eq!(a.agents, vec!["main".to_string(), "cocina".to_string()]);
+    assert_eq!(a.default, None);
+    let a: Agents = serde_json::from_str(r#"{"agents":[],"default":"main"}"#).unwrap();
+    assert_eq!(a.default.as_deref(), Some("main"));
+}
+
+#[test]
+fn history_decodes() {
+    let h: History = serde_json::from_str(
+        r#"{"conversation_id":"cv-1","messages":[
+            {"id":"m-1","role":"user","text":"enciende la luz","timestamp":"2026-11-26T08:00:00Z"},
+            {"id":"m-2","role":"assistant","text":"hecho","timestamp":null},
+            {"id":"m-3","role":"system","text":"x","timestamp":null}
+        ],"has_more":true}"#,
+    )
+    .unwrap();
+    assert_eq!(h.conversation_id, "cv-1");
+    assert!(h.has_more);
+    assert_eq!(h.messages[0].role, Role::User);
+    assert_eq!(h.messages[1].role, Role::Assistant);
+    assert_eq!(h.messages[1].timestamp, None);
+    assert_eq!(h.messages[2].role, Role::Other);
+    let dbg = format!("{h:?}");
+    assert!(!dbg.contains("enciende"), "{dbg}");
+}
+
+#[test]
+fn history_message_without_id() {
+    let h: History = serde_json::from_str(
+        r#"{"conversation_id":"cv-1","messages":[{"role":"assistant","text":"hola","timestamp":null}],"has_more":false}"#,
+    )
+    .unwrap();
+    assert_eq!(h.messages[0].id, None);
+    assert_eq!(h.messages[0].text, "hola");
+}
+
+#[test]
+fn api_error_code() {
+    let e: ApiError = serde_json::from_str(r#"{"detail":"missing_scope"}"#).unwrap();
+    assert_eq!(e.code(), Some("missing_scope"));
+    let e: ApiError = serde_json::from_str(
+        r#"{"detail":[{"type":"missing","loc":["body","username"],"msg":"Field required"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(e.code(), None);
+}
+
+#[test]
+fn secrets_are_redacted() {
+    let h = Handshake {
+        client_key: "sekret-handshake".into(),
+        protocol: PROTOCOL_VERSION,
+        input_mode: InputMode::Text,
+        output_mode: vec![OutputMode::Text],
+        agent: None,
+    };
+    let p: PairResponse = serde_json::from_str(
+        r#"{"client_id":"c","name":"n","token":"sekret-pair","scopes":[],"gateway":{"name":"g","version":"5"}}"#,
+    )
+    .unwrap();
+    let req = LoginRequest {
+        username: "ana".into(),
+        password: "sekret-password".into(),
+        device_name: "Mac".into(),
+        client_type: None,
+        capabilities: None,
+        scopes: None,
+    };
+    let resp: LoginResponse = serde_json::from_str(
+        r#"{"client_id":"c","token":"sekret-login","scopes":[],"user":{"id":"u","username":"a","display_name":"A","role":"member"},"home":null}"#,
+    )
+    .unwrap();
+    let dbg = format!("{h:?} {h:#?} {p:?} {p:#?} {req:?} {req:#?} {resp:?} {resp:#?}");
+    assert!(!dbg.contains("sekret"), "{dbg}");
+    assert!(dbg.contains("redacted"), "{dbg}");
 }

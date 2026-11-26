@@ -237,7 +237,7 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                         | CloseAction::FixClient
                         // 4003 (CERTAIN (5.0, #417)): never retried; the label tells the app to update.
                         | CloseAction::UpgradeClient
-                        | CloseAction::ConversationTaken => {
+                        | CloseAction::MissingScope => {
                             if self.park(action, &egress).await {
                                 attempt = 0;
                                 continue;

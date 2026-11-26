@@ -35,14 +35,14 @@ pub enum LinkState {
 
 impl LinkState {
     /// Parked for a reason only the person can settle, so their `Reconnect` gets one new attempt:
-    /// 4102 (spec §13: "reconecta solo si lo pide el usuario") 4020/4021 (the admin may have
+    /// 4011 (the admin may have granted the scope meanwhile) 4020/4021 (the admin may have
     /// allowed the agent meanwhile) and 4003 (the person may have updated the gateway; one
     /// attempt, and a second 4003 parks again). Not `Repair`/`FixClient`: the same request fails the same way.
     pub fn user_may_reconnect(&self) -> bool {
         matches!(
             self,
             LinkState::Parked {
-                reason: CloseAction::ConversationTaken
+                reason: CloseAction::MissingScope
                     | CloseAction::AgentRefused
                     | CloseAction::UpgradeClient
             }
@@ -76,7 +76,8 @@ impl LinkState {
                 reason: CloseAction::AgentRefused,
             } => "parked_agent_refused",
             LinkState::Parked {
-                reason: CloseAction::ConversationTaken,
+                // shortcut: old label kept until Task 4 renames it `parked_missing_scope` with the app.
+                reason: CloseAction::MissingScope,
             } => "parked_conversation_taken",
             LinkState::Parked {
                 reason: CloseAction::UpgradeClient,

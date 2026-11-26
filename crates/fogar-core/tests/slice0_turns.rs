@@ -161,12 +161,7 @@ async fn push_while_a_push_is_open_is_dropped() {
 
 #[tokio::test(start_paused = true)]
 async fn conversation_taken_mid_answer_stops_playback_and_parks() {
-    closed_mid_answer(
-        4102,
-        "conversation opened elsewhere",
-        CloseAction::ConversationTaken,
-    )
-    .await;
+    closed_mid_answer(4011, "missing scope", CloseAction::MissingScope).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -179,7 +174,7 @@ async fn unreadable_client_config_mid_answer_ends_the_turn_then_retries() {
     closed_mid_answer(1011, "session setup failed", CloseAction::RetryBackoff).await;
 }
 
-/// M19 (3.0.1 §13): the open turn gets `turn_end{closed}` before these mid-session closes. The
+/// M19 (3.0.1 §13; 4011 since 5.0): the open turn gets `turn_end{closed}` before these mid-session closes. The
 /// link going down also stops playback, so `turns_cancelled` is what proves the `closed`.
 async fn closed_mid_answer(code: u16, reason: &str, action: CloseAction) {
     let mock = MockConfig {

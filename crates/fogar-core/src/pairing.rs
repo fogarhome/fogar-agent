@@ -386,6 +386,7 @@ impl<C: Clock, H: GatewayHttp, T: TailnetPeers> Pairing<C, H, T> {
             name,
             client_key,
             gateway,
+            ..
         } = resp;
         let client_key = SecretString::from(client_key);
         if !key_is_usable(client_key.expose_secret()) {

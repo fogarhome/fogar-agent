@@ -13,7 +13,7 @@ use fogar_ports::{
 use fogar_testkit::{FakeIpcClient, FakeTailnet, HttpRoutes, MemorySecretStore, MockConfig};
 use std::{sync::Arc, time::Duration};
 
-const PAIR_OK: &str = r#"{"client_id":"c-9","name":"Mac de Sito","client_key":"test-client-key","gateway":{"name":"green-house","version":"1.29.0"}}"#;
+const PAIR_OK: &str = r#"{"client_id":"c-9","name":"Mac de Sito","token":"test-client-key","gateway":{"name":"green-house","version":"1.29.0"}}"#;
 
 /// A rig that is NOT paired, with an IPC socket and a Fogar answering `/pair` with 201.
 fn unpaired() -> RigBuilder<fogar_testkit::FakeGatewayLink> {
