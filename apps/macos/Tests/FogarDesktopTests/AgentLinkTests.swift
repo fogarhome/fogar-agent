@@ -210,9 +210,16 @@ extension AgentLinkOverASocket {
         #expect(Textos.titular(.live(s)).sub == "El gateway habla una versión nueva. Actualiza Fogar Desktop; si ya lo hiciste, pulsa Reconectar.")
     }
 
-    /// The two pauses the person can lift say how, and no longer send them to restart the agent.
+    /// Gateway 5.0 close 4011: the key still works; the admin grants the scope, then Reconectar.
+    @Test func missingScopeParkSaysToAskForPermission() {
+        let s = WireStatus(link: "parked_missing_scope", phase: .parked, gateway: ready.gateway, sessions: 0,
+                           turns_completed: 0, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown)
+        #expect(Textos.titular(.live(s)).sub == "Este Mac no tiene permiso para conversar con Fogar. Pide a quien administra Fogar que se lo dé y pulsa Reconectar.")
+    }
+
+    /// The pauses the person can lift say how, and no longer send them to restart the agent.
     @Test func pausesWithReconnectSayReconectar() {
-        for link in ["parked_conversation_taken", "parked_agent_refused", "parked_upgrade_client"] {
+        for link in ["parked_missing_scope", "parked_agent_refused", "parked_upgrade_client"] {
             let s = WireStatus(link: link, phase: .parked, gateway: ready.gateway, sessions: 0,
                                turns_completed: 0, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown)
             let sub = Textos.titular(.live(s)).sub

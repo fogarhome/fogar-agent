@@ -3,8 +3,8 @@
 //! and aborted on shutdown.
 //!
 //! Authorization (IPC-4): `Pair`/`Unpair` change where the user's voice goes and `Reconnect`
-//! makes the agent spend the stored key to take the conversation back from another session (any
-//! same-user process could otherwise drive the 4102 ping-pong spec §13 forbids), so they are
+//! makes the agent spend the stored key on a new attempt after a park (any same-user process
+//! could otherwise drive the reconnect loop spec §13 forbids), so they are
 //! answered only for a `PeerCheck::SameSigner` peer, unless the composition root opted in to
 //! `UidOnly` peers at compile time (`Config::pair_from_uid_only_peers`).
 //!

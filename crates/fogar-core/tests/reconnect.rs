@@ -11,7 +11,10 @@
 mod common;
 use common::*;
 use fogar_core::LinkState;
-use fogar_ports::ipc::{IPC_VERSION, IpcRequest, IpcResponse};
+use fogar_ports::{
+    ipc::{IPC_VERSION, IpcRequest, IpcResponse},
+    secrets::SecretKey,
+};
 use fogar_proto::CloseAction;
 use fogar_testkit::{FakeIpcClient, MockConfig};
 use std::time::Duration;
@@ -49,8 +52,33 @@ async fn no_new_attempts(rig: &Rig, attempts: u64) {
     assert_eq!(rig.health.snapshot().stats.connect_attempts, attempts);
 }
 
+/// 4011 (5.0 §13): the key stays valid, so it is never deleted; the link parks without retrying
+/// and the app asks the person to have the scope granted.
 #[tokio::test(start_paused = true)]
-async fn conversation_taken_then_reconnect_is_ready_again() {
+async fn close_4011_parks_and_keeps_the_key() {
+    let mut b = RigBuilder::fake(MockConfig {
+        missing_scope: true,
+        ..MockConfig::default()
+    });
+    b.with_ipc = true;
+    b.signed_peer = true;
+    let mut rig = b.start();
+    wait_state(&mut rig.health, |v| {
+        v.state
+            == LinkState::Parked {
+                reason: CloseAction::MissingScope,
+            }
+    })
+    .await;
+    assert_eq!(rig.health.snapshot().link.label(), "parked_missing_scope");
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    assert_eq!(rig.health.snapshot().stats.connect_attempts, 1);
+    assert!(rig.secrets.contains(SecretKey::GatewayPairing));
+    assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
+}
+
+#[tokio::test(start_paused = true)]
+async fn close_4011_then_reconnect_is_ready_again() {
     let mut rig = rig(true);
     wait_ready(&mut rig.health).await;
     park(&mut rig, 4011, "missing scope", CloseAction::MissingScope).await;
@@ -70,7 +98,7 @@ async fn conversation_taken_then_reconnect_is_ready_again() {
         c.request(IpcRequest::Reconnect).await,
         Some(IpcResponse::Refused { .. })
     ));
-    // Taken again: parked again, and the click that ended the first park does not end this one.
+    // Refused again: parked again, and the click that ended the first park does not end this one.
     park(&mut rig, 4011, "missing scope", CloseAction::MissingScope).await;
     no_new_attempts(&rig, 2).await;
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);

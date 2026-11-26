@@ -280,7 +280,7 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
         let mut reconnect = self.reconnect.clone();
         // Load-bearing: `self.reconnect` is never advanced, so a fresh clone still sees every past
         // request as new; without this, each park after the first accepted Reconnect would wake
-        // at once (a 4102 ping-pong, NET-4). Before publishing Parked, so a request sent after
+        // at once (a reconnect loop, NET-4). Before publishing Parked, so a request sent after
         // the IPC service saw Parked does wake it.
         reconnect.borrow_and_update();
         let state = LinkState::Parked { reason };

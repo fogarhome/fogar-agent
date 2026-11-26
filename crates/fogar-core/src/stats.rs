@@ -23,8 +23,8 @@ pub enum LinkState {
     },
     /// No pairing record: the agent is not paired. Waits (no timer) for a pairing change.
     NotPaired,
-    /// Parked: retrying would loop (key revoked/invalid, agent refused, client bug, conversation
-    /// taken). Stays alive and reports health; leaves this state on restart, re-pairing, or an
+    /// Parked: retrying would loop (key revoked/invalid, agent refused, client bug, missing
+    /// scope). Stays alive and reports health; leaves this state on restart, re-pairing, or an
     /// IPC `Reconnect` when [`LinkState::user_may_reconnect`].
     Parked {
         reason: CloseAction,
@@ -76,9 +76,8 @@ impl LinkState {
                 reason: CloseAction::AgentRefused,
             } => "parked_agent_refused",
             LinkState::Parked {
-                // shortcut: old label kept until Task 4 renames it `parked_missing_scope` with the app.
                 reason: CloseAction::MissingScope,
-            } => "parked_conversation_taken",
+            } => "parked_missing_scope",
             LinkState::Parked {
                 reason: CloseAction::UpgradeClient,
             } => "parked_upgrade_client",

@@ -111,7 +111,7 @@ fn pair_reply_carries_token_and_scopes() {
             .unwrap();
         assert_eq!(r.status, 201);
         let p: PairResponse = serde_json::from_slice(&r.body).unwrap();
-        assert_eq!(p.scopes, ["conversations:write"]);
+        assert_eq!(p.scopes, [fogar_proto::account::Scope::ConversationsWrite]);
         assert!(String::from_utf8_lossy(&r.body).contains(r#""token":"test-client-key""#));
     });
 }

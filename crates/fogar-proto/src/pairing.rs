@@ -44,7 +44,7 @@ pub struct PairResponse {
     pub client_key: String,
     /// The granted scopes. CERTAIN (5.0, M22).
     #[serde(default)]
-    pub scopes: Vec<String>,
+    pub scopes: Vec<crate::account::Scope>,
     pub gateway: GatewayIdent,
 }
 

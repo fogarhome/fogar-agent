@@ -569,7 +569,7 @@ mod tests {
             fx.turn_completed && !fx.stop_playback,
             "a finished turn plays to the end"
         );
-        // `closed` precedes a 4102/4200 close: the tail must not play on a dead session.
+        // `closed` precedes a 4011/4020/4200 close: the tail must not play on a dead session.
         m.on_server(&ts("t-4", 4, Some(TurnOrigin::User)), T0);
         let closed = te("t-4", Some(TurnEndReason::Closed));
         assert!(m.on_server(&closed, T0).stop_playback);

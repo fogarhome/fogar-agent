@@ -160,7 +160,7 @@ async fn push_while_a_push_is_open_is_dropped() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn conversation_taken_mid_answer_stops_playback_and_parks() {
+async fn missing_scope_mid_answer_stops_playback_and_parks() {
     closed_mid_answer(4011, "missing scope", CloseAction::MissingScope).await;
 }
 

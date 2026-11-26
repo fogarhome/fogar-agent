@@ -6,8 +6,9 @@ use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::fmt;
 use serde::{Deserialize, Serialize};
 
-/// One item of `GET /conversations`, or the `201` of `POST /conversations`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// One item of `GET /conversations`, or the `201` of `POST /conversations`. `Debug` hides
+/// `title`: OpenClaw derives it from the user's text.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct Conversation {
     pub id: String,
     #[serde(default)]
@@ -33,6 +34,25 @@ pub struct Conversation {
     /// Only when created with `message`.
     #[serde(default)]
     pub message_id: Option<String>,
+}
+
+impl fmt::Debug for Conversation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Conversation")
+            .field("id", &self.id)
+            .field("client_id", &self.client_id)
+            .field("client_name", &self.client_name)
+            .field("agent", &self.agent)
+            .field("kind", &self.kind)
+            .field("day", &self.day)
+            .field("created_at", &self.created_at)
+            .field("last_turn_at", &self.last_turn_at)
+            .field("turn_count", &self.turn_count)
+            .field("title", &self.title.as_ref().map(|_| "<redacted>"))
+            .field("owner_user_id", &self.owner_user_id)
+            .field("message_id", &self.message_id)
+            .finish()
+    }
 }
 
 /// `POST /conversations` (the gateway forbids extra fields). Absent fields are not sent.

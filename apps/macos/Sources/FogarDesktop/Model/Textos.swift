@@ -84,11 +84,11 @@ enum Textos {
             return Titular(titulo: "Hay que volver a emparejar este Mac",
                            sub: "\(nombre.map { "El gateway \($0)" } ?? "El gateway") ya no reconoce la clave de este Mac. Desemparéjalo en Ajustes y emparéjalo con un código nuevo.",
                            tono: .bad)
-        case "parked_conversation_taken":
-            // Gateway M19 close 4102: reconnecting by itself would evict the other session, which
-            // would evict this one back (spec §13), so only the person's «Reconectar» does it.
-            return Titular(titulo: "Otra sesión abrió la conversación de este Mac",
-                           sub: "Algo más (otra pestaña del panel u otro cliente) abrió en \(gw) la conversación que usaba este Mac, así que este Mac se ha apartado. Pulsa Reconectar cuando quieras volver: la otra sesión se cerrará.",
+        case "parked_missing_scope":
+            // Gateway 5.0 close 4011: the key still works but lacks `conversations:write`; retrying
+            // by itself never helps, so only the person's «Reconectar» does it (spec §13).
+            return Titular(titulo: "Este Mac no tiene permiso",
+                           sub: "Este Mac no tiene permiso para conversar con Fogar. Pide a quien administra Fogar que se lo dé y pulsa Reconectar.",
                            tono: .bad)
         case "parked_upgrade_client":
             // Gateway 5.0 close 4003: this client's protocol is not supported; retrying by itself never helps; the person may press Reconectar.

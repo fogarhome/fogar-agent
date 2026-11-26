@@ -600,7 +600,13 @@ fn pair_response_token_and_scopes() {
     )
     .unwrap();
     assert_eq!(r.client_key, "sk-1");
-    assert_eq!(r.scopes, vec!["conversations:write".to_string()]);
+    assert_eq!(r.scopes, vec![Scope::ConversationsWrite]);
+    // Lenient like login: an unknown scope is `Other`, not an error.
+    let r: PairResponse = serde_json::from_str(
+        r#"{"client_id":"c-1","name":"Mac","token":"sk-1","scopes":["home:robots"],"gateway":{"name":"casa","version":"5.0.0"}}"#,
+    )
+    .unwrap();
+    assert_eq!(r.scopes, vec![Scope::Other]);
     let r: PairResponse = serde_json::from_str(
         r#"{"client_id":"c-1","name":"Mac","token":"sk-1","gateway":{"name":"casa","version":"5.0.0"}}"#,
     )
@@ -727,10 +733,18 @@ fn me_decodes_and_ignores_device() {
     assert_eq!(m.notify_client_id.as_deref(), Some("c-2"));
     assert_eq!(
         serde_json::to_string(&UpdateMe {
-            notify_client_id: "c-2".into()
+            notify_client_id: Some("c-2".into())
         })
         .unwrap(),
         r#"{"notify_client_id":"c-2"}"#
+    );
+    // `null` clears the notification device (gateway `MeUpdate`): it must be sent, not skipped.
+    assert_eq!(
+        serde_json::to_string(&UpdateMe {
+            notify_client_id: None
+        })
+        .unwrap(),
+        r#"{"notify_client_id":null}"#
     );
 }
 
@@ -852,7 +866,18 @@ fn secrets_are_redacted() {
         r#"{"client_id":"c","token":"sekret-login","scopes":[],"user":{"id":"u","username":"a","display_name":"A","role":"member"},"home":null}"#,
     )
     .unwrap();
-    let dbg = format!("{h:?} {h:#?} {p:?} {p:#?} {req:?} {req:#?} {resp:?} {resp:#?}");
+    // Personal data and user-derived text stay out of logs too.
+    let me: Me = serde_json::from_str(
+        r#"{"user":{"id":"u","username":"a","display_name":"sekret-name","role":"member"},"scopes":[]}"#,
+    )
+    .unwrap();
+    let conv: Conversation = serde_json::from_str(
+        r#"{"id":"cv","agent":"main","created_at":"t","title":"sekret-title"}"#,
+    )
+    .unwrap();
+    let dbg = format!(
+        "{h:?} {h:#?} {p:?} {p:#?} {req:?} {req:#?} {resp:?} {resp:#?} {me:?} {me:#?} {conv:?} {conv:#?}"
+    );
     assert!(!dbg.contains("sekret"), "{dbg}");
     assert!(dbg.contains("redacted"), "{dbg}");
 }

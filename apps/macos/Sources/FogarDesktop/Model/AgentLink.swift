@@ -214,8 +214,8 @@ final class AgentLink {
         }
     }
 
-    /// One new attempt from a link parked by the gateway (`parked_conversation_taken`,
-    /// `parked_agent_refused`); how it goes arrives as live status.
+    /// One new attempt from a link parked by the gateway (`parked_missing_scope`,
+    /// `parked_agent_refused`, `parked_upgrade_client`); how it goes arrives as live status.
     func reconnect() async throws(CommandError) {
         guard case .reconnecting = try await command(.reconnect, timeout: .seconds(5)) else { throw .unexpected }
     }

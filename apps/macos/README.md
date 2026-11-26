@@ -84,7 +84,7 @@ started with `FOGAR_AGENT_UNSIGNED=1`; a release build has no such switch (CI ch
 binary does not even contain the name).
 
 Only debug builds honour `FOGAR_AGENT_SOCKET`. Phases: `not_paired`, `connecting`, `ready`,
-`reconnecting`, `parked_repair`, `parked_agent_refused`, `parked_conversation_taken`, `parked_upgrade_client`, `parked_client_error`, `stopping` (also typed
+`reconnecting`, `parked_repair`, `parked_agent_refused`, `parked_missing_scope`, `parked_upgrade_client`, `parked_client_error`, `stopping` (also typed
 on the stand-in's stdin to change the live state). `--version 3` plays a newer agent, `--refuse-pair`
 an agent that refuses this app, `--boot safe` the crash-loop safe mode, `--peer uid_only` an unverified
 app (pair/unpair refused, like the core), `--old` today's pre-S1 core (no live status). Pairing codes decide the outcome: `482913` pairs; `111111` invalid_code, `222222` unreachable,

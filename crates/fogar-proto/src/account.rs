@@ -82,13 +82,25 @@ impl fmt::Debug for LoginResponse {
     }
 }
 
-/// `role` stays a string (`owner`, `admin`, `member`; may grow).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// `role` stays a string (`owner`, `admin`, `member`; may grow). `Debug` hides `display_name`
+/// (personal data).
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct User {
     pub id: String,
     pub username: String,
     pub display_name: String,
     pub role: String,
+}
+
+impl fmt::Debug for User {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("User")
+            .field("id", &self.id)
+            .field("username", &self.username)
+            .field("display_name", &"<redacted>")
+            .field("role", &self.role)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -111,9 +123,10 @@ pub struct Me {
 }
 
 /// `PATCH /auth/me`: choose this person's notification device (`422 invalid_notify_device`).
+/// `None` is sent as `null`: it clears the notification device (gateway `MeUpdate`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UpdateMe<'a> {
-    pub notify_client_id: Cow<'a, str>,
+    pub notify_client_id: Option<Cow<'a, str>>,
 }
 
 /// Any non-2xx JSON body: `{"detail": "<code>"}`, or FastAPI's 422 list.
