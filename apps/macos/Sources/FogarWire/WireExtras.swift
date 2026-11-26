@@ -20,8 +20,8 @@ public enum WireCodec {
     }
 }
 
-/// `print`, interpolation and `dump` of a login (or a `WireRequest` holding one) never show the
-/// password.
+/// `print` and interpolation of a login (or a `WireRequest` holding one) never show the password.
+/// `dump` and `Mirror` still do: never use them on a request.
 extension WireLogin: CustomStringConvertible, CustomDebugStringConvertible {
     public var description: String { "WireLogin(address: \(address), username: \(username), password: <redacted>)" }
     public var debugDescription: String { description }

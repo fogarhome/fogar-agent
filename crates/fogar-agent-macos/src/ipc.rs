@@ -516,8 +516,9 @@ impl MacIpcConn {
     fn new(stream: UnixStream, verified: Option<Attribution>) -> Self {
         Self {
             stream,
-            // 8 KiB: a max-size login frame (1024-byte password, escaped) never reallocates, so
-            // no unwiped copy of it is freed.
+            // 8 KiB: a typical login frame (even a 1024-byte escaped password) fits without
+            // reallocating. A frame with a very long address, or one queued behind a big frame,
+            // can still grow the buffer and free one unwiped partial copy.
             buf: Zeroizing::new(Vec::with_capacity(8 * 1024)),
             verified,
         }
