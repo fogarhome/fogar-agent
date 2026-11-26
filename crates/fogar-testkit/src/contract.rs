@@ -1739,7 +1739,7 @@ pub mod gateway_http {
         assert!(routes.seen().is_empty(), "nothing reached the wire");
     }
 
-    /// A query string goes out with the path (`?before=`).
+    /// A query string goes out with the path (`?limit=&before=`).
     pub async fn query_reaches_the_server<H: GatewayHttp>(
         h: &H,
         addr: &GatewayAddr,
@@ -1748,6 +1748,7 @@ pub mod gateway_http {
         let call = HttpCall::GetMessages {
             id: PathId::new("c1").unwrap(),
             before: Some(PathId::new("m5").unwrap()),
+            limit: 50,
         };
         let tok = SecretString::from("t");
         // Unrouted: a 404 is fine, only what the server saw matters.
@@ -1755,7 +1756,7 @@ pub mod gateway_http {
             .await
             .expect("query");
         let seen = routes.seen().pop().unwrap();
-        assert!(seen.path.contains("?before="), "{}", seen.path);
+        assert!(seen.path.ends_with("?limit=50&before=m5"), "{}", seen.path);
         assert!(seen.path.starts_with("/conversations/c1/messages?"));
     }
 

@@ -35,7 +35,7 @@
 //!   replies are decoded; the cap counts decoded bytes. It never follows redirects (a redirect
 //!   could move the key exchange to another host).
 //! - Bodies are wiped from memory on drop and never printed: the `/pair` reply carries the
-//!   `client_key` exactly once. Adapters read the body into ONE buffer pre-sized from
+//!   `token` exactly once. Adapters read the body into ONE buffer pre-sized from
 //!   `Content-Length` (capped at the call's limit), so growth never leaves stray copies.
 //!
 //! How Windows/Linux would do this: the same portable HTTP/1.1 client (fogar-host); nothing OS
@@ -87,34 +87,39 @@ pub enum HttpCall {
     WellKnownLegacy,
     /// `POST /pair` with a JSON body.
     Pair,
-    /// `POST /auth/login`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    /// `POST /auth/login`. CERTAIN (5.0, M22)
     Login,
-    /// `POST /auth/logout`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    /// `POST /auth/logout`. CERTAIN (5.0, M22)
     Logout,
-    /// `GET /auth/me`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    /// `GET /auth/me`. CERTAIN (5.0, M22)
     Me,
-    /// `PATCH /auth/me`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    /// `PATCH /auth/me`. CERTAIN (5.0, M22)
     UpdateMe,
-    /// `GET /conversations`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    /// `GET /conversations`. CERTAIN (5.0, M22)
     ListConversations,
-    /// `GET /conversations/agents`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    /// `GET /conversations/agents`. CERTAIN (5.0, M22)
     ListAgents,
-    /// `GET /conversations/{id}`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    /// `GET /conversations/{id}`. CERTAIN (5.0, M22)
     GetConversation { id: PathId },
-    /// `GET /conversations/{id}/messages[?before=]`. GUESSED (JGW Spec 5.0, Mapa de la API)
-    GetMessages { id: PathId, before: Option<PathId> },
-    /// `POST /conversations`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    /// `GET /conversations/{id}/messages?limit=N[&before=]`. CERTAIN (5.0, M22)
+    /// The gateway accepts `limit` 1–1000; callers keep it ≤ 200 so the reply fits
+    /// `MAX_LIST_BODY_BYTES`.
+    GetMessages {
+        id: PathId,
+        before: Option<PathId>,
+        limit: u16,
+    },
+    /// `POST /conversations`. CERTAIN (5.0, M22)
     CreateConversation,
-    /// `POST /conversations/{id}/messages`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    /// `POST /conversations/{id}/messages`. CERTAIN (5.0, M22)
     PostMessage { id: PathId },
-    /// `DELETE /conversations/{id}/messages/{message}`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    /// `DELETE /conversations/{id}/messages/{message}`. CERTAIN (5.0, M22)
     Withdraw { id: PathId, message: PathId },
-    /// `POST /conversations/{id}/cancel`. GUESSED (JGW Spec 5.0, Mapa de la API)
+    /// `POST /conversations/{id}/cancel`. CERTAIN (5.0, M22)
     Cancel { id: PathId },
-    /// `GET /events[?audio=1]` (stream). GUESSED (JGW Spec 5.0, Mapa de la API)
+    /// `GET /events[?audio=1]` (stream). CERTAIN (5.0, M22)
     Events { audio: bool },
-    /// `POST /conversations/{id}/messages/{message}/speech` (stream).
-    /// GUESSED (JGW Spec 5.0, Mapa de la API)
+    /// `POST /conversations/{id}/messages/{message}/speech` (stream). CERTAIN (5.0, M22)
     Speech { id: PathId, message: PathId },
 }
 
@@ -154,12 +159,17 @@ impl HttpCall {
             ListConversations | CreateConversation => "/conversations".into(),
             ListAgents => "/conversations/agents".into(),
             GetConversation { id } => format!("/conversations/{}", id.as_str()),
-            GetMessages { id, before: None } => format!("/conversations/{}/messages", id.as_str()),
+            GetMessages {
+                id,
+                before: None,
+                limit,
+            } => format!("/conversations/{}/messages?limit={limit}", id.as_str()),
             GetMessages {
                 id,
                 before: Some(b),
+                limit,
             } => format!(
-                "/conversations/{}/messages?before={}",
+                "/conversations/{}/messages?limit={limit}&before={}",
                 id.as_str(),
                 b.as_str()
             ),
@@ -403,6 +413,23 @@ mod tests {
     }
 
     #[test]
+    fn get_messages_path_has_limit_and_before() {
+        let id = PathId::new("c1").unwrap();
+        let first = HttpCall::GetMessages {
+            id: id.clone(),
+            before: None,
+            limit: 50,
+        };
+        assert_eq!(first.path(), "/conversations/c1/messages?limit=50");
+        let older = HttpCall::GetMessages {
+            id,
+            before: PathId::new("m9"),
+            limit: 1,
+        };
+        assert_eq!(older.path(), "/conversations/c1/messages?limit=1&before=m9");
+    }
+
+    #[test]
     fn calls_map_to_method_path_and_limits() {
         let id = || PathId::new("c1").unwrap();
         let m = || PathId::new("m9").unwrap();
@@ -452,9 +479,10 @@ mod tests {
                 HttpCall::GetMessages {
                     id: id(),
                     before: None,
+                    limit: 50,
                 },
                 "GET",
-                "/conversations/c1/messages",
+                "/conversations/c1/messages?limit=50",
                 true,
                 false,
             ),
@@ -462,9 +490,10 @@ mod tests {
                 HttpCall::GetMessages {
                     id: id(),
                     before: Some(m()),
+                    limit: 50,
                 },
                 "GET",
-                "/conversations/c1/messages?before=m9",
+                "/conversations/c1/messages?limit=50&before=m9",
                 true,
                 false,
             ),
