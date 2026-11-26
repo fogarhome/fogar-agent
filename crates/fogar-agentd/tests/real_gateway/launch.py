@@ -91,13 +91,13 @@ async def main() -> None:
                     while line := await loop.run_in_executor(None, sys.stdin.readline):
                         cmd = line.strip()
                         if cmd == "code":
-                            r = await c.post("/admin/pairing", json={"client_type": "app"})
+                            r = await c.post("/home/pairing", json={"client_type": "app"})
                             r.raise_for_status()
                             print(f"code {r.json()['code']}", flush=True)
                         elif cmd == "revoke":
-                            ids = [x["id"] for x in (await c.get("/admin/clients")).json()]
+                            ids = [x["id"] for x in (await c.get("/home/devices")).json()]
                             for i in ids:
-                                (await c.delete(f"/admin/clients/{i}")).raise_for_status()
+                                (await c.delete(f"/home/devices/{i}")).raise_for_status()
                             print(f"revoked {len(ids)}", flush=True)
                         elif cmd == "restart":
                             # Off the loop: the fake OpenClaw keeps answering while uvicorn drains.

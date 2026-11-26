@@ -161,17 +161,14 @@ impl HttpRoutes {
         );
     }
     /// A 5.0 Fogar gateway: the well-known has no `name` (it arrives in `/pair`).
+    /// `POST /pair` answers `201` with the default mock key as `token` and the scope the
+    /// mock's sessions need (CERTAIN, 5.0 M22).
     pub fn fogar() -> Self {
         let r = Self::new();
         let wk = r#"{"service":"fogar-gateway","version":"5.0.0","instance_id":"mock-instance"}"#;
         r.set("GET", "/.well-known/fogar-gateway", 200, wk);
-        r
-    }
-    /// A 4.x Fogar gateway named `name`: the well-known still carries `name`.
-    pub fn fogar_4x(name: &str) -> Self {
-        let r = Self::new();
-        let wk = format!(r#"{{"service":"fogar-gateway","version":"1.29.0","name":"{name}"}}"#);
-        r.set("GET", "/.well-known/fogar-gateway", 200, wk);
+        let pair = r#"{"client_id":"mock-client","name":"Mac de Sito","token":"test-client-key","scopes":["conversations:write"],"gateway":{"name":"mock","version":"5.0.0"}}"#;
+        r.set("POST", "/pair", 201, pair);
         r
     }
     pub fn seen(&self) -> Vec<SeenRequest> {

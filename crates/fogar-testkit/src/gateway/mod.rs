@@ -6,7 +6,9 @@
 //!
 //! Server behaviour modelled (spec section in brackets): handshake without `type`, 5 s timeout,
 //! 4096-char limit, `protocol: 5` (close 4003, checked before the key; `ready` repeats it, 5.0
-//! #417; `MockConfig::require_protocol = false` plays a 4.x gateway), key check with the exact 1008 reasons [§4, §11]; optional `status` before
+//! #417), credential in `token` (a handshake without it, e.g. the 4.x `client_key`, is 4000),
+//! key check (4010; the exact 1008 reasons with `m19 = false`) then 4011 `missing scope` when
+//! `MockConfig::missing_scope` [§1, §13]; `POST /pair` answers `token` + `scopes`; optional `status` before
 //! `ready` [§5]; `end` -> `transcription_partial` + `transcription` [§7]; `send` replaces the
 //! active turn [§9]; `turn_start`/`token`/paced `0xA1` audio/`turn_end` [§7, §12]; `cancel` ->
 //! `turn_end` [§6]; idle close 1000 after client silence [§13]; malformed JSON ->
@@ -24,9 +26,9 @@
 
 /// fogar-gateway commit (`origin/next/5.0`, gateway 5.0) whose `docs/client-protocol.md` this mock was last
 /// checked against.
-pub const SPEC_GATEWAY_COMMIT: &str = "fb019b88769e53824d15c2bf6b86e8e940f3614a";
+pub const SPEC_GATEWAY_COMMIT: &str = "290efa0f8df7c72dec453ca491b6117225f5a2f9";
 /// `git hash-object docs/client-protocol.md` at [`SPEC_GATEWAY_COMMIT`].
-pub const SPEC_BLOB: &str = "b1f9d584b97f085faee428a6804355b174e28548";
+pub const SPEC_BLOB: &str = "55168f0e78f4f563a4e5c05efcd692541a7582a2";
 
 mod driver;
 mod http;

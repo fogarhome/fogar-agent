@@ -643,7 +643,7 @@ pub mod gateway_link {
 
     pub fn handshake() -> String {
         format!(
-            r#"{{"client_key":"{}","protocol":5,"input_mode":"audio","output_mode":["audio","text"]}}"#,
+            r#"{{"token":"{}","protocol":5,"input_mode":"audio","output_mode":["audio","text"]}}"#,
             MockConfig::default().client_key
         )
     }
@@ -829,8 +829,7 @@ pub mod gateway_link {
     pub async fn bad_key_is_closed_as_repair<L: GatewayLink>(link: &L, addr: &GatewayAddr) {
         let mut s = link.connect(addr, WsRoute::Stream).await.unwrap();
         s.send(Frame::Text(
-            r#"{"client_key":"wrong","protocol":5,"input_mode":"audio","output_mode":["audio"]}"#
-                .into(),
+            r#"{"token":"wrong","protocol":5,"input_mode":"audio","output_mode":["audio"]}"#.into(),
         ))
         .await
         .unwrap();
@@ -1461,7 +1460,7 @@ pub mod gateway_http {
         addr: &GatewayAddr,
         routes: &HttpRoutes,
     ) {
-        routes.set("POST", "/pair", 201, r#"{"client_key":"k"}"#);
+        routes.set("POST", "/pair", 201, r#"{"token":"k"}"#);
         let body = br#"{"code":"482913"}"#.to_vec();
         let r = bounded(h.request(
             addr,
@@ -1471,10 +1470,7 @@ pub mod gateway_http {
         ))
         .await
         .expect("post");
-        assert_eq!(
-            (r.status, &r.body[..]),
-            (201, &br#"{"client_key":"k"}"#[..])
-        );
+        assert_eq!((r.status, &r.body[..]), (201, &br#"{"token":"k"}"#[..]));
         let seen = routes.seen();
         let last = seen.last().expect("request seen");
         assert_eq!(

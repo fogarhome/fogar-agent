@@ -24,6 +24,7 @@ pub const REASON_BAD_JSON: &str = "Handshake invalido. Se esperaba JSON de confi
 pub const REASON_TOO_LARGE: &str = "Handshake too large";
 pub const REASON_TIMEOUT: &str = "Handshake timeout";
 pub const REASON_PROTOCOL: &str = "protocol version not supported";
+const REASON_SCOPE: &str = "missing scope";
 
 #[derive(Debug, Clone)]
 pub struct MockConfig {
@@ -55,9 +56,9 @@ pub struct MockConfig {
     /// `false` plays a gateway without voice: `status transcriber/tts unavailable` before
     /// `ready` and `live_capabilities` all false (3.0.1 §3). Text still works.
     pub voice: bool,
-    /// 5.0: the handshake must carry `protocol: 5` (else close 4003) and `ready` repeats it.
-    /// Only in M19 mode. `false` plays a 4.x gateway: no check, no `protocol` in `ready`. Default `true`.
-    pub require_protocol: bool,
+    /// 5.0 (CERTAIN, M22): a valid key whose device lacks `conversations:write` is closed with
+    /// 4011 `missing scope` instead of getting `ready`. Default `false`.
+    pub missing_scope: bool,
 }
 
 impl Default for MockConfig {
@@ -81,7 +82,7 @@ impl Default for MockConfig {
             ],
             partial_every_frames: None,
             voice: true,
-            require_protocol: true,
+            missing_scope: false,
         }
     }
 }
@@ -332,19 +333,23 @@ impl Conn {
         let has_type = obj.contains_key("type");
         // 5.0 doc: 4003 comes before the rest of the handshake and the credential.
         if self.cfg.m19
-            && self.cfg.require_protocol
             && obj.get("protocol").and_then(serde_json::Value::as_u64)
                 != Some(u64::from(PROTOCOL_VERSION))
         {
             self.reject(t, REASON_PROTOCOL).await;
             return false;
         }
+        // A handshake without `token` (a 4.x `client_key` one) does not decode: 4000.
         let Ok(hs) = serde_json::from_str::<Handshake<'_>>(&text) else {
             self.reject(t, REASON_BAD_JSON).await;
             return false;
         };
         if hs.client_key != self.cfg.client_key {
             self.reject(t, REASON_BAD_KEY).await;
+            return false;
+        }
+        if self.cfg.missing_scope {
+            self.reject(t, REASON_SCOPE).await;
             return false;
         }
         self.output_text = hs.output_mode.contains(&OutputMode::Text);
@@ -408,7 +413,7 @@ impl Conn {
             output_mode: hs.output_mode.clone(),
             requested_capabilities: caps,
             live_capabilities: live,
-            protocol: (self.cfg.m19 && self.cfg.require_protocol).then_some(PROTOCOL_VERSION),
+            protocol: self.cfg.m19.then_some(PROTOCOL_VERSION),
         });
         matches!(self.send(t, &ready).await, Step::Continue)
     }
@@ -430,6 +435,7 @@ impl Conn {
             REASON_TOO_LARGE => (4002, "handshake too large"),
             REASON_TIMEOUT => (4900, "handshake timeout"),
             REASON_PROTOCOL => (4003, "protocol version not supported"),
+            REASON_SCOPE => (4011, "missing scope"),
             _ => (4000, "invalid handshake"),
         }
     }

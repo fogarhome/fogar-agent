@@ -709,9 +709,14 @@ async fn candidate_without_name_shows_the_host() {
     assert_eq!(found[0].name, "100.64.0.10");
     assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
 
-    // 4.x: the name in the well-known wins.
-    let mut b = unpaired();
-    b.routes = fogar_testkit::HttpRoutes::fogar_4x("green-house");
+    // A well-known that carries `name` (lenient reader): it wins.
+    let b = unpaired();
+    b.routes.set(
+        "GET",
+        "/.well-known/fogar-gateway",
+        200,
+        r#"{"service":"fogar-gateway","version":"5.0.0","name":"green-house"}"#,
+    );
     b.routes.set("POST", "/pair", 201, PAIR_OK);
     let rig = b.start();
     let mut c = client(&rig).await;
