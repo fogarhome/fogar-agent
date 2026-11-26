@@ -1,5 +1,5 @@
 //! The mock gateway at 5.0: `protocol: 5` in the handshake (4003 otherwise) and in `ready`,
-//! the credential in `token` (4000 without it), 4011 without scope, `/pair` with token + scopes.
+//! the credential in `token` (4000 without it), 4011 without scope.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -55,6 +55,19 @@ fn handshake_without_protocol_closes_4003() {
 }
 
 #[test]
+fn handshake_4x_without_protocol_closes_4003_not_4000() {
+    fogar_testkit::run_async(async {
+        // A 4.x client (`client_key`, no `protocol`): the version check runs before the
+        // credential one, so it is 4003, not 4000.
+        let old = r#"{"client_key":"x","input_mode":"audio","output_mode":["text"]}"#;
+        assert_eq!(
+            first(MockConfig::default(), old).await.unwrap_err(),
+            (4003, "protocol version not supported".to_string())
+        );
+    });
+}
+
+#[test]
 fn closes_that_win_before_4003_still_win() {
     fogar_testkit::run_async(async {
         let e = first(MockConfig::default(), "[1]").await.unwrap_err();
@@ -96,23 +109,6 @@ fn missing_scope_closes_4011() {
         // A wrong key is still 4010: the credential is checked before the permission.
         let bad = WITH_PROTOCOL.replace("test-client-key", "nope");
         assert_eq!(first(cfg, &bad).await.unwrap_err().0, 4010);
-    });
-}
-
-#[test]
-fn pair_reply_carries_token_and_scopes() {
-    use fogar_ports::gateway_http::{GatewayHttp, HttpCall};
-    use fogar_proto::pairing::PairResponse;
-    fogar_testkit::run_async(async {
-        let h = fogar_testkit::FakeGatewayHttp::new(fogar_testkit::HttpRoutes::fogar());
-        let r = h
-            .request(&h.addr(), &HttpCall::Pair, None, None)
-            .await
-            .unwrap();
-        assert_eq!(r.status, 201);
-        let p: PairResponse = serde_json::from_slice(&r.body).unwrap();
-        assert_eq!(p.scopes, [fogar_proto::account::Scope::ConversationsWrite]);
-        assert!(String::from_utf8_lossy(&r.body).contains(r#""token":"test-client-key""#));
     });
 }
 

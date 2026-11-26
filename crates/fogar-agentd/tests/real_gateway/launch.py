@@ -95,7 +95,9 @@ async def main() -> None:
                             r.raise_for_status()
                             print(f"code {r.json()['code']}", flush=True)
                         elif cmd == "revoke":
-                            ids = [x["id"] for x in (await c.get("/home/devices")).json()]
+                            devices = await c.get("/home/devices")
+                            devices.raise_for_status()
+                            ids = [x["id"] for x in devices.json()]
                             for i in ids:
                                 (await c.delete(f"/home/devices/{i}")).raise_for_status()
                             print(f"revoked {len(ids)}", flush=True)

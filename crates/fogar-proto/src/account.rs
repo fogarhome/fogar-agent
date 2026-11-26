@@ -11,7 +11,7 @@ use crate::pairing::ClientType;
 
 /// A device permission. CERTAIN (5.0, M22). `Other` is a scope this client does not know yet
 /// (read leniently); it is never written: serializing it is an error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Scope {
     #[serde(rename = "conversations:read")]
     ConversationsRead,
@@ -27,20 +27,17 @@ pub enum Scope {
 }
 
 /// `POST /auth/login`. Absent options are not sent. `Debug` redacts the password.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct LoginRequest<'a> {
-    #[serde(borrow)]
     pub username: Cow<'a, str>,
-    #[serde(borrow)]
     pub password: Cow<'a, str>,
-    #[serde(borrow)]
     pub device_name: Cow<'a, str>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub client_type: Option<ClientType>,
-    #[serde(borrow, default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<Cow<'a, str>>>,
     /// Without it the gateway grants `conversations:write`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<Scope>>,
 }
 
@@ -130,9 +127,21 @@ pub struct UpdateMe<'a> {
 }
 
 /// Any non-2xx JSON body: `{"detail": "<code>"}`, or FastAPI's 422 list.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+/// `Debug` shows only the string code: the raw body is server text and stays out of logs.
+#[derive(Clone, PartialEq, Deserialize)]
 pub struct ApiError {
     pub detail: Value,
+}
+
+impl fmt::Debug for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut d = f.debug_struct("ApiError");
+        match self.code() {
+            Some(code) => d.field("detail", &code),
+            None => d.field("detail", &format_args!("<non-string detail>")),
+        };
+        d.finish()
+    }
 }
 
 impl ApiError {

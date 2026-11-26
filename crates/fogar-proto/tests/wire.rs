@@ -839,6 +839,12 @@ fn api_error_code() {
     )
     .unwrap();
     assert_eq!(e.code(), None);
+    // Debug never echoes the raw body: a non-string detail is a placeholder.
+    let dbg = format!("{e:?}");
+    assert!(!dbg.contains("Field required"), "{dbg}");
+    assert!(dbg.contains("<non-string detail>"), "{dbg}");
+    let e: ApiError = serde_json::from_str(r#"{"detail":"bad\nINFO forged"}"#).unwrap();
+    assert!(!format!("{e:?}").contains('\n'));
 }
 
 #[test]
