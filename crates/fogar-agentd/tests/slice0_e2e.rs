@@ -6,7 +6,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use fogar_core::{
-    Agent, AgentPorts, Config, HealthProbe, LinkState, NoHttp, NoIpc, PairingRecord,
+    AccountRecord, Agent, AgentPorts, Config, HealthProbe, LinkState, NoHttp, NoIpc,
     crashloop::BootMode,
 };
 use fogar_host::{TokioClock, WsConfig, WsGatewayLink};
@@ -90,18 +90,11 @@ async fn app_on_screen(ipc: FakeIpc, subscribed: tokio::sync::oneshot::Sender<()
     }
 }
 
-/// A store paired with the gateway at `addr`.
+/// A store signed in at the gateway at `addr` with token `key`.
 fn paired(addr: GatewayAddr, key: &str) -> MemorySecretStore {
     let s = MemorySecretStore::default();
-    let rec = PairingRecord::new(
-        addr,
-        "c-1".into(),
-        key.to_owned().into(),
-        "mock".into(),
-        "1".into(),
-        "e2e".into(),
-    );
-    s.put(SecretKey::GatewayPairing, rec.encode()).unwrap();
+    let rec = AccountRecord::new(addr, "c-1".into(), key.to_owned().into());
+    s.put(SecretKey::GatewayAccount, rec.encode()).unwrap();
     s
 }
 
@@ -316,8 +309,8 @@ async fn gateway_closes_are_classified_over_websocket() {
         ),
         (
             Ctl::Close {
-                code: 1008,
-                reason: "revoked".into(),
+                code: 4200,
+                reason: "credential revoked".into(),
             },
             CloseAction::Repair,
             false,
@@ -349,7 +342,7 @@ async fn gateway_closes_are_classified_over_websocket() {
         if reconnects {
             ready(&mut e.health, 2).await;
         } else {
-            // Revocation deletes the pairing (spec §0); other refusals park and keep it.
+            // Revocation deletes the account (spec §0); other refusals park and keep it.
             let expect = if action == CloseAction::Repair {
                 LinkState::NotPaired
             } else {

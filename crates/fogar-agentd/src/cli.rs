@@ -4,12 +4,12 @@ use std::path::PathBuf;
 
 pub(crate) const USAGE: &str = "usage:
   fogar-agentd run [--gateway ws://127.0.0.1:8004/ws/stream] [--agent NAME] [--state-dir DIR] [--keepalive-secs N] [--no-ipc]
-  fogar-agentd store-key [--state-dir DIR]   (client key on stdin; dev only: `run --gateway` turns it into a pairing)";
+  fogar-agentd store-key [--state-dir DIR]   (device token on stdin; dev only: `run --gateway` turns it into the account)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunOpts {
-    /// Dev path (Linux): pairs a key stored with `store-key` to this address. The app pairs
-    /// through the IPC instead.
+    /// Dev path (Linux): a token stored with `store-key` becomes the account for this address.
+    /// The app signs in through the IPC instead.
     pub(crate) gateway: Option<String>,
     pub(crate) agent: Option<String>,
     pub(crate) state_dir: Option<PathBuf>,

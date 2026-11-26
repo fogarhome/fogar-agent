@@ -1,11 +1,13 @@
-//! S1 end-to-end: the whole pairing lifecycle over the REAL transport. Real HTTP
-//! (`fogar_host::HttpGateway`) and real WebSocket (`WsGatewayLink`), against two gateways:
-//! - the Rust mock (`MockGateway`), which serves `/pair` and `/ws/stream` on one loopback port
-//!   like the real one: always runs, covers the 4200 revocation;
+//! S4 end-to-end (the file keeps its S1 name: CI runs it by name): the whole account lifecycle
+//! over the REAL transport. Real HTTP (`fogar_host::HttpGateway`) and real WebSocket
+//! (`WsGatewayLink`), against two gateways:
+//! - the Rust mock (`MockGateway`), which serves `/auth/*` and `/ws/stream` on one loopback port
+//!   like the real one: always runs;
 //! - the REAL fogar-gateway (Python) with its own fake OpenClaw and no STT/TTS, started by
 //!   `real_gateway/launch.py` from the checkout in `FOGAR_GATEWAY_DIR` (skipped when unset; CI
 //!   job `.github/workflows/e2e-gateway.yml` checks out the commit in `real_gateway/GATEWAY_REF`).
 //!
+//! Loopback is one of the addresses option B allows for a password over plain HTTP.
 //! The app side of the IPC is the in-memory `FakeIpc` (the real socket's code-signing check
 //! cannot accept a test binary). Real sockets, so real time, not paused time.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -13,7 +15,7 @@
 use fogar_core::{Agent, AgentPorts, Config, HealthProbe, LinkState, crashloop::BootMode};
 use fogar_host::{HttpConfig, HttpGateway, TokioClock, WsConfig, WsGatewayLink};
 use fogar_ports::{
-    ipc::{IpcRequest, IpcResponse, LinkPhase, PairCode},
+    ipc::{GatewayInfo, IpcRequest, IpcResponse, LinkPhase, LoginForm, Password},
     secrets::{SecretCaps, SecretError, SecretKey, SecretStore, SecretString},
 };
 use fogar_testkit::{
@@ -28,11 +30,11 @@ use std::{
     time::Duration,
 };
 
-/// Memory store that counts deletions of the pairing record.
+/// Memory store that counts deletions of the account.
 #[derive(Debug, Default)]
 struct CountingStore {
     inner: MemorySecretStore,
-    pairing_deletes: AtomicU32,
+    account_deletes: AtomicU32,
 }
 
 impl SecretStore for CountingStore {
@@ -46,8 +48,8 @@ impl SecretStore for CountingStore {
         self.inner.put(key, value)
     }
     fn delete(&self, key: SecretKey) -> Result<(), SecretError> {
-        if key == SecretKey::GatewayPairing {
-            self.pairing_deletes.fetch_add(1, Ordering::SeqCst);
+        if key == SecretKey::GatewayAccount && self.inner.contains(key) {
+            self.account_deletes.fetch_add(1, Ordering::SeqCst);
         }
         self.inner.delete(key)
     }
@@ -61,10 +63,10 @@ fn fast_config() -> Config {
     c
 }
 
-/// The gateway's `201` for `POST /pair` (spec §0), handing out `key`.
-fn pair_ok(key: &str) -> String {
+/// The gateway's `201` for `POST /auth/login`, handing out `token`.
+fn login_ok(token: &str) -> String {
     format!(
-        r#"{{"client_id":"c-1","name":"Mac de Sito","token":"{key}","scopes":["conversations:write"],"gateway":{{"name":"mock","version":"5.0.0"}}}}"#
+        r#"{{"client_id":"c-1","token":"{token}","scopes":["conversations:read","conversations:write"],"user":{{"id":"u-1","username":"sito","display_name":"Sito","role":"member"}},"home":{{"id":"home","name":"mock"}}}}"#
     )
 }
 
@@ -80,14 +82,25 @@ async fn ready(h: &mut HealthProbe, session: u64) {
     .await;
 }
 
-async fn pair(c: &mut FakeIpcClient, address: &str, code: &str) {
+async fn login(c: &mut FakeIpcClient, address: &str, user: &str, password: &str) -> GatewayInfo {
     let r = c
-        .request(IpcRequest::Pair {
+        .request(IpcRequest::Login(Box::new(LoginForm {
             address: address.into(),
-            code: PairCode::parse(code),
-        })
+            username: user.into(),
+            password: Password::parse(password),
+        })))
         .await;
-    assert!(matches!(r, Some(IpcResponse::Paired(_))), "{r:?}");
+    match r {
+        Some(IpcResponse::LoggedIn(info)) => *info,
+        other => panic!("{other:?}"),
+    }
+}
+
+async fn logout(c: &mut FakeIpcClient) -> bool {
+    match c.request(IpcRequest::Logout).await {
+        Some(IpcResponse::LoggedOut { gateway_reached }) => gateway_reached,
+        other => panic!("{other:?}"),
+    }
 }
 
 async fn phase(c: &mut FakeIpcClient) -> LinkPhase {
@@ -103,7 +116,7 @@ fn alive_tasks() -> usize {
         .num_alive_tasks()
 }
 
-/// An unpaired agent on the real adapters, with a counting store and a signed fake IPC.
+/// A signed-out agent on the real adapters, with a counting store and a signed fake IPC.
 fn start_agent() -> (Agent<TokioClock>, Arc<CountingStore>, FakeIpc) {
     let secrets = Arc::new(CountingStore::default());
     let ipc = FakeIpc::signed();
@@ -123,15 +136,19 @@ fn start_agent() -> (Agent<TokioClock>, Arc<CountingStore>, FakeIpc) {
     (agent, secrets, ipc)
 }
 
-/// unpaired -> pair -> ready -> gateway restart (1012) -> ready again -> revoked -> key deleted
-/// once, not_paired, no retry -> pair again with a new key -> ready.
-async fn lifecycle(revoke: (u16, &str)) {
+/// signed out -> login -> ready -> gateway restart (1012) -> ready again -> revoked (4200) ->
+/// account deleted once, signed out, no retry -> login again with a new token -> ready ->
+/// logout (gateway told with the token, account deleted) -> signed out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn login_lifecycle_against_the_mock_gateway() {
     let mock = MockConfig {
         client_key: "key-1".into(),
         ..MockConfig::default()
     };
     let gw = MockGateway::start(mock.clone()).await.unwrap();
-    gw.routes().set("POST", "/pair", 201, pair_ok("key-1"));
+    gw.routes()
+        .set("POST", "/auth/login", 201, login_ok("key-1"));
+    gw.routes().set("POST", "/auth/logout", 204, "");
     let baseline = alive_tasks();
     let (agent, secrets, ipc) = start_agent();
     let mut h = agent.health();
@@ -143,8 +160,9 @@ async fn lifecycle(revoke: (u16, &str)) {
     let mut app = ipc.client().await;
     assert_eq!(phase(&mut app).await, LinkPhase::NotPaired);
 
-    // Pair over HTTP, then the link comes up over WebSocket with the key /pair handed out.
-    pair(&mut app, &gw.addr().to_string(), "482 913").await;
+    // Sign in over HTTP, then the link comes up over WebSocket with the token it handed out.
+    let info = login(&mut app, &gw.addr().to_string(), " sito ", "contraseña-1").await;
+    assert_eq!((info.user.as_str(), info.name.as_str()), ("Sito", "mock"));
     ready(&mut h, 1).await;
     let post = gw
         .routes()
@@ -152,9 +170,13 @@ async fn lifecycle(revoke: (u16, &str)) {
         .into_iter()
         .find(|r| r.method == "POST")
         .unwrap();
-    assert_eq!(post.path, "/pair");
+    assert_eq!(post.path, "/auth/login");
+    assert_eq!(post.authorization, None);
     let body = String::from_utf8_lossy(&post.body);
-    assert!(body.contains(r#""code":"482913""#), "{body}");
+    assert!(
+        body.contains(r#""username":"sito","password":"contraseña-1""#),
+        "{body}"
+    );
     assert_eq!(gw.log().handshakes_ok, 1);
     assert_eq!(
         gw.log().connections,
@@ -162,20 +184,21 @@ async fn lifecycle(revoke: (u16, &str)) {
         "the REST calls are not WS sessions"
     );
 
-    // Gateway restart: reconnects by itself, keeps the key.
+    // Gateway restart: reconnects by itself, keeps the token.
     assert_eq!(gw.close_all(1012, ""), 1);
     ready(&mut h, 2).await;
-    assert_eq!(secrets.pairing_deletes.load(Ordering::SeqCst), 0);
+    assert_eq!(secrets.account_deletes.load(Ordering::SeqCst), 0);
     assert_eq!(gw.log().handshakes_ok, 2);
 
-    // The admin revokes the key. From now on the gateway only knows the next one, so a retry
-    // with the old key would be refused (and delete again).
+    // The device is removed (web or admin). From now on the gateway only knows the next token,
+    // so a retry with the old one would be refused (and delete again).
     gw.set_config(MockConfig {
         client_key: "key-2".into(),
         ..mock
     });
-    gw.routes().set("POST", "/pair", 201, pair_ok("key-2"));
-    assert_eq!(gw.close_all(revoke.0, revoke.1), 1);
+    gw.routes()
+        .set("POST", "/auth/login", 201, login_ok("key-2"));
+    assert_eq!(gw.close_all(4200, "credential revoked"), 1);
     within(
         Duration::from_secs(10),
         h.wait_link(|v| v.state == LinkState::NotPaired),
@@ -186,19 +209,29 @@ async fn lifecycle(revoke: (u16, &str)) {
     let log = gw.log();
     assert_eq!(log.connections, 2, "no reconnect after revocation");
     assert_eq!(log.handshakes_rejected, 0);
-    assert_eq!(secrets.pairing_deletes.load(Ordering::SeqCst), 1);
-    assert!(!secrets.inner.contains(SecretKey::GatewayPairing));
+    assert_eq!(secrets.account_deletes.load(Ordering::SeqCst), 1);
+    assert!(!secrets.inner.contains(SecretKey::GatewayAccount));
 
-    // Pairing again works and the link comes up with the new key.
-    pair(&mut app, &gw.addr().to_string(), "105 772").await;
+    // Signing in again works and the link comes up with the new token.
+    login(&mut app, &gw.addr().to_string(), "sito", "contraseña-1").await;
+    ready(&mut h, 3).await;
+    assert_eq!(gw.log().handshakes_ok, 3);
+
+    // Logout: the gateway hears it with the token, the account is gone, no reconnect.
+    assert!(logout(&mut app).await);
+    let out = gw.routes().seen().into_iter().last().unwrap();
+    assert_eq!(
+        (out.path.as_str(), out.authorization.as_deref()),
+        ("/auth/logout", Some("Bearer key-2"))
+    );
+    assert_eq!(secrets.account_deletes.load(Ordering::SeqCst), 2);
     within(
         Duration::from_secs(10),
-        h.wait_link(|v| matches!(v.state, LinkState::Ready { .. })),
+        h.wait_link(|v| v.state == LinkState::NotPaired),
     )
     .await;
-    assert_eq!(phase(&mut app).await, LinkPhase::Ready);
-    assert_eq!(gw.log().handshakes_ok, 3);
-    assert_eq!(secrets.pairing_deletes.load(Ordering::SeqCst), 1);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(gw.log().connections, 3, "no reconnect after logout");
 
     drop(app);
     assert!(agent.shutdown(Duration::from_secs(5)).await.clean);
@@ -209,11 +242,6 @@ async fn lifecycle(revoke: (u16, &str)) {
     })
     .await;
     gw.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pairing_lifecycle_gateway_revokes_with_4200() {
-    lifecycle((4200, "credential revoked")).await;
 }
 
 /// The real gateway, driven over `launch.py`'s line protocol. Dropping it closes stdin, which
@@ -301,12 +329,15 @@ async fn pairing_lifecycle_against_the_real_gateway() {
     .await;
     let mut app = ipc.client().await;
 
-    // Pair with a code the admin opened, then the session comes up.
-    let code = gw.cmd("code", "code", Duration::from_secs(10)).await;
-    pair(&mut app, &gw.addr, &code).await;
+    // A member the admin created; sign in over plain HTTP to loopback, then the session comes up.
+    let creds = gw.cmd("user", "user", Duration::from_secs(10)).await;
+    let (user, password) = creds.split_once(' ').unwrap();
+    let info = login(&mut app, &gw.addr, user, password).await;
+    assert_eq!(info.user, "Sito");
+    assert!(!info.name.is_empty(), "the home's name: {info:?}");
     ready(&mut h, 1).await;
 
-    // Restart (uvicorn closes with 1012): reconnects by itself once it is back, same key.
+    // Restart (uvicorn closes with 1012): reconnects by itself once it is back, same token.
     gw.cmd("restart", "restarted", Duration::from_secs(180))
         .await;
     let v = within(
@@ -315,9 +346,9 @@ async fn pairing_lifecycle_against_the_real_gateway() {
     )
     .await;
     assert_eq!(v.last_close.map(|c| c.0), Some(1012));
-    assert_eq!(secrets.pairing_deletes.load(Ordering::SeqCst), 0);
+    assert_eq!(secrets.account_deletes.load(Ordering::SeqCst), 0);
 
-    // The admin deletes the client: 4200 on the live session, key deleted once, no retry.
+    // The admin removes the device: 4200 on the live session, account deleted once, no retry.
     assert_eq!(
         gw.cmd("revoke", "revoked", Duration::from_secs(10)).await,
         "1"
@@ -336,17 +367,29 @@ async fn pairing_lifecycle_against_the_real_gateway() {
         attempts,
         "no reconnect after revocation"
     );
-    assert_eq!(secrets.pairing_deletes.load(Ordering::SeqCst), 1);
+    assert_eq!(secrets.account_deletes.load(Ordering::SeqCst), 1);
 
-    // A new code pairs again.
-    let code = gw.cmd("code", "code", Duration::from_secs(10)).await;
-    pair(&mut app, &gw.addr, &code).await;
+    // Signing in again makes a new device.
+    login(&mut app, &gw.addr, user, password).await;
     within(
         Duration::from_secs(10),
         h.wait_link(|v| matches!(v.state, LinkState::Ready { .. })),
     )
     .await;
-    assert_eq!(secrets.pairing_deletes.load(Ordering::SeqCst), 1);
+
+    // Logout: the gateway accepts the token (204) and retires the device; the account is gone.
+    // The gateway also closes the live session (4200), which may delete the account first.
+    assert!(logout(&mut app).await, "the gateway answered the logout");
+    assert!(!secrets.inner.contains(SecretKey::GatewayAccount));
+    within(
+        Duration::from_secs(10),
+        h.wait_link(|v| v.state == LinkState::NotPaired),
+    )
+    .await;
+    assert_eq!(
+        gw.cmd("devices", "devices", Duration::from_secs(10)).await,
+        "0"
+    );
 
     drop(app);
     assert!(agent.shutdown(Duration::from_secs(5)).await.clean);

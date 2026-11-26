@@ -5,10 +5,16 @@ OpenClaw and no STT/TTS. Run from the gateway checkout (its `tests.fakes` must i
 
 Line protocol. stdout: `ready <port>` once the gateway answers, then one line per command.
 stdin commands:
-  code     -> `code <6 digits>` (opens a pairing code over the admin API)
-  revoke   -> `revoked <n>` (deletes every client: live sessions close with 4200)
+  user     -> `user <username> <password>` (creates a member account over the admin API, once)
+  devices  -> `devices <n>` (devices not retired: personal ones are what a login creates)
+  revoke   -> `revoked <n>` (retires every device: live sessions close with 4200)
   restart  -> `restarted` (SIGTERM, i.e. close 1012, then the same port again)
 EOF on stdin stops everything.
+
+Gateway facts (290efa0): `POST /home/users` and `/home/devices` accept the machine's
+`X-Admin-Token` (`require_admin` / `require_scope`); `POST /auth/login` over plain HTTP is allowed
+from a loopback peer (`login_transport_ok`); `DELETE /home/devices/{id}` retires the device and
+closes its sessions with 4200 (`close_client_sessions`). `UserCreate.password` needs 8+ chars.
 """
 
 import asyncio
@@ -90,10 +96,17 @@ async def main() -> None:
                 async with httpx.AsyncClient(base_url=base, headers=hdr) as c:
                     while line := await loop.run_in_executor(None, sys.stdin.readline):
                         cmd = line.strip()
-                        if cmd == "code":
-                            r = await c.post("/home/pairing", json={"client_type": "app"})
+                        if cmd == "user":
+                            password = secrets.token_hex(16)
+                            r = await c.post("/home/users", json={
+                                "username": "sito", "display_name": "Sito",
+                                "password": password, "role": "member"})
                             r.raise_for_status()
-                            print(f"code {r.json()['code']}", flush=True)
+                            print(f"user sito {password}", flush=True)
+                        elif cmd == "devices":
+                            devices = await c.get("/home/devices")
+                            devices.raise_for_status()
+                            print(f"devices {len(devices.json())}", flush=True)
                         elif cmd == "revoke":
                             devices = await c.get("/home/devices")
                             devices.raise_for_status()

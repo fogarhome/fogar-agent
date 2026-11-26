@@ -6,16 +6,16 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
-    /// Name proposed to the gateway at pairing (`POST /pair` `name`); the admin may override it.
+    /// This device's name at sign-in (`POST /auth/login` `device_name`).
     /// The composition root sets it (e.g. the Mac's name).
     pub client_name: String,
     /// Deadline for probing one address (`/.well-known`, both paths; spec §0: 1–2 s).
     pub probe_timeout: Duration,
-    /// Deadline for asking the tailnet for its peers during discovery.
+    /// Deadline for asking the tailnet for its peers (discovery, and the sign-in address check).
     pub tailnet_timeout: Duration,
-    /// Deadline for `POST /pair` (a 5xx or no answer leaves the code open: retry it).
-    pub pair_timeout: Duration,
-    /// Answer `Pair`/`Unpair` from a peer the IPC adapter only checked by OS user (IPC-4).
+    /// Deadline for `POST /auth/login` and `POST /auth/logout`.
+    pub account_timeout: Duration,
+    /// Answer `Login`/`Logout` from a peer the IPC adapter only checked by OS user (IPC-4).
     /// `false` = only `PeerCheck::SameSigner`. The composition root may set it ONLY from a
     /// compile-time switch of development builds, never from a runtime flag.
     pub pair_from_uid_only_peers: bool,
@@ -75,7 +75,7 @@ impl Default for Config {
             // The Tailscale CLI answers in ~0.1 s; discovery as a whole must stay well under the
             // app's 10 s `discover` timeout (tailnet_timeout + probe_timeout).
             tailnet_timeout: Duration::from_secs(2),
-            pair_timeout: Duration::from_secs(10),
+            account_timeout: Duration::from_secs(10),
             pair_from_uid_only_peers: false,
             agent: None,
             input_mode: InputMode::Audio,

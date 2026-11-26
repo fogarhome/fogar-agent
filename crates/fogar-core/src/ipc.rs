@@ -1,9 +1,9 @@
 //! Local UI service over the IpcServer port (ADR-0002): version handshake, status, status
-//! subscription, discovery and pairing. Connections live in a JoinSet drained in the same loop
-//! and aborted on shutdown.
+//! subscription, discovery and the account (login/logout). Connections live in a JoinSet drained
+//! in the same loop and aborted on shutdown.
 //!
-//! Authorization (IPC-4): `Pair`/`Unpair` change where the user's voice goes and `Reconnect`
-//! makes the agent spend the stored key on a new attempt after a park (any same-user process
+//! Authorization (IPC-4): `Login`/`Logout` change where (and as whom) the user's voice goes and
+//! `Reconnect` makes the agent spend the stored token on a new attempt after a park (any same-user process
 //! could otherwise drive the reconnect loop spec §13 forbids), so they are
 //! answered only for a `PeerCheck::SameSigner` peer, unless the composition root opted in to
 //! `UidOnly` peers at compile time (`Config::pair_from_uid_only_peers`).
@@ -21,12 +21,12 @@
 //! the moment the connection closes or stops being subscribed.
 
 use crate::{
+    account::Account,
     agent::HealthProbe,
     capture::{OPEN_DEADLINE, Start},
     conversation::ID_MAX_BYTES,
     engine::Command,
     link::LinkView,
-    pairing::Pairing,
     queues::IPC_MAX_CONNS,
     stats::Stats,
     time::deadline,
@@ -36,7 +36,7 @@ use fogar_ports::{
     gateway_http::GatewayHttp,
     ipc::{
         CaptureGesture, CaptureRefusal, IPC_VERSION, IpcConn, IpcError, IpcRequest, IpcResponse,
-        IpcServer, PeerCheck, SEND_TEXT_MAX_BYTES, StatusReport, TextRefusal,
+        IpcServer, LoginForm, PeerCheck, SEND_TEXT_MAX_BYTES, StatusReport, TextRefusal,
     },
     tailnet::TailnetPeers,
 };
@@ -86,7 +86,7 @@ pub(crate) async fn run<C: Clock, S: IpcServer, H: GatewayHttp, T: TailnetPeers>
     clock: Arc<C>,
     health: HealthProbe,
     limits: Limits,
-    pairing: Pairing<C, H, T>,
+    account: Account<C, H, T>,
     cmds: mpsc::Sender<Command>,
     ingress: CancellationToken,
 ) {
@@ -100,7 +100,7 @@ pub(crate) async fn run<C: Clock, S: IpcServer, H: GatewayHttp, T: TailnetPeers>
             Some(_) = conns.join_next(), if !conns.is_empty() => {}
             r = server.accept(), if conns.len() < IPC_MAX_CONNS => match r {
                 Ok((peer, conn)) => {
-                    // Per connection, as verified by the adapter (gates Pair/Unpair, IPC-4).
+                    // Per connection, as verified by the adapter (gates Login/Logout, IPC-4).
                     let peer_check = peer.check();
                     fail_delay = Duration::from_millis(250);
                     Stats::inc(&health.stats.ipc_connections);
@@ -109,7 +109,7 @@ pub(crate) async fn run<C: Clock, S: IpcServer, H: GatewayHttp, T: TailnetPeers>
                         clock: clock.clone(),
                         health: health.clone(),
                         limits,
-                        pairing: pairing.clone(),
+                        account: account.clone(),
                         cmds: cmds.clone(),
                         peer_check,
                         cancel: ingress.child_token(),
@@ -134,7 +134,7 @@ struct Conn<K, C, H, T> {
     clock: Arc<C>,
     health: HealthProbe,
     limits: Limits,
-    pairing: Pairing<C, H, T>,
+    account: Account<C, H, T>,
     cmds: mpsc::Sender<Command>,
     peer_check: PeerCheck,
     cancel: CancellationToken,
@@ -385,7 +385,7 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
                 Some(()) => IpcResponse::TurnCancelSent,
                 None => BUSY,
             },
-            IpcRequest::Discover => match op(&c.cancel, c.pairing.discover(c.may_pair())).await {
+            IpcRequest::Discover => match op(&c.cancel, c.account.discover(c.may_pair())).await {
                 Some(found) => IpcResponse::Discovered(found),
                 None => return,
             },
@@ -400,26 +400,35 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
                     reason: "needs the signed Fogar app",
                 }
             }
-            // shortcut: the account arrives in the next commit of S4 PR 3 (Task 2).
-            IpcRequest::Login(_) | IpcRequest::Logout => IpcResponse::Refused { reason: "not yet" },
-            IpcRequest::Pair { address, code } => {
-                match op(&c.cancel, c.pairing.pair(&address, code.as_ref())).await {
-                    Some(Ok(info)) => IpcResponse::Paired(info),
-                    Some(Err(f)) => IpcResponse::PairFailed(f),
+            IpcRequest::Login(form) => {
+                let LoginForm {
+                    address,
+                    username,
+                    password,
+                } = *form;
+                let login = c.account.login(&address, &username, password.as_ref());
+                match op(&c.cancel, login).await {
+                    Some(Ok(info)) => IpcResponse::LoggedIn(Box::new(info)),
+                    Some(Err(f)) => IpcResponse::LoginFailed(f),
                     None => return,
                 }
             }
-            IpcRequest::Unpair => match op(&c.cancel, c.pairing.unpair()).await {
-                Some(Ok(())) => IpcResponse::Unpaired,
+            IpcRequest::Logout => match op(&c.cancel, c.account.logout()).await {
+                Some(Ok(gateway_reached)) => IpcResponse::LoggedOut { gateway_reached },
                 Some(Err(_)) => IpcResponse::Refused {
-                    reason: "could not delete the pairing",
+                    reason: "could not delete the account",
                 },
                 None => return,
+            },
+            // shortcut: pairing is gone; the app stops sending these in S4 PR 3 Task 3, which
+            // removes them from the contract.
+            IpcRequest::Pair { .. } | IpcRequest::Unpair => IpcResponse::Refused {
+                reason: "pairing removed",
             },
             // Checked against the published state: the link only listens while parked for such a
             // reason, and discards a request it saw before parking.
             IpcRequest::Reconnect if view.borrow().state.user_may_reconnect() => {
-                c.pairing.reconnect.send_replace(());
+                c.account.reconnect.send_replace(());
                 IpcResponse::Reconnecting
             }
             IpcRequest::Reconnect => IpcResponse::Refused {

@@ -3,8 +3,8 @@
 #![allow(dead_code)]
 
 use fogar_core::{
-    Agent, AgentPorts, Config, HealthProbe, LinkState, LinkView, NoHttp, NoIpc, NoTailnet,
-    PairingRecord, crashloop::BootMode,
+    AccountRecord, Agent, AgentPorts, Config, HealthProbe, LinkState, LinkView, NoHttp, NoIpc,
+    NoTailnet, crashloop::BootMode,
 };
 use fogar_ports::{
     gateway::{GatewayAddr, GatewayLink},
@@ -32,7 +32,7 @@ pub(crate) struct Rig<L: GatewayLink = FakeGatewayLink> {
     pub(crate) app: tokio::task::JoinSet<()>,
 }
 
-/// Address of the paired test gateway (the in-memory link ignores it; `FakeGatewayHttp`
+/// Address of the signed-in test gateway (the in-memory link ignores it; `FakeGatewayHttp`
 /// answers on it).
 pub(crate) const GW_ADDR: &str = "127.0.0.1:8004";
 
@@ -40,22 +40,19 @@ pub(crate) fn test_config() -> Config {
     Config::default()
 }
 
-/// A pairing record for `GW_ADDR` with `key`.
-pub(crate) fn record(key: &str) -> PairingRecord {
-    PairingRecord::new(
+/// An account at `GW_ADDR` with token `key`.
+pub(crate) fn record(key: &str) -> AccountRecord {
+    AccountRecord::new(
         GatewayAddr::parse(GW_ADDR).unwrap(),
         "client-1".into(),
         key.to_owned().into(),
-        "green-house".into(),
-        "1.29.0".into(),
-        "Mac".into(),
     )
 }
 
-/// A store holding a pairing record with `key`.
+/// A store signed in with token `key`.
 pub(crate) fn paired_store(key: &str) -> MemorySecretStore {
     let s = MemorySecretStore::default();
-    s.put(SecretKey::GatewayPairing, record(key).encode())
+    s.put(SecretKey::GatewayAccount, record(key).encode())
         .unwrap();
     s
 }

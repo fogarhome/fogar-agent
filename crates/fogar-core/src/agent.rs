@@ -15,13 +15,13 @@
 //! Invariant: `Config::close_timeout` < budget/2 (1 s vs 2 s for the daemon's 4 s budget).
 
 use crate::{
+    account::Account,
     capture::CaptureGate,
     config::Config,
     crashloop::BootMode,
     engine::Engine,
     heartbeat::Heartbeat,
     link::{Inbound, LinkCtx, LinkView},
-    pairing::Pairing,
     playback::PlaybackGate,
     queues,
     stats::{Health, LinkState, Stats},
@@ -52,7 +52,8 @@ pub struct AgentPorts<C, L, I, H = NoHttp, T = NoTailnet> {
     pub link: L,
     /// `None` = no local UI socket on this platform/build.
     pub ipc: Option<I>,
-    /// Discovery and pairing (`/.well-known`, `POST /pair`); used by the IPC service only.
+    /// Discovery and the account (`/.well-known`, `/auth/login`, `/auth/logout`); used by the
+    /// IPC service only.
     pub http: H,
     /// Tailnet peers for discovery; `NoTailnet` where there is no adapter.
     pub tailnet: T,
@@ -162,8 +163,8 @@ impl<C: Clock> Agent<C> {
             last_close: None,
             gateway: None,
         });
-        // Pairing generation (`queues`: watch, coalescing): IPC pair/unpair -> link.
-        let (pairing_tx, pairing_rx) = watch::channel(());
+        // Account generation (`queues`: watch, coalescing): IPC login/logout -> link.
+        let (account_tx, account_rx) = watch::channel(());
         // IPC reconnect -> parked link (`queues`: watch, coalescing).
         let (reconnect_tx, reconnect_rx) = watch::channel(());
         let (out_tx, out_rx) = mpsc::channel::<Frame>(queues::OUTBOUND);
@@ -215,23 +216,24 @@ impl<C: Clock> Agent<C> {
             stats: stats.clone(),
             view: view_tx.clone(),
             budget: queues::ByteBudget::new(queues::INBOUND_BYTES),
-            pairing: pairing_rx,
-            _pairing_keep: pairing_tx.clone(),
+            account: account_rx,
+            _account_keep: account_tx.clone(),
             reconnect: reconnect_rx,
             _reconnect_keep: reconnect_tx.clone(),
         };
         io.spawn(link.run(out_rx, in_tx, egress.clone()));
 
         if let Some(server) = ports.ipc {
-            let pairing = Pairing {
+            let account = Account {
                 clock: ports.clock.clone(),
                 http: Arc::new(ports.http),
                 tailnet: Arc::new(ports.tailnet),
                 secrets: ports.secrets,
                 cfg: cfg.clone(),
-                changed: pairing_tx,
+                stats: stats.clone(),
+                changed: account_tx,
                 reconnect: reconnect_tx,
-                lock: Arc::new(Semaphore::new(queues::PAIRING)),
+                lock: Arc::new(Semaphore::new(queues::ACCOUNT)),
             };
             edge.spawn(crate::ipc::run(
                 server,
@@ -243,7 +245,7 @@ impl<C: Clock> Agent<C> {
                     pair_from_uid_only_peers: cfg.pair_from_uid_only_peers,
                     permission_wait: cfg.mic_permission_wait,
                 },
-                pairing,
+                account,
                 cmd_tx,
                 ingress.clone(),
             ));
@@ -386,7 +388,7 @@ impl TailnetPeers for NoTailnet {
 }
 
 /// For builds without the HTTP adapter yet: nothing ever answers (discovery finds nothing,
-/// pairing fails with `Unreachable`).
+/// sign-in fails with `Unreachable`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoHttp;
 

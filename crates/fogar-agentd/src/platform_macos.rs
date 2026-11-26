@@ -37,7 +37,7 @@ pub(crate) fn default_state_dir() -> Option<PathBuf> {
 
 /// The default state directory keeps the frozen Keychain service; an explicit `--state-dir`
 /// elsewhere gets its own, derived from the path (`instance::keychain_service`), so agents run
-/// side by side for measurements never share or overwrite one pairing.
+/// side by side for measurements never share or overwrite one account.
 pub(crate) fn secret_store(state_dir: &Path) -> std::io::Result<Arc<dyn SecretStore>> {
     Ok(Arc::new(keychain_store(state_dir, default_state_dir().as_deref())?))
 }

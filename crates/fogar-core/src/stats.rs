@@ -21,10 +21,11 @@ pub enum LinkState {
         attempt: u32,
         last_close: Option<CloseAction>,
     },
-    /// No pairing record: the agent is not paired. Waits (no timer) for a pairing change.
+    /// No account: the agent is signed out (the name predates accounts; on the wire
+    /// `not_paired`). Waits (no timer) for an account change.
     NotPaired,
-    /// Parked: retrying would loop (key revoked/invalid, agent refused, client bug, missing
-    /// scope). Stays alive and reports health; leaves this state on restart, re-pairing, or an
+    /// Parked: retrying would loop (token invalid, agent refused, client bug, missing
+    /// scope). Stays alive and reports health; leaves this state on restart, a new sign-in, or an
     /// IPC `Reconnect` when [`LinkState::user_may_reconnect`].
     Parked {
         reason: CloseAction,
@@ -154,6 +155,7 @@ counters! {
     transcriptions_timed_out: "final transcripts that never came after `end`",
     mic_permission_requests: "explicit permission requests passed to the OS",
     ipc_connections: "IPC connections served",
+    legacy_secret_delete_failures: "old pairing items (S1 record, slice-0 key) the store failed to delete at login/logout",
     out_queue_hwm: "high-water mark of the uplink queue",
     in_queue_hwm: "high-water mark of the inbound queue",
 }

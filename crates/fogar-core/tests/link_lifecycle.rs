@@ -17,7 +17,7 @@ type Case = (Option<(u16, &'static str)>, CloseAction, Expect);
 enum Expect {
     Reconnects,
     Parks(CloseAction),
-    /// Revoked (spec §0): the pairing record is deleted and the link shows "not paired".
+    /// Revoked (spec §0): the account is deleted and the link shows "signed out".
     Unpairs,
 }
 
@@ -48,10 +48,12 @@ async fn every_close_code_is_classified_and_acted_on() {
             CloseAction::FixClient,
             Expect::Parks(CloseAction::FixClient),
         ),
+        // 4.x texts: still classified Repair, but only 4010/4200 delete the account (4.x is
+        // gone), so they park and keep the token.
         (
             Some((1008, "Clave de cliente invalida o inactiva.")),
             CloseAction::Repair,
-            Expect::Unpairs,
+            Expect::Parks(CloseAction::Repair),
         ),
         (
             Some((1008, "Agent 'x' not permitted for this client.")),
@@ -66,7 +68,7 @@ async fn every_close_code_is_classified_and_acted_on() {
         (
             Some((1008, "revoked")),
             CloseAction::Repair,
-            Expect::Unpairs,
+            Expect::Parks(CloseAction::Repair),
         ),
         (
             Some((1011, "Servicio crítico no disponible.")),
@@ -170,15 +172,15 @@ async fn every_close_code_is_classified_and_acted_on() {
                 assert_eq!(s.connect_attempts, 1, "{close:?} must not retry");
                 assert_eq!(rig.link.log().connections, 1);
                 assert!(
-                    rig.secrets.contains(SecretKey::GatewayPairing),
-                    "{close:?} keeps the key"
+                    rig.secrets.contains(SecretKey::GatewayAccount),
+                    "{close:?} keeps the token"
                 );
             }
             Expect::Unpairs => {
                 let v = wait_state(&mut rig.health, |v| v.state == LinkState::NotPaired).await;
                 assert_eq!(v.gateway, None);
                 assert!(
-                    !rig.secrets.contains(SecretKey::GatewayPairing),
+                    !rig.secrets.contains(SecretKey::GatewayAccount),
                     "{close:?}"
                 );
                 tokio::time::sleep(Duration::from_secs(3600)).await;
@@ -195,33 +197,16 @@ async fn every_close_code_is_classified_and_acted_on() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn handshake_rejection_of_the_key_unpairs() {
-    // Wrong key stored locally: an M19 gateway closes 4010 before `ready`: the record is deleted
-    // and the link waits for a new pairing.
+async fn handshake_rejection_of_the_token_signs_out() {
+    // Wrong token stored locally: the gateway closes 4010 before `ready`: the account is deleted
+    // and the link waits for a new sign-in.
     let mut b = RigBuilder::fake(MockConfig::default());
     b.secrets = std::sync::Arc::new(paired_store("wrong"));
     let mut rig = b.start();
     let v = wait_state(&mut rig.health, |v| v.last_close.is_some()).await;
     assert_eq!(v.last_close, Some((4010, CloseAction::Repair)));
     wait_state(&mut rig.health, |v| v.state == LinkState::NotPaired).await;
-    assert!(!rig.secrets.contains(SecretKey::GatewayPairing));
-    assert_eq!(rig.health.snapshot().stats.sessions_started, 0);
-    assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
-}
-
-#[tokio::test(start_paused = true)]
-async fn handshake_rejection_of_the_key_unpairs_on_a_v2_gateway() {
-    // Gateway <= 2.x: 1008 "Clave de cliente invalida o inactiva." means the same.
-    let mut b = RigBuilder::fake(MockConfig {
-        m19: false,
-        ..MockConfig::default()
-    });
-    b.secrets = std::sync::Arc::new(paired_store("wrong"));
-    let mut rig = b.start();
-    let v = wait_state(&mut rig.health, |v| v.last_close.is_some()).await;
-    assert_eq!(v.last_close, Some((1008, CloseAction::Repair)));
-    wait_state(&mut rig.health, |v| v.state == LinkState::NotPaired).await;
-    assert!(!rig.secrets.contains(SecretKey::GatewayPairing));
+    assert!(!rig.secrets.contains(SecretKey::GatewayAccount));
     assert_eq!(rig.health.snapshot().stats.sessions_started, 0);
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
@@ -310,7 +295,7 @@ async fn without_keepalive_the_idle_close_is_classified_and_recovered() {
 #[tokio::test(start_paused = true)]
 async fn not_paired_waits_quietly() {
     let b = RigBuilder::fake(MockConfig::default());
-    b.secrets.delete(SecretKey::GatewayPairing).ok();
+    b.secrets.delete(SecretKey::GatewayAccount).ok();
     let mut rig = b.start();
     wait_state(&mut rig.health, |v| v.state == LinkState::NotPaired).await;
     // A store read while idle would consume this injected failure and show up as Backoff.
@@ -326,14 +311,14 @@ async fn not_paired_waits_quietly() {
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
 
-/// Spec §0 "no reintentes en bucle": a revocation whose record cannot be read (locked
-/// keychain) parks with Repair instead of retrying the dead key.
+/// Spec §0 "no reintentes en bucle": a revocation whose account cannot be read (locked
+/// keychain) parks with Repair instead of retrying the dead token.
 #[tokio::test(start_paused = true)]
 async fn revocation_with_an_unreadable_store_parks() {
     let mut rig = RigBuilder::fake(MockConfig::default()).start();
     wait_ready(&mut rig.health).await;
     rig.secrets.fail_next(1);
-    assert_eq!(rig.link.close_all(1008, "revoked"), 1);
+    assert_eq!(rig.link.close_all(4200, "revoked"), 1);
     wait_state(&mut rig.health, |v| {
         v.state
             == LinkState::Parked {
