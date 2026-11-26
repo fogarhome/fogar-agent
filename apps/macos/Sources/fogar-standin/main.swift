@@ -77,7 +77,7 @@ func fail(_ message: String) -> Never {
 }
 
 let greenHouse = WireGateway(
-    address: "http://green-house:8004", name: "green-house", version: "1.29.0", client_name: "Mac de Sito")
+    address: "http://green-house:8004", name: "green-house", version: "1.29.0", client_name: "Mac de Sito", user: "Sito")
 
 /// The agent's state and its subscribers. Phases follow `LinkState::label` / `LinkPhase`.
 actor StandIn {
@@ -184,7 +184,8 @@ actor StandIn {
             }
             if let failure { return .pairFailed(WirePairFailed(reason: failure)) }
             let paired = WireGateway(address: greenHouse.address, name: greenHouse.name,
-                                     version: greenHouse.version, client_name: greenHouse.client_name)
+                                     version: greenHouse.version, client_name: greenHouse.client_name,
+                                     user: greenHouse.user)
             gateway = paired
             await set(link: "connecting")
             Task {
@@ -196,6 +197,9 @@ actor StandIn {
             if options.refusePair || options.peer == .uidOnly { return .refused(WireRefused(reason: "peer not allowed to unpair")) }
             await set(link: "not_paired")
             return .unpaired
+        case .login, .logout:
+            // Like the core until the account lands (S4 PR 3 Task 2).
+            return .refused(WireRefused(reason: "not yet"))
         case .reconnect:
             // Like the core: signed peers only, and only from a pause the person can settle.
             if options.refusePair || options.peer == .uidOnly { return .refused(WireRefused(reason: "peer not allowed to reconnect")) }

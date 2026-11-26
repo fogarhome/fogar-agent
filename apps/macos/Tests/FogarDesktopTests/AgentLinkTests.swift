@@ -67,7 +67,7 @@ nonisolated final class FakeAgent: @unchecked Sendable {
 }
 
 nonisolated let ready = WireStatus(link: "ready", phase: .ready,
-                       gateway: WireGateway(address: "http://green-house:8004", name: "green-house", version: "1.29.0", client_name: "Mac"),
+                       gateway: WireGateway(address: "http://green-house:8004", name: "green-house", version: "1.29.0", client_name: "Mac", user: ""),
                        sessions: 1, turns_completed: 2, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown)
 
 func answers(version: UInt32 = ipcVersion, pair: WireResponse = .unpaired) -> @Sendable (WireRequest) -> [WireResponse] {
@@ -81,7 +81,7 @@ func answers(version: UInt32 = ipcVersion, pair: WireResponse = .unpaired) -> @S
         case .reconnect: [.event(ready), .reconnecting]
         case .status: [.status(ready)]
         case .subscribeConversation, .sendText, .captureStart, .captureEnd, .cancelTurn,
-             .turnVisible, .requestMicPermission:
+             .turnVisible, .requestMicPermission, .login, .logout:
             [.refused(WireRefused(reason: "not in these tests"))]
         }
     }

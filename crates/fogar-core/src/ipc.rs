@@ -389,13 +389,19 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
                 Some(found) => IpcResponse::Discovered(found),
                 None => return,
             },
-            IpcRequest::Pair { .. } | IpcRequest::Unpair | IpcRequest::Reconnect
+            IpcRequest::Pair { .. }
+            | IpcRequest::Unpair
+            | IpcRequest::Login(_)
+            | IpcRequest::Logout
+            | IpcRequest::Reconnect
                 if !c.may_pair() =>
             {
                 IpcResponse::Refused {
                     reason: "needs the signed Fogar app",
                 }
             }
+            // shortcut: the account arrives in the next commit of S4 PR 3 (Task 2).
+            IpcRequest::Login(_) | IpcRequest::Logout => IpcResponse::Refused { reason: "not yet" },
             IpcRequest::Pair { address, code } => {
                 match op(&c.cancel, c.pairing.pair(&address, code.as_ref())).await {
                     Some(Ok(info)) => IpcResponse::Paired(info),

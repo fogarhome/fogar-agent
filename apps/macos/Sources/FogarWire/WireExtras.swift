@@ -3,8 +3,8 @@ import Foundation
 // Hand-written companions to the generated Wire.swift (never edit that file by hand).
 
 /// IPC protocol version this app speaks (`fogar_ports::ipc::IPC_VERSION`). 2 = S1, 3 = reconnect,
-/// 4 = conversation (S2).
-public let ipcVersion: UInt32 = 4
+/// 4 = conversation (S2), 5 = account (login/logout; the app signs in from S4 PR 3 Task 3).
+public let ipcVersion: UInt32 = 5
 
 /// The pairing code as the agent accepts it (`PairCode::parse`): whitespace (any kind) and `-`
 /// removed, then exactly 6 ASCII digits. `nil` means "do not send": a typo must never spend one of

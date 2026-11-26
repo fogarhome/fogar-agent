@@ -116,11 +116,14 @@ impl<R: Resolver> HttpGateway<R> {
         last_event_id: Option<&str>,
         body: Option<Zeroizing<Vec<u8>>>,
     ) -> Result<Conn, HttpError> {
+        // Everything but discovery carries the password or the token.
+        let secret = !matches!(call, HttpCall::WellKnown | HttpCall::WellKnownLegacy);
         let mut s = dial(
             &self.resolver,
             self.tls.as_ref(),
             addr,
             self.cfg.connect_timeout,
+            secret,
         )
         .await
         .map_err(|e| match e {

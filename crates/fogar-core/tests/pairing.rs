@@ -117,12 +117,12 @@ async fn pairing_happy_path_persists_then_connects() {
     // The link restarts on the new record and the subscriber sees it.
     ready_promptly(&mut rig.health).await;
     event_until(&mut c, |r| {
-        r.phase == LinkPhase::Ready && r.gateway.as_ref() == Some(&info)
+        r.phase == LinkPhase::Ready && r.gateway.as_deref() == Some(&info)
     })
     .await;
     let s = p.request(IpcRequest::Status).await;
     assert!(
-        matches!(&s, Some(IpcResponse::Status(r)) if r.gateway.as_ref() == Some(&info)),
+        matches!(&s, Some(IpcResponse::Status(r)) if r.gateway.as_deref() == Some(&info)),
         "{s:?}"
     );
     assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);

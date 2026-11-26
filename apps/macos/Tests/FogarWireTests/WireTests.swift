@@ -7,13 +7,14 @@ import Testing
 /// app must parse and produce. If Rust changes it, IPC_VERSION bumps and these fail.
 @Suite struct GoldenJSON {
     @Test func eventDecodes() throws {
-        let json = #"{"type":"event","data":{"link":"ready","phase":"ready","gateway":{"address":"http://green-house:8004","name":"green-house","version":"1.29.0","client_name":"Mac de Sito"},"sessions":3,"turns_completed":7,"boot_mode":"normal","peer_check":"same_signer","transcriber":"up","tts":"down"}}"#
+        let json = #"{"type":"event","data":{"link":"ready","phase":"ready","gateway":{"address":"http://green-house:8004","name":"green-house","version":"1.29.0","client_name":"Mac de Sito","user":"Sito"},"sessions":3,"turns_completed":7,"boot_mode":"normal","peer_check":"same_signer","transcriber":"up","tts":"down"}}"#
         guard case .event(let s) = try WireCodec.decodeResponse(Data(json.utf8)) else {
             Issue.record("not an event"); return
         }
         #expect(s.phase == .ready)
         #expect(s.gateway?.name == "green-house")
         #expect(s.gateway?.client_name == "Mac de Sito")
+        #expect(s.gateway?.user == "Sito")
         #expect(s.sessions == 3 && s.turns_completed == 7)
         #expect(s.peer_check == .sameSigner)
     }

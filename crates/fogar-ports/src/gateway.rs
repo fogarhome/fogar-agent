@@ -110,7 +110,8 @@ pub trait GatewayLink: Send + Sync + 'static {
     type Session: LinkSession;
     /// Opens a new transport session to `addr` (TCP [+TLS] + WS upgrade on `route.path()` for the
     /// real adapter). The address comes from the pairing record, so it can change between calls.
-    /// For `Scheme::Plain` the adapter applies [`cleartext_allowed`] to EVERY resolved socket
+    /// The session carries the account token, so for `Scheme::Plain` the adapter applies
+    /// [`secret_cleartext_allowed`] (loopback or tailnet only) to EVERY resolved socket
     /// address before sending a byte (not to the host string: a LAN name can resolve to a public
     /// IP on a hostile network) and refuses with `NotConfigured`; it also refuses `Scheme::Tls`
     /// when it has no TLS. The core wraps this in its own deadline; dropping the future
@@ -128,10 +129,10 @@ pub const DEFAULT_GATEWAY_PORT: u16 = 8004;
 /// gateway. GUESSED (the protocol only names 8004 for plain LAN/tailnet access).
 pub const DEFAULT_TLS_PORT: u16 = 443;
 
-/// Single clear-text policy for every gateway transport (NET-1): the client key, the pairing
-/// code and the `/pair` reply may travel unencrypted only to loopback, private LAN (RFC 1918),
-/// Tailscale/CGNAT (100.64.0.0/10), IPv6 ULA (fc00::/7) and link-local addresses. IPv4-mapped
-/// IPv6 is judged as IPv4. Everything else needs TLS.
+/// Clear-text policy for calls WITHOUT a secret (discovery, `/.well-known`, NET-1): unencrypted
+/// only to loopback, private LAN (RFC 1918), Tailscale/CGNAT (100.64.0.0/10), IPv6 ULA
+/// (fc00::/7) and link-local addresses. IPv4-mapped IPv6 is judged as IPv4. Everything else
+/// needs TLS. Calls that carry a secret use the stricter [`secret_cleartext_allowed`].
 pub fn cleartext_allowed(ip: std::net::IpAddr) -> bool {
     use std::net::IpAddr;
     match ip {
@@ -150,6 +151,20 @@ pub fn cleartext_allowed(ip: std::net::IpAddr) -> bool {
             }
         },
     }
+}
+
+/// Clear-text policy for a call that carries a secret (the account password or token: every
+/// HTTP call except `/.well-known`, every WebSocket connect). Option B (NV-1): only loopback and
+/// the Tailscale tailnet ([`crate::tailnet::is_tailnet_ip`]), which WireGuard already encrypts.
+/// The home LAN (RFC 1918), link-local and ULA are refused: anyone on the Wi-Fi could read the
+/// password. IPv4-mapped IPv6 is judged as IPv4.
+pub fn secret_cleartext_allowed(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    };
+    ip.is_loopback() || crate::tailnet::is_tailnet_ip(ip)
 }
 
 /// Transport security of a gateway address. LAN and tailnet gateways speak clear text
@@ -278,6 +293,42 @@ impl fmt::Display for GatewayAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_cleartext_only_loopback_and_tailnet() {
+        let ip = |s: &str| {
+            s.parse::<std::net::IpAddr>()
+                .unwrap_or_else(|_| panic!("{s}"))
+        };
+        for lan in [
+            "192.168.1.19",
+            "10.0.0.1",
+            "172.16.0.1",
+            "169.254.1.1",
+            "fd00::1",
+        ] {
+            assert!(!secret_cleartext_allowed(ip(lan)), "{lan}");
+            assert!(cleartext_allowed(ip(lan)), "discovery keeps {lan}");
+        }
+        for other in [
+            "8.8.8.8",
+            "::ffff:192.168.1.19",
+            "2001:db8::1",
+            "100.128.0.1",
+        ] {
+            assert!(!secret_cleartext_allowed(ip(other)), "{other}");
+        }
+        for ok in [
+            "127.0.0.1",
+            "::1",
+            "100.89.15.7",
+            "fd7a:115c:a1e0::1",
+            "::ffff:100.89.15.7",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(secret_cleartext_allowed(ip(ok)), "{ok}");
+        }
+    }
 
     /// Fuzz find (fuzz/ ipc_frames): a 251-255 char host without a port parsed, but its
     /// `Display` form (which always adds `:port`) did not, so a stored pairing could not be read back.

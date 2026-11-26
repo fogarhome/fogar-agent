@@ -7,15 +7,16 @@
 //! the whole connect, send, recv and the close handshake are bounded by the core
 //! (`fogar_core::Config`).
 //!
-//! Transport policy (NET-1, ADR-0006 item 4): the name is resolved ONCE by [`Resolver`],
-//! `cleartext_allowed` is applied to every resolved address, and the upgrade runs over the
+//! Transport policy (NET-1, ADR-0006 item 4, option B of NV-1): the name is resolved ONCE by
+//! [`Resolver`], `secret_cleartext_allowed` (loopback or tailnet; never the LAN, the handshake
+//! carries the account token) is applied to every resolved address, and the upgrade runs over the
 //! socket already connected to one of them (tungstenite never resolves again). `wss://` runs
 //! over rustls with the OS trust store (`net::platform_tls`); no clear-text fallback.
 
 use crate::net::{Conn, DialError, Resolver, SystemResolver, dial, platform_tls};
 use fogar_ports::gateway::{
     Frame, GatewayAddr, GatewayLink, LinkError, LinkEvent, LinkSession, Scheme, WsRoute,
-    cleartext_allowed,
+    secret_cleartext_allowed,
 };
 use fogar_proto::limits::WS_MAX_FRAME_BYTES;
 use futures_util::{SinkExt, StreamExt};
@@ -51,7 +52,7 @@ impl Default for WsConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WsConfigError {
-    /// Plain `ws://` to an IP outside loopback/LAN/tailnet would send the client key in clear
+    /// Plain `ws://` to an IP outside loopback/tailnet would send the account token in clear
     /// text.
     InsecureRemote,
 }
@@ -60,7 +61,7 @@ impl fmt::Display for WsConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             WsConfigError::InsecureRemote => {
-                "plain ws:// is only allowed to loopback, LAN or tailnet addresses"
+                "plain ws:// is only allowed to loopback or tailnet addresses"
             }
         })
     }
@@ -78,7 +79,7 @@ impl WsConfig {
                 if addr
                     .host()
                     .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| !cleartext_allowed(ip)) =>
+                    .is_ok_and(|ip| !secret_cleartext_allowed(ip)) =>
             {
                 Err(WsConfigError::InsecureRemote)
             }
@@ -217,6 +218,7 @@ impl<R: Resolver> GatewayLink for WsGatewayLink<R> {
             self.tls.as_ref(),
             addr,
             cfg.attempt_timeout,
+            true, // the handshake carries the account token
         )
         .await
         {
@@ -252,7 +254,11 @@ mod tests {
         assert!(p("localhost").is_ok());
         assert!(p("[::1]:8004").is_ok());
         assert!(p("100.64.0.2:8004").is_ok());
-        assert!(p("192.168.1.19").is_ok());
+        assert!(p("100.89.15.7:8004").is_ok());
+        // The link always carries the account token: no clear text to a LAN address.
+        assert_eq!(p("192.168.1.19"), Err(WsConfigError::InsecureRemote));
+        assert_eq!(p("10.0.0.1"), Err(WsConfigError::InsecureRemote));
+        assert!(p("https://192.168.1.19").is_ok());
         assert!(
             p("green-house").is_ok(),
             "names are checked after resolving"
