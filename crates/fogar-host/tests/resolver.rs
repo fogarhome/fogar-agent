@@ -66,8 +66,8 @@ fn http_refuses_a_lan_name_that_resolves_public() {
             let h = HttpGateway::with_resolver(HttpConfig::default(), Fixed::new(ips));
             let r = bounded(h.request(&addr, &HttpCall::WellKnown, None, None)).await;
             assert!(matches!(r, Err(HttpError::Refused)), "{ips:?}");
-            let r =
-                bounded(h.request(&addr, &HttpCall::Pair, None, Some(b"{}".to_vec().into()))).await;
+            let r = bounded(h.request(&addr, &HttpCall::Login, None, Some(b"{}".to_vec().into())))
+                .await;
             assert!(matches!(r, Err(HttpError::Refused)), "{ips:?}");
         }
     })

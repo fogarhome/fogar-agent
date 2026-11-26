@@ -31,7 +31,7 @@ enum AgentState: Equatable {
 enum CommandError: Error, Equatable {
     case agentNotRunning
     case versionMismatch(agent: UInt32)
-    /// `refused`: on pair/unpair/reconnect, the agent did not verify this app's signer (uid_only);
+    /// `refused`: on login/logout/reconnect, the agent did not verify this app's signer (uid_only);
     /// on reconnect also «nothing to reconnect» (the link left the pause meanwhile).
     case refused
     case noAnswer
@@ -44,18 +44,18 @@ enum CommandError: Error, Equatable {
 /// connection per command (an unsubscribed connection is closed after 30 s idle by the agent, and
 /// there are no request ids, so commands never share the event stream). The subscription plus at
 /// most one connection per command in flight: 3 of the agent's 4 IPC slots when a search and a
-/// pairing overlap.
+/// sign-in overlap.
 @Observable
 final class AgentLink {
     private(set) var state: AgentState = .looking
     /// When the current state began (for «desde hace…» and the log in later slices).
     private(set) var since = Date()
-    /// The agent went from paired to `not_paired` without this app asking (gateway revocation).
+    /// The agent went from signed in to `not_paired` without this app asking (gateway revocation).
     // shortcut: only seen while the app runs; an app opened after the revocation cannot tell it from
-    // «never paired». Upgrade with the close code in `WireStatus` (contract PR: fogar-ports/testkit).
+    // «never signed in». Upgrade with the close code in `WireStatus` (contract PR: fogar-ports/testkit).
     private(set) var accesoRetirado = false
-    /// Set before this app's own `unpair` goes out: its `not_paired` event can beat the answer.
-    @ObservationIgnored private var desemparejando = false
+    /// Set before this app's own `logout` goes out: its `not_paired` event can beat the answer.
+    @ObservationIgnored private var cerrandoSesion = false
 
     @ObservationIgnored let socketPath: String
     @ObservationIgnored let verificacion: VerificacionPar
@@ -67,7 +67,7 @@ final class AgentLink {
         self.verificacion = verificacion
     }
 
-    /// What `pair`, `unpair`, `reconnect` and the conversation require. Release: the signed agent.
+    /// What `login`, `logout`, `reconnect` and the conversation require. Release: the signed agent.
     /// Debug builds accept an unsigned server of the same user ONLY when `FOGAR_AGENT_UNSIGNED=1`
     /// is set explicitly (the stand-in, see the README). The read-only status always needs only
     /// the directory and user checks (`verificacionLectura`).
@@ -160,19 +160,19 @@ final class AgentLink {
 
     private func set(_ new: AgentState) {
         guard new != state else { return }
-        accesoRetirado = Self.retirado(antes: state, despues: new, desemparejando: desemparejando, yaRetirado: accesoRetirado)
-        if new.status?.phase == .notPaired { desemparejando = false }
+        accesoRetirado = Self.retirado(antes: state, despues: new, cerrandoSesion: cerrandoSesion, yaRetirado: accesoRetirado)
+        if new.status?.phase == .notPaired { cerrandoSesion = false }
         if new.phaseKey != state.phaseKey { since = Date() }
         state = new
     }
 
     /// Whether the notice «se retiró el acceso» holds after `antes` → `despues`.
-    static func retirado(antes: AgentState, despues: AgentState, desemparejando: Bool, yaRetirado: Bool) -> Bool {
+    static func retirado(antes: AgentState, despues: AgentState, cerrandoSesion: Bool, yaRetirado: Bool) -> Bool {
         guard let fase = despues.status?.phase else { return yaRetirado } // agent silent: keep what we knew
         guard fase == .notPaired else { return false }
-        // Paired before = a phase with a gateway (a Keychain error at boot shows `reconnecting`
-        // with none, then `not_paired`: never paired, nothing was withdrawn).
-        if let previa = antes.status, previa.phase != .notPaired, previa.gateway != nil { return !desemparejando }
+        // Signed in before = a phase with a gateway (a Keychain error at boot shows `reconnecting`
+        // with none, then `not_paired`: never signed in, nothing was withdrawn).
+        if let previa = antes.status, previa.phase != .notPaired, previa.gateway != nil { return !cerrandoSesion }
         return yaRetirado
     }
 
@@ -185,29 +185,36 @@ final class AgentLink {
         }
     }
 
-    enum PairOutcome: Equatable {
-        case paired(WireGateway)
-        case failed(WirePairFailure)
+    enum LoginOutcome: Equatable {
+        case loggedIn(WireGateway)
+        case failed(WireLoginFailure)
     }
 
-    func pair(address: String, code: String) async throws(CommandError) -> PairOutcome {
-        // Discovery of the address and the HTTP round trip happen in the agent: allow for both.
-        switch try await command(.pair(WirePair(address: address, code: code)), timeout: .seconds(20)) {
-        case .paired(let g): .paired(g)
-        case .pairFailed(let f): .failed(f.reason)
+    /// The password goes out once, to the signed agent only, and is not kept here. Never print or
+    /// interpolate the request that carries it.
+    func login(address: String, username: String, password: String) async throws(CommandError) -> LoginOutcome {
+        // The agent's worst case: tailnet lookup (2 s) + discovery probes + `POST /auth/login`
+        // under its 10 s `account_timeout` + the Keychain. Outlast it.
+        let pedido = WireRequest.login(WireLogin(address: address, username: username, password: password))
+        switch try await command(pedido, timeout: .seconds(25)) {
+        case .loggedIn(let g): return .loggedIn(g)
+        case .loginFailed(let f): return .failed(f.reason)
         default: throw .unexpected
         }
     }
 
-    func unpair() async throws(CommandError) {
-        desemparejando = true
+    /// Signs out. The agent deletes the account always; `true` = the gateway heard the logout.
+    func logout() async throws(CommandError) -> Bool {
+        cerrandoSesion = true
         do throws(CommandError) {
-            guard case .unpaired = try await command(.unpair, timeout: .seconds(5)) else { throw CommandError.unexpected }
+            // Outlasts the agent's `POST /auth/logout` (10 s), so «el gateway no contestó» can show.
+            guard case .loggedOut(let o) = try await command(.logout, timeout: .seconds(15)) else { throw CommandError.unexpected }
+            return o.gateway_reached
         } catch {
-            // Only when the agent surely did nothing: after `noAnswer` it may still unpair, and its
+            // Only when the agent surely did nothing: after `noAnswer` it may still sign out, and its
             // `not_paired` must not read as a revocation (the next `not_paired` clears the flag).
             switch error {
-            case .agentNotRunning, .refused, .versionMismatch, .notOurAgent: desemparejando = false
+            case .agentNotRunning, .refused, .versionMismatch, .notOurAgent: cerrandoSesion = false
             case .noAnswer, .unexpected: break
             }
             throw error
@@ -224,7 +231,7 @@ final class AgentLink {
         let path = socketPath
         // What carries the person's content or changes where it goes needs the signed agent.
         let v: VerificacionPar = switch request {
-        case .pair, .unpair, .reconnect: verificacion
+        case .login, .logout, .reconnect: verificacion
         default: .rutaYUsuario
         }
         do {

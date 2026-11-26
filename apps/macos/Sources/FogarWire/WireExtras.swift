@@ -3,19 +3,8 @@ import Foundation
 // Hand-written companions to the generated Wire.swift (never edit that file by hand).
 
 /// IPC protocol version this app speaks (`fogar_ports::ipc::IPC_VERSION`). 2 = S1, 3 = reconnect,
-/// 4 = conversation (S2), 5 = account (login/logout; the app signs in from S4 PR 3 Task 3).
+/// 4 = conversation (S2), 5 = account (login/logout; pair/unpair removed).
 public let ipcVersion: UInt32 = 5
-
-/// The pairing code as the agent accepts it (`PairCode::parse`): whitespace (any kind) and `-`
-/// removed, then exactly 6 ASCII digits. `nil` means "do not send": a typo must never spend one of
-/// the gateway's 5 attempts.
-public func parsePairCode(_ typed: String) -> String? {
-    let digits = typed.unicodeScalars.filter {
-        !CharacterSet.whitespacesAndNewlines.contains($0) && $0 != "-"
-    }
-    guard digits.count == 6, digits.allSatisfy({ ("0"..."9").contains($0) }) else { return nil }
-    return String(String.UnicodeScalarView(digits))
-}
 
 public enum WireCodec {
     public static func encode(_ value: some Encodable) throws -> Data {

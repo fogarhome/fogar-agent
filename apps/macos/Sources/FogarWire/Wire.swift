@@ -4,9 +4,6 @@
 
 import Foundation
 
-/// The pairing code on the wire: redacted `Debug`, wiped on drop.
-public typealias WireCode = String
-
 /// The account password on the wire: redacted `Debug`, wiped on drop.
 public typealias WirePassword = String
 
@@ -258,36 +255,6 @@ public struct WireMicPermission: Codable, Sendable, Equatable, Hashable {
 	}
 }
 
-public struct WirePair: Codable, Sendable, Equatable, Hashable {
-	public let address: String
-	public let code: WireCode
-
-	public init(address: String, code: WireCode) {
-		self.address = address
-		self.code = code
-	}
-}
-
-public enum WirePairFailure: String, Codable, Sendable, Equatable, Hashable {
-	case badAddress = "bad_address"
-	case badCode = "bad_code"
-	case unreachable
-	case notAGateway = "not_a_gateway"
-	case invalidCode = "invalid_code"
-	case gatewayError = "gateway_error"
-	case storageFailed = "storage_failed"
-	case alreadyPaired = "already_paired"
-	case busy
-}
-
-public struct WirePairFailed: Codable, Sendable, Equatable, Hashable {
-	public let reason: WirePairFailure
-
-	public init(reason: WirePairFailure) {
-		self.reason = reason
-	}
-}
-
 public struct WireRefused: Codable, Sendable, Equatable, Hashable {
 	public let reason: String
 
@@ -370,8 +337,6 @@ public enum WireRequest: Codable, Sendable, Equatable, Hashable {
 	case status
 	case subscribe
 	case discover
-	case pair(WirePair)
-	case unpair
 	case login(WireLogin)
 	case logout
 	case reconnect
@@ -388,8 +353,6 @@ public enum WireRequest: Codable, Sendable, Equatable, Hashable {
 			status,
 			subscribe,
 			discover,
-			pair,
-			unpair,
 			login,
 			logout,
 			reconnect,
@@ -423,14 +386,6 @@ public enum WireRequest: Codable, Sendable, Equatable, Hashable {
 				return
 			case .discover:
 				self = .discover
-				return
-			case .pair:
-				if let content = try? container.decode(WirePair.self, forKey: .data) {
-					self = .pair(content)
-					return
-				}
-			case .unpair:
-				self = .unpair
 				return
 			case .login:
 				if let content = try? container.decode(WireLogin.self, forKey: .data) {
@@ -489,11 +444,6 @@ public enum WireRequest: Codable, Sendable, Equatable, Hashable {
 			try container.encode(CodingKeys.subscribe, forKey: .type)
 		case .discover:
 			try container.encode(CodingKeys.discover, forKey: .type)
-		case .pair(let content):
-			try container.encode(CodingKeys.pair, forKey: .type)
-			try container.encode(content, forKey: .data)
-		case .unpair:
-			try container.encode(CodingKeys.unpair, forKey: .type)
 		case .login(let content):
 			try container.encode(CodingKeys.login, forKey: .type)
 			try container.encode(content, forKey: .data)
@@ -530,9 +480,6 @@ public enum WireResponse: Codable, Sendable, Equatable, Hashable {
 	case subscribed
 	case event(WireStatus)
 	case discovered(WireDiscovered)
-	case paired(WireGateway)
-	case pairFailed(WirePairFailed)
-	case unpaired
 	case loggedIn(WireGateway)
 	case loginFailed(WireLoginFailed)
 	case loggedOut(WireLoggedOut)
@@ -555,9 +502,6 @@ public enum WireResponse: Codable, Sendable, Equatable, Hashable {
 			subscribed,
 			event,
 			discovered,
-			paired,
-			pairFailed = "pair_failed",
-			unpaired,
 			loggedIn = "logged_in",
 			loginFailed = "login_failed",
 			loggedOut = "logged_out",
@@ -610,19 +554,6 @@ public enum WireResponse: Codable, Sendable, Equatable, Hashable {
 					self = .discovered(content)
 					return
 				}
-			case .paired:
-				if let content = try? container.decode(WireGateway.self, forKey: .data) {
-					self = .paired(content)
-					return
-				}
-			case .pairFailed:
-				if let content = try? container.decode(WirePairFailed.self, forKey: .data) {
-					self = .pairFailed(content)
-					return
-				}
-			case .unpaired:
-				self = .unpaired
-				return
 			case .loggedIn:
 				if let content = try? container.decode(WireGateway.self, forKey: .data) {
 					self = .loggedIn(content)
@@ -704,14 +635,6 @@ public enum WireResponse: Codable, Sendable, Equatable, Hashable {
 		case .discovered(let content):
 			try container.encode(CodingKeys.discovered, forKey: .type)
 			try container.encode(content, forKey: .data)
-		case .paired(let content):
-			try container.encode(CodingKeys.paired, forKey: .type)
-			try container.encode(content, forKey: .data)
-		case .pairFailed(let content):
-			try container.encode(CodingKeys.pairFailed, forKey: .type)
-			try container.encode(content, forKey: .data)
-		case .unpaired:
-			try container.encode(CodingKeys.unpaired, forKey: .type)
 		case .loggedIn(let content):
 			try container.encode(CodingKeys.loggedIn, forKey: .type)
 			try container.encode(content, forKey: .data)

@@ -389,13 +389,7 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
                 Some(found) => IpcResponse::Discovered(found),
                 None => return,
             },
-            IpcRequest::Pair { .. }
-            | IpcRequest::Unpair
-            | IpcRequest::Login(_)
-            | IpcRequest::Logout
-            | IpcRequest::Reconnect
-                if !c.may_pair() =>
-            {
+            IpcRequest::Login(_) | IpcRequest::Logout | IpcRequest::Reconnect if !c.may_pair() => {
                 IpcResponse::Refused {
                     reason: "needs the signed Fogar app",
                 }
@@ -419,11 +413,6 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
                     reason: "could not delete the account",
                 },
                 None => return,
-            },
-            // shortcut: pairing is gone; the app stops sending these in S4 PR 3 Task 3, which
-            // removes them from the contract.
-            IpcRequest::Pair { .. } | IpcRequest::Unpair => IpcResponse::Refused {
-                reason: "pairing removed",
             },
             // Checked against the published state: the link only listens while parked for such a
             // reason, and discards a request it saw before parking.

@@ -68,7 +68,7 @@ private struct Cabecera: View {
     @ViewBuilder private var accion: some View {
         switch state {
         case .live(let s) where s.phase == .notPaired:
-            Button("Emparejar este Mac") { nav.seccion = .emparejar }
+            Button("Iniciar sesión") { nav.seccion = .iniciarSesion }
                 .buttonStyle(Pildora(variante: .principal))
         case .live(let s) where s.link == "parked_repair":
             Button("Ir a Ajustes") { nav.seccion = .ajustes }
@@ -215,17 +215,17 @@ private struct Lienzo: View {
             .nodo(encendido: s.phase == .connecting)
             .accessibilityElement(children: .combine)
         } else if status?.phase == .notPaired {
-            Button { nav.seccion = .emparejar } label: {
+            Button { nav.seccion = .iniciarSesion } label: {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Sin gateway").font(Tipo.texto(15, peso: 600)).foregroundStyle(Color.hueso)
-                    Text("empareja este Mac").meta()
+                    Text("inicia sesión").meta()
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .nodo(punteado: true)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Sin gateway. Emparejar este Mac")
+            .accessibilityLabel("Sin gateway. Iniciar sesión")
         } else {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Tu gateway").font(Tipo.texto(15, peso: 600)).foregroundStyle(Color.huesoSuave)

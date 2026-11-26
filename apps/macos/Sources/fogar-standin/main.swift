@@ -4,16 +4,20 @@
 //   swift run fogar-standin [--socket PATH (default /tmp/fogar-standin/agent.sock)] [--phase not_paired|connecting|ready|reconnecting|
 //       parked_repair|parked_agent_refused|parked_missing_scope|parked_upgrade_client|parked_client_error|stopping]
 //       [--version N]
-//       [--gateways 0|1|2] [--refuse-pair] [--peer uid_only|same_signer] [--boot safe] [--old]
+//       [--gateways 0|1|2] [--refuse-login] [--logout-offline] [--peer uid_only|same_signer] [--boot safe] [--old]
 //       [--mic granted|denied|not_determined|restricted] [--mic-deny] [--transcriber up|down|degraded]
 //       [--tts up|down] [--mic-prompt-secs N] [--no-mic]
 //
 // Never the real agent's socket: it refuses that path. The app trusts this unsigned stand-in only
 // in a debug build started with FOGAR_AGENT_UNSIGNED=1 (see the README).
 //
-// Pairing codes decide the outcome: 482913 pairs; 111111 invalid_code, 222222 unreachable,
-// 333333 not_a_gateway, 444444 gateway_error, 555555 storage_failed, 666666 busy,
-// 777777 bad_address; any other 6 digits invalid_code. Pairing while paired -> already_paired.
+// Sign in as `sito` with password `fogar` (fixed test credentials, synthetic). Other passwords
+// script the failures: inseguro insecure_transport, muchos too_many_attempts, lejos unreachable,
+// otro not_a_gateway, roto gateway_error, llavero storage_failed, ocupado busy, mal bad_address;
+// anything else invalid_credentials. Like the core, an address that is not https://, .ts.net,
+// a 100.x tailnet IP or this Mac is needs_secure_address, and signing in while signed in is
+// already_signed_in. `--logout-offline`: logout says the gateway did not answer. The password
+// is never printed.
 // Typed on stdin: a phase name (above) switches the live state; `quit` stops.
 //
 // Conversation (IPC v4, only for a `same_signer` peer, like the core): typed text gets a scripted
@@ -34,10 +38,11 @@ struct Options {
     var phase = "not_paired"
     var version: UInt32 = ipcVersion
     var gateways = 1
-    var refusePair = false
+    var refuseLogin = false
+    var logoutOffline = false
     var peer = WirePeerCheck.sameSigner
     var boot = "normal"
-    /// Plays today's pre-S1 core: `subscribe`, `discover`, `pair`, `unpair` answered `refused`.
+    /// Plays a pre-S1 core: everything but `hello` and `status` answered `refused`.
     var old = false
     var mic = WireMic.notDetermined
     var micDeny = false
@@ -55,7 +60,8 @@ struct Options {
             case "--phase": phase = it.next() ?? phase
             case "--version": version = UInt32(it.next() ?? "") ?? version
             case "--gateways": gateways = Int(it.next() ?? "") ?? gateways
-            case "--refuse-pair": refusePair = true
+            case "--refuse-login": refuseLogin = true
+            case "--logout-offline": logoutOffline = true
             case "--peer": peer = WirePeerCheck(rawValue: it.next() ?? "") ?? peer
             case "--boot": boot = it.next() ?? boot
             case "--old": old = true
@@ -77,7 +83,7 @@ func fail(_ message: String) -> Never {
 }
 
 let greenHouse = WireGateway(
-    address: "http://green-house:8004", name: "green-house", version: "1.29.0", client_name: "Mac de Sito", user: "Sito")
+    address: "https://green-house.tail5e1f.ts.net", name: "green-house", version: "1.29.0", client_name: "Mac de Sito", user: "Sito")
 
 /// The agent's state and its subscribers. Phases follow `LinkState::label` / `LinkPhase`.
 actor StandIn {
@@ -85,7 +91,7 @@ actor StandIn {
     private var link: String
     private var gateway: WireGateway?
     private var subscribers: [ObjectIdentifier: FramedConnection] = [:]
-    private var pairing = false
+    private var iniciando = false
     private var sim: ConversacionSimulada
     private var conversacion: [Int: FramedConnection] = [:]
 
@@ -159,50 +165,48 @@ actor StandIn {
         case .discover:
             try? await Task.sleep(for: .milliseconds(800))
             let all = [
-                WireCandidate(address: "http://green-house:8004", name: "green-house", version: "1.29.0"),
+                WireCandidate(address: "https://green-house.tail5e1f.ts.net", name: "green-house", version: "1.29.0"),
                 WireCandidate(address: "http://100.101.7.12:8004", name: "estudio", version: "1.28.2"),
             ]
             return .discovered(WireDiscovered(gateways: Array(all.prefix(max(0, options.gateways)))))
-        case .pair(let p):
-            // Like the core: pair/unpair only for a verified same-signer peer.
-            if options.refusePair || options.peer == .uidOnly { return .refused(WireRefused(reason: "peer not allowed to pair")) }
-            if pairing { return .pairFailed(WirePairFailed(reason: .busy)) }
-            if link != "not_paired" { return .pairFailed(WirePairFailed(reason: .alreadyPaired)) }
-            guard let code = parsePairCode(p.code) else { return .pairFailed(WirePairFailed(reason: .badCode)) }
-            pairing = true
+        case .login(let l):
+            // Like the core: login/logout only for a verified same-signer peer.
+            if options.refuseLogin || options.peer == .uidOnly { return .refused(WireRefused(reason: "needs the signed Fogar app")) }
+            if iniciando { return .loginFailed(WireLoginFailed(reason: .busy)) }
+            if link != "not_paired" { return .loginFailed(WireLoginFailed(reason: .alreadySignedIn)) }
+            let usuario = l.username.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !usuario.isEmpty, !l.password.isEmpty else { return .loginFailed(WireLoginFailed(reason: .badCredentialsInput)) }
+            guard Self.direccionSegura(l.address) else { return .loginFailed(WireLoginFailed(reason: .needsSecureAddress)) }
+            iniciando = true
             try? await Task.sleep(for: .milliseconds(1200))
-            pairing = false
-            let failure: WirePairFailure? = switch code {
-            case "482913": nil
-            case "222222": .unreachable
-            case "333333": .notAGateway
-            case "444444": .gatewayError
-            case "555555": .storageFailed
-            case "666666": .busy
-            case "777777": .badAddress
-            default: .invalidCode
+            iniciando = false
+            let failure: WireLoginFailure? = switch l.password {
+            case "fogar": usuario == "sito" ? nil : .invalidCredentials
+            case "inseguro": .insecureTransport
+            case "muchos": .tooManyAttempts
+            case "lejos": .unreachable
+            case "otro": .notAGateway
+            case "roto": .gatewayError
+            case "llavero": .storageFailed
+            case "ocupado": .busy
+            case "mal": .badAddress
+            default: .invalidCredentials
             }
-            if let failure { return .pairFailed(WirePairFailed(reason: failure)) }
-            let paired = WireGateway(address: greenHouse.address, name: greenHouse.name,
-                                     version: greenHouse.version, client_name: greenHouse.client_name,
-                                     user: greenHouse.user)
-            gateway = paired
+            if let failure { return .loginFailed(WireLoginFailed(reason: failure)) }
+            gateway = greenHouse
             await set(link: "connecting")
             Task {
                 try? await Task.sleep(for: .milliseconds(1500))
                 await self.set(link: "ready")
             }
-            return .paired(paired)
-        case .unpair:
-            if options.refusePair || options.peer == .uidOnly { return .refused(WireRefused(reason: "peer not allowed to unpair")) }
+            return .loggedIn(greenHouse)
+        case .logout:
+            if options.refuseLogin || options.peer == .uidOnly { return .refused(WireRefused(reason: "needs the signed Fogar app")) }
             await set(link: "not_paired")
-            return .unpaired
-        case .login, .logout:
-            // Like the core until the account lands (S4 PR 3 Task 2).
-            return .refused(WireRefused(reason: "not yet"))
+            return .loggedOut(WireLoggedOut(gateway_reached: !options.logoutOffline))
         case .reconnect:
             // Like the core: signed peers only, and only from a pause the person can settle.
-            if options.refusePair || options.peer == .uidOnly { return .refused(WireRefused(reason: "peer not allowed to reconnect")) }
+            if options.refuseLogin || options.peer == .uidOnly { return .refused(WireRefused(reason: "peer not allowed to reconnect")) }
             guard link == "parked_missing_scope" || link == "parked_agent_refused" || link == "parked_upgrade_client" else {
                 return .refused(WireRefused(reason: "nothing to reconnect"))
             }
@@ -217,6 +221,15 @@ actor StandIn {
             // Like the core: the conversation is strictly for the signed app (no dev opt-in).
             return .refused(WireRefused(reason: "needs the signed Fogar app"))
         }
+    }
+
+    /// The core's option-B check, simplified: https, a .ts.net name, a 100.x tailnet IP or this Mac.
+    // shortcut: the core also asks Tailscale whether a 100.x address is a peer; the stand-in trusts it.
+    static func direccionSegura(_ address: String) -> Bool {
+        if address.hasPrefix("https://") { return true }
+        let sinEsquema = address.hasPrefix("http://") ? String(address.dropFirst(7)) : address
+        let host = sinEsquema.split(separator: ":").first.map(String.init) ?? ""
+        return host.hasSuffix(".ts.net") || host.hasPrefix("100.") || host == "127.0.0.1" || host == "localhost"
     }
 
     // MARK: Conversation (IPC v4)

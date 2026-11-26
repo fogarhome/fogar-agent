@@ -67,14 +67,14 @@ struct FogarDesktopApp: App {
 }
 
 enum Seccion: String, CaseIterable, Identifiable {
-    case conversacion, estado, emparejar, ajustes
+    case conversacion, estado, iniciarSesion, ajustes
     var id: Self { self }
 
     var titulo: String {
         switch self {
         case .conversacion: "Conversación"
         case .estado: "Estado"
-        case .emparejar: "Emparejar"
+        case .iniciarSesion: "Iniciar sesión"
         case .ajustes: "Ajustes"
         }
     }
@@ -83,7 +83,7 @@ enum Seccion: String, CaseIterable, Identifiable {
         switch self {
         case .conversacion: "bubble.left.and.bubble.right"
         case .estado: "point.3.connected.trianglepath.dotted"
-        case .emparejar: "link"
+        case .iniciarSesion: "person.crop.circle"
         case .ajustes: "gearshape"
         }
     }
@@ -92,7 +92,7 @@ enum Seccion: String, CaseIterable, Identifiable {
         switch self {
         case .conversacion: "1"
         case .estado: "2"
-        case .emparejar: "3"
+        case .iniciarSesion: "3"
         case .ajustes: "4"
         }
     }

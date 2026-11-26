@@ -3,11 +3,11 @@
 //! `MAX_FRAME_BYTES`, `"type"`-tagged, `deny_unknown_fields`, closed vocabulary.
 //!
 //! Sans-I/O: framing works on byte buffers; adapters own the socket and peer authentication.
-//! Pairing codes and account passwords cross this layer once; the frame buffers holding them
-//! are wiped (`take_frame`, `Zeroizing` bodies) and so are the decoded `WireCode` /
-//! `WirePassword`. Known limit: serde_json's internal scratch for a string with escapes is not
-//! wiped. Codes are 6 digits (never escaped), but a password containing `"`, `\` or a control
-//! character leaves one unwiped copy in freed memory of the agent (and of the app). No key or
+//! Account passwords cross this layer once; the frame buffers holding them are wiped
+//! (`take_frame`, `Zeroizing` bodies) and so is the decoded `WirePassword`. Known limit:
+//! serde_json's internal scratch for a string with escapes is not wiped: a password containing
+//! `"`, `\` or a control character leaves one unwiped copy in freed memory of the agent (and of
+//! the app). No key or
 //! token ever crosses IPC.
 
 use fogar_ports::{
@@ -15,31 +15,12 @@ use fogar_ports::{
     ipc::{
         CaptureGesture, CaptureRefusal, CaptureThen, ConversationView, GatewayCandidate,
         GatewayInfo, IpcError, IpcRequest, IpcResponse, LinkPhase, LoginFailure, LoginForm,
-        MAX_FRAME_BYTES, Notice, PairCode, PairFailure, Password, PeerCheck, ProgressKind,
-        ServiceState, StatusReport, TextRefusal, TurnAudio, TurnOutcome, TurnSource, TurnView,
-        UserActivity, UserText,
+        MAX_FRAME_BYTES, Notice, Password, PeerCheck, ProgressKind, ServiceState, StatusReport,
+        TextRefusal, TurnAudio, TurnOutcome, TurnSource, TurnView, UserActivity, UserText,
     },
 };
 use secrecy::zeroize::{Zeroize, Zeroizing};
 use serde::{Deserialize, Serialize};
-
-/// The pairing code on the wire: redacted `Debug`, wiped on drop.
-#[cfg_attr(typeshare, typeshare)]
-#[derive(Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct WireCode(String);
-
-impl std::fmt::Debug for WireCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("<redacted>")
-    }
-}
-
-impl Drop for WireCode {
-    fn drop(&mut self) {
-        self.0.zeroize();
-    }
-}
 
 /// The account password on the wire: redacted `Debug`, wiped on drop.
 #[cfg_attr(typeshare, typeshare)]
@@ -81,14 +62,6 @@ pub struct WireHello {
 #[cfg_attr(typeshare, typeshare)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WirePair {
-    pub address: String,
-    pub code: WireCode,
-}
-
-#[cfg_attr(typeshare, typeshare)]
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct WireLogin {
     pub address: String,
     pub username: String,
@@ -108,8 +81,6 @@ pub enum WireRequest {
     Status,
     Subscribe,
     Discover,
-    Pair(WirePair),
-    Unpair,
     Login(WireLogin),
     Logout,
     Reconnect,
@@ -378,21 +349,6 @@ pub enum WirePeerCheck {
 #[cfg_attr(typeshare, typeshare)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WirePairFailure {
-    BadAddress,
-    BadCode,
-    Unreachable,
-    NotAGateway,
-    InvalidCode,
-    GatewayError,
-    StorageFailed,
-    AlreadyPaired,
-    Busy,
-}
-
-#[cfg_attr(typeshare, typeshare)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum WireLoginFailure {
     BadAddress,
     NeedsSecureAddress,
@@ -462,13 +418,6 @@ pub struct WireDiscovered {
 #[cfg_attr(typeshare, typeshare)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WirePairFailed {
-    pub reason: WirePairFailure,
-}
-
-#[cfg_attr(typeshare, typeshare)]
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct WireLoginFailed {
     pub reason: WireLoginFailure,
 }
@@ -495,9 +444,6 @@ pub enum WireResponse {
     Subscribed,
     Event(WireStatus),
     Discovered(WireDiscovered),
-    Paired(WireGateway),
-    PairFailed(WirePairFailed),
-    Unpaired,
     LoggedIn(WireGateway),
     LoginFailed(WireLoginFailed),
     LoggedOut(WireLoggedOut),
@@ -518,7 +464,7 @@ pub enum WireResponse {
 
 /// Pops one complete frame body from `buf` if present (leaves partial frames in place, so a
 /// reader that keeps `buf` across cancelled reads is cancel-safe).
-/// The returned body and the consumed bytes of `buf` are wiped (a pairing code may be inside).
+/// The returned body and the consumed bytes of `buf` are wiped (a password may be inside).
 pub fn take_frame(buf: &mut Vec<u8>) -> Result<Option<Zeroizing<Vec<u8>>>, IpcError> {
     let Some(hdr) = buf.first_chunk::<4>() else {
         return Ok(None);
@@ -564,11 +510,6 @@ pub fn decode_request(body: &[u8]) -> Result<IpcRequest, IpcError> {
             WireRequest::Status => IpcRequest::Status,
             WireRequest::Subscribe => IpcRequest::Subscribe,
             WireRequest::Discover => IpcRequest::Discover,
-            WireRequest::Pair(p) => IpcRequest::Pair {
-                code: PairCode::parse(&p.code.0),
-                address: p.address,
-            },
-            WireRequest::Unpair => IpcRequest::Unpair,
             WireRequest::Login(l) => IpcRequest::Login(Box::new(LoginForm {
                 password: Password::parse(&l.password.0),
                 address: l.address,
@@ -607,15 +548,6 @@ pub fn encode_request(r: &IpcRequest) -> Result<Zeroizing<Vec<u8>>, IpcError> {
         IpcRequest::Status => WireRequest::Status,
         IpcRequest::Subscribe => WireRequest::Subscribe,
         IpcRequest::Discover => WireRequest::Discover,
-        IpcRequest::Pair { address, code } => WireRequest::Pair(WirePair {
-            address: address.clone(),
-            code: WireCode(
-                code.as_ref()
-                    .map(|c| c.digits().to_owned())
-                    .unwrap_or_default(),
-            ),
-        }),
-        IpcRequest::Unpair => WireRequest::Unpair,
         IpcRequest::Login(l) => WireRequest::Login(WireLogin {
             address: l.address.clone(),
             username: l.username.clone(),
@@ -680,35 +612,6 @@ fn phase_from_wire(p: WirePhase) -> LinkPhase {
         WirePhase::Reconnecting => LinkPhase::Reconnecting,
         WirePhase::Parked => LinkPhase::Parked,
         WirePhase::Stopping => LinkPhase::Stopping,
-    }
-}
-
-fn failure_to_wire(f: PairFailure) -> WirePairFailure {
-    match f {
-        PairFailure::BadAddress => WirePairFailure::BadAddress,
-        PairFailure::BadCode => WirePairFailure::BadCode,
-        PairFailure::Unreachable => WirePairFailure::Unreachable,
-        PairFailure::NotAGateway => WirePairFailure::NotAGateway,
-        PairFailure::InvalidCode => WirePairFailure::InvalidCode,
-        PairFailure::StorageFailed => WirePairFailure::StorageFailed,
-        PairFailure::AlreadyPaired => WirePairFailure::AlreadyPaired,
-        PairFailure::Busy => WirePairFailure::Busy,
-        // GatewayError and any future failure: "try again".
-        _ => WirePairFailure::GatewayError,
-    }
-}
-
-fn failure_from_wire(f: WirePairFailure) -> PairFailure {
-    match f {
-        WirePairFailure::BadAddress => PairFailure::BadAddress,
-        WirePairFailure::BadCode => PairFailure::BadCode,
-        WirePairFailure::Unreachable => PairFailure::Unreachable,
-        WirePairFailure::NotAGateway => PairFailure::NotAGateway,
-        WirePairFailure::InvalidCode => PairFailure::InvalidCode,
-        WirePairFailure::GatewayError => PairFailure::GatewayError,
-        WirePairFailure::StorageFailed => PairFailure::StorageFailed,
-        WirePairFailure::AlreadyPaired => PairFailure::AlreadyPaired,
-        WirePairFailure::Busy => PairFailure::Busy,
     }
 }
 
@@ -1069,11 +972,6 @@ pub fn encode_response(r: IpcResponse) -> Result<Vec<u8>, IpcError> {
                 })
                 .collect(),
         }),
-        IpcResponse::Paired(g) => WireResponse::Paired(gateway_to_wire(g)),
-        IpcResponse::PairFailed(f) => WireResponse::PairFailed(WirePairFailed {
-            reason: failure_to_wire(f),
-        }),
-        IpcResponse::Unpaired => WireResponse::Unpaired,
         IpcResponse::LoggedIn(g) => WireResponse::LoggedIn(gateway_to_wire(*g)),
         IpcResponse::LoginFailed(f) => WireResponse::LoginFailed(WireLoginFailed {
             reason: login_failure_to_wire(f),
@@ -1121,9 +1019,6 @@ pub fn decode_response(body: &[u8]) -> Result<IpcResponse, IpcError> {
                     .map(|c| GatewayCandidate::new(c.address, c.name, c.version))
                     .collect(),
             ),
-            WireResponse::Paired(g) => IpcResponse::Paired(gateway_from_wire(g)),
-            WireResponse::PairFailed(f) => IpcResponse::PairFailed(failure_from_wire(f.reason)),
-            WireResponse::Unpaired => IpcResponse::Unpaired,
             WireResponse::LoggedIn(g) => IpcResponse::LoggedIn(Box::new(gateway_from_wire(g))),
             WireResponse::LoginFailed(f) => {
                 IpcResponse::LoginFailed(login_failure_from_wire(f.reason))
@@ -1265,12 +1160,7 @@ mod tests {
             IpcRequest::Status,
             IpcRequest::Subscribe,
             IpcRequest::Discover,
-            IpcRequest::Unpair,
             IpcRequest::Reconnect,
-            IpcRequest::Pair {
-                address: "green-house".into(),
-                code: PairCode::parse("482 913"),
-            },
             IpcRequest::Login(Box::new(LoginForm {
                 address: "https://casa".into(),
                 username: "sito".into(),
@@ -1306,16 +1196,21 @@ mod tests {
         }
         assert!(decode_request(br#"{"type":"status","exec":"rm -rf"}"#).is_err());
         assert!(decode_request(br#"{"type":"run","data":{"cmd":"x"}}"#).is_err());
-        assert!(decode_request(br#"{"type":"pair","data":{"address":"x"}}"#).is_err());
         assert!(decode_request(br#"{"type":"hello","data":{"version":2,"admin":true}}"#).is_err());
-        // A typo is decoded (so the core can answer BadCode), not dropped as malformed.
-        assert_eq!(
-            decode_request(br#"{"type":"pair","data":{"address":"x","code":"12a456"}}"#).unwrap(),
-            IpcRequest::Pair {
-                address: "x".into(),
-                code: None
-            }
-        );
+        // v5: pairing left the vocabulary (signing in replaced it).
+        for gone in [
+            &br#"{"type":"pair","data":{"address":"x","code":"482913"}}"#[..],
+            br#"{"type":"unpair"}"#,
+        ] {
+            assert!(decode_request(gone).is_err());
+        }
+        for gone in [
+            &br#"{"type":"paired","data":{"address":"a","name":"n","version":"v","client_name":"c","user":"u"}}"#[..],
+            br#"{"type":"pair_failed","data":{"reason":"invalid_code"}}"#,
+            br#"{"type":"unpaired"}"#,
+        ] {
+            assert!(decode_response(gone).is_err());
+        }
     }
 
     #[test]
@@ -1330,9 +1225,6 @@ mod tests {
                 "green-house".into(),
                 "1.29.0".into(),
             )]),
-            IpcResponse::Paired(*report().gateway.unwrap()),
-            IpcResponse::PairFailed(PairFailure::InvalidCode),
-            IpcResponse::Unpaired,
             IpcResponse::LoggedIn(report().gateway.unwrap()),
             IpcResponse::LoggedOut {
                 gateway_reached: true,
@@ -1552,14 +1444,6 @@ mod tests {
                 json
             );
         }
-        let s = String::from_utf8(
-            encode_response(IpcResponse::PairFailed(PairFailure::InvalidCode)).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            s,
-            r#"{"type":"pair_failed","data":{"reason":"invalid_code"}}"#
-        );
         let s = String::from_utf8(encode_response(IpcResponse::Subscribed).unwrap()).unwrap();
         assert_eq!(s, r#"{"type":"subscribed"}"#);
         // v5: the account.
@@ -1600,15 +1484,6 @@ mod tests {
         assert_eq!(s, r#"{"type":"reconnecting"}"#);
         let r = encode_request(&IpcRequest::Reconnect).unwrap();
         assert_eq!(std::str::from_utf8(&r).unwrap(), r#"{"type":"reconnect"}"#);
-        let r = encode_request(&IpcRequest::Pair {
-            address: "green-house".into(),
-            code: PairCode::parse("482913"),
-        })
-        .unwrap();
-        assert_eq!(
-            std::str::from_utf8(&r).unwrap(),
-            r#"{"type":"pair","data":{"address":"green-house","code":"482913"}}"#
-        );
     }
 
     #[test]
@@ -1639,14 +1514,5 @@ mod tests {
                 IpcRequest::Login(l) if l.password.is_none()
             ));
         }
-    }
-
-    #[test]
-    fn pair_code_never_prints() {
-        let r = IpcRequest::Pair {
-            address: "x".into(),
-            code: PairCode::parse("482913"),
-        };
-        assert!(!format!("{r:?}").contains("482913"));
     }
 }

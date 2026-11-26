@@ -1,10 +1,11 @@
 import FogarWire
 import SwiftUI
 
-/// Emparejar: the dashboard's Conectar screen for this Mac. On one side the brand (living
-/// background, living line, one line of purpose); on the other, the only thing the person types:
-/// where the gateway is (found or by hand) and the 6-digit code. Everything else the agent sets.
-struct EmparejarView: View {
+/// Iniciar sesión: the dashboard's Conectar screen for this Mac. On one side the brand (living
+/// background, living line, one line of purpose); on the other, the only things the person types:
+/// where the gateway is (found or by hand), their user and their password. Everything else the
+/// agent sets. The password lives only in this view's state and is cleared after each attempt.
+struct IniciarSesionView: View {
     @Environment(AgentLink.self) private var link
 
     var body: some View {
@@ -19,7 +20,7 @@ struct EmparejarView: View {
                     case .live(let s) where s.phase == .notPaired:
                         Formulario()
                     case .live(let s):
-                        YaEmparejado(status: s)
+                        YaConSesion(status: s)
                     default:
                         SinAgente(state: link.state)
                     }
@@ -34,7 +35,7 @@ struct EmparejarView: View {
             .modifier(SinBordeDeScroll())
         }
         .ignoresSafeArea(edges: .top)
-        .navigationTitle("Emparejar")
+        .navigationTitle("Iniciar sesión")
     }
 }
 
@@ -70,13 +71,16 @@ private struct Formulario: View {
     @State private var candidatos: [WireCandidate] = []
     @State private var buscando = false
     @State private var direccion = ""
-    @State private var codigo = ""
+    @State private var usuario = ""
+    /// Only here, never logged or kept: emptied after every attempt and when the view goes away.
+    @State private var contrasena = ""
     @State private var errorDireccion: String?
-    @State private var errorCodigo: String?
+    @State private var errorCredenciales: String?
     @State private var errorGeneral: String?
-    @State private var emparejando = false
+    @State private var entrando = false
     @FocusState private var focoDireccion: Bool
-    @FocusState private var focoCodigo: Bool
+    @FocusState private var focoUsuario: Bool
+    @FocusState private var focoContrasena: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
@@ -89,30 +93,37 @@ private struct Formulario: View {
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(.bottom, 12)
                 }
-                Text("Hola. Emparejemos este Mac.").titularFogar()
+                Text("Hola. Inicia sesión en este Mac.").titularFogar()
                     .fixedSize(horizontal: false, vertical: true)
-                Text("Abre un código en tu gateway: en su panel, en Clientes → Emparejar, o con fogar-gw pair. Aquí solo hace falta escribirlo.")
+                Text("Con tu usuario y tu contraseña de Fogar, los mismos de la web. La contraseña solo viaja cifrada: por https o por Tailscale.")
                     .font(Tipo.cuerpo).suave()
                     .fixedSize(horizontal: false, vertical: true)
             }
 
             encontrados
 
-            Campo(etiqueta: "Dirección del gateway", pista: "Sin http://; si no pones puerto, es el 8004.", error: errorDireccion, campo: {
-                TextField("", text: $direccion, prompt: Text("gateway.local o 192.168.0.10:8004").foregroundStyle(Color.huesoTenue))
+            Campo(etiqueta: "Dirección del gateway", pista: "Su dirección https:// o la de Tailscale (termina en .ts.net).", error: errorDireccion, campo: {
+                TextField("", text: $direccion, prompt: Text("https://casa.ejemplo.com o casa.tu-red.ts.net").foregroundStyle(Color.huesoTenue))
                     .autocorrectionDisabled()
                     .onChange(of: direccion) { errorDireccion = nil }
+                    .onSubmit { focoUsuario = true }
             }, enfocado: $focoDireccion)
 
-            Campo(etiqueta: "Código de 6 cifras", pista: "Vale una sola vez y caduca a los 10 minutos.", error: errorCodigo, campo: {
-                TextField("", text: $codigo, prompt: Text("6 cifras").foregroundStyle(Color.huesoTenue))
-                    .textContentType(.oneTimeCode)
+            Campo(etiqueta: "Usuario", error: nil, campo: {
+                TextField("", text: $usuario, prompt: Text("tu usuario").foregroundStyle(Color.huesoTenue))
+                    .textContentType(.username)
                     .autocorrectionDisabled()
-                    .font(Tipo.texto(22, peso: 500)).monospacedDigit().tracking(2)
-                    // Typing clears the error; the app emptying a spent code must not.
-                    .onChange(of: codigo) { _, nuevo in if !nuevo.isEmpty { errorCodigo = nil; errorGeneral = nil } }
-                    .onSubmit(emparejar)
-            }, enfocado: $focoCodigo)
+                    .onChange(of: usuario) { errorCredenciales = nil; errorGeneral = nil }
+                    .onSubmit { focoContrasena = true }
+            }, enfocado: $focoUsuario)
+
+            Campo(etiqueta: "Contraseña", error: errorCredenciales, campo: {
+                SecureField("", text: $contrasena, prompt: Text("tu contraseña").foregroundStyle(Color.huesoTenue))
+                    .textContentType(.password)
+                    // Typing clears the error; the app emptying the field after an attempt must not.
+                    .onChange(of: contrasena) { _, nueva in if !nueva.isEmpty { errorCredenciales = nil; errorGeneral = nil } }
+                    .onSubmit(entrar)
+            }, enfocado: $focoContrasena)
 
             if let errorGeneral {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -123,15 +134,15 @@ private struct Formulario: View {
                 .accessibilityElement(children: .combine)
             }
 
-            // Busy, not disabled: the label keeps full contrast; `emparejar()` ignores repeats.
-            Button(action: emparejar) {
-                Text(emparejando ? "Emparejando…" : "Emparejar")
+            // Busy, not disabled: the label keeps full contrast; `entrar()` ignores repeats.
+            Button(action: entrar) {
+                Text(entrando ? "Iniciando sesión…" : "Iniciar sesión")
             }
-            .buttonStyle(Pildora(variante: .principal, ocupado: emparejando, ancho: true))
+            .buttonStyle(Pildora(variante: .principal, ocupado: entrando, ancho: true))
             .keyboardShortcut(.defaultAction)
         }
         .task { await buscar() }
-        .onDisappear { codigo = "" }
+        .onDisappear { contrasena = "" }
     }
 
     @ViewBuilder private var encontrados: some View {
@@ -152,7 +163,7 @@ private struct Formulario: View {
                     ForEach(candidatos, id: \.address) { c in
                         Candidato(c: c, elegido: direccion == sinEsquema(c.address)) {
                             direccion = sinEsquema(c.address)
-                            focoCodigo = true
+                            focoUsuario = true
                         }
                     }
                 }
@@ -168,8 +179,8 @@ private struct Formulario: View {
             candidatos = try await link.discover()
             if candidatos.count == 1, direccion.isEmpty { direccion = sinEsquema(candidatos[0].address) }
             // Keyboard first: straight to what is still missing.
-            if !focoDireccion && !focoCodigo {
-                if direccion.isEmpty { focoDireccion = true } else { focoCodigo = true }
+            if !focoDireccion && !focoUsuario && !focoContrasena {
+                if direccion.isEmpty { focoDireccion = true } else { focoUsuario = true }
             }
         } catch {
             candidatos = []
@@ -177,40 +188,39 @@ private struct Formulario: View {
         }
     }
 
-    private func emparejar() {
-        guard !emparejando else { return }
-        errorDireccion = nil; errorCodigo = nil; errorGeneral = nil
+    private func entrar() {
+        guard !entrando else { return }
+        errorDireccion = nil; errorCredenciales = nil; errorGeneral = nil
         let dir = direccion.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !dir.isEmpty else {
             errorDireccion = "Elige un gateway o escribe su dirección."
             focoDireccion = true
             return
         }
-        guard let digits = parsePairCode(codigo) else {
-            // Checked here so a typo never spends one of the gateway's 5 attempts.
-            errorCodigo = Textos.fallo(.badCode)
-            focoCodigo = true
+        // Checked here too (the agent checks again): an empty field never reaches the gateway.
+        // The password is never trimmed: spaces are part of it.
+        guard !usuario.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !contrasena.isEmpty, contrasena.utf8.count <= 1024 else {
+            errorCredenciales = Textos.fallo(.badCredentialsInput)
+            focoContrasena = !usuario.isEmpty
+            focoUsuario = usuario.isEmpty
             return
         }
-        emparejando = true
+        let (u, c) = (usuario, contrasena)
+        contrasena = "" // whatever happens next, the field is empty again
+        entrando = true
         Task {
-            defer { emparejando = false }
-            var sigueValiendo = false // the gateway did not consume it: keep it for the retry
-            defer { if !sigueValiendo { codigo = "" } }
+            defer { entrando = false }
             do {
-                switch try await link.pair(address: dir, code: digits) {
-                case .paired:
+                switch try await link.login(address: dir, username: u, password: c) {
+                case .loggedIn:
                     nav.seccion = .estado
                 case .failed(let f):
                     switch f {
-                    case .badAddress, .unreachable, .notAGateway:
-                        sigueValiendo = true
+                    case .badAddress, .unreachable, .notAGateway, .needsSecureAddress, .insecureTransport:
                         errorDireccion = Textos.fallo(f); focoDireccion = true
-                    case .badCode, .invalidCode:
-                        errorCodigo = Textos.fallo(f); focoCodigo = true
-                    case .gatewayError, .busy:
-                        sigueValiendo = true
-                        errorGeneral = Textos.fallo(f)
+                    case .invalidCredentials, .badCredentialsInput:
+                        errorCredenciales = Textos.fallo(f); focoContrasena = true
                     default:
                         errorGeneral = Textos.fallo(f)
                     }
@@ -262,17 +272,17 @@ private struct Candidato: View {
     }
 }
 
-private struct YaEmparejado: View {
+private struct YaConSesion: View {
     let status: WireStatus
     @Environment(Navegacion.self) private var nav
 
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
             VStack(alignment: .leading, spacing: 12) {
-                Text("Este Mac ya está emparejado.").titularFogar()
+                Text("Ya has iniciado sesión en este Mac.").titularFogar()
                     .fixedSize(horizontal: false, vertical: true)
-                Text(status.gateway.map { "Está unido a \($0.name) (\($0.address)). Para emparejarlo con otro gateway, desemparéjalo primero en Ajustes." }
-                     ?? "Para emparejarlo con otro gateway, desemparéjalo primero en Ajustes.")
+                Text(status.gateway.map { "\(Textos.cuenta($0)). Para entrar con otra cuenta o en otro gateway, cierra sesión primero en Ajustes." }
+                     ?? "Para entrar con otra cuenta o en otro gateway, cierra sesión primero en Ajustes.")
                     .font(Tipo.cuerpo).suave()
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -295,7 +305,7 @@ private struct SinAgente: View {
         VStack(alignment: .leading, spacing: 24) {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Primero, el agente.").titularFogar()
-                Text("Para emparejar hace falta el agente de Fogar en este Mac. \(t.sub)")
+                Text("Para iniciar sesión hace falta el agente de Fogar en este Mac. \(t.sub)")
                     .font(Tipo.cuerpo).suave()
                     .fixedSize(horizontal: false, vertical: true)
                 Estado(tono: t.tono, texto: t.titulo).font(Tipo.texto(14, peso: 550)).foregroundStyle(Color.hueso)

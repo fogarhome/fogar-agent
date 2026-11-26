@@ -1,5 +1,5 @@
 //! GatewayHttp port: the gateway's closed REST call set (client-protocol §0 and JGW Spec 5.0):
-//! discovery (`/.well-known/*`), pairing (`POST /pair`), login/session and the conversation
+//! discovery (`/.well-known/*`), login/session and the conversation
 //! calls. [`HttpCall`] is the whole set: fixed method and path per variant, so the port cannot
 //! be used as a generic HTTP client.
 //!
@@ -11,7 +11,7 @@
 //!   core is generic over `H: GatewayHttp`.
 //! - Bearer token: authenticated calls (`HttpCall::authenticated`) carry
 //!   `Authorization: Bearer <token>`. A missing, empty or non-printable-ASCII token is `Refused`
-//!   before a byte is sent, and so is a token on an unauthenticated call (discovery, pairing,
+//!   before a byte is sent, and so is a token on an unauthenticated call (discovery,
 //!   login): it would leak to a gateway that has not been authenticated. The adapter writes the token straight from its secret buffer into
 //!   the socket; it is never copied into a `String`, a log or an error.
 //! - Streaming calls (`HttpCall::is_stream`) are refused by `request`: they go through
@@ -34,8 +34,8 @@
 //!   `chunked`) is `TooLarge` as soon as the limit is crossed, never buffered first. `chunked`
 //!   replies are decoded; the cap counts decoded bytes. It never follows redirects (a redirect
 //!   could move the key exchange to another host).
-//! - Bodies are wiped from memory on drop and never printed: the `/pair` reply carries the
-//!   `token` exactly once. Adapters read the body into ONE buffer pre-sized from
+//! - Bodies are wiped from memory on drop and never printed: the `/auth/login` reply carries
+//!   the `token` exactly once. Adapters read the body into ONE buffer pre-sized from
 //!   `Content-Length` (capped at the call's limit), so growth never leaves stray copies.
 //!
 //! How Windows/Linux would do this: the same portable HTTP/1.1 client (fogar-host); nothing OS
@@ -85,8 +85,6 @@ pub enum HttpCall {
     WellKnown,
     /// `GET /.well-known/jota-gateway` (gateways from before the Fogar rename).
     WellKnownLegacy,
-    /// `POST /pair` with a JSON body.
-    Pair,
     /// `POST /auth/login`. CERTAIN (5.0, M22)
     Login,
     /// `POST /auth/logout`. CERTAIN (5.0, M22)
@@ -137,8 +135,7 @@ impl HttpCall {
             | Events { .. } => "GET",
             UpdateMe => "PATCH",
             Withdraw { .. } => "DELETE",
-            Pair
-            | Login
+            Login
             | Logout
             | CreateConversation
             | PostMessage { .. }
@@ -152,7 +149,6 @@ impl HttpCall {
         match self {
             WellKnown => "/.well-known/fogar-gateway".into(),
             WellKnownLegacy => "/.well-known/jota-gateway".into(),
-            Pair => "/pair".into(),
             Login => "/auth/login".into(),
             Logout => "/auth/logout".into(),
             Me | UpdateMe => "/auth/me".into(),
@@ -204,11 +200,11 @@ impl HttpCall {
         matches!(self, HttpCall::Events { .. } | HttpCall::Speech { .. })
     }
 
-    /// Needs the session credential (everything except discovery, pairing and login).
+    /// Needs the session credential (everything except discovery and login).
     pub fn authenticated(&self) -> bool {
         !matches!(
             self,
-            HttpCall::WellKnown | HttpCall::WellKnownLegacy | HttpCall::Pair | HttpCall::Login
+            HttpCall::WellKnown | HttpCall::WellKnownLegacy | HttpCall::Login
         )
     }
 }
@@ -449,7 +445,6 @@ mod tests {
                 false,
                 false,
             ),
-            (HttpCall::Pair, "POST", "/pair", false, false),
             (HttpCall::Login, "POST", "/auth/login", false, false),
             (HttpCall::Logout, "POST", "/auth/logout", true, false),
             (HttpCall::Me, "GET", "/auth/me", true, false),

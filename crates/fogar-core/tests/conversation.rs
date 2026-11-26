@@ -206,7 +206,7 @@ async fn cancel_mid_turn_sends_cancel_and_ends_cancelled() {
 async fn uid_only_peers_are_refused_even_with_the_pairing_opt_in() {
     let mut b = rig_with(MockConfig::default());
     b.signed_peer = false;
-    // The development opt-in for Pair/Unpair must NOT extend to the conversation.
+    // The development opt-in for Login/Logout must NOT extend to the conversation.
     b.cfg.pair_from_uid_only_peers = true;
     let mut rig = b.start();
     wait_ready(&mut rig.health).await;

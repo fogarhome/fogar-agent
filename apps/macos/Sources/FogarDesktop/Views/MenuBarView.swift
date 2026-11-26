@@ -25,7 +25,8 @@ struct MenuBarView: View {
                 Text(t.sub).font(Tipo.texto(13)).suave()
                     .fixedSize(horizontal: false, vertical: true)
                 if let g = link.state.status?.gateway, link.state.status?.phase != .notPaired {
-                    Text("\(g.address.replacingOccurrences(of: "http://", with: "")) · versión \(g.version)").meta()
+                    Text("\(Textos.cuenta(g)) · versión \(g.version)").meta()
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
@@ -53,7 +54,7 @@ struct MenuBarView: View {
                     .buttonStyle(Pildora(pequena: true, ancho: true))
                 switch link.state {
                 case .live(let s) where s.phase == .notPaired:
-                    Button { abrir(.emparejar) } label: { Text("Emparejar este Mac…") }
+                    Button { abrir(.iniciarSesion) } label: { Text("Iniciar sesión…") }
                         .buttonStyle(Pildora(pequena: true, ancho: true))
                 case .notRunning, .refused, .noLiveStatus, .unintelligible, .noVerificado:
                     Button { link.retryNow() } label: { Text("Volver a llamar al agente") }

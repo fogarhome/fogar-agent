@@ -726,32 +726,6 @@ async fn uid_only_peers_cannot_login_or_logout() {
     assert!(rig2.agent.shutdown(Duration::from_secs(4)).await.clean);
 }
 
-/// Pairing is gone: the old requests are refused and touch nothing.
-#[tokio::test(start_paused = true)]
-async fn pairing_requests_are_refused() {
-    let mut b = RigBuilder::fake(MockConfig::default());
-    b.with_ipc = true;
-    let mut rig = b.start();
-    wait_ready(&mut rig.health).await;
-    let mut c = client(&rig).await;
-    for req in [
-        IpcRequest::Unpair,
-        IpcRequest::Pair {
-            address: "127.0.0.1".into(),
-            code: fogar_ports::ipc::PairCode::parse("482913"),
-        },
-    ] {
-        let r = c.request(req.clone()).await;
-        assert!(
-            matches!(r, Some(IpcResponse::Refused { .. })),
-            "{req:?}: {r:?}"
-        );
-    }
-    assert!(rig.routes.seen().is_empty());
-    assert!(rig.secrets.contains(SecretKey::GatewayAccount));
-    assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
-}
-
 #[tokio::test(start_paused = true)]
 async fn discover_finds_gateways_on_tailnet_peers() {
     // A gateway on this machine and one on a tailnet peer; another peer runs no gateway.

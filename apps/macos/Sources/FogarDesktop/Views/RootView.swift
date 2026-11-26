@@ -18,7 +18,7 @@ struct RootView: View {
                 switch nav.seccion {
                 case .conversacion: ConversacionView()
                 case .estado: EstadoView()
-                case .emparejar: EmparejarView()
+                case .iniciarSesion: IniciarSesionView()
                 case .ajustes: AjustesView(enVentana: true)
                 }
             }
@@ -32,8 +32,9 @@ struct RootView: View {
         .tint(.hueso)
         .vigilaVisibilidad()
         .onChange(of: link.state.status?.phase) { old, new in
-            // Revoked or unpaired elsewhere: go where the person can fix it.
-            if new == .notPaired, let old, old != .notPaired { nav.seccion = .emparejar }
+            // Revoked or signed out elsewhere: go where the person can fix it. Not from Ajustes: a
+            // logout from there must keep its notice («el gateway no contestó…») on screen.
+            if new == .notPaired, let old, old != .notPaired, nav.seccion != .ajustes { nav.seccion = .iniciarSesion }
         }
         // Announce a new headline, not every counter tick.
         .onChange(of: Textos.titular(link.state, retirado: link.accesoRetirado).titulo) { _, titulo in

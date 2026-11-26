@@ -945,8 +945,8 @@ pub mod ipc_server {
     use fogar_ports::audio::MicPermission;
     use fogar_ports::ipc::{
         CaptureGesture, CaptureThen, ConversationView, GatewayInfo, IpcConn, IpcRequest,
-        IpcResponse, IpcServer, LinkPhase, PairCode, PairFailure, PeerCheck, StatusReport,
-        TurnView, UserText,
+        IpcResponse, IpcServer, LinkPhase, LoginFailure, LoginForm, Password, PeerCheck,
+        StatusReport, TurnView, UserText,
     };
     use std::{future::Future, time::Duration};
 
@@ -1005,22 +1005,19 @@ pub mod ipc_server {
                     }
                     continue;
                 }
-                IpcRequest::Pair { code: None, .. } => {
-                    IpcResponse::PairFailed(PairFailure::BadCode)
-                }
-                IpcRequest::Pair {
-                    address,
-                    code: Some(c),
-                } => {
-                    assert_eq!(c.digits(), "482913", "code must cross the wire intact");
-                    IpcResponse::Paired(GatewayInfo::new(
-                        address,
-                        "gw".into(),
-                        "1".into(),
-                        "Mac".into(),
-                    ))
-                }
-                IpcRequest::Unpair => IpcResponse::Unpaired,
+                IpcRequest::Login(form) => match form.password {
+                    None => IpcResponse::LoginFailed(LoginFailure::BadCredentialsInput),
+                    Some(p) => {
+                        assert_eq!(p.expose(), PASSWORD, "password must cross the wire intact");
+                        IpcResponse::LoggedIn(Box::new(
+                            GatewayInfo::new(form.address, "gw".into(), "1".into(), "Mac".into())
+                                .with_user(form.username),
+                        ))
+                    }
+                },
+                IpcRequest::Logout => IpcResponse::LoggedOut {
+                    gateway_reached: true,
+                },
                 IpcRequest::Reconnect => IpcResponse::Reconnecting,
                 IpcRequest::SubscribeConversation => {
                     conn.send(IpcResponse::ConversationSubscribed)
@@ -1147,8 +1144,10 @@ pub mod ipc_server {
                 Some(IpcResponse::Status(report(1)))
             );
             assert_eq!(
-                c.request(IpcRequest::Unpair).await,
-                Some(IpcResponse::Unpaired)
+                c.request(IpcRequest::Logout).await,
+                Some(IpcResponse::LoggedOut {
+                    gateway_reached: true
+                })
             );
             assert_eq!(
                 c.request(IpcRequest::Reconnect).await,
@@ -1186,9 +1185,20 @@ pub mod ipc_server {
         bounded(async { tokio::join!(serve_one(&server, 3), client) }).await;
     }
 
-    /// The pairing code crosses the adapter intact; a typo arrives as `code: None` (decoded, not
-    /// dropped), so the core can answer `BadCode`.
-    pub async fn pair_request_crosses_intact<S, F, Fut, K>(server: S, connect: F)
+    /// Escapes, spaces and non-ASCII on purpose: nothing may trim or re-encode a password.
+    const PASSWORD: &str = " contraseña \"con\" \\ escapes ";
+
+    fn login(address: &str, password: &str) -> IpcRequest {
+        IpcRequest::Login(Box::new(LoginForm {
+            address: address.into(),
+            username: "sito".into(),
+            password: Password::parse(password),
+        }))
+    }
+
+    /// The password crosses the adapter intact; an empty one arrives as `password: None`
+    /// (decoded, not dropped), so the core can answer `BadCredentialsInput`.
+    pub async fn login_request_crosses_intact<S, F, Fut, K>(server: S, connect: F)
     where
         S: IpcServer,
         F: FnOnce() -> Fut,
@@ -1197,23 +1207,16 @@ pub mod ipc_server {
     {
         let client = async {
             let mut c = connect().await;
-            match c
-                .request(IpcRequest::Pair {
-                    address: "green-house:8004".into(),
-                    code: PairCode::parse("482 913"),
-                })
-                .await
-            {
-                Some(IpcResponse::Paired(g)) => assert_eq!(g.address, "green-house:8004"),
+            match c.request(login("green-house:8004", PASSWORD)).await {
+                Some(IpcResponse::LoggedIn(g)) => {
+                    assert_eq!(g.address, "green-house:8004");
+                    assert_eq!(g.user, "sito");
+                }
                 other => panic!("{other:?}"),
             }
             assert_eq!(
-                c.request(IpcRequest::Pair {
-                    address: "x".into(),
-                    code: None
-                })
-                .await,
-                Some(IpcResponse::PairFailed(PairFailure::BadCode))
+                c.request(login("x", "")).await,
+                Some(IpcResponse::LoginFailed(LoginFailure::BadCredentialsInput))
             );
             drop(c);
         };
@@ -1244,10 +1247,7 @@ pub mod ipc_server {
     {
         let (half_tx, half_rx) = tokio::sync::oneshot::channel::<()>();
         let (pushed_tx, pushed_rx) = tokio::sync::oneshot::channel::<()>();
-        let req = IpcRequest::Pair {
-            address: "green-house".into(),
-            code: PairCode::parse("482913"),
-        };
+        let req = req_clone();
         let serve = async {
             let (_peer, mut conn) = server.accept().await.expect("accept");
             half_rx.await.expect("half written");
@@ -1267,7 +1267,7 @@ pub mod ipc_server {
                 Ok(Some(r)) => assert_eq!(r, req_clone(), "cancel-safety: request corrupted"),
                 other => panic!("cancel-safety: request lost: {other:?}"),
             }
-            conn.send(IpcResponse::Unpaired).await.expect("send");
+            conn.send(IpcResponse::Subscribed).await.expect("send");
             // Keep the connection until the client read the reply.
             let _ = conn.recv().await;
         };
@@ -1278,17 +1278,14 @@ pub mod ipc_server {
             pushed_rx.await.expect("pushed");
             assert_eq!(c.next().await, Some(IpcResponse::Event(report(9))));
             c.send_half(&req, false).await;
-            assert_eq!(c.next().await, Some(IpcResponse::Unpaired));
+            assert_eq!(c.next().await, Some(IpcResponse::Subscribed));
             drop(c);
         };
         bounded(async { tokio::join!(serve, client) }).await;
     }
 
     fn req_clone() -> IpcRequest {
-        IpcRequest::Pair {
-            address: "green-house".into(),
-            code: PairCode::parse("482913"),
-        }
+        login("green-house", PASSWORD)
     }
 
     /// Dropping a pending `accept` must not lose the next connection.
@@ -1348,10 +1345,10 @@ pub mod ipc_server {
                     })
                 }
                 #[test]
-                fn pair_request_crosses_intact() {
+                fn login_request_crosses_intact() {
                     $crate::run_async(async {
                         let (server, connect) = $make;
-                        c::pair_request_crosses_intact(server, connect).await
+                        c::login_request_crosses_intact(server, connect).await
                     })
                 }
             }
@@ -1460,11 +1457,11 @@ pub mod gateway_http {
         addr: &GatewayAddr,
         routes: &HttpRoutes,
     ) {
-        routes.set("POST", "/pair", 201, r#"{"token":"k"}"#);
-        let body = br#"{"code":"482913"}"#.to_vec();
+        routes.set("POST", "/auth/login", 201, r#"{"token":"k"}"#);
+        let body = br#"{"username":"u","password":"p"}"#.to_vec();
         let r = bounded(h.request(
             addr,
-            &HttpCall::Pair,
+            &HttpCall::Login,
             None,
             Some(Zeroizing::new(body.clone())),
         ))
@@ -1475,7 +1472,7 @@ pub mod gateway_http {
         let last = seen.last().expect("request seen");
         assert_eq!(
             (last.method.as_str(), last.path.as_str()),
-            ("POST", "/pair")
+            ("POST", "/auth/login")
         );
         assert_eq!(last.body, body);
         assert!(
@@ -1493,13 +1490,13 @@ pub mod gateway_http {
     ) {
         routes.set(
             "POST",
-            "/pair",
+            "/auth/login",
             400,
             r#"{"detail":"invalid or expired code"}"#,
         );
         let r = bounded(h.request(
             addr,
-            &HttpCall::Pair,
+            &HttpCall::Login,
             None,
             Some(Zeroizing::new(b"{}".to_vec())),
         ))
@@ -1544,7 +1541,7 @@ pub mod gateway_http {
             Duration::from_secs(1),
             h.request(
                 &public,
-                &HttpCall::Pair,
+                &HttpCall::Login,
                 None,
                 Some(Zeroizing::new(b"{}".to_vec())),
             ),
@@ -1559,10 +1556,10 @@ pub mod gateway_http {
         addr: &GatewayAddr,
         routes: &HttpRoutes,
     ) {
-        routes.set_redirect("POST", "/pair", "http://evil.example/pair");
+        routes.set_redirect("POST", "/auth/login", "http://evil.example/auth/login");
         let r = bounded(h.request(
             addr,
-            &HttpCall::Pair,
+            &HttpCall::Login,
             None,
             Some(Zeroizing::new(b"{}".to_vec())),
         ))
@@ -1596,11 +1593,11 @@ pub mod gateway_http {
             })
             .await;
         }
-        routes.set_delayed("POST", "/pair", 201, "{}", Duration::from_millis(500));
+        routes.set_delayed("POST", "/auth/login", 201, "{}", Duration::from_millis(500));
         let before = routes.seen().len();
         {
-            let pair = HttpCall::Pair;
-            let call = h.request(addr, &pair, None, Some(Zeroizing::new(b"{}".to_vec())));
+            let login = HttpCall::Login;
+            let call = h.request(addr, &login, None, Some(Zeroizing::new(b"{}".to_vec())));
             let wait_seen = async {
                 while routes.seen().len() == before {
                     tokio::time::sleep(Duration::from_millis(2)).await;

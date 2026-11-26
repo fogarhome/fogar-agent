@@ -1,6 +1,6 @@
 # Fogar Desktop (macOS)
 
-The companion app for `fogar-agent`: a SwiftUI app with a main window (Conversación, Estado, Emparejar, Ajustes),
+The companion app for `fogar-agent`: a SwiftUI app with a main window (Conversación, Estado, Iniciar sesión, Ajustes),
 Settings (⌘,) and a menu bar quick view. It talks to the agent over the agent's Unix socket
 (ADR-0002) using the wire types generated from `crates/fogar-host/src/ipc_wire.rs` (ADR-0004).
 macOS 14+. Bundle id `com.fogar.desktop` (GUESSED: the agent's peer check requires exactly this).
@@ -14,7 +14,7 @@ open "build/Fogar Desktop.app"
 
 Signing uses the first "Apple Development" identity in the keychain (free Personal Team), with the
 hardened runtime the agent's "same signer" check needs. Without one the app is signed ad hoc and the
-agent treats it as `uid_only`: status works, pair/unpair are refused.
+agent treats it as `uid_only`: status works, login/logout are refused.
 
 ## The agent inside the app (S2 PR 6)
 
@@ -47,14 +47,15 @@ inside out, no `--deep`; then it checks what it signed and fails on any mismatch
 - From the S1 hand-run agent to the bundled one: stop the hand-run agent first (Ctrl-C, or
   `launchctl bootout gui/$(id -u)/<label>` if you loaded a plist of your own, then delete that
   plist); otherwise the bundled agent finds the socket in use and exits. The state directory
-  (`~/Library/Application Support/com.fogar.agent`) and the Keychain item (`com.fogar.agent` /
-  `gateway_pairing`) are the same, so the pairing carries over. **GUESSED:** that the bundled
-  agent reads that Keychain item without a dialog (the item was created by another binary);
-  if macOS asks, «Permitir siempre» once, or unpair and pair again from the app.
+  (`~/Library/Application Support/com.fogar.agent`) and the Keychain service (`com.fogar.agent`)
+  are the same. The session is ONE item, `gateway_account`; a 4.x `gateway_pairing` item is never
+  read and is deleted at the next sign-in. **GUESSED:** that the bundled agent reads the item
+  without a dialog (it may have been created by another binary); if macOS asks, «Permitir
+  siempre» once, or sign out and in again from the app.
 - After rebuilding: macOS keeps the microphone permission while the signer stays the same (spike,
   step 0). If the plist changes, remove the registration and register again.
 - Agents started by hand with `--state-dir` other than the default use their own Keychain service
-  (`com.fogar.agent.dir-<hash of the path>`), so measurement runs never touch the real pairing.
+  (`com.fogar.agent.dir-<hash of the path>`), so measurement runs never touch the real session.
 
 `build-app.sh` is **for development only**: Apple Development identity (Personal Team), no
 secure timestamp (`--timestamp=none`), no notarization. A build to give to anyone else needs
@@ -77,7 +78,7 @@ The app authenticates the server behind the socket before sending anything (ADR-
 Always: the socket and its directory are the user's (directory 0700, no symlinks) and the server
 runs as the same user. That is enough for the read-only status (`hello`, `status`, `subscribe`,
 `discover`), so an agent not yet packaged and signed still shows its state. The conversation and
-`pair`, `unpair`, `reconnect` also need the agent's code signed by the app's own Team with the
+`login` (it carries the password), `logout`, `reconnect` also need the agent's code signed by the app's own Team with the
 identifier `com.fogar.agent` (GUESSED until PR 6 packages the agent), the hardened runtime, no
 `get-task-allow` and no debugger attached. The unsigned stand-in passes those only in a debug build
 started with `FOGAR_AGENT_UNSIGNED=1`; a release build has no such switch (CI checks the release
@@ -85,11 +86,21 @@ binary does not even contain the name).
 
 Only debug builds honour `FOGAR_AGENT_SOCKET`. Phases: `not_paired`, `connecting`, `ready`,
 `reconnecting`, `parked_repair`, `parked_agent_refused`, `parked_missing_scope`, `parked_upgrade_client`, `parked_client_error`, `stopping` (also typed
-on the stand-in's stdin to change the live state). `--version 3` plays a newer agent, `--refuse-pair`
+on the stand-in's stdin to change the live state). `--version 6` plays a newer agent, `--refuse-login`
 an agent that refuses this app, `--boot safe` the crash-loop safe mode, `--peer uid_only` an unverified
-app (pair/unpair refused, like the core), `--old` today's pre-S1 core (no live status). Pairing codes decide the outcome: `482913` pairs; `111111` invalid_code, `222222` unreachable,
-`333333` not_a_gateway, `444444` gateway_error, `555555` storage_failed, `666666` busy, `777777`
-bad_address.
+app (login/logout refused, like the core), `--old` a pre-S1 core (no live status),
+`--logout-offline` a logout the gateway did not hear.
+
+Sign in as `sito` / `fogar` (fixed test credentials, synthetic). Other passwords script the
+failures: `inseguro` insecure_transport, `muchos` too_many_attempts, `lejos` unreachable, `otro`
+not_a_gateway, `roto` gateway_error, `llavero` storage_failed, `ocupado` busy, `mal` bad_address;
+anything else invalid_credentials. Like the agent, an address that is not `https://`, a `.ts.net`
+name, a `100.x` tailnet address or this Mac is needs_secure_address (the password would cross the
+home network in clear text), and signing in while signed in is already_signed_in.
+
+The sign-in screen keeps the password only in its own state and empties it after every attempt
+and when it goes away. The app never prints or logs a `WireRequest`: `login` carries the password
+and the generated `WireLogin` has no redaction.
 
 Conversation (IPC v4, only with `--peer same_signer`, the default): typed text gets a scripted
 reply (preparing → thinking → «Usando ha_call_service…» → text); text with «error» or «lento» ends in
@@ -99,7 +110,7 @@ an error or a timeout. The reply's audio «plays» only after the app's `turn_vi
 `not_determined`), `--mic-deny` (the permission prompt says no), `--mic-prompt-secs N` (how long the
 prompt takes), `--no-mic`, `--transcriber down`, `--tts down`.
 On stdin: `push` (Fogar writes on its own), `dia` (a new day), `mic <state>`, `transcriber <state>`,
-`tts <state>`, `silencio` / `seguridad` (cut the open take), `frase_perdida`. Launch arguments `-seccion emparejar` and `-apariencia clara|oscura|sistema` pick the
+`tts <state>`, `silencio` / `seguridad` (cut the open take), `frase_perdida`. Launch arguments `-seccion iniciarSesion` and `-apariencia clara|oscura|sistema` pick the
 screen and appearance.
 
 ## Wire types
@@ -117,7 +128,7 @@ scripts/gen-wire.sh --check  # fails if the committed file is stale
 swift test
 ```
 
-Golden JSON from the Rust tests, framing, the pairing code check, the app's links to the agent
+Golden JSON from the Rust tests, framing, the app's links to the agent
 (status and conversation) against a scripted agent on a real Unix socket, the conversation model
 (take gestures, visible-turn rule, microphone states), the agent's registration (`ServicioAgente`
 against a fake registry), and the stand-in's conversation rules. In CI (`macos` job),

@@ -77,8 +77,8 @@ pub fn ipc_frames(data: &[u8]) {
                     Some(&before[..used])
                 );
                 if let Ok(req) = decode_request(&body) {
-                    if let IpcRequest::Pair { address, .. } = &req
-                        && let Ok(addr) = GatewayAddr::parse(address)
+                    if let IpcRequest::Login(form) = &req
+                        && let Ok(addr) = GatewayAddr::parse(&form.address)
                     {
                         assert_eq!(GatewayAddr::parse(&addr.to_string()).ok(), Some(addr));
                     }
@@ -93,8 +93,8 @@ pub fn ipc_frames(data: &[u8]) {
     }
 }
 
-/// A gateway address as typed by the person (it reaches the core inside an IPC `Pair`). An
-/// accepted address must round-trip through `Display`: that is how a pairing is stored and read
+/// A gateway address as typed by the person (it reaches the core inside an IPC `Login`). An
+/// accepted address must round-trip through `Display`: that is how the account is stored and read
 /// back.
 pub fn gateway_addr(data: &[u8]) {
     let input = String::from_utf8_lossy(data);

@@ -13,12 +13,12 @@
 //! ```
 //!
 //! fd-sharing attack (ADR-0002, `tests/fixtures/fd_share_attack.py`): an unsigned script connects, then forks + execs `./app idle`;
-//! the child (mode `child`) or the parent before the exec (mode `pre`) writes a `Pair` frame.
-//! Expected: `peer SameSigner` then `recv REFUSED` (never `recv DELIVERED Pair`).
+//! the child (mode `child`) or the parent before the exec (mode `pre`) writes a `Logout` frame.
+//! Expected: `peer SameSigner` then `recv REFUSED` (never `recv DELIVERED Logout`).
 //!
 //! `server <dir> [peer-identifier]` accepts ONE connection after 1 s (so the measured `accept`
 //! time is the peer check alone), prints caps, the verdict and what each request became.
-//! `client <dir>` sends `Hello`, then `Pair` after the reply. `idle` just holds inherited fds.
+//! `client <dir>` sends `Hello`, then `Logout` after the reply. `idle` just holds inherited fds.
 
 #[cfg(target_os = "macos")]
 fn main() {
@@ -60,7 +60,11 @@ fn main() {
                         }
                         Ok(Some(r)) => {
                             println!("recv DELIVERED {r:?}");
-                            let _ = conn.send(IpcResponse::Unpaired).await;
+                            let _ = conn
+                                .send(IpcResponse::LoggedOut {
+                                    gateway_reached: false,
+                                })
+                                .await;
                         }
                         Ok(None) => {
                             println!("recv closed");
@@ -84,11 +88,7 @@ fn main() {
                     c.request(IpcRequest::Hello { version: 2 }).await
                 );
                 // A privileged request, sent only after the Hello was answered (as the app must).
-                let pair = IpcRequest::Pair {
-                    address: "green-house:8004".into(),
-                    code: fogar_ports::ipc::PairCode::parse("482913"),
-                };
-                println!("reply {:?}", c.request(pair).await);
+                println!("reply {:?}", c.request(IpcRequest::Logout).await);
             }
             _ => std::process::exit(2),
         }

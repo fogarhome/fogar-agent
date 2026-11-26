@@ -1,4 +1,4 @@
-//! The gateway's REST surface (well-known, `POST /pair`, the 5.0 calls; routes are keyed by
+//! The gateway's REST surface (well-known, the 5.0 calls; routes are keyed by
 //! method and path WITH query, as `HttpCall::path` renders it):
 //! - [`HttpRoutes`]: scripted replies + a log of what was asked;
 //! - [`FakeGatewayHttp`]: an in-memory `GatewayHttp` over those routes (paused-time tests);
@@ -160,8 +160,8 @@ impl HttpRoutes {
             },
         );
     }
-    /// A 5.0 Fogar gateway: the well-known has no `name` (it arrives in `/pair`). Rigs that
-    /// pair set their own `POST /pair`.
+    /// A 5.0 Fogar gateway: the well-known has no `name` (it arrives at login). Rigs that
+    /// sign in set their own `POST /auth/login`.
     pub fn fogar() -> Self {
         let r = Self::new();
         let wk = r#"{"service":"fogar-gateway","version":"5.0.0","instance_id":"mock-instance"}"#;

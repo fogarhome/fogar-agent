@@ -70,18 +70,19 @@ nonisolated let ready = WireStatus(link: "ready", phase: .ready,
                        gateway: WireGateway(address: "http://green-house:8004", name: "green-house", version: "1.29.0", client_name: "Mac", user: ""),
                        sessions: 1, turns_completed: 2, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown)
 
-func answers(version: UInt32 = ipcVersion, pair: WireResponse = .unpaired) -> @Sendable (WireRequest) -> [WireResponse] {
+func answers(version: UInt32 = ipcVersion, login: WireResponse = .loggedIn(ready.gateway!),
+             logout: WireResponse = .loggedOut(WireLoggedOut(gateway_reached: true))) -> @Sendable (WireRequest) -> [WireResponse] {
     { req in
         switch req {
         case .hello: [.hello(WireHello(version: version))]
         case .subscribe: [.subscribed, .event(ready)]
         case .discover: [.event(ready), .discovered(WireDiscovered(gateways: []))] // a stray event must not be the answer
-        case .pair: [pair]
-        case .unpair: [.unpaired]
+        case .login: [.event(ready), login]
+        case .logout: [logout]
         case .reconnect: [.event(ready), .reconnecting]
         case .status: [.status(ready)]
         case .subscribeConversation, .sendText, .captureStart, .captureEnd, .cancelTurn,
-             .turnVisible, .requestMicPermission, .login, .logout:
+             .turnVisible, .requestMicPermission:
             [.refused(WireRefused(reason: "not in these tests"))]
         }
     }
@@ -124,20 +125,38 @@ func waitFor(_ link: AgentLink, _ ok: (AgentState) -> Bool) async -> Bool {
     }
 
     @Test func commandsSkipEventsAndMapFailures() async throws {
-        let agent = try FakeAgent(answers(pair: .pairFailed(WirePairFailed(reason: .invalidCode))))
+        let agent = try FakeAgent(answers(login: .loginFailed(WireLoginFailed(reason: .invalidCredentials))))
         try await Task.sleep(for: .milliseconds(200))
         let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
         #expect(try await link.discover().isEmpty)
-        #expect(try await link.pair(address: "green-house", code: "111111") == .failed(.invalidCode))
-        try await link.unpair()
+        #expect(try await link.login(address: "https://casa.ts.net", username: "sito", password: "mala") == .failed(.invalidCredentials))
+        #expect(try await link.logout())
         try await link.reconnect()
     }
 
-    @Test func refusedPairIsTheSignerSentence() async throws {
-        let agent = try FakeAgent(answers(pair: .refused(WireRefused(reason: "peer not allowed"))))
+    @Test func loginReturnsTheSignedInGateway() async throws {
+        let agent = try FakeAgent(answers())
         try await Task.sleep(for: .milliseconds(200))
         let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
-        await #expect(throws: CommandError.refused) { _ = try await link.pair(address: "x", code: "482913") }
+        #expect(try await link.login(address: "https://casa.ts.net", username: "sito", password: "fogar") == .loggedIn(ready.gateway!))
+    }
+
+    /// The account is gone from this Mac either way; the person learns the gateway did not hear.
+    @Test func logoutWithTheGatewayDownSaysSo() async throws {
+        let agent = try FakeAgent(answers(logout: .loggedOut(WireLoggedOut(gateway_reached: false))))
+        try await Task.sleep(for: .milliseconds(200))
+        let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
+        let alcanzado = try await link.logout()
+        #expect(!alcanzado)
+        #expect(Textos.sesionCerrada(gatewayAlcanzado: alcanzado)
+                == "Sesión cerrada en este Mac. El gateway no contestó: retira este aparato desde la web si hace falta.")
+    }
+
+    @Test func refusedLoginIsTheSignerSentence() async throws {
+        let agent = try FakeAgent(answers(login: .refused(WireRefused(reason: "peer not allowed"))))
+        try await Task.sleep(for: .milliseconds(200))
+        let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
+        await #expect(throws: CommandError.refused) { _ = try await link.login(address: "x", username: "sito", password: "fogar") }
     }
 }
 
@@ -187,12 +206,29 @@ extension AgentLinkOverASocket {
 }
 
 @Suite struct Copy {
-    @Test func everyPairFailureHasItsOwnSentence() {
-        let all: [WirePairFailure] = [.badAddress, .badCode, .unreachable, .notAGateway, .invalidCode,
-                                      .gatewayError, .storageFailed, .alreadyPaired, .busy]
+    @Test func everyLoginFailureHasItsOwnSentence() {
+        let all: [WireLoginFailure] = [.badAddress, .needsSecureAddress, .badCredentialsInput, .unreachable,
+                                       .notAGateway, .invalidCredentials, .insecureTransport, .tooManyAttempts,
+                                       .gatewayError, .storageFailed, .alreadySignedIn, .busy]
         let sentences = Set(all.map(Textos.fallo))
         #expect(sentences.count == all.count)
-        #expect(Textos.fallo(.invalidCode) == "Ese código no vale. Si estás seguro, pide uno nuevo.")
+        #expect(Textos.fallo(.needsSecureAddress) == "Esa dirección es de tu red de casa: la contraseña viajaría sin cifrar. Usa la dirección https:// del gateway o la de Tailscale (termina en .ts.net).")
+        #expect(Textos.fallo(.invalidCredentials) == "Usuario o contraseña incorrectos.")
+        #expect(Textos.fallo(.insecureTransport) == "El gateway no acepta la contraseña por esta vía. Usa su dirección https:// o la de Tailscale.")
+        #expect(Textos.fallo(.tooManyAttempts) == "Demasiados intentos. Espera un poco y vuelve a probar.")
+        #expect(Textos.fallo(.badCredentialsInput) == "Escribe tu usuario y tu contraseña.")
+        #expect(Textos.fallo(.storageFailed) == "No se pudo guardar la sesión en el Llavero.")
+    }
+
+    /// The status names the person and the home; never «como » with an unknown person.
+    @Test func readyNamesThePersonAndTheHome() {
+        let conPersona = WireGateway(address: "https://casa.ts.net", name: "green-house", version: "5.0.0", client_name: "Mac", user: "Sito")
+        let s = WireStatus(link: "ready", phase: .ready, gateway: conPersona, sessions: 1, turns_completed: 0,
+                           boot_mode: "normal", peer_check: .sameSigner, transcriber: .up, tts: .up)
+        let t = Textos.titular(.live(s))
+        #expect(t.titulo == "Conectado a green-house")
+        #expect(t.sub.contains("Sito"))
+        #expect(!Textos.titular(.live(ready)).sub.contains("como"))
     }
 
     @Test func everyPhaseHasAHeadline() {
@@ -232,34 +268,35 @@ extension AgentLinkOverASocket {
 nonisolated let notPaired = WireStatus(link: "not_paired", phase: .notPaired, gateway: nil, sessions: 1,
                                        turns_completed: 2, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown)
 
-/// Revocation (gateway 4200/4010): the agent goes from paired to `not_paired` by itself.
+/// Revocation (gateway 4200/4010): the agent goes from signed in to `not_paired` by itself.
 @Suite struct AccesoRetirado {
-    @Test func pairedToNotPairedWithoutAskingIsARevocation() {
-        #expect(AgentLink.retirado(antes: .live(ready), despues: .live(notPaired), desemparejando: false, yaRetirado: false))
+    @Test func signedInToNotPairedWithoutAskingIsARevocation() {
+        #expect(AgentLink.retirado(antes: .live(ready), despues: .live(notPaired), cerrandoSesion: false, yaRetirado: false))
     }
 
-    @Test func unpairingFromThisAppIsNot() {
-        #expect(!AgentLink.retirado(antes: .live(ready), despues: .live(notPaired), desemparejando: true, yaRetirado: false))
+    @Test func signingOutFromThisAppIsNot() {
+        #expect(!AgentLink.retirado(antes: .live(ready), despues: .live(notPaired), cerrandoSesion: true, yaRetirado: false))
     }
 
-    @Test func neverPairedIsNot() {
-        #expect(!AgentLink.retirado(antes: .looking, despues: .live(notPaired), desemparejando: false, yaRetirado: false))
-        #expect(!AgentLink.retirado(antes: .notRunning, despues: .live(notPaired), desemparejando: false, yaRetirado: false))
+    @Test func neverSignedInIsNot() {
+        #expect(!AgentLink.retirado(antes: .looking, despues: .live(notPaired), cerrandoSesion: false, yaRetirado: false))
+        #expect(!AgentLink.retirado(antes: .notRunning, despues: .live(notPaired), cerrandoSesion: false, yaRetirado: false))
         // Keychain error at boot: `reconnecting` with no gateway, then `not_paired`.
         let sinClave = WireStatus(link: "backoff", phase: .reconnecting, gateway: nil, sessions: 0,
                                   turns_completed: 0, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown)
-        #expect(!AgentLink.retirado(antes: .live(sinClave), despues: .live(notPaired), desemparejando: false, yaRetirado: false))
+        #expect(!AgentLink.retirado(antes: .live(sinClave), despues: .live(notPaired), cerrandoSesion: false, yaRetirado: false))
     }
 
-    @Test func survivesAnAgentRestartAndEndsWhenPairedAgain() {
-        #expect(AgentLink.retirado(antes: .live(notPaired), despues: .notRunning, desemparejando: false, yaRetirado: true))
-        #expect(AgentLink.retirado(antes: .notRunning, despues: .live(notPaired), desemparejando: false, yaRetirado: true))
-        #expect(!AgentLink.retirado(antes: .live(notPaired), despues: .live(ready), desemparejando: false, yaRetirado: true))
+    @Test func survivesAnAgentRestartAndEndsWhenSignedInAgain() {
+        #expect(AgentLink.retirado(antes: .live(notPaired), despues: .notRunning, cerrandoSesion: false, yaRetirado: true))
+        #expect(AgentLink.retirado(antes: .notRunning, despues: .live(notPaired), cerrandoSesion: false, yaRetirado: true))
+        #expect(!AgentLink.retirado(antes: .live(notPaired), despues: .live(ready), cerrandoSesion: false, yaRetirado: true))
     }
 
     @Test func theHeadlineSaysAccessWasWithdrawn() {
         #expect(Textos.titular(.live(notPaired), retirado: true).titulo == "Se retiró el acceso a este Mac")
-        #expect(Textos.titular(.live(notPaired)).titulo == "Este Mac aún no está emparejado")
+        #expect(Textos.titular(.live(notPaired)).titulo == "Aún no has iniciado sesión en este Mac")
+        #expect(Textos.titular(.live(notPaired), retirado: true).sub.contains("inicia sesión"))
     }
 }
 

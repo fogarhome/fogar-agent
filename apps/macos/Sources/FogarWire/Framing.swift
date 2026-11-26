@@ -33,7 +33,7 @@ public struct FrameBuffer: Sendable {
         guard len <= maxFrameBytes else { throw .tooLarge(len) }
         guard bytes.count >= 4 + len else { return nil }
         let body = Data(bytes[start + 4..<start + 4 + len])
-        // A pairing code may sit in the consumed bytes: overwrite before dropping them.
+        // A password may sit in the consumed bytes: overwrite before dropping them.
         bytes.resetBytes(in: start..<start + 4 + len)
         bytes.removeSubrange(start..<start + 4 + len)
         return body

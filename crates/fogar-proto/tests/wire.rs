@@ -577,7 +577,7 @@ fn m19_turn_vectors_decode() {
 
 use fogar_proto::account::{ApiError, LoginRequest, LoginResponse, Me, Scope, UpdateMe};
 use fogar_proto::conversations::{Agents, Conversation, CreateConversation, History, Role};
-use fogar_proto::pairing::{ClientType, PairResponse};
+use fogar_proto::pairing::ClientType;
 
 #[test]
 fn handshake_sends_token_not_client_key() {
@@ -591,34 +591,6 @@ fn handshake_sends_token_not_client_key() {
     let j = encode_handshake(&h).unwrap();
     assert!(j.contains(r#""token":"k""#), "{j}");
     assert!(!j.contains("client_key"), "{j}");
-}
-
-#[test]
-fn pair_response_token_and_scopes() {
-    let r: PairResponse = serde_json::from_str(
-        r#"{"client_id":"c-1","name":"Mac","token":"sk-1","scopes":["conversations:write"],"gateway":{"name":"casa","version":"5.0.0"}}"#,
-    )
-    .unwrap();
-    assert_eq!(r.client_key, "sk-1");
-    assert_eq!(r.scopes, vec![Scope::ConversationsWrite]);
-    // Lenient like login: an unknown scope is `Other`, not an error.
-    let r: PairResponse = serde_json::from_str(
-        r#"{"client_id":"c-1","name":"Mac","token":"sk-1","scopes":["home:robots"],"gateway":{"name":"casa","version":"5.0.0"}}"#,
-    )
-    .unwrap();
-    assert_eq!(r.scopes, vec![Scope::Other]);
-    let r: PairResponse = serde_json::from_str(
-        r#"{"client_id":"c-1","name":"Mac","token":"sk-1","gateway":{"name":"casa","version":"5.0.0"}}"#,
-    )
-    .unwrap();
-    assert!(r.scopes.is_empty());
-    // 4.x is dropped: the old field name is not a credential any more.
-    assert!(
-        serde_json::from_str::<PairResponse>(
-            r#"{"client_id":"c-1","name":"Mac","client_key":"sk-1","gateway":{"name":"casa","version":"1.29.0"}}"#
-        )
-        .is_err()
-    );
 }
 
 #[test]
@@ -856,10 +828,6 @@ fn secrets_are_redacted() {
         output_mode: vec![OutputMode::Text],
         agent: None,
     };
-    let p: PairResponse = serde_json::from_str(
-        r#"{"client_id":"c","name":"n","token":"sekret-pair","scopes":[],"gateway":{"name":"g","version":"5"}}"#,
-    )
-    .unwrap();
     let req = LoginRequest {
         username: "ana".into(),
         password: "sekret-password".into(),
@@ -882,7 +850,7 @@ fn secrets_are_redacted() {
     )
     .unwrap();
     let dbg = format!(
-        "{h:?} {h:#?} {p:?} {p:#?} {req:?} {req:#?} {resp:?} {resp:#?} {me:?} {me:#?} {conv:?} {conv:#?}"
+        "{h:?} {h:#?} {req:?} {req:#?} {resp:?} {resp:#?} {me:?} {me:#?} {conv:?} {conv:#?}"
     );
     assert!(!dbg.contains("sekret"), "{dbg}");
     assert!(dbg.contains("redacted"), "{dbg}");

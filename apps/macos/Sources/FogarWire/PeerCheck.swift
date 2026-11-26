@@ -9,7 +9,7 @@ public enum VerificacionPar: Sendable, Equatable {
     /// The run directory is ours (0700, no symlink), the server runs as our user, and its code is
     /// signed by this app's own Team with the agent's identifier and the hardened runtime, not
     /// debuggable. Required for everything that carries the person's content or changes where it
-    /// goes: the conversation, `pair`, `unpair`, `reconnect`.
+    /// goes: the conversation, `login` (it carries the password), `logout`, `reconnect`.
     case agenteFirmado
     /// Only the directory and user checks. Enough for the read-only status (`hello`, `status`,
     /// `subscribe`, `discover`), so an agent not yet packaged and signed (S1, until S2 PR 6) still

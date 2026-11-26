@@ -37,7 +37,7 @@ impl FakeIpc {
             signed: false,
         }
     }
-    /// Peers count as the agent's own signed app (`com.fogar.desktop`): may Pair/Unpair.
+    /// Peers count as the agent's own signed app (`com.fogar.desktop`): may Login/Logout.
     pub fn signed() -> Self {
         Self {
             signed: true,
