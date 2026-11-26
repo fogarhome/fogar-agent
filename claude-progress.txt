@@ -165,6 +165,8 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
   Repair/FixClient parks are not retried. Old app vs new agent (or reverse) = version mismatch.
 - Tests: fogar-core tests/reconnect.rs (paused time, mock gateway), wire golden, IPC contract.
   UNVERIFIED: the park-side `user_may_reconnect` guard (the IPC refuses first), button by eye.
+- [2026-11-26, S4 PR 2b] 4102 is retired in gateway 5.0 (now FixClient, no reconnect); the
+  reconnectable parks are 4011 (missing scope, key kept) and 4020/4021. See the S4 PR 2b entry.
 
 ## S1 — fuzz targets (2026-11-16)
 - fuzz/ (cargo-fuzz, libfuzzer-sys =0.4.13), its own [workspace] + Cargo.lock, outside the main
@@ -381,3 +383,18 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
   a test model of the app on screen subscribes (waits for ConversationSubscribed before any
   `say`), confirms each awaiting entry keyed by id + number of entries with that id (the view has
   no seq), retries "engine busy". The two E2E tests pass again; `test --workspace` green.
+
+## S4 — PR 2b: the account protocol of the 5.0 (2026-11-26, core-async)
+- Wire (fogar-proto): the handshake and `POST /pair` carry the single `token` credential (no
+  `client_key` alias: 4.x dropped on this branch); scopes (unknown read as Other, never
+  written); 4011 missing scope; 4102 retired (falls into 4000-4899 = FixClient); typed bodies
+  for login, /auth/me, conversations, agents, history and ApiError. Secrets and user text
+  redacted in Debug; ApiError's Debug shows only the string code (no raw server body in logs).
+- Ports: HttpCall::GetMessages carries `limit`; the 5.0 routes are CERTAIN at gateway 290efa0.
+- Core: 4011 parks without retry and keeps the key; the person can Reconnect (replaces 4102).
+- Mock gateway pinned to gateway 290efa0: 4003 checked before the credential (a 4.x handshake
+  gets 4003, not 4000), 4011 without scope. No default `/pair` route: each rig sets its own.
+- Tests: wire.rs, gateway_http unit tests, mock_protocol.rs, reconnect.rs (paused time). The
+  real-gateway E2E (s1_pairing_e2e.rs via launch.py) passed locally against 290efa0.
+- NOT here: login screen, HTTP calls from core, Keychain change (PR 3); chat over /events,
+  dictation, «Escuchar» (PR 4+). Nothing verified on the M2.

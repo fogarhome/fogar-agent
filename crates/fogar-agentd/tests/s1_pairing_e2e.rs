@@ -1,7 +1,7 @@
 //! S1 end-to-end: the whole pairing lifecycle over the REAL transport. Real HTTP
 //! (`fogar_host::HttpGateway`) and real WebSocket (`WsGatewayLink`), against two gateways:
 //! - the Rust mock (`MockGateway`), which serves `/pair` and `/ws/stream` on one loopback port
-//!   like the real one: always runs, covers v3 (4200) and 2.x (1008 "revoked");
+//!   like the real one: always runs, covers the 4200 revocation;
 //! - the REAL fogar-gateway (Python) with its own fake OpenClaw and no STT/TTS, started by
 //!   `real_gateway/launch.py` from the checkout in `FOGAR_GATEWAY_DIR` (skipped when unset; CI
 //!   job `.github/workflows/e2e-gateway.yml` checks out the commit in `real_gateway/GATEWAY_REF`).
@@ -64,7 +64,7 @@ fn fast_config() -> Config {
 /// The gateway's `201` for `POST /pair` (spec §0), handing out `key`.
 fn pair_ok(key: &str) -> String {
     format!(
-        r#"{{"client_id":"c-1","name":"Mac de Sito","client_key":"{key}","gateway":{{"name":"mock","version":"2.0.0"}}}}"#
+        r#"{{"client_id":"c-1","name":"Mac de Sito","token":"{key}","scopes":["conversations:write"],"gateway":{{"name":"mock","version":"5.0.0"}}}}"#
     )
 }
 
@@ -125,10 +125,9 @@ fn start_agent() -> (Agent<TokioClock>, Arc<CountingStore>, FakeIpc) {
 
 /// unpaired -> pair -> ready -> gateway restart (1012) -> ready again -> revoked -> key deleted
 /// once, not_paired, no retry -> pair again with a new key -> ready.
-async fn lifecycle(m19: bool, revoke: (u16, &str)) {
+async fn lifecycle(revoke: (u16, &str)) {
     let mock = MockConfig {
         client_key: "key-1".into(),
-        m19,
         ..MockConfig::default()
     };
     let gw = MockGateway::start(mock.clone()).await.unwrap();
@@ -213,13 +212,8 @@ async fn lifecycle(m19: bool, revoke: (u16, &str)) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pairing_lifecycle_v3_gateway_revokes_with_4200() {
-    lifecycle(true, (4200, "credential revoked")).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pairing_lifecycle_v2_gateway_revokes_with_1008() {
-    lifecycle(false, (1008, "revoked")).await;
+async fn pairing_lifecycle_gateway_revokes_with_4200() {
+    lifecycle((4200, "credential revoked")).await;
 }
 
 /// The real gateway, driven over `launch.py`'s line protocol. Dropping it closes stdin, which

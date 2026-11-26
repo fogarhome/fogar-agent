@@ -1,4 +1,5 @@
-//! The mock gateway at 5.0: `protocol: 5` in the handshake (4003 otherwise) and in `ready`.
+//! The mock gateway at 5.0: `protocol: 5` in the handshake (4003 otherwise) and in `ready`,
+//! the credential in `token` (4000 without it), 4011 without scope.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -27,11 +28,10 @@ async fn first(cfg: MockConfig, handshake: &str) -> Result<ServerMsg, (u16, Stri
 }
 
 const NO_PROTOCOL: &str =
-    r#"{"client_key":"test-client-key","input_mode":"audio","output_mode":["text"]}"#;
-const BAD_KEY_NO_PROTOCOL: &str =
-    r#"{"client_key":"nope","input_mode":"audio","output_mode":["text"]}"#;
+    r#"{"token":"test-client-key","input_mode":"audio","output_mode":["text"]}"#;
+const BAD_KEY_NO_PROTOCOL: &str = r#"{"token":"nope","input_mode":"audio","output_mode":["text"]}"#;
 const WITH_PROTOCOL: &str =
-    r#"{"client_key":"test-client-key","protocol":5,"input_mode":"audio","output_mode":["text"]}"#;
+    r#"{"token":"test-client-key","protocol":5,"input_mode":"audio","output_mode":["text"]}"#;
 
 #[test]
 fn handshake_without_protocol_closes_4003() {
@@ -55,6 +55,19 @@ fn handshake_without_protocol_closes_4003() {
 }
 
 #[test]
+fn handshake_4x_without_protocol_closes_4003_not_4000() {
+    fogar_testkit::run_async(async {
+        // A 4.x client (`client_key`, no `protocol`): the version check runs before the
+        // credential one, so it is 4003, not 4000.
+        let old = r#"{"client_key":"x","input_mode":"audio","output_mode":["text"]}"#;
+        assert_eq!(
+            first(MockConfig::default(), old).await.unwrap_err(),
+            (4003, "protocol version not supported".to_string())
+        );
+    });
+}
+
+#[test]
 fn closes_that_win_before_4003_still_win() {
     fogar_testkit::run_async(async {
         let e = first(MockConfig::default(), "[1]").await.unwrap_err();
@@ -73,26 +86,29 @@ fn ready_carries_protocol_5() {
 }
 
 #[test]
-fn a_4x_gateway_does_not_check_nor_send_protocol() {
+fn handshake_with_client_key_only_closes_4000() {
     fogar_testkit::run_async(async {
-        let mut cfg = MockConfig::default();
-        cfg.require_protocol = false;
-        let Ok(ServerMsg::Ready(r)) = first(cfg, NO_PROTOCOL).await else {
-            panic!("no ready")
-        };
-        assert_eq!(r.protocol, None);
+        // The 4.x field name: protocol is right, so 4003 does not fire; no `token` is 4000.
+        let old = WITH_PROTOCOL.replace(r#""token""#, r#""client_key""#);
+        assert_eq!(
+            first(MockConfig::default(), &old).await.unwrap_err(),
+            (4000, "invalid handshake".to_string())
+        );
     });
 }
 
 #[test]
-fn legacy_m19_off_does_not_require_protocol() {
+fn missing_scope_closes_4011() {
     fogar_testkit::run_async(async {
         let mut cfg = MockConfig::default();
-        cfg.m19 = false;
-        let Ok(ServerMsg::Ready(r)) = first(cfg, NO_PROTOCOL).await else {
-            panic!("no ready")
-        };
-        assert_eq!(r.protocol, None);
+        cfg.missing_scope = true;
+        assert_eq!(
+            first(cfg.clone(), WITH_PROTOCOL).await.unwrap_err(),
+            (4011, "missing scope".to_string())
+        );
+        // A wrong key is still 4010: the credential is checked before the permission.
+        let bad = WITH_PROTOCOL.replace("test-client-key", "nope");
+        assert_eq!(first(cfg, &bad).await.unwrap_err().0, 4010);
     });
 }
 

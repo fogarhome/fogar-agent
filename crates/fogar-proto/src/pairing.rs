@@ -39,7 +39,12 @@ pub struct PairRequest<'a> {
 pub struct PairResponse {
     pub client_id: String,
     pub name: String,
+    /// On the wire `"token"`: CERTAIN (5.0, M22), no `client_key` alias (4.x is not supported).
+    #[serde(rename = "token")]
     pub client_key: String,
+    /// The granted scopes. CERTAIN (5.0, M22).
+    #[serde(default)]
+    pub scopes: Vec<crate::account::Scope>,
     pub gateway: GatewayIdent,
 }
 
@@ -49,6 +54,7 @@ impl fmt::Debug for PairResponse {
             .field("client_id", &self.client_id)
             .field("name", &self.name)
             .field("client_key", &"<redacted>")
+            .field("scopes", &self.scopes)
             .field("gateway", &self.gateway)
             .finish()
     }

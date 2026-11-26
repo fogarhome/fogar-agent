@@ -21,9 +21,9 @@ pub enum CloseAction {
     /// 4003: this client speaks a protocol the gateway does not support; never auto-retry, the app
     /// must be updated. CERTAIN (5.0, #417).
     UpgradeClient,
-    /// M19 4102: another session of this client opened our conversation. Reconnecting on our own
-    /// would close it, and it would do the same: the two would evict each other forever. Park.
-    ConversationTaken,
+    /// 4011: the device lacks `conversations:write`; the key stays valid; never auto-retry.
+    /// CERTAIN (5.0, M22).
+    MissingScope,
     /// Idle (1000): reconnect lazily, not an error.
     IdleOrNormal,
     /// 1011 critical service, 1013 slow, 1006: reconnect with backoff.
@@ -45,7 +45,8 @@ pub fn classify_close(code: u16, reason: &str) -> CloseAction {
         4010 | 4200 => CloseAction::Repair,
         4020 | 4021 => CloseAction::AgentRefused,
         4003 => CloseAction::UpgradeClient,
-        4102 => CloseAction::ConversationTaken,
+        4011 => CloseAction::MissingScope,
+        // 4102 was retired in 5.0 and is never reused: it falls into the range rule.
         4000..=4899 => CloseAction::FixClient,
         4900..=4999 => CloseAction::RetryBackoff,
         // Gateway <= 2.x.
@@ -123,10 +124,11 @@ mod tests {
             (4002, "", CloseAction::FixClient),
             (4100, "conversation not found", CloseAction::FixClient),
             (4101, "", CloseAction::FixClient),
+            (4011, "missing scope", CloseAction::MissingScope),
             (
                 4102,
                 "conversation opened elsewhere",
-                CloseAction::ConversationTaken,
+                CloseAction::FixClient,
             ),
             (4300, "a future refusal", CloseAction::FixClient),
             (4899, "", CloseAction::FixClient),

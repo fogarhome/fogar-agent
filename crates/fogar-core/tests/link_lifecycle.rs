@@ -95,9 +95,9 @@ async fn every_close_code_is_classified_and_acted_on() {
             Expect::Parks(CloseAction::FixClient),
         ),
         (
-            Some((4102, "conversation opened elsewhere")),
-            CloseAction::ConversationTaken,
-            Expect::Parks(CloseAction::ConversationTaken),
+            Some((4011, "missing scope")),
+            CloseAction::MissingScope,
+            Expect::Parks(CloseAction::MissingScope),
         ),
         (
             Some((4500, "a future refusal")),

@@ -18,9 +18,11 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+pub mod account;
 pub mod audio;
 pub mod client;
 pub mod close;
+pub mod conversations;
 pub mod pairing;
 pub mod server;
 

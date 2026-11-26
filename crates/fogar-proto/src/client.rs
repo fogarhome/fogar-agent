@@ -16,7 +16,9 @@ pub const PROTOCOL_VERSION: u32 = 5;
 /// The gateway has `extra="allow"`, but we send only documented fields (strict writer).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Handshake<'a> {
-    #[serde(borrow)]
+    /// The device credential. Serialized as `"token"`: CERTAIN (5.0, M22), the 4.x name
+    /// `client_key` is gone (no alias: 4.x is not supported).
+    #[serde(borrow, rename = "token")]
     pub client_key: Cow<'a, str>,
     /// Always serialized; writers set `PROTOCOL_VERSION`. CERTAIN (5.0, #417). A decoder (the
     /// fake gateway) reads a missing one as 0, which a 5.0 gateway refuses with 4003.

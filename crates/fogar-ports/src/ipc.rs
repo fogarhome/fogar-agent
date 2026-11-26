@@ -132,8 +132,8 @@ pub enum IpcRequest {
     /// Forget the pairing (delete the record) and stop the link. Answered with `Unpaired`.
     Unpair,
     /// The person asks to connect again after the link parked for a reason only they can settle
-    /// (gateway close 4102 "conversation opened elsewhere", 4020/4021 agent refused once the
-    /// admin fixed it). Answered with `Reconnecting` (one new attempt; progress arrives as status
+    /// (gateway close 4011 "missing scope" or 4020/4021 agent refused once the admin fixed it,
+    /// 4003 once the gateway was updated). Answered with `Reconnecting` (one new attempt; progress arrives as status
     /// `Event`s), or `Refused` when the link is not parked for such a reason.
     Reconnect,
     // ---- conversation (v4). Strictly `PeerCheck::SameSigner`: they carry or reveal user
@@ -180,7 +180,7 @@ pub enum LinkPhase {
     /// Waiting before the next attempt.
     Reconnecting,
     /// The gateway refused us in a way retrying on our own will not fix (bad config, client bug,
-    /// conversation taken by another session). Some reasons accept a `Reconnect`.
+    /// missing scope). Some reasons accept a `Reconnect`.
     Parked,
     Stopping,
 }
