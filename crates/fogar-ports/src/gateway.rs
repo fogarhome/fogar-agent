@@ -109,7 +109,7 @@ impl WsRoute {
 pub trait GatewayLink: Send + Sync + 'static {
     type Session: LinkSession;
     /// Opens a new transport session to `addr` (TCP [+TLS] + WS upgrade on `route.path()` for the
-    /// real adapter). The address comes from the pairing record, so it can change between calls.
+    /// real adapter). The address comes from the stored account, so it can change between calls.
     /// The session carries the account token, so for `Scheme::Plain` the adapter applies
     /// [`secret_cleartext_allowed`] (loopback or tailnet only) to EVERY resolved socket
     /// address before sending a byte (not to the host string: a LAN name can resolve to a public
@@ -135,7 +135,7 @@ pub const DEFAULT_TLS_PORT: u16 = 443;
 /// needs TLS. Calls that carry a secret use the stricter [`secret_cleartext_allowed`].
 pub fn cleartext_allowed(ip: std::net::IpAddr) -> bool {
     use std::net::IpAddr;
-    match ip {
+    match unmap_ipv4(ip) {
         IpAddr::V4(v4) => {
             let o = v4.octets();
             v4.is_loopback()
@@ -143,13 +143,19 @@ pub fn cleartext_allowed(ip: std::net::IpAddr) -> bool {
                 || v4.is_link_local()
                 || (o[0] == 100 && (o[1] & 0xC0) == 64)
         }
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => cleartext_allowed(IpAddr::V4(v4)),
-            None => {
-                let seg0 = v6.segments()[0];
-                v6.is_loopback() || (seg0 & 0xfe00) == 0xfc00 || (seg0 & 0xffc0) == 0xfe80
-            }
-        },
+        IpAddr::V6(v6) => {
+            let seg0 = v6.segments()[0];
+            v6.is_loopback() || (seg0 & 0xfe00) == 0xfc00 || (seg0 & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) as the IPv4 it carries; any other IP as is.
+/// Every address policy judges the mapped form as IPv4.
+pub fn unmap_ipv4(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
+        v4 => v4,
     }
 }
 
@@ -159,11 +165,7 @@ pub fn cleartext_allowed(ip: std::net::IpAddr) -> bool {
 /// The home LAN (RFC 1918), link-local and ULA are refused: anyone on the Wi-Fi could read the
 /// password. IPv4-mapped IPv6 is judged as IPv4.
 pub fn secret_cleartext_allowed(ip: std::net::IpAddr) -> bool {
-    use std::net::IpAddr;
-    let ip = match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
-        v4 => v4,
-    };
+    let ip = unmap_ipv4(ip);
     ip.is_loopback() || crate::tailnet::is_tailnet_ip(ip)
 }
 

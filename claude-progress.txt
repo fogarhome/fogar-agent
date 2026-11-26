@@ -398,3 +398,27 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
   real-gateway E2E (s1_pairing_e2e.rs via launch.py) passed locally against 290efa0.
 - NOT here: login screen, HTTP calls from core, Keychain change (PR 3); chat over /events,
   dictation, «Escuchar» (PR 4+). Nothing verified on the M2.
+
+## S4 — PR 3: the account (login, Keychain, logout; secrets only over an encrypted channel) (2026-11-26)
+- Contract (IPC v5): Login/Logout same-signer only; pairing gone from the contract. One Keychain
+  item (address + token), read back before LoggedIn; legacy pairing items deleted at login;
+  logout always clears; 4010/4200 delete the account only if it is still the same token.
+- Option B: the password/token never go in clear text to the home LAN. Core check before any
+  request; adapter check of every resolved IP (`secret_cleartext_allowed`: loopback or tailnet).
+- Review fix wave (2026-11-26): signing in over loopback/localhost is refused unless
+  `Config::login_over_loopback` (Sito: another local user can listen on 127.0.0.1:8004); only
+  fogar-agentd's `dev-login-over-loopback` feature sets it (compile_error! in release, checked).
+  Core tests and the agentd E2E set it in their test config (CI command unchanged). The adapter
+  backstop still allows loopback (the core is the decision point; the dev WS link needs it).
+  Testkit fakes and the gateway_http/gateway_link contract suites now enforce the secret rule
+  (Login / WS connect to plain 192.168.1.19 refused at once; fakes and host adapter pass). A
+  201 that cannot be kept is logged out at once (no orphan device). IPC read buffers pre-sized
+  8 KiB (Linux also wiped); client encoder pre-sized. App: this Mac is never a sign-in
+  candidate; a revocation jumps to sign-in even from Ajustes; a Keychain delete failure on
+  logout is said as such; WireLogin prints redacted. Less code: AccountRecord.username dropped
+  (old records still decode), one `unmap_ipv4`, no `impl Zeroize for WirePassword`.
+- Verified (macOS, local): fmt, clippy -D warnings, `cargo test --workspace --exclude
+  fogar-agent-macos` green; fogar-agent-macos ipc:: and gateway contract green (3 audio
+  hardware contract tests fail here with «audio backend failure», unrelated); gen-wire --check
+  up to date; swift build + swift test (110) green; real-gateway E2E against 290efa0 passed.
+- NOT verified: Keychain on the real Mac with the signed app, the app by eye, anything on the M2.

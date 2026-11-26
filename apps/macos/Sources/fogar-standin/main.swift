@@ -223,13 +223,14 @@ actor StandIn {
         }
     }
 
-    /// The core's option-B check, simplified: https, a .ts.net name, a 100.x tailnet IP or this Mac.
+    /// The core's option-B check, simplified: https, a .ts.net name or a 100.x tailnet IP. Not this
+    /// Mac: the agent refuses loopback unless built with its development switch.
     // shortcut: the core also asks Tailscale whether a 100.x address is a peer; the stand-in trusts it.
     static func direccionSegura(_ address: String) -> Bool {
         if address.hasPrefix("https://") { return true }
         let sinEsquema = address.hasPrefix("http://") ? String(address.dropFirst(7)) : address
         let host = sinEsquema.split(separator: ":").first.map(String.init) ?? ""
-        return host.hasSuffix(".ts.net") || host.hasPrefix("100.") || host == "127.0.0.1" || host == "localhost"
+        return host.hasSuffix(".ts.net") || host.hasPrefix("100.")
     }
 
     // MARK: Conversation (IPC v4)

@@ -4,7 +4,8 @@
 
 import Foundation
 
-/// The account password on the wire: redacted `Debug`, wiped on drop.
+/// The account password on the wire. In the agent: redacted `Debug`, wiped on drop. In the
+/// Swift app it is a plain `String` that is not wiped: never print or log it.
 public typealias WirePassword = String
 
 public struct WireCandidate: Codable, Sendable, Equatable, Hashable {

@@ -152,6 +152,15 @@ func waitFor(_ link: AgentLink, _ ok: (AgentState) -> Bool) async -> Bool {
                 == "Sesión cerrada en este Mac. El gateway no contestó: retira este aparato desde la web si hace falta.")
     }
 
+    /// The signed agent could not delete the Keychain item: say that, not the signer sentence.
+    @Test func logoutKeychainFailureIsSaid() async throws {
+        let agent = try FakeAgent(answers(logout: .refused(WireRefused(reason: "could not delete the account"))))
+        try await Task.sleep(for: .milliseconds(200))
+        let link = AgentLink(socketPath: agent.path, verificacion: .rutaYUsuario)
+        await #expect(throws: CommandError.sessionNotDeleted) { _ = try await link.logout() }
+        #expect(Textos.fallo(CommandError.sessionNotDeleted) == "No se pudo borrar la sesión del Llavero. Vuelve a intentarlo.")
+    }
+
     @Test func refusedLoginIsTheSignerSentence() async throws {
         let agent = try FakeAgent(answers(login: .refused(WireRefused(reason: "peer not allowed"))))
         try await Task.sleep(for: .milliseconds(200))
@@ -291,6 +300,29 @@ nonisolated let notPaired = WireStatus(link: "not_paired", phase: .notPaired, ga
         #expect(AgentLink.retirado(antes: .live(notPaired), despues: .notRunning, cerrandoSesion: false, yaRetirado: true))
         #expect(AgentLink.retirado(antes: .notRunning, despues: .live(notPaired), cerrandoSesion: false, yaRetirado: true))
         #expect(!AgentLink.retirado(antes: .live(notPaired), despues: .live(ready), cerrandoSesion: false, yaRetirado: true))
+    }
+
+    /// This Mac is never a sign-in candidate (another local user could listen there).
+    @Test func thisMacIsNotASignInCandidate() {
+        for a in ["http://127.0.0.1:8004", "127.0.0.1", "127.0.0.2:8004", "localhost:8004", "http://LOCALHOST",
+                  "http://[::1]:8004", "[::1]", "http://[::ffff:127.0.0.1]:8004"] {
+            #expect(esDeEsteMac(a), "\(a)")
+        }
+        for a in ["http://100.89.15.7:8004", "casa.tail1.ts.net", "https://fogar.example.com", "192.168.1.19:8004",
+                  "http://[fd7a:115c:a1e0::1]:8004", "localhost.example.com"] {
+            #expect(!esDeEsteMac(a), "\(a)")
+        }
+    }
+
+    /// A revocation jumps to «Iniciar sesión» even from Ajustes; this app's own logout from
+    /// Ajustes stays there (its notice stays on screen).
+    @Test func revocationJumpsToSignInFromAnywhere() {
+        #expect(Navegacion.irAIniciarSesion(antes: .ready, despues: .notPaired, en: .ajustes, retirado: true))
+        #expect(Navegacion.irAIniciarSesion(antes: .ready, despues: .notPaired, en: .estado, retirado: false))
+        #expect(!Navegacion.irAIniciarSesion(antes: .ready, despues: .notPaired, en: .ajustes, retirado: false))
+        #expect(!Navegacion.irAIniciarSesion(antes: nil, despues: .notPaired, en: .estado, retirado: true))
+        #expect(!Navegacion.irAIniciarSesion(antes: .notPaired, despues: .notPaired, en: .estado, retirado: true))
+        #expect(!Navegacion.irAIniciarSesion(antes: .notPaired, despues: .ready, en: .estado, retirado: false))
     }
 
     @Test func theHeadlineSaysAccessWasWithdrawn() {

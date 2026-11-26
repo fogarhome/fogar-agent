@@ -191,6 +191,7 @@ enum Textos {
         case .noAnswer: "El agente no ha contestado a tiempo. Prueba otra vez."
         case .unexpected: "El agente ha contestado algo que esta app no esperaba. Prueba otra vez."
         case .notOurAgent: "Lo que responde en el sitio del agente no está firmado como esta app: no le he enviado nada."
+        case .sessionNotDeleted: "No se pudo borrar la sesión del Llavero. Vuelve a intentarlo."
         }
     }
 

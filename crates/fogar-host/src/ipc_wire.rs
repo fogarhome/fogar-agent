@@ -3,12 +3,13 @@
 //! `MAX_FRAME_BYTES`, `"type"`-tagged, `deny_unknown_fields`, closed vocabulary.
 //!
 //! Sans-I/O: framing works on byte buffers; adapters own the socket and peer authentication.
-//! Account passwords cross this layer once; the frame buffers holding them are wiped
-//! (`take_frame`, `Zeroizing` bodies) and so is the decoded `WirePassword`. Known limit:
-//! serde_json's internal scratch for a string with escapes is not wiped: a password containing
-//! `"`, `\` or a control character leaves one unwiped copy in freed memory of the agent (and of
-//! the app). No key or
-//! token ever crosses IPC.
+//! Account passwords cross this layer once; in the agent the frame buffers holding them are
+//! wiped (`take_frame`, `Zeroizing` bodies, pre-sized encode and read buffers) and so is the
+//! decoded `WirePassword`. Known limit: serde_json's internal scratch for a string with escapes
+//! is not wiped: a password containing `"`, `\` or a control character leaves one unwiped copy
+//! in freed memory of the agent. The Swift app does not wipe at all: it gets a plain `String`
+//! (and Foundation's buffers), which must never be printed or logged. No key or token ever
+//! crosses IPC.
 
 use fogar_ports::{
     audio::MicPermission,
@@ -22,7 +23,8 @@ use fogar_ports::{
 use secrecy::zeroize::{Zeroize, Zeroizing};
 use serde::{Deserialize, Serialize};
 
-/// The account password on the wire: redacted `Debug`, wiped on drop.
+/// The account password on the wire. In the agent: redacted `Debug`, wiped on drop. In the
+/// Swift app it is a plain `String` that is not wiped: never print or log it.
 #[cfg_attr(typeshare, typeshare)]
 #[derive(Serialize, Deserialize)]
 #[serde(transparent)]
@@ -34,15 +36,9 @@ impl std::fmt::Debug for WirePassword {
     }
 }
 
-impl Zeroize for WirePassword {
-    fn zeroize(&mut self) {
-        self.0.zeroize();
-    }
-}
-
 impl Drop for WirePassword {
     fn drop(&mut self) {
-        self.zeroize();
+        self.0.zeroize();
     }
 }
 
@@ -585,9 +581,15 @@ pub fn encode_request(r: &IpcRequest) -> Result<Zeroizing<Vec<u8>>, IpcError> {
         IpcRequest::RequestMicPermission => WireRequest::RequestMicPermission,
         _ => return Err(IpcError::Unsupported("request not in the wire vocabulary")),
     };
-    serde_json::to_vec(&w)
-        .map(Zeroizing::new)
-        .map_err(|_| IpcError::Malformed)
+    // Pre-sized for the worst case (every byte escaped as `\uXXXX`): a reallocation would free
+    // an unwiped copy of the password.
+    let cap = match &w {
+        WireRequest::Login(l) => (l.address.len() + l.username.len() + l.password.0.len()) * 6,
+        _ => 0,
+    } + 256;
+    let mut out = Zeroizing::new(Vec::with_capacity(cap));
+    serde_json::to_writer(&mut *out, &w).map_err(|_| IpcError::Malformed)?;
+    Ok(out)
 }
 
 // ---- responses ---------------------------------------------------------------------------
@@ -1496,12 +1498,10 @@ mod tests {
         let body = encode_request(&r).unwrap();
         let w: WireRequest = serde_json::from_slice(&body).unwrap();
         assert!(!format!("{w:?}").contains("hunter2"));
-        let mut p = WirePassword("hunter2".into());
+        let p = WirePassword("hunter2".into());
         assert_eq!(format!("{p:?}"), "<redacted>");
-        // Drop runs the same zeroize (observing freed memory would need `unsafe`).
+        // Drop wipes it (observing freed memory would need `unsafe`).
         assert!(std::mem::needs_drop::<WirePassword>());
-        p.zeroize();
-        assert!(p.0.is_empty());
         // Empty or over-long passwords decode to `None`: the core answers BadCredentialsInput
         // without calling the gateway.
         let long = "a".repeat(fogar_ports::ipc::PASSWORD_MAX_BYTES + 1);

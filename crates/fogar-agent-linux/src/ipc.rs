@@ -115,14 +115,17 @@ impl IpcServer for UdsIpcServer {
 #[derive(Debug)]
 pub struct UdsConn {
     stream: UnixStream,
-    buf: Vec<u8>,
+    /// Wiped on drop: it holds login frames (the password).
+    buf: Zeroizing<Vec<u8>>,
 }
 
 impl UdsConn {
     fn new(stream: UnixStream) -> Self {
         Self {
             stream,
-            buf: Vec::with_capacity(512),
+            // 8 KiB: a max-size login frame (1024-byte password, escaped) never reallocates, so
+            // no unwiped copy of it is freed.
+            buf: Zeroizing::new(Vec::with_capacity(8 * 1024)),
         }
     }
 }

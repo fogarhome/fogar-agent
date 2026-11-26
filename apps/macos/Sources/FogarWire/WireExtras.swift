@@ -20,6 +20,13 @@ public enum WireCodec {
     }
 }
 
+/// `print`, interpolation and `dump` of a login (or a `WireRequest` holding one) never show the
+/// password.
+extension WireLogin: CustomStringConvertible, CustomDebugStringConvertible {
+    public var description: String { "WireLogin(address: \(address), username: \(username), password: <redacted>)" }
+    public var debugDescription: String { description }
+}
+
 // MARK: Tolerant reading of the conversation (an agent newer than this app)
 
 extension WireCodec {

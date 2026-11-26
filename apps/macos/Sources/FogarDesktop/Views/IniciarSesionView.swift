@@ -1,4 +1,5 @@
 import FogarWire
+import Network
 import SwiftUI
 
 /// Iniciar sesión: the dashboard's Conectar screen for this Mac. On one side the brand (living
@@ -154,7 +155,7 @@ private struct Formulario: View {
                     .buttonStyle(Pildora(pequena: true, ocupado: buscando))
             }
             if candidatos.isEmpty {
-                Text(buscando ? "Mirando en la dirección guardada, en este Mac y en tu tailnet…"
+                Text(buscando ? "Mirando en la dirección guardada y en tu tailnet…"
                               : "No he encontrado ninguno. Escribe su dirección aquí abajo.")
                     .meta()
                     .fixedSize(horizontal: false, vertical: true)
@@ -176,7 +177,7 @@ private struct Formulario: View {
         buscando = true
         defer { buscando = false }
         do {
-            candidatos = try await link.discover()
+            candidatos = try await link.discover().filter { !esDeEsteMac($0.address) }
             if candidatos.count == 1, direccion.isEmpty { direccion = sinEsquema(candidatos[0].address) }
             // Keyboard first: straight to what is still missing.
             if !focoDireccion && !focoUsuario && !focoContrasena {
@@ -264,12 +265,7 @@ private struct Candidato: View {
         .accessibilityAddTraits(elegido ? .isSelected : [])
     }
 
-    /// The local candidate is «en este Mac», never presented as verified (any local user could
-    /// listen on 127.0.0.1:8004).
-    private var detalle: String {
-        let local = c.address.contains("127.0.0.1") || c.address.contains("localhost")
-        return local ? "en este Mac · versión \(c.version)" : "\(sinEsquema(c.address)) · versión \(c.version)"
-    }
+    private var detalle: String { "\(sinEsquema(c.address)) · versión \(c.version)" }
 }
 
 private struct YaConSesion: View {
@@ -319,6 +315,20 @@ private struct SinAgente: View {
 /// Addresses as the person writes them (the hint says «sin http://»).
 func sinEsquema(_ address: String) -> String {
     address.replacingOccurrences(of: "http://", with: "")
+}
+
+/// Whether `address` is this Mac (a loopback IP or `localhost`). Such a candidate is never
+/// offered or filled in for sign-in: any local user could listen on 127.0.0.1:8004 and receive
+/// the password, then the token (the agent refuses these addresses too).
+func esDeEsteMac(_ address: String) -> Bool {
+    let url = address.contains("://") ? address : "http://" + address
+    guard let host = URLComponents(string: url)?.host?
+        .trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased() else { return false }
+    if host == "localhost" { return true }
+    // All of 127.0.0.0/8 (Network's `isLoopback` only knows 127.0.0.1), also IPv4-mapped.
+    let v4 = IPv4Address(host) ?? IPv6Address(host)?.asIPv4
+    if let v4 { return v4.rawValue.first == 127 }
+    return IPv6Address(host)?.isLoopback ?? false
 }
 
 /// macOS 26 draws a soft scroll-edge band under the title bar; on this full-bleed screen it reads

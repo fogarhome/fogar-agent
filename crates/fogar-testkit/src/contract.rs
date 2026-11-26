@@ -823,6 +823,17 @@ pub mod gateway_link {
         );
     }
 
+    /// Option B: the session carries the token, so plain ws to the home LAN is refused at once.
+    pub async fn secret_in_clear_to_lan_is_refused<L: GatewayLink>(link: &L) {
+        let lan = GatewayAddr::parse("192.168.1.19:8004").expect("addr");
+        let r =
+            tokio::time::timeout(Duration::from_secs(1), link.connect(&lan, WsRoute::Stream)).await;
+        assert!(
+            matches!(r, Ok(Err(LinkError::NotConfigured))),
+            "plain ws to a LAN IP must be NotConfigured at once"
+        );
+    }
+
     /// The gateway's handshake rejection is a close with the documented reason.
     /// Whatever protocol generation the mock speaks (M19 4010, or 1008 + the old text), the
     /// close reaches the core intact and classifies as "re-pair".
@@ -918,6 +929,13 @@ pub mod gateway_link {
                     $crate::run_async(async {
                         let (link, _gw) = $make;
                         c::cleartext_to_public_ip_is_refused(&link).await
+                    })
+                }
+                #[test]
+                fn secret_in_clear_to_lan_is_refused() {
+                    $crate::run_async(async {
+                        let (link, _gw) = $make;
+                        c::secret_in_clear_to_lan_is_refused(&link).await
                     })
                 }
                 #[test]
@@ -1550,6 +1568,26 @@ pub mod gateway_http {
         assert!(matches!(t, Ok(Err(HttpError::Refused))));
     }
 
+    /// Option B: a call carrying a secret (here the login password) in plain http to the home
+    /// LAN is refused before any byte is sent.
+    pub async fn secret_in_clear_to_lan_is_refused<H: GatewayHttp>(h: &H) {
+        let lan = GatewayAddr::parse("192.168.1.19:8004").expect("addr");
+        let t = tokio::time::timeout(
+            Duration::from_secs(1),
+            h.request(
+                &lan,
+                &HttpCall::Login,
+                None,
+                Some(Zeroizing::new(b"{}".to_vec())),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(t, Ok(Err(HttpError::Refused))),
+            "plain http login to a LAN IP must be Refused at once"
+        );
+    }
+
     /// A redirect could move the key exchange elsewhere: it is returned, never followed.
     pub async fn redirects_are_not_followed<H: GatewayHttp>(
         h: &H,
@@ -1807,6 +1845,13 @@ pub mod gateway_http {
                     $crate::run_async(async {
                         let (h, _s) = $make;
                         c::cleartext_to_public_ip_is_refused(&h).await
+                    })
+                }
+                #[test]
+                fn secret_in_clear_to_lan_is_refused() {
+                    $crate::run_async(async {
+                        let (h, _s) = $make;
+                        c::secret_in_clear_to_lan_is_refused(&h).await
                     })
                 }
                 #[test]

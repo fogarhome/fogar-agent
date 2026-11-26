@@ -104,6 +104,14 @@ import Testing
         #expect(ours == theirs)
     }
 
+    @Test func loginNeverPrintsThePassword() {
+        let req = WireRequest.login(WireLogin(address: "https://casa.ts.net", username: "sito", password: "hunter2"))
+        for s in [String(describing: req), String(reflecting: req), "\(req)"] {
+            #expect(!s.contains("hunter2"), "\(s)")
+            #expect(s.contains("<redacted>"), "\(s)")
+        }
+    }
+
     @Test func unknownResponseTypeIsAnError() {
         #expect(throws: (any Error).self) {
             try WireCodec.decodeResponse(Data(#"{"type":"exec","data":{}}"#.utf8))

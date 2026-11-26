@@ -1,4 +1,5 @@
 import AppKit
+import FogarWire
 import SwiftUI
 
 /// Fogar Desktop: the main window (sidebar + sections), Settings (⌘,) and the menu bar quick view.
@@ -107,6 +108,14 @@ final class Navegacion {
 
     init() {
         seccion = UserDefaults.standard.string(forKey: "seccion").flatMap(Seccion.init(rawValue:)) ?? .estado
+    }
+
+    /// The account just went away: go where the person can sign in again. A revocation jumps
+    /// from anywhere, Ajustes included; this app's own logout from Ajustes stays there, so its
+    /// notice («el gateway no contestó…») remains on screen.
+    static func irAIniciarSesion(antes: WirePhase?, despues: WirePhase?, en seccion: Seccion, retirado: Bool) -> Bool {
+        guard despues == .notPaired, let antes, antes != .notPaired else { return false }
+        return seccion != .ajustes || retirado
     }
 }
 

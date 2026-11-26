@@ -19,6 +19,11 @@ pub struct Config {
     /// `false` = only `PeerCheck::SameSigner`. The composition root may set it ONLY from a
     /// compile-time switch of development builds, never from a runtime flag.
     pub pair_from_uid_only_peers: bool,
+    /// Allow signing in to this machine (a loopback literal or `localhost`) over clear text.
+    /// `false` = refused with `NeedsSecureAddress`: another local user can listen on
+    /// 127.0.0.1:8004 and receive the password and the token. Development and tests only; the
+    /// composition root may set it ONLY from a compile-time switch of development builds.
+    pub login_over_loopback: bool,
     /// Requested agent; `None` = gateway fallback cascade (spec §2).
     pub agent: Option<String>,
     pub input_mode: InputMode,
@@ -77,6 +82,7 @@ impl Default for Config {
             tailnet_timeout: Duration::from_secs(2),
             account_timeout: Duration::from_secs(10),
             pair_from_uid_only_peers: false,
+            login_over_loopback: false,
             agent: None,
             input_mode: InputMode::Audio,
             output_mode: vec![OutputMode::Audio, OutputMode::Text, OutputMode::Status],

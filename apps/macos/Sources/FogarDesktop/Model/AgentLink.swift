@@ -38,6 +38,9 @@ enum CommandError: Error, Equatable {
     case unexpected
     /// What answers on the socket is not provably our agent: nothing was sent.
     case notOurAgent
+    /// `logout` refused by the signed agent because the Keychain item could not be deleted
+    /// (`fogar-core::ipc`: «could not delete the account»): the session is still there.
+    case sessionNotDeleted
 }
 
 /// The app's single link to the agent: one long subscription for live status, plus a short
@@ -194,9 +197,10 @@ final class AgentLink {
     /// interpolate the request that carries it.
     func login(address: String, username: String, password: String) async throws(CommandError) -> LoginOutcome {
         // The agent's worst case: tailnet lookup (2 s) + discovery probes + `POST /auth/login`
-        // under its 10 s `account_timeout` + the Keychain. Outlast it.
+        // under its 10 s `account_timeout` + the Keychain, and after a 201 it cannot keep a
+        // best-effort `POST /auth/logout` (another 10 s). Outlast it.
         let pedido = WireRequest.login(WireLogin(address: address, username: username, password: password))
-        switch try await command(pedido, timeout: .seconds(25)) {
+        switch try await command(pedido, timeout: .seconds(35)) {
         case .loggedIn(let g): return .loggedIn(g)
         case .loginFailed(let f): return .failed(f.reason)
         default: throw .unexpected
@@ -214,7 +218,7 @@ final class AgentLink {
             // Only when the agent surely did nothing: after `noAnswer` it may still sign out, and its
             // `not_paired` must not read as a revocation (the next `not_paired` clears the flag).
             switch error {
-            case .agentNotRunning, .refused, .versionMismatch, .notOurAgent: cerrandoSesion = false
+            case .agentNotRunning, .refused, .versionMismatch, .notOurAgent, .sessionNotDeleted: cerrandoSesion = false
             case .noAnswer, .unexpected: break
             }
             throw error
@@ -243,6 +247,8 @@ final class AgentLink {
                 while true {
                     switch try WireCodec.decodeResponse(await c.receive()) {
                     case .event, .status: continue // not subscribed, but never mistake one for the answer
+                    // The agent's reason for a Keychain delete that failed on `logout` (`fogar-core::ipc`).
+                    case .refused(let r) where r.reason == "could not delete the account": throw CommandError.sessionNotDeleted
                     case .refused: throw CommandError.refused
                     case let answer: return answer
                     }

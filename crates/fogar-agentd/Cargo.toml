@@ -11,6 +11,9 @@ description = "Composition root: the daemon binary. The ONLY crate (besides adap
 # IPC-4 development opt-in: Login/Logout/Reconnect also from IPC peers checked by uid only (ad-hoc signed
 # or unsigned builds, Linux). Never enable it for a release build.
 dev-uid-pairing = []
+# Development opt-in: signing in to a gateway on this machine (127.0.0.1/localhost) over clear
+# text. Another local user could listen there and get the password. Never enable it for a release.
+dev-login-over-loopback = []
 
 [[bin]]
 name = "fogar-agentd"

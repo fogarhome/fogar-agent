@@ -14,6 +14,9 @@
 //!   before a byte is sent, and so is a token on an unauthenticated call (discovery,
 //!   login): it would leak to a gateway that has not been authenticated. The adapter writes the token straight from its secret buffer into
 //!   the socket; it is never copied into a `String`, a log or an error.
+//! - Secrets in clear text: every call except `WellKnown`/`WellKnownLegacy` (and every stream)
+//!   carries a secret, so over plain http it is `Refused` unless EVERY resolved IP passes
+//!   `gateway::secret_cleartext_allowed` (loopback or tailnet; never the home LAN).
 //! - Streaming calls (`HttpCall::is_stream`) are refused by `request`: they go through
 //!   `open_stream`, which returns the status once the response head arrived and a
 //!   [`ResponseBody`] read chunk by chunk (at most `MAX_CHUNK_BYTES` each). Dial, request and

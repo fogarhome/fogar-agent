@@ -32,9 +32,9 @@ struct RootView: View {
         .tint(.hueso)
         .vigilaVisibilidad()
         .onChange(of: link.state.status?.phase) { old, new in
-            // Revoked or signed out elsewhere: go where the person can fix it. Not from Ajustes: a
-            // logout from there must keep its notice («el gateway no contestó…») on screen.
-            if new == .notPaired, let old, old != .notPaired, nav.seccion != .ajustes { nav.seccion = .iniciarSesion }
+            if Navegacion.irAIniciarSesion(antes: old, despues: new, en: nav.seccion, retirado: link.accesoRetirado) {
+                nav.seccion = .iniciarSesion
+            }
         }
         // Announce a new headline, not every counter tick.
         .onChange(of: Textos.titular(link.state, retirado: link.accesoRetirado).titulo) { _, titulo in

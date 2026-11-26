@@ -187,10 +187,12 @@ impl HttpRoutes {
     }
 }
 
-/// Fakes apply the clear-text policy to IP literals (they resolve nothing; names pass).
-pub(crate) fn policy_allows(addr: &GatewayAddr) -> bool {
-    use fogar_ports::gateway::{Scheme, cleartext_allowed};
+/// Fakes apply the clear-text policy to IP literals (they resolve nothing; names pass), like the
+/// host adapter: a call carrying a secret uses the stricter `secret_cleartext_allowed`.
+pub(crate) fn policy_allows(addr: &GatewayAddr, secret: bool) -> bool {
+    use fogar_ports::gateway::{Scheme, cleartext_allowed, secret_cleartext_allowed};
     match (addr.scheme(), addr.host().parse::<std::net::IpAddr>()) {
+        (Scheme::Plain, Ok(ip)) if secret => secret_cleartext_allowed(ip),
         (Scheme::Plain, Ok(ip)) => cleartext_allowed(ip),
         _ => true,
     }
@@ -233,7 +235,8 @@ impl GatewayHttp for FakeGatewayHttp {
         token: Option<&SecretString>,
         body: Option<Zeroizing<Vec<u8>>>,
     ) -> Result<HttpReply, HttpError> {
-        if !request_allowed(call, token) || !policy_allows(addr) {
+        let secret = !matches!(call, HttpCall::WellKnown | HttpCall::WellKnownLegacy);
+        if !request_allowed(call, token) || !policy_allows(addr, secret) {
             return Err(HttpError::Refused);
         }
         // Yield once so a dropped in-flight call is a real cancellation point.
@@ -275,7 +278,7 @@ impl GatewayHttp for FakeGatewayHttp {
         last_event_id: Option<&str>,
         body: Option<Zeroizing<Vec<u8>>>,
     ) -> Result<StreamReply<FakeStreamBody>, HttpError> {
-        if !stream_allowed(call, token, last_event_id) || !policy_allows(addr) {
+        if !stream_allowed(call, token, last_event_id) || !policy_allows(addr, true) {
             return Err(HttpError::Refused);
         }
         tokio::task::yield_now().await;

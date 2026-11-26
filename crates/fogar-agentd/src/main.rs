@@ -15,6 +15,9 @@
 // IPC-4: the uid-only pairing opt-in must never reach an optimized (release) build.
 #[cfg(all(feature = "dev-uid-pairing", not(debug_assertions)))]
 compile_error!("the dev-uid-pairing feature is for development builds only");
+// Signing in over loopback hands the password to whoever listens on 127.0.0.1 (another user).
+#[cfg(all(feature = "dev-login-over-loopback", not(debug_assertions)))]
+compile_error!("the dev-login-over-loopback feature is for development builds only");
 
 mod cli;
 mod crash;
@@ -285,6 +288,8 @@ async fn serve(
         // builds) is a development convenience behind an explicit Cargo feature, fixed at
         // compile time (not tied to debug-assertions, which a release profile could enable).
         pair_from_uid_only_peers: cfg!(feature = "dev-uid-pairing"),
+        // A local gateway (127.0.0.1/localhost) for development, same compile-time rule.
+        login_over_loopback: cfg!(feature = "dev-login-over-loopback"),
         ..fogar_core::Config::default()
     };
     if let Some(k) = opts.keepalive_secs {

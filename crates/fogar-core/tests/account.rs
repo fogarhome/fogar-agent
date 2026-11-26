@@ -193,7 +193,13 @@ async fn login_against(status: u16, body: &str) -> Option<IpcResponse> {
     let rig = b.start();
     let mut c = client(&rig).await;
     let r = c.request(login_ok("127.0.0.1:8004")).await;
-    assert_eq!(posts(&rig.routes), 1, "{status} {body}");
+    let logins = rig
+        .routes
+        .seen()
+        .iter()
+        .filter(|r| r.path == "/auth/login")
+        .count();
+    assert_eq!(logins, 1, "{status} {body}");
     assert!(!rig.secrets.contains(SecretKey::GatewayAccount));
     tokio::time::sleep(Duration::from_secs(60)).await;
     assert_eq!(rig.health.snapshot().stats.connect_attempts, 0);
@@ -248,6 +254,40 @@ async fn unexpected_answers_are_gateway_errors() {
             "{status} {body}"
         );
     }
+}
+
+/// The `Authorization` of every `POST /auth/logout` the gateway saw.
+fn logouts(routes: &HttpRoutes) -> Vec<Option<String>> {
+    routes
+        .seen()
+        .into_iter()
+        .filter(|r| r.method == "POST" && r.path == "/auth/logout")
+        .map(|r| r.authorization)
+        .collect()
+}
+
+/// A 201 we cannot keep leaves no orphan device: the agent logs the new token out (best effort)
+/// before answering. Unusable token, and a store that fails.
+#[tokio::test(start_paused = true)]
+async fn unkept_login_logs_the_new_device_out() {
+    let long = "k".repeat(1025);
+    let b = signed_out();
+    b.routes.set(
+        "POST",
+        "/auth/login",
+        201,
+        LOGIN_OK.replace("test-client-key", &long),
+    );
+    let rig = b.start();
+    let mut c = client(&rig).await;
+    let r = c.request(login_ok("127.0.0.1")).await;
+    assert_eq!(
+        r,
+        Some(IpcResponse::LoginFailed(LoginFailure::GatewayError))
+    );
+    assert_eq!(logouts(&rig.routes), [Some(format!("Bearer {long}"))]);
+    assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
+    // The store failing after the 201: `storage_read_back_failure_is_storage_failed`.
 }
 
 /// Failures decided before the gateway is asked to check the password.
@@ -361,6 +401,38 @@ async fn lan_address_needs_secure_without_network() {
     }
 }
 
+/// Without the development switch, this machine is not trusted either: another local user can
+/// listen on 127.0.0.1:8004 and receive the password, then the token. Refused before any request.
+#[tokio::test(start_paused = true)]
+async fn loopback_needs_secure_without_network() {
+    for address in [
+        "127.0.0.1",
+        "http://127.0.0.1:8004",
+        "127.0.0.2:8004",
+        "[::1]:8004",
+        "[::ffff:127.0.0.1]:8004",
+        "localhost:8004",
+    ] {
+        let mut b = signed_out();
+        b.cfg.login_over_loopback = false;
+        b.http_addrs = vec!["127.0.0.1:8004"];
+        b.tailnet = FakeTailnet::with_peers(&["100.89.15.7"]);
+        let calls = b.tailnet.calls.clone();
+        let rig = b.start();
+        let mut c = client(&rig).await;
+        let r = c.request(login_ok(address)).await;
+        assert_eq!(
+            r,
+            Some(IpcResponse::LoginFailed(LoginFailure::NeedsSecureAddress)),
+            "{address}"
+        );
+        assert!(rig.routes.seen().is_empty(), "{address}: no request at all");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(!rig.secrets.contains(SecretKey::GatewayAccount));
+        assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
+    }
+}
+
 /// A tailnet IP literal is trusted only when Tailscale lists it as a peer (CGNAT operators use
 /// 100.64/10 too).
 #[tokio::test(start_paused = true)]
@@ -399,6 +471,28 @@ async fn tailnet_ip_needs_tailscale_to_list_it() {
     }
 }
 
+/// The core's check passes (a `.ts.net` name), but the name resolves to the LAN: the adapter
+/// refuses the login before sending it, and the person hears `NeedsSecureAddress`.
+#[tokio::test(start_paused = true)]
+async fn adapter_refusal_after_the_core_check_needs_secure() {
+    let mut b = signed_out();
+    b.http_addrs = vec!["gw.tail1234.ts.net:8004"];
+    b.names_resolve_to_lan = true;
+    let rig = b.start();
+    let mut c = client(&rig).await;
+    let r = c.request(login_ok("gw.tail1234.ts.net:8004")).await;
+    assert_eq!(
+        r,
+        Some(IpcResponse::LoginFailed(LoginFailure::NeedsSecureAddress))
+    );
+    // Discovery answered; the login never reached the gateway.
+    assert_eq!(rig.routes.seen().len(), 1);
+    assert_eq!(posts(&rig.routes), 0);
+    assert!(!rig.secrets.contains(SecretKey::GatewayAccount));
+    assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
+}
+
+/// Loopback here only because `test_config()` turns on `login_over_loopback` (development).
 #[tokio::test(start_paused = true)]
 async fn ts_net_and_https_and_loopback_are_accepted() {
     for address in [
@@ -519,6 +613,8 @@ async fn storage_read_back_failure_is_storage_failed() {
         Some(IpcResponse::LoginFailed(LoginFailure::StorageFailed))
     );
     assert!(!rig.secrets.contains(SecretKey::GatewayAccount));
+    // No orphan device: the token we could not keep was logged out.
+    assert_eq!(logouts(&rig.routes), [Some(format!("Bearer {TOKEN}"))]);
     tokio::time::sleep(Duration::from_secs(120)).await;
     assert_eq!(rig.health.snapshot().link, LinkState::NotPaired);
     assert_eq!(rig.health.snapshot().stats.connect_attempts, 0);

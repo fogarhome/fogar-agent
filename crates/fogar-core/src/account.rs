@@ -6,9 +6,11 @@
 //! Invariants:
 //! - the record holds address + token as ONE item, so the token never meets another gateway;
 //! - the record is written and READ BACK before the UI hears `LoggedIn`;
-//! - option B (NV-1): the password only leaves for an address that is `https`, this machine, a
-//!   `.ts.net` name or a tailnet IP that Tailscale lists ([`Account::secure_enough`]), checked
-//!   before any request; the adapter re-checks every resolved IP (`secret_cleartext_allowed`);
+//! - option B (NV-1): the password only leaves for an address that is `https`, a `.ts.net` name
+//!   or a tailnet IP that Tailscale lists (this machine only with the development
+//!   `Config::login_over_loopback`) ([`Account::secure_enough`]), checked before any request; the
+//!   adapter re-checks every resolved IP (`secret_cleartext_allowed`);
+//! - a 201 we cannot keep is undone with a best-effort `POST /auth/logout` (no orphan device);
 //! - the password lives in `Password` (wiped) and in one pre-sized `Zeroizing` body; the token is
 //!   a `SecretString` from the moment it is decoded. Neither reaches `Debug`, `Stats` or an error;
 //! - one sign-in at a time (`queues::ACCOUNT`: a second gets `Busy`); logout waits for it;
@@ -23,7 +25,7 @@ use crate::{
 };
 use fogar_ports::{
     clock::Clock,
-    gateway::{GatewayAddr, Scheme},
+    gateway::{GatewayAddr, Scheme, unmap_ipv4},
     gateway_http::{GatewayHttp, HttpCall, token_is_sendable},
     ipc::{GatewayInfo, LoginFailure, Password},
     secrets::{ExposeSecret, SecretError, SecretKey, SecretStore, SecretString},
@@ -53,7 +55,6 @@ pub struct AccountRecord {
     address: GatewayAddr,
     client_id: String,
     token: SecretString,
-    username: String,
     display_name: String,
     home_name: String,
     gateway_version: String,
@@ -66,20 +67,22 @@ struct RecordOut<'a> {
     address: String,
     client_id: &'a str,
     token: &'a str,
-    username: &'a str,
     display_name: &'a str,
     home_name: &'a str,
     gateway_version: &'a str,
     device_name: &'a str,
 }
 
+/// Unknown fields are ignored (records written before `username` was dropped still decode).
+/// Like `WirePassword`: if serde has to unescape the token it goes through a scratch buffer that
+/// is not wiped, and a decode that fails after `token` drops that `String` unwiped;
+/// `SecretString` covers only the final copy.
 #[derive(Deserialize)]
 struct RecordIn {
     v: u8,
     address: String,
     client_id: String,
     token: String,
-    username: String,
     display_name: String,
     home_name: String,
     gateway_version: String,
@@ -93,7 +96,6 @@ impl AccountRecord {
             address,
             client_id,
             token,
-            username: String::new(),
             display_name: String::new(),
             home_name: String::new(),
             gateway_version: String::new(),
@@ -127,7 +129,6 @@ impl AccountRecord {
             address: self.address.to_string(),
             client_id: &self.client_id,
             token: self.token.expose_secret(),
-            username: &self.username,
             display_name: &self.display_name,
             home_name: &self.home_name,
             gateway_version: &self.gateway_version,
@@ -136,7 +137,6 @@ impl AccountRecord {
         let raw = out.address.len()
             + out.client_id.len()
             + out.token.len()
-            + out.username.len()
             + out.display_name.len()
             + out.home_name.len()
             + out.gateway_version.len()
@@ -160,7 +160,6 @@ impl AccountRecord {
             address: GatewayAddr::parse(&r.address).ok()?,
             client_id: r.client_id,
             token,
-            username: r.username,
             display_name: r.display_name,
             home_name: r.home_name,
             gateway_version: r.gateway_version,
@@ -190,8 +189,10 @@ pub(crate) fn load(secrets: &dyn SecretStore) -> Result<Option<AccountRecord>, S
 /// The gateway revoked `record`'s token (4010/4200): delete it, unless the account was replaced
 /// meanwhile (a logout + login raced the close). `false` = the store could not be read or the
 /// delete failed: the caller parks rather than retry a dead token.
-/// Check-then-delete without the account lock: safe because nothing awaits in between and
-/// login/logout write the store synchronously too (one runtime thread in fogar-agentd).
+/// Check-then-delete without the account lock; nothing awaits between the two. Logout does await
+/// (its HTTP call) between its load and its delete, so a revocation can land in that window: the
+/// race is benign, as both sides only ever delete the item and logout deletes it anyway. A login
+/// can only store a new account once the old one is gone, and then `same_as` keeps it.
 pub(crate) fn revoke_if_current(secrets: &dyn SecretStore, record: &AccountRecord) -> bool {
     let Ok(stored) = load(secrets) else {
         return false;
@@ -251,31 +252,28 @@ impl<C, H, T> Clone for Account<C, H, T> {
     }
 }
 
-/// IPv4-mapped IPv6 judged as the IPv4 it carries.
-fn canonical(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
-        v4 => v4,
-    }
-}
-
 impl<C: Clock, H: GatewayHttp, T: TailnetPeers> Account<C, H, T> {
-    /// Option B, without sending anything to `addr`: `https`; this machine; a `.ts.net` name; or
-    /// a tailnet IP literal that Tailscale lists as a peer (CGNAT operators use 100.64/10 too).
+    /// Option B, without sending anything to `addr`: `https`; a `.ts.net` name; or a tailnet IP
+    /// literal that Tailscale lists as a peer (CGNAT operators use 100.64/10 too). This machine
+    /// (loopback literal or `localhost`) only with `Config::login_over_loopback` (development):
+    /// another local user can listen on 127.0.0.1:8004 and receive the password and the token.
     /// Anything else (LAN, `.local`, bare names, public IPs) would carry the password in clear.
     async fn secure_enough(&self, addr: &GatewayAddr) -> bool {
         if addr.scheme() == Scheme::Tls {
             return true;
         }
         let host = addr.host();
-        if host == "localhost" || host.ends_with(".ts.net") {
+        if host.ends_with(".ts.net") {
             return true;
         }
-        let Ok(ip) = host.parse::<IpAddr>().map(canonical) else {
+        if host == "localhost" {
+            return self.cfg.login_over_loopback;
+        }
+        let Ok(ip) = host.parse::<IpAddr>().map(unmap_ipv4) else {
             return false;
         };
         if ip.is_loopback() {
-            return true;
+            return self.cfg.login_over_loopback;
         }
         if !is_tailnet_ip(ip) || !self.tailnet.capabilities().is_available() {
             return false;
@@ -283,7 +281,7 @@ impl<C: Clock, H: GatewayHttp, T: TailnetPeers> Account<C, H, T> {
         deadline(&*self.clock, self.cfg.tailnet_timeout, self.tailnet.peers())
             .await
             .and_then(Result::ok)
-            .is_some_and(|peers| peers.into_iter().any(|p| canonical(p) == ip))
+            .is_some_and(|peers| peers.into_iter().any(|p| unmap_ipv4(p) == ip))
     }
 
     pub(crate) async fn login(
@@ -359,6 +357,8 @@ impl<C: Clock, H: GatewayHttp, T: TailnetPeers> Account<C, H, T> {
             429 => return Err(LoginFailure::TooManyAttempts),
             _ => return Err(LoginFailure::GatewayError),
         }
+        // Known limit (as for `RecordIn` and `WirePassword`): if decoding fails after `token`,
+        // serde drops that `String` unwiped, and an escaped token passes an unwiped scratch.
         let resp: LoginResponse =
             serde_json::from_slice(&reply.body).map_err(|_| LoginFailure::GatewayError)?;
         drop(reply);
@@ -371,19 +371,22 @@ impl<C: Clock, H: GatewayHttp, T: TailnetPeers> Account<C, H, T> {
         } = resp;
         let token = SecretString::from(token);
         if !token_is_usable(&token) {
+            self.forget_device(&addr, &token).await;
             return Err(LoginFailure::GatewayError);
         }
         let record = AccountRecord {
             address: addr,
             client_id: label(client_id),
             token,
-            username: label(user.username),
             display_name: label(user.display_name),
             home_name: home.map(|h| label(h.name)).unwrap_or_default(),
             gateway_version: version,
             device_name: label(self.cfg.client_name.clone()),
         };
-        self.persist(&record)?;
+        if let Err(e) = self.persist(&record) {
+            self.forget_device(&record.address, &record.token).await;
+            return Err(e);
+        }
         self.delete_legacy();
         self.changed.send_replace(());
         Ok(record.info())
@@ -407,6 +410,19 @@ impl<C: Clock, H: GatewayHttp, T: TailnetPeers> Account<C, H, T> {
                 Err(LoginFailure::StorageFailed)
             }
         }
+    }
+
+    /// Best effort after a 201 we cannot keep (unusable token, store failed): the gateway forgets
+    /// the device it just created, so no orphan is left in the person's device list. The answer
+    /// does not change the result.
+    async fn forget_device(&self, addr: &GatewayAddr, token: &SecretString) {
+        let _ = deadline(
+            &*self.clock,
+            self.cfg.account_timeout,
+            self.http
+                .request(addr, &HttpCall::Logout, Some(token), None),
+        )
+        .await;
     }
 
     /// The S1 pairing record and the slice-0 key are never used again: deleted, failures counted.
@@ -452,7 +468,6 @@ mod tests {
             address: GatewayAddr::parse("gw.tail1.ts.net").unwrap(),
             client_id: "c-1".into(),
             token: SecretString::from("tok-\"secret\""),
-            username: "sito".into(),
             display_name: "Sito \"G\"".into(),
             home_name: "green-house".into(),
             gateway_version: "5.0.0".into(),
@@ -474,6 +489,36 @@ mod tests {
         );
         let dbg = format!("{r:?} {:?} {:?}", r.encode(), r.info());
         assert!(!dbg.contains("secret"), "{dbg}");
+    }
+
+    /// A close for an old token (same address and client_id) must not delete the newer account
+    /// that a logout + login stored meanwhile; a close for the stored one deletes it.
+    #[test]
+    fn revoke_if_current_keeps_a_newer_account() {
+        let store = fogar_testkit::MemorySecretStore::default();
+        let newer = rec();
+        store
+            .put(SecretKey::GatewayAccount, newer.encode())
+            .unwrap();
+        let mut old = rec();
+        old.token = SecretString::from("tok-old");
+        assert!(revoke_if_current(&store, &old));
+        assert!(load(&store).unwrap().is_some_and(|r| r.same_as(&newer)));
+        assert!(revoke_if_current(&store, &newer));
+        assert!(load(&store).unwrap().is_none());
+    }
+
+    /// An old record that still has `username` (dropped later) decodes.
+    #[test]
+    fn record_with_the_old_username_field_decodes() {
+        let enc = rec().encode();
+        let old = enc.expose_secret().replacen(
+            "\"display_name\"",
+            "\"username\":\"sito\",\"display_name\"",
+            1,
+        );
+        let back = AccountRecord::decode(&SecretString::from(old)).unwrap();
+        assert!(back.same_as(&rec()));
     }
 
     #[test]

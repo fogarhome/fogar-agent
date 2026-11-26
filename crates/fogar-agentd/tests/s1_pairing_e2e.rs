@@ -60,6 +60,8 @@ fn fast_config() -> Config {
     c.backoff.base = Duration::from_millis(20);
     c.backoff.cap = Duration::from_millis(200);
     c.backoff.floor = Duration::from_millis(5);
+    // The mock and the real gateway listen on 127.0.0.1 (the dev-login-over-loopback switch).
+    c.login_over_loopback = true;
     c
 }
 
