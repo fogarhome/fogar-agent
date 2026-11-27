@@ -143,12 +143,17 @@ mod mock_http_server_matches_the_fake {
         token: Option<&secrecy::SecretString>,
         body: Option<&[u8]>,
     ) -> Result<fogar_ports::gateway_http::HttpReply, fogar_ports::gateway_http::HttpError> {
-        use fogar_ports::gateway::cleartext_allowed;
-        use fogar_ports::gateway_http::{HttpError, HttpReply};
+        use fogar_ports::gateway::{cleartext_allowed, secret_cleartext_allowed};
+        use fogar_ports::gateway_http::{HttpCall, HttpError, HttpReply};
         use secrecy::ExposeSecret;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let secret = !matches!(call, HttpCall::WellKnown | HttpCall::WellKnownLegacy);
         if let Ok(ip) = addr.host().parse::<std::net::IpAddr>()
-            && !cleartext_allowed(ip)
+            && !(if secret {
+                secret_cleartext_allowed(ip)
+            } else {
+                cleartext_allowed(ip)
+            })
         {
             return Err(HttpError::Refused);
         }

@@ -66,8 +66,8 @@ fn http_refuses_a_lan_name_that_resolves_public() {
             let h = HttpGateway::with_resolver(HttpConfig::default(), Fixed::new(ips));
             let r = bounded(h.request(&addr, &HttpCall::WellKnown, None, None)).await;
             assert!(matches!(r, Err(HttpError::Refused)), "{ips:?}");
-            let r =
-                bounded(h.request(&addr, &HttpCall::Pair, None, Some(b"{}".to_vec().into()))).await;
+            let r = bounded(h.request(&addr, &HttpCall::Login, None, Some(b"{}".to_vec().into())))
+                .await;
             assert!(matches!(r, Err(HttpError::Refused)), "{ips:?}");
         }
     })
@@ -140,6 +140,60 @@ fn ws_connects_to_the_resolved_private_address() {
         fogar_ports::gateway::LinkSession::close(&mut s, 1000, "bye")
             .await
             .unwrap();
+    })
+}
+
+/// Option B (NV-1): a call carrying a secret never goes in clear text to a LAN address, even
+/// when the first resolved address is loopback. The mock on 127.0.0.1 would answer, so "no
+/// request seen" proves no byte left.
+#[test]
+fn secret_dial_refuses_lan() {
+    run_async(async {
+        let s = MockHttpServer::start(HttpRoutes::fogar()).await.unwrap();
+        let addr = GatewayAddr::parse(&format!("green-house:{}", s.addr().port())).unwrap();
+        for ips in [&["192.168.1.19"][..], &["127.0.0.1", "192.168.1.19"]] {
+            let h = HttpGateway::with_resolver(HttpConfig::default(), Fixed::new(ips));
+            let body = Some(br#"{"username":"u","password":"p"}"#.to_vec().into());
+            let r = bounded(h.request(&addr, &HttpCall::Login, None, body)).await;
+            assert!(matches!(r, Err(HttpError::Refused)), "{ips:?}");
+            let tok = secrecy::SecretString::from("t");
+            let r = bounded(h.request(&addr, &HttpCall::Logout, Some(&tok), None)).await;
+            assert!(matches!(r, Err(HttpError::Refused)), "{ips:?}");
+            let call = HttpCall::Events { audio: false };
+            let r = bounded(h.open_stream(&addr, &call, &tok, None, None)).await;
+            assert!(matches!(r, Err(HttpError::Refused)), "{ips:?}");
+        }
+        assert!(
+            s.routes().seen().is_empty(),
+            "no request reached the gateway"
+        );
+        let gw = MockGateway::start(MockConfig::default()).await.unwrap();
+        let addr = GatewayAddr::parse(&format!("green-house:{}", gw.addr().port())).unwrap();
+        let link = WsGatewayLink::with_resolver(
+            WsConfig::default(),
+            Fixed::new(&["127.0.0.1", "192.168.1.19"]),
+        );
+        let r = bounded(link.connect(&addr, WsRoute::Stream)).await;
+        assert!(matches!(r, Err(LinkError::NotConfigured)));
+    })
+}
+
+/// Discovery carries no secret: a LAN gateway is still found (the loopback address answers
+/// first, so the test never dials the LAN one).
+#[test]
+fn well_known_still_allowed_on_lan() {
+    run_async(async {
+        let s = MockHttpServer::start(HttpRoutes::fogar()).await.unwrap();
+        let addr = GatewayAddr::parse(&format!("green-house:{}", s.addr().port())).unwrap();
+        let h = HttpGateway::with_resolver(
+            HttpConfig::default(),
+            Fixed::new(&["127.0.0.1", "192.168.1.19"]),
+        );
+        for call in [HttpCall::WellKnown, HttpCall::WellKnownLegacy] {
+            let r = bounded(h.request(&addr, &call, None, None)).await;
+            assert!(!matches!(r, Err(HttpError::Refused)), "{call:?}");
+        }
+        assert_eq!(s.routes().seen().len(), 2);
     })
 }
 

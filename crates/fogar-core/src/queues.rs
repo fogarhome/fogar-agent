@@ -19,10 +19,10 @@
 //! | link state / health | many -> readers | `watch` (1) | coalesce: latest value wins |
 //! | IPC connections | IPC adapter -> service | `IPC_MAX_CONNS` concurrent (subscribers included) | further accepts wait (the accept branch is disabled while full); a connection idle for `Config::ipc_idle_timeout` (30 s) is closed, so silent clients cannot hold the slots; a SUBSCRIBED connection is exempt from the idle close but each push runs under `write_timeout` and a miss closes it |
 //! | status subscription | link view -> each subscribed connection | `watch` (1) | coalesce: latest value wins, a push is skipped when the status did not change; never a backlog |
-//! | pairing generation | IPC pair/unpair -> link | `watch` (1) | coalesce: the link only needs "the record changed", then re-reads it |
+//! | account generation | IPC login/logout -> link | `watch` (1) | coalesce: the link only needs "the account changed", then re-reads it |
 //! | reconnect request | IPC reconnect -> parked link | `watch` (1) | coalesce: many clicks are one new attempt; a request seen before the link parked is discarded |
 //! | discovery probes | IPC `Discover` -> gateway `/.well-known` | one `JoinSet` per request, at most `MAX_TAILNET_PEERS + 2` probes (saved, local, tailnet peers) | no queue: every probe runs at once under `probe_timeout`, after the tailnet query under `tailnet_timeout`; a cancelled request drops the set and aborts them |
-//! | pairing operations | IPC connections -> gateway `/pair` | `PAIRING` in flight | admission control: a second `Pair` gets `PairFailure::Busy` at once (`try_acquire`); `Unpair` waits for the running one, which is bounded by its HTTP deadlines |
+//! | account operations | IPC connections -> gateway `/auth/login`, `/auth/logout` | `ACCOUNT` in flight | admission control: a second `Login` gets `LoginFailure::Busy` at once (`try_acquire`); `Logout` waits for the running one, which is bounded by its deadlines (tailnet check, probe, `account_timeout`) |
 //!
 //! Stale uplink frames left in the `out` channel when a session dies are discarded (and counted)
 //! before the next session starts: they belonged to a turn that no longer exists.
@@ -50,8 +50,8 @@ pub const INBOUND: usize = 128;
 pub const ENGINE_COMMANDS: usize = 8;
 /// Concurrent local UI connections.
 pub const IPC_MAX_CONNS: usize = 4;
-/// Pairing operations in flight (one: the gateway's code is one-use).
-pub const PAIRING: usize = 1;
+/// Account operations (sign-in / sign-out) in flight: one, so two sign-ins cannot race to store.
+pub const ACCOUNT: usize = 1;
 /// Bytes of inbound frames (JSON text length / binary length) queued link -> engine at once
 /// (review sec#4): with 1 MiB frames, `INBOUND` messages alone would allow 128 MiB.
 pub const INBOUND_BYTES: usize = 4 << 20;

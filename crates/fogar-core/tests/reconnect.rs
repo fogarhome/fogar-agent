@@ -73,7 +73,7 @@ async fn close_4011_parks_and_keeps_the_key() {
     assert_eq!(rig.health.snapshot().link.label(), "parked_missing_scope");
     tokio::time::sleep(Duration::from_secs(600)).await;
     assert_eq!(rig.health.snapshot().stats.connect_attempts, 1);
-    assert!(rig.secrets.contains(SecretKey::GatewayPairing));
+    assert!(rig.secrets.contains(SecretKey::GatewayAccount));
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
 

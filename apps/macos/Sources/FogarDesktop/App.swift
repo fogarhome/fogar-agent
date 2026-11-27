@@ -1,4 +1,5 @@
 import AppKit
+import FogarWire
 import SwiftUI
 
 /// Fogar Desktop: the main window (sidebar + sections), Settings (⌘,) and the menu bar quick view.
@@ -67,14 +68,14 @@ struct FogarDesktopApp: App {
 }
 
 enum Seccion: String, CaseIterable, Identifiable {
-    case conversacion, estado, emparejar, ajustes
+    case conversacion, estado, iniciarSesion, ajustes
     var id: Self { self }
 
     var titulo: String {
         switch self {
         case .conversacion: "Conversación"
         case .estado: "Estado"
-        case .emparejar: "Emparejar"
+        case .iniciarSesion: "Iniciar sesión"
         case .ajustes: "Ajustes"
         }
     }
@@ -83,7 +84,7 @@ enum Seccion: String, CaseIterable, Identifiable {
         switch self {
         case .conversacion: "bubble.left.and.bubble.right"
         case .estado: "point.3.connected.trianglepath.dotted"
-        case .emparejar: "link"
+        case .iniciarSesion: "person.crop.circle"
         case .ajustes: "gearshape"
         }
     }
@@ -92,7 +93,7 @@ enum Seccion: String, CaseIterable, Identifiable {
         switch self {
         case .conversacion: "1"
         case .estado: "2"
-        case .emparejar: "3"
+        case .iniciarSesion: "3"
         case .ajustes: "4"
         }
     }
@@ -107,6 +108,14 @@ final class Navegacion {
 
     init() {
         seccion = UserDefaults.standard.string(forKey: "seccion").flatMap(Seccion.init(rawValue:)) ?? .estado
+    }
+
+    /// The account just went away: go where the person can sign in again. A revocation jumps
+    /// from anywhere, Ajustes included; this app's own logout from Ajustes stays there, so its
+    /// notice («el gateway no contestó…») remains on screen.
+    static func irAIniciarSesion(antes: WirePhase?, despues: WirePhase?, en seccion: Seccion, retirado: Bool) -> Bool {
+        guard despues == .notPaired, let antes, antes != .notPaired else { return false }
+        return seccion != .ajustes || retirado
     }
 }
 

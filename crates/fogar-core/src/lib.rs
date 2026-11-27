@@ -8,27 +8,28 @@
 //! - every queue is bounded and has a written full-policy ([`queues`]).
 #![forbid(unsafe_code)]
 
+pub mod account;
 pub mod agent;
 pub mod backoff;
 pub mod config;
 pub mod conversation;
 pub mod crashloop;
 pub mod heartbeat;
-pub mod pairing;
 pub mod queues;
 pub mod stats;
 pub mod turn;
 pub mod vad;
 
 mod capture;
+mod discovery;
 mod engine;
 mod ipc;
 mod link;
 mod playback;
 mod time;
 
+pub use account::AccountRecord;
 pub use agent::{Agent, AgentPorts, HealthProbe, NoHttp, NoIpc, NoTailnet, ShutdownReport};
 pub use config::Config;
 pub use link::LinkView;
-pub use pairing::PairingRecord;
 pub use stats::{Health, LinkState, StatsSnapshot};

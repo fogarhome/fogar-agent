@@ -7,23 +7,45 @@ import Testing
 /// app must parse and produce. If Rust changes it, IPC_VERSION bumps and these fail.
 @Suite struct GoldenJSON {
     @Test func eventDecodes() throws {
-        let json = #"{"type":"event","data":{"link":"ready","phase":"ready","gateway":{"address":"http://green-house:8004","name":"green-house","version":"1.29.0","client_name":"Mac de Sito"},"sessions":3,"turns_completed":7,"boot_mode":"normal","peer_check":"same_signer","transcriber":"up","tts":"down"}}"#
+        let json = #"{"type":"event","data":{"link":"ready","phase":"ready","gateway":{"address":"http://green-house:8004","name":"green-house","version":"1.29.0","client_name":"Mac de Sito","user":"Sito"},"sessions":3,"turns_completed":7,"boot_mode":"normal","peer_check":"same_signer","transcriber":"up","tts":"down"}}"#
         guard case .event(let s) = try WireCodec.decodeResponse(Data(json.utf8)) else {
             Issue.record("not an event"); return
         }
         #expect(s.phase == .ready)
         #expect(s.gateway?.name == "green-house")
         #expect(s.gateway?.client_name == "Mac de Sito")
+        #expect(s.gateway?.user == "Sito")
         #expect(s.sessions == 3 && s.turns_completed == 7)
         #expect(s.peer_check == .sameSigner)
     }
 
-    @Test func pairFailedAndDatalessDecode() throws {
-        guard case .pairFailed(let f) = try WireCodec.decodeResponse(
-            Data(#"{"type":"pair_failed","data":{"reason":"invalid_code"}}"#.utf8)) else {
-            Issue.record("not pair_failed"); return
+    /// IPC v5: the account answers.
+    @Test func accountAnswersDecode() throws {
+        guard case .loggedIn(let g) = try WireCodec.decodeResponse(
+            Data(#"{"type":"logged_in","data":{"address":"http://green-house:8004","name":"green-house","version":"1.29.0","client_name":"Mac de Sito","user":"Sito"}}"#.utf8)) else {
+            Issue.record("not logged_in"); return
         }
-        #expect(f.reason == .invalidCode)
+        #expect(g.name == "green-house" && g.user == "Sito")
+        guard case .loginFailed(let f) = try WireCodec.decodeResponse(
+            Data(#"{"type":"login_failed","data":{"reason":"needs_secure_address"}}"#.utf8)) else {
+            Issue.record("not login_failed"); return
+        }
+        #expect(f.reason == .needsSecureAddress)
+        guard case .loggedOut(let o) = try WireCodec.decodeResponse(
+            Data(#"{"type":"logged_out","data":{"gateway_reached":false}}"#.utf8)) else {
+            Issue.record("not logged_out"); return
+        }
+        #expect(!o.gateway_reached)
+    }
+
+    /// Pairing left the vocabulary in v5: an agent still sending it is not understood.
+    @Test func pairingIsGone() {
+        for json in [#"{"type":"pair_failed","data":{"reason":"invalid_code"}}"#, #"{"type":"unpaired"}"#] {
+            #expect(throws: (any Error).self) { try WireCodec.decodeResponse(Data(json.utf8)) }
+        }
+    }
+
+    @Test func datalessDecodes() throws {
         guard case .subscribed = try WireCodec.decodeResponse(Data(#"{"type":"subscribed"}"#.utf8)) else {
             Issue.record("not subscribed"); return
         }
@@ -61,12 +83,13 @@ import Testing
 
     /// Requests are compared as JSON objects: JSONEncoder's key order is not stable.
     @Test(arguments: [
-        (WireRequest.pair(WirePair(address: "green-house", code: "482913")),
-         #"{"type":"pair","data":{"address":"green-house","code":"482913"}}"#),
+        // Fixed test credentials only: a failing expectation prints both sides.
+        (WireRequest.login(WireLogin(address: "https://casa.ts.net", username: "sito", password: "p\"w")),
+         #"{"type":"login","data":{"address":"https://casa.ts.net","username":"sito","password":"p\"w"}}"#),
+        (.logout, #"{"type":"logout"}"#),
         (.hello(WireHello(version: 2)), #"{"type":"hello","data":{"version":2}}"#),
         (.subscribe, #"{"type":"subscribe"}"#),
         (.discover, #"{"type":"discover"}"#),
-        (.unpair, #"{"type":"unpair"}"#),
         (.subscribeConversation, #"{"type":"subscribe_conversation"}"#),
         (.sendText(WireSendText(text: "hola \"Fogar\"\n")), #"{"type":"send_text","data":{"text":"hola \"Fogar\"\n"}}"#),
         (.captureStart(WireCaptureStart(gesture: .hold)), #"{"type":"capture_start","data":{"gesture":"hold"}}"#),
@@ -79,6 +102,14 @@ import Testing
         let ours = try JSONSerialization.jsonObject(with: WireCodec.encode(request)) as? NSDictionary
         let theirs = try JSONSerialization.jsonObject(with: Data(golden.utf8)) as? NSDictionary
         #expect(ours == theirs)
+    }
+
+    @Test func loginNeverPrintsThePassword() {
+        let req = WireRequest.login(WireLogin(address: "https://casa.ts.net", username: "sito", password: "hunter2"))
+        for s in [String(describing: req), String(reflecting: req), "\(req)"] {
+            #expect(!s.contains("hunter2"), "\(s)")
+            #expect(s.contains("<redacted>"), "\(s)")
+        }
     }
 
     @Test func unknownResponseTypeIsAnError() {
@@ -108,15 +139,6 @@ import Testing
         #expect(throws: FrameError.tooLarge(maxFrameBytes + 1)) { try b.next() }
         #expect(try frame(Data(count: maxFrameBytes)).count == maxFrameBytes + 4)
     }
-}
-
-@Suite struct PairCodeParsing {
-    @Test(arguments: [("482913", "482913"), ("482 913", "482913"), ("482-913", "482913"),
-                      ("482\u{00A0}913", "482913"), (" 482913\n", "482913")])
-    func accepts(typed: String, digits: String) { #expect(parsePairCode(typed) == digits) }
-
-    @Test(arguments: ["48291", "4829134", "48291a", "٤٨٢٩١٣", "", "482_913"])
-    func rejects(typed: String) { #expect(parsePairCode(typed) == nil) }
 }
 
 /// End to end over a real Unix socket against an in-test listener: framing + connection.
@@ -204,7 +226,7 @@ private func socketEn(_ path: String) -> Int32 {
         defer { try? FileManager.default.removeItem(atPath: dir) }
         let path = dir + "/a.sock"
         let uno = try frame(Data(#"{"type":"subscribed"}"#.utf8))
-        let dos = try frame(Data(#"{"type":"unpaired"}"#.utf8))
+        let dos = try frame(Data(#"{"type":"reconnecting"}"#.utf8))
         let params = NWParameters.tcp
         params.requiredLocalEndpoint = .unix(path: path)
         let l = try NWListener(using: params)
@@ -223,7 +245,7 @@ private func socketEn(_ path: String) -> Int32 {
         let c = try await FramedConnection.connect(path: path, verificacion: .rutaYUsuario)
         defer { c.cancel() }
         #expect(try WireCodec.decodeResponse(await c.receive()) == .subscribed)
-        #expect(try WireCodec.decodeResponse(await c.receive()) == .unpaired)
-        #expect(try WireCodec.decodeResponse(await c.receive()) == .unpaired)
+        #expect(try WireCodec.decodeResponse(await c.receive()) == .reconnecting)
+        #expect(try WireCodec.decodeResponse(await c.receive()) == .reconnecting)
     }
 }

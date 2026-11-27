@@ -15,7 +15,7 @@
 # com.fogar.agent, microphone entitlement, never get-task-allow), then the app (microphone
 # entitlement + NSMicrophoneUsageDescription: macOS attributes the agent's microphone to the app).
 # Ad hoc ("-") when there is no identity: then neither side trusts the other beyond the uid
-# (the agent refuses pair/unpair, the app refuses the conversation; ADR-0002 amendment).
+# (the agent refuses login/logout, the app refuses the conversation; ADR-0002 amendment).
 # FOGAR_SIGN_IDENTITY overrides the identity. CARGO_TARGET_DIR is honoured for the agent build.
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)

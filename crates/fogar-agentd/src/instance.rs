@@ -2,7 +2,7 @@
 //! agents side by side, each with its own state directory).
 //!
 //! The macOS Keychain is per user, not per directory: without this every instance would share the
-//! default item (`com.fogar.agent` / `gateway_pairing`) and one instance's pairing or unpairing
+//! default item (`com.fogar.agent` / `gateway_account`) and one instance's sign-in or sign-out
 //! would change the others'. With an explicit state directory other than the default one, the
 //! agent uses its own Keychain service, derived from the directory so the same directory always
 //! finds its own item again. The default (no `--state-dir`, or the default path spelled out)
@@ -29,7 +29,7 @@ pub(crate) fn keychain_service_canonical(
 /// is none), else `<base>.dir-<16 hex digits>`, a stable FNV-1a 64 hash of the path's bytes.
 ///
 /// FNV-1a and not `DefaultHasher`: its output is not guaranteed across Rust releases, and a
-/// different service after a toolchain update would lose the pairing. The hash only separates
+/// different service after a toolchain update would lose the account. The hash only separates
 /// instances; it guards nothing (all instances run as the same user and could read each other's
 /// items anyway).
 pub(crate) fn keychain_service(base: &str, state_dir: &Path, default: Option<&Path>) -> String {

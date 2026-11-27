@@ -115,14 +115,18 @@ impl IpcServer for UdsIpcServer {
 #[derive(Debug)]
 pub struct UdsConn {
     stream: UnixStream,
-    buf: Vec<u8>,
+    /// Wiped on drop: it holds login frames (the password).
+    buf: Zeroizing<Vec<u8>>,
 }
 
 impl UdsConn {
     fn new(stream: UnixStream) -> Self {
         Self {
             stream,
-            buf: Vec::with_capacity(512),
+            // 8 KiB: a typical login frame (even a 1024-byte escaped password) fits without
+            // reallocating. A frame with a very long address, or one queued behind a big frame,
+            // can still grow the buffer and free one unwiped partial copy.
+            buf: Zeroizing::new(Vec::with_capacity(8 * 1024)),
         }
     }
 }

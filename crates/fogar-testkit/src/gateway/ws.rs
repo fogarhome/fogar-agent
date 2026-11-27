@@ -118,7 +118,7 @@ impl MockGateway {
     pub fn addr(&self) -> fogar_ports::gateway::GatewayAddr {
         fogar_ports::gateway::GatewayAddr::parse(&self.addr.to_string()).expect("mock addr")
     }
-    /// The REST routes served on the same port (`/.well-known/fogar-gateway`, `POST /pair`).
+    /// The REST routes served on the same port (`/.well-known/fogar-gateway`, `/auth/*`).
     pub fn routes(&self) -> HttpRoutes {
         self.routes.clone()
     }

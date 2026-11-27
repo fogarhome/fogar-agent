@@ -23,7 +23,7 @@
 //! must be attributable to the verified process, else the connection is closed: none of its bytes
 //! were queued before the verification, the token read after the frame is still the verified one
 //! (the verified process wrote last) and nothing else is queued or buffered behind it (nobody else
-//! wrote after it). The companion app therefore sends `Pair`/`Unpair` only after its `Hello` was
+//! wrote after it). The companion app therefore sends `Login`/`Logout` only after its `Hello` was
 //! answered, and waits for each answer before writing again.
 //! This is a mitigation, not per-message identity: a write that blocked before the verification,
 //! or I/O by the genuine app on an inherited fd, defeats it (open residuals, ADR-0002).
@@ -486,7 +486,7 @@ impl IpcServer for MacIpcServer {
 #[derive(Debug)]
 pub struct MacIpcConn {
     stream: UnixStream,
-    /// Wiped on drop: a half-received `Pair` request carries the pairing code.
+    /// Wiped on drop: a half-received `Login` request carries the password.
     buf: Zeroizing<Vec<u8>>,
     /// `Some` on a verified (`SameSigner`) connection: who may send privileged requests.
     verified: Option<Attribution>,
@@ -516,7 +516,10 @@ impl MacIpcConn {
     fn new(stream: UnixStream, verified: Option<Attribution>) -> Self {
         Self {
             stream,
-            buf: Zeroizing::new(Vec::with_capacity(512)),
+            // 8 KiB: a typical login frame (even a 1024-byte escaped password) fits without
+            // reallocating. A frame with a very long address, or one queued behind a big frame,
+            // can still grow the buffer and free one unwiped partial copy.
+            buf: Zeroizing::new(Vec::with_capacity(8 * 1024)),
             verified,
         }
     }
@@ -762,13 +765,6 @@ mod tests {
             .to_vec()
     }
 
-    fn pair_req() -> IpcRequest {
-        IpcRequest::Pair {
-            address: "evil:8004".into(),
-            code: fogar_ports::ipc::PairCode::parse("482913"),
-        }
-    }
-
     /// ADR-0002 attack: whoever shares the verified connection's fd cannot send a privileged
     /// request; the verified process itself still can (also after a pipelined `Hello`).
     #[test]
@@ -777,22 +773,19 @@ mod tests {
         fogar_testkit::run_async(async {
             let hello = wire(&IpcRequest::Hello { version: 2 });
 
-            // Legit: Hello sent before the verification, Pair after it, both by us.
+            // Legit: Hello sent before the verification, Logout after it, both by us.
             let (mut conn, mut cli) = verified_pair(true, &hello);
             assert!(matches!(
                 conn.recv().await,
                 Ok(Some(IpcRequest::Hello { .. }))
             ));
-            cli.write_all(&wire(&pair_req())).expect("write");
-            assert!(matches!(
-                conn.recv().await,
-                Ok(Some(IpcRequest::Pair { .. }))
-            ));
+            cli.write_all(&wire(&IpcRequest::Logout)).expect("write");
+            assert!(matches!(conn.recv().await, Ok(Some(IpcRequest::Logout))));
 
             // Another process (cat) writes on the shared fd: refused, connection closes.
             let (mut conn, cli) = verified_pair(false, &[]);
             let f = std::env::temp_dir().join(format!("fogar-unit-frame-{}", std::process::id()));
-            std::fs::write(&f, wire(&pair_req())).expect("frame file");
+            std::fs::write(&f, wire(&IpcRequest::Logout)).expect("frame file");
             let out = std::process::Stdio::from(std::os::fd::OwnedFd::from(
                 cli.try_clone().expect("dup"),
             ));
@@ -810,11 +803,11 @@ mod tests {
             // A harmless request from it would still pass (the core answers it to anyone).
 
             // Written before the verification (the pre-exec parent): refused.
-            let (mut conn, _cli) = verified_pair(true, &wire(&pair_req()));
+            let (mut conn, _cli) = verified_pair(true, &wire(&IpcRequest::Logout));
             assert!(conn.recv().await.is_err());
 
             // Something queued behind the privileged frame: nobody can tell who wrote last.
-            let mut both = wire(&pair_req());
+            let mut both = wire(&IpcRequest::Logout);
             both.extend(wire(&IpcRequest::Status));
             let (mut conn, mut cli) = verified_pair(false, &[]);
             cli.write_all(&both).expect("write");

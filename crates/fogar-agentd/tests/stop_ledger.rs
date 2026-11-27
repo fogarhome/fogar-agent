@@ -170,7 +170,7 @@ fn plain_ws_gateway_prints_a_loud_warning() {
 
 /// Round-2 review F3: the stderr rate limit must never swallow a terminal state. The gateway
 /// flaps (`ready`, then a normal 1000 close) until the burst is used up, then revokes the key
-/// (1008 `revoked` -> the pairing is deleted, NotPaired; S1 spec §0). The `link not_paired` line
+/// (4200 -> the account is deleted, NotPaired; spec §0). The `link not_paired` line
 /// must still appear, and the count of
 /// suppressed lines must be reported (here: at the latest when the daemon stops).
 #[test]
@@ -198,7 +198,7 @@ fn rate_limit_never_swallows_parked_and_reports_suppressed_lines() {
             let (code, reason) = if n <= FLAPS {
                 (1000u16, "")
             } else {
-                (1008u16, "revoked")
+                (4200u16, "credential revoked")
             };
             let _ = ws
                 .close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
@@ -224,7 +224,7 @@ fn rate_limit_never_swallows_parked_and_reports_suppressed_lines() {
         let parked = l.contains("link not_paired");
         if parked {
             // The revocation names its close, like the backoff lines do.
-            assert!(l.contains("(last close 1008 -> Repair)"), "{l}");
+            assert!(l.contains("(last close 4200 -> Repair)"), "{l}");
         }
         all.push((Instant::now(), l));
         // Before the fix this line never came once the flaps had used up the burst.

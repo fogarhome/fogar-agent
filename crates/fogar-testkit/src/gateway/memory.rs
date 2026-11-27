@@ -171,7 +171,8 @@ impl GatewayLink for FakeGatewayLink {
         addr: &fogar_ports::gateway::GatewayAddr,
         route: WsRoute,
     ) -> Result<FakeSession, LinkError> {
-        if !super::http::policy_allows(addr) {
+        // Every session carries the account token.
+        if !super::http::policy_allows(addr, true) {
             return Err(LinkError::NotConfigured);
         }
         let fail = self

@@ -2,7 +2,7 @@ import FogarWire
 import ServiceManagement
 import SwiftUI
 
-/// Ajustes: only what is real today. Unpair (the agent forgets the key), the agent's registration
+/// Ajustes: only what is real today. Sign out (the agent forgets the account), the agent's registration
 /// with launchd (SMAppService.agent), appearance, open at login (SMAppService, the system's own
 /// login item), and what this build is. Shown as a section of the
 /// window and as the Settings scene (⌘,).
@@ -14,7 +14,7 @@ struct AjustesView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 36) {
                 if enVentana { Text("Ajustes").titularFogar() }
-                Emparejamiento(enVentana: enVentana)
+                Cuenta(enVentana: enVentana)
                 AgenteBloque()
                 AparienciaBloque()
                 InicioSesion()
@@ -47,63 +47,70 @@ private struct Bloque<Content: View>: View {
     }
 }
 
-private struct Emparejamiento: View {
+private struct Cuenta: View {
     let enVentana: Bool
     @Environment(AgentLink.self) private var link
     @Environment(Navegacion.self) private var nav
     @Environment(\.openWindow) private var openWindow
     @State private var confirmar = false
     @State private var trabajando = false
-    @State private var error: String?
+    /// What the last «Cerrar sesión» left: outlives the switch to «sin sesión» that follows it.
+    @State private var aviso: (texto: String, tono: Tono)?
 
     var body: some View {
-        Bloque(titulo: "Emparejamiento") {
+        Bloque(titulo: "Cuenta") {
             switch link.state {
             case .live(let s) where s.phase != .notPaired:
-                Text(s.gateway.map { "Este Mac está emparejado con \($0.name) (\($0.address))." } ?? "Este Mac está emparejado.")
+                Text(s.gateway.map { "\(Textos.cuenta($0))." } ?? "Este Mac tiene una sesión iniciada.")
                     .font(Tipo.cuerpo).foregroundStyle(Color.hueso)
                     .fixedSize(horizontal: false, vertical: true)
-                Text("Al desemparejarlo, el agente borra su clave y deja de hablar con el gateway. Para volver, hará falta un código nuevo.")
+                Text("Al cerrar sesión, el agente avisa al gateway, borra la sesión del Llavero de este Mac y deja de hablar con Fogar. Para volver, inicia sesión otra vez.")
                     .meta().fixedSize(horizontal: false, vertical: true)
-                Button("Desemparejar este Mac…") { confirmar = true }
+                Button("Cerrar sesión…") { confirmar = true }
                     .buttonStyle(Pildora(ocupado: trabajando))
                     .disabled(trabajando)
                     .confirmationDialog(
-                        s.gateway.map { "¿Desemparejar este Mac de \($0.name)?" } ?? "¿Desemparejar este Mac?",
+                        s.gateway.map { "¿Cerrar sesión en \($0.name)?" } ?? "¿Cerrar sesión?",
                         isPresented: $confirmar
                     ) {
-                        Button("Desemparejar", role: .destructive, action: desemparejar)
+                        Button("Cerrar sesión", role: .destructive, action: cerrarSesion)
                         Button("Cancelar", role: .cancel) {}
                     } message: {
-                        Text("El agente borra la clave de este Mac y se desconecta. Para volver, necesitarás un código nuevo del gateway.")
+                        Text("El agente borra la sesión de este Mac y se desconecta. Para volver, necesitarás tu usuario y tu contraseña.")
                     }
             case .live:
-                Text("Este Mac no está emparejado.").font(Tipo.cuerpo).foregroundStyle(Color.hueso)
-                Button("Emparejar este Mac…") {
-                    nav.seccion = .emparejar
+                Text("No hay ninguna sesión iniciada en este Mac.").font(Tipo.cuerpo).foregroundStyle(Color.hueso)
+                Button("Iniciar sesión…") {
+                    nav.seccion = .iniciarSesion
                     if !enVentana { openWindow(id: "main") }
                 }
                 .buttonStyle(Pildora())
             default:
-                Text("Sin el agente no se sabe con qué gateway está emparejado este Mac.")
+                Text("Sin el agente no se sabe si este Mac tiene una sesión iniciada.")
                     .font(Tipo.cuerpo).suave()
             }
-            if let error {
+            if let aviso {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    EstadoIcono(tono: .bad, tam: 12)
-                    Text(error).font(Tipo.cuerpo).foregroundStyle(Color.hueso)
+                    EstadoIcono(tono: aviso.tono, tam: 12)
+                    Text(aviso.texto).font(Tipo.cuerpo).foregroundStyle(Color.hueso)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .accessibilityElement(children: .combine)
             }
         }
     }
 
-    private func desemparejar() {
+    private func cerrarSesion() {
         trabajando = true
-        error = nil
+        aviso = nil
         Task {
             defer { trabajando = false }
-            do { try await link.unpair() } catch { self.error = Textos.fallo(error) }
+            do {
+                let alcanzado = try await link.logout()
+                aviso = (Textos.sesionCerrada(gatewayAlcanzado: alcanzado), alcanzado ? .ok : .warn)
+            } catch {
+                aviso = (Textos.fallo(error), .bad)
+            }
         }
     }
 }

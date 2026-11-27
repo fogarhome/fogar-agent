@@ -3,12 +3,13 @@
 //!
 //! Why not hyper/reqwest: the port needs a closed set of fixed requests, one per connection, no
 //! redirects, no pooling, no compression, and a body read into ONE pre-sized wiped buffer.
-//! hyper would add ~10 crates, its own buffering (copies of the `/pair` reply we cannot wipe)
-//! and connection reuse we would have to switch off. A small client here is easier to review.
-//! shortcut: over https the decrypted `/pair` reply (client_key) and the bearer token written
-//! on every request also pass through rustls' internal plaintext buffers, which are not
-//! zeroized; only our own copies are wiped. Upgrade
-//! if a rustls release offers zeroizing buffers.
+//! hyper would add ~10 crates, its own buffering (copies of the `/auth/login` body and reply we
+//! cannot wipe) and connection reuse we would have to switch off. A small client here is easier
+//! to review.
+//! shortcut: over https the login body (the password), its reply (the account token) and the
+//! bearer token written on every request also pass through rustls' internal plaintext buffers,
+//! which are not zeroized; only our own copies are wiped. Upgrade if a rustls release offers
+//! zeroizing buffers.
 //!
 //! Bounds: response head <= `MAX_HEAD_BYTES`, body <= the call's `max_body()` (checked from
 //! `Content-Length` before reading, and while reading when the length is unknown or `chunked`);
@@ -116,11 +117,14 @@ impl<R: Resolver> HttpGateway<R> {
         last_event_id: Option<&str>,
         body: Option<Zeroizing<Vec<u8>>>,
     ) -> Result<Conn, HttpError> {
+        // Everything but discovery carries the password or the token.
+        let secret = !matches!(call, HttpCall::WellKnown | HttpCall::WellKnownLegacy);
         let mut s = dial(
             &self.resolver,
             self.tls.as_ref(),
             addr,
             self.cfg.connect_timeout,
+            secret,
         )
         .await
         .map_err(|e| match e {

@@ -3,19 +3,8 @@ import Foundation
 // Hand-written companions to the generated Wire.swift (never edit that file by hand).
 
 /// IPC protocol version this app speaks (`fogar_ports::ipc::IPC_VERSION`). 2 = S1, 3 = reconnect,
-/// 4 = conversation (S2).
-public let ipcVersion: UInt32 = 4
-
-/// The pairing code as the agent accepts it (`PairCode::parse`): whitespace (any kind) and `-`
-/// removed, then exactly 6 ASCII digits. `nil` means "do not send": a typo must never spend one of
-/// the gateway's 5 attempts.
-public func parsePairCode(_ typed: String) -> String? {
-    let digits = typed.unicodeScalars.filter {
-        !CharacterSet.whitespacesAndNewlines.contains($0) && $0 != "-"
-    }
-    guard digits.count == 6, digits.allSatisfy({ ("0"..."9").contains($0) }) else { return nil }
-    return String(String.UnicodeScalarView(digits))
-}
+/// 4 = conversation (S2), 5 = account (login/logout; pair/unpair removed).
+public let ipcVersion: UInt32 = 5
 
 public enum WireCodec {
     public static func encode(_ value: some Encodable) throws -> Data {
@@ -29,6 +18,13 @@ public enum WireCodec {
     public static func decodeRequest(_ body: Data) throws -> WireRequest {
         try JSONDecoder().decode(WireRequest.self, from: body)
     }
+}
+
+/// `print` and interpolation of a login (or a `WireRequest` holding one) never show the password.
+/// `dump` and `Mirror` still do: never use them on a request.
+extension WireLogin: CustomStringConvertible, CustomDebugStringConvertible {
+    public var description: String { "WireLogin(address: \(address), username: \(username), password: <redacted>)" }
+    public var debugDescription: String { description }
 }
 
 // MARK: Tolerant reading of the conversation (an agent newer than this app)

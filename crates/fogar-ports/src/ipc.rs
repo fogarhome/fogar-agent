@@ -71,40 +71,46 @@ impl PeerIdentity {
     }
 }
 
-/// A 6-digit pairing code as typed by the person (spaces allowed, client-protocol §0). One-use
-/// and short-lived, but still a credential while open: redacted `Debug`, wiped on drop.
-#[derive(Clone, PartialEq, Eq)]
-pub struct PairCode(secrecy::zeroize::Zeroizing<String>);
+/// Largest password accepted (UTF-8 bytes; the gateway caps it at 1024).
+pub const PASSWORD_MAX_BYTES: usize = 1024;
 
-impl PairCode {
-    /// Keeps the code only if it is exactly 6 ASCII digits once whitespace (any kind, e.g. a
-    /// pasted no-break space) and `-` are removed, so a typo never spends one of the gateway's
-    /// 5 attempts.
+/// The person's account password, exactly as typed (never trimmed). It crosses the IPC once,
+/// for `Login`: redacted `Debug`, wiped on drop, never stored.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Password(secrecy::zeroize::Zeroizing<String>);
+
+impl Password {
+    /// Keeps the password only if it is 1..=`PASSWORD_MAX_BYTES` bytes.
     pub fn parse(typed: &str) -> Option<Self> {
-        let digits: String = typed
-            .chars()
-            .filter(|c| !c.is_whitespace() && *c != '-')
-            .collect();
-        (digits.len() == 6 && digits.bytes().all(|b| b.is_ascii_digit()))
-            .then(|| Self(secrecy::zeroize::Zeroizing::new(digits)))
+        (!typed.is_empty() && typed.len() <= PASSWORD_MAX_BYTES)
+            .then(|| Self(secrecy::zeroize::Zeroizing::new(typed.to_owned())))
     }
-    pub fn digits(&self) -> &str {
+    pub fn expose(&self) -> &str {
         &self.0
     }
 }
 
-impl std::fmt::Debug for PairCode {
+impl std::fmt::Debug for Password {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("PairCode(<redacted>)")
+        f.write_str("Password(<redacted>)")
     }
 }
 
-/// Requests a UI may send. Closed set (no generic "exec"). The address in `Pair` is the person's
+/// What the person typed to sign in. `password` is `None` when it is empty or over
+/// `PASSWORD_MAX_BYTES`: the core answers `BadCredentialsInput` without calling the gateway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginForm {
+    pub address: String,
+    pub username: String,
+    pub password: Option<Password>,
+}
+
+/// Requests a UI may send. Closed set (no generic "exec"). The address in `Login` is the person's
 /// raw input; the core validates it (`GatewayAddr::parse`).
 ///
-/// Authorization (IPC-4): `Pair` and `Unpair` change where the agent sends the user's voice, and
-/// `Reconnect` makes the agent spend the stored key to take the conversation back from another
-/// session of the user, so the core answers the three only for a `PeerCheck::SameSigner` peer; a
+/// Authorization (IPC-4): `Login` and `Logout` change where the agent sends the user's voice and
+/// under whose account, and `Reconnect` makes the agent spend the stored key to take the conversation back from another
+/// session of the user, so the core answers them only for a `PeerCheck::SameSigner` peer; a
 /// `UidOnly` peer gets `Refused` unless the composition root explicitly opts in for development
 /// builds. Everything else is read-only and open to any authenticated peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,15 +128,12 @@ pub enum IpcRequest {
     Subscribe,
     /// Look for gateways (saved address, this Mac, the tailnet peers). Answered with `Discovered`.
     Discover,
-    /// Redeem a pairing code at a gateway. Answered with `Paired` or `PairFailed`. `code` is
-    /// `None` when what was typed is not 6 digits: the core answers `BadCode` without calling
-    /// the gateway.
-    Pair {
-        address: String,
-        code: Option<PairCode>,
-    },
-    /// Forget the pairing (delete the record) and stop the link. Answered with `Unpaired`.
-    Unpair,
+    /// Sign in to a gateway with the person's account (v5). Answered with `LoggedIn` or
+    /// `LoginFailed`. Boxed so the enum (and every queue slot carrying it) stays its v4 size.
+    Login(Box<LoginForm>),
+    /// Sign out: tell the gateway (best effort), delete the account from the secret store and
+    /// stop the link. Answered with `LoggedOut`.
+    Logout,
     /// The person asks to connect again after the link parked for a reason only they can settle
     /// (gateway close 4011 "missing scope" or 4020/4021 agent refused once the admin fixed it,
     /// 4003 once the gateway was updated). Answered with `Reconnecting` (one new attempt; progress arrives as status
@@ -138,7 +141,7 @@ pub enum IpcRequest {
     Reconnect,
     // ---- conversation (v4). Strictly `PeerCheck::SameSigner`: they carry or reveal user
     // content and can open the microphone. NOT `may_pair()`: the development uid-only opt-in
-    // for pairing never extends to these. ----
+    // for signing in never extends to these. ----
     /// From now on the agent pushes `IpcResponse::Conversation` (latest view only). Answered
     /// with `ConversationSubscribed` + one `Conversation`. Only a subscribed connection may
     /// start a take or confirm a turn as visible.
@@ -173,7 +176,7 @@ pub enum IpcRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LinkPhase {
-    /// No pairing record: the UI shows the pairing screen.
+    /// No account (wire value kept from S1): the UI shows the sign-in screen.
     NotPaired,
     Connecting,
     Ready,
@@ -185,18 +188,20 @@ pub enum LinkPhase {
     Stopping,
 }
 
-/// The gateway the agent is paired with. Never carries the key.
+/// The gateway the agent is signed in to. Never carries the token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct GatewayInfo {
     /// `http(s)://host:port` form of the address.
     pub address: String,
-    /// The gateway's `name` (e.g. "green-house").
+    /// The home's name (the gateway's `name`, e.g. "green-house").
     pub name: String,
     /// Gateway version from the last `/.well-known` or `ready`; empty when unknown.
     pub version: String,
     /// The name this client was registered with (the admin may have overridden ours).
     pub client_name: String,
+    /// The signed-in person's display name; empty when unknown.
+    pub user: String,
 }
 
 impl GatewayInfo {
@@ -206,7 +211,12 @@ impl GatewayInfo {
             name,
             version,
             client_name,
+            user: String::new(),
         }
+    }
+    pub fn with_user(mut self, user: String) -> Self {
+        self.user = user;
+        self
     }
 }
 
@@ -227,8 +237,8 @@ pub struct StatusReport {
     /// Human-readable link label (as in slice 0), for logs and the CLI.
     pub link: String,
     pub phase: LinkPhase,
-    /// `None` when not paired.
-    pub gateway: Option<GatewayInfo>,
+    /// `None` when not signed in. Boxed so pushed status events stay small in every queue.
+    pub gateway: Option<Box<GatewayInfo>>,
     pub sessions: u64,
     pub turns_completed: u64,
     pub boot_mode: String,
@@ -256,7 +266,7 @@ impl StatusReport {
         Self {
             link,
             phase,
-            gateway,
+            gateway: gateway.map(Box::new),
             sessions,
             turns_completed,
             boot_mode,
@@ -271,7 +281,7 @@ impl StatusReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct GatewayCandidate {
-    /// `http(s)://host:port`, ready to send back in `Pair`.
+    /// `http(s)://host:port`, ready to send back in `Login`.
     pub address: String,
     pub name: String,
     pub version: String,
@@ -287,27 +297,34 @@ impl GatewayCandidate {
     }
 }
 
-/// Why pairing did not happen. Each maps to one sentence in the UI.
+/// Why signing in did not happen. Each maps to one sentence in the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum PairFailure {
+pub enum LoginFailure {
     /// The address does not parse.
     BadAddress,
-    /// The code is not 6 digits (never sent to the gateway).
-    BadCode,
+    /// The password would travel in clear text over the home network: use `https://`, a
+    /// `.ts.net` name or a tailnet address (option B). Nothing was sent.
+    NeedsSecureAddress,
+    /// Username or password empty or too long (never sent to the gateway).
+    BadCredentialsInput,
     /// Nothing answered at that address.
     Unreachable,
     /// Something answered, but it is not a Fogar gateway.
     NotAGateway,
-    /// 400: unknown, expired, used or mistyped code. "Pide otro código si estás seguro."
-    InvalidCode,
-    /// 5xx / no answer after sending: the code may still be open; retry with the same code.
+    /// 401: wrong username or password.
+    InvalidCredentials,
+    /// 403 `insecure_transport`: the gateway refuses passwords over this path.
+    InsecureTransport,
+    /// 429: too many attempts; wait and retry.
+    TooManyAttempts,
+    /// 5xx, an unexpected answer or none after sending.
     GatewayError,
-    /// The key arrived but could not be stored: it is lost, ask for a new code.
+    /// Signed in, but the account could not be stored.
     StorageFailed,
-    /// Already paired: unpair first.
-    AlreadyPaired,
-    /// Another pairing is in progress.
+    /// Already signed in: sign out first.
+    AlreadySignedIn,
+    /// Another sign-in is in progress.
     Busy,
 }
 
@@ -326,9 +343,13 @@ pub enum IpcResponse {
     /// Pushed WITHOUT a request after `Subscribe`: the latest status.
     Event(StatusReport),
     Discovered(Vec<GatewayCandidate>),
-    Paired(GatewayInfo),
-    PairFailed(PairFailure),
-    Unpaired,
+    LoggedIn(Box<GatewayInfo>),
+    LoginFailed(LoginFailure),
+    /// The account is gone from this machine (always, even when the gateway did not answer).
+    /// `gateway_reached` = the gateway answered the logout.
+    LoggedOut {
+        gateway_reached: bool,
+    },
     /// `Reconnect` accepted: the parked link makes one new attempt.
     Reconnecting,
     /// `SubscribeConversation` accepted; one `Conversation` follows, then one per change.
@@ -352,13 +373,14 @@ pub enum IpcResponse {
 }
 
 /// IPC protocol version spoken by this build. 2 = S1 (subscribe, discover, pair, unpair);
-/// 3 = reconnect; 4 = conversation (S2).
-pub const IPC_VERSION: u32 = 4;
+/// 3 = reconnect; 4 = conversation (S2); 5 = account (login/logout, `GatewayInfo::user`;
+/// pair/unpair removed).
+pub const IPC_VERSION: u32 = 5;
 
 // ---- conversation (IPC v4, spec S2) ------------------------------------------------------
 //
 // Everything below carries the user's content. The core answers these requests only for a
-// `PeerCheck::SameSigner` peer (like Pair), never logs the text, and every type here prints
+// `PeerCheck::SameSigner` peer (like Login), never logs the text, and every type here prints
 // sizes, not content, in `Debug`.
 
 /// Largest text a UI may send in one `SendText` (UTF-8 bytes; the core validates).
@@ -627,19 +649,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pair_code_accepts_what_people_paste() {
-        for ok in ["482913", "482 913", "482-913", "482\u{a0}913", " 482913\t"] {
-            assert_eq!(
-                PairCode::parse(ok)
-                    .map(|c| c.digits().to_owned())
-                    .as_deref(),
-                Some("482913"),
-                "{ok:?}"
-            );
+    fn password_parse_bounds_and_redacts() {
+        assert!(Password::parse("").is_none());
+        assert!(Password::parse(&"a".repeat(PASSWORD_MAX_BYTES + 1)).is_none());
+        // Bytes, not characters: 513 two-byte chars are over the cap.
+        assert!(Password::parse(&"ñ".repeat(513)).is_none());
+        for ok in [
+            " ",
+            " espacios \"y\" \\ ",
+            "x",
+            &"a".repeat(PASSWORD_MAX_BYTES),
+        ] {
+            let p = Password::parse(ok).unwrap_or_else(|| panic!("{ok:?}"));
+            assert_eq!(p.expose(), ok, "never trimmed or altered");
         }
-        for bad in ["48291", "4829134", "48a913", "", "４８２９１３"] {
-            assert!(PairCode::parse(bad).is_none(), "{bad:?}");
-        }
-        assert!(!format!("{:?}", PairCode::parse("482913")).contains("482913"));
+        let p = Password::parse("hunter2-secreta").unwrap();
+        assert_eq!(format!("{p:?}"), "Password(<redacted>)");
+        let r = IpcRequest::Login(Box::new(LoginForm {
+            address: "https://casa".into(),
+            username: "sito".into(),
+            password: Some(p),
+        }));
+        assert!(!format!("{r:?}").contains("hunter2"));
     }
 }

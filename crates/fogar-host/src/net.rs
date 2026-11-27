@@ -1,10 +1,11 @@
 //! Shared dialer for the gateway adapters (HTTP + WS): resolve ONCE, apply the clear-text
-//! policy to EVERY resolved address, then connect to exactly those IPs (no second lookup, so
+//! policy (the stricter secret one when the call carries a password or token) to EVERY
+//! resolved address, then connect to exactly those IPs (no second lookup, so
 //! no TOCTOU between the policy check and the connect). `Scheme::Tls` wraps the socket in
 //! rustls; the certificate is verified for the host the person typed (NET-1), so the
 //! clear-text policy does not apply to it.
 
-use fogar_ports::gateway::{GatewayAddr, Scheme, cleartext_allowed};
+use fogar_ports::gateway::{GatewayAddr, Scheme, cleartext_allowed, secret_cleartext_allowed};
 use rustls::{ClientConfig, pki_types::ServerName};
 use std::{future::Future, io, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
@@ -68,11 +69,14 @@ pub(crate) enum DialError {
 
 /// Resolves `addr` once and connects to the first resolved address that answers within
 /// `per_attempt`; for `Scheme::Tls` then runs the handshake (also within `per_attempt`).
+/// `secret` = the call carries the password or the token: clear text then needs EVERY resolved
+/// address to be loopback or tailnet ([`secret_cleartext_allowed`], option B), never the LAN.
 pub(crate) async fn dial<R: Resolver>(
     resolver: &R,
     tls: Option<&Arc<ClientConfig>>,
     addr: &GatewayAddr,
     per_attempt: Duration,
+    secret: bool,
 ) -> Result<Conn, DialError> {
     let tls = match addr.scheme() {
         Scheme::Tls => {
@@ -95,9 +99,14 @@ pub(crate) async fn dial<R: Resolver>(
             v
         }
     };
-    // Refuse the whole call if ANY address is public: a hostile resolver must not get the
-    // client key in clear text by mixing one private address with a public one.
-    if tls.is_none() && ips.iter().any(|a| !cleartext_allowed(a.ip())) {
+    // Refuse the whole call if ANY address fails the policy: a hostile resolver must not get a
+    // secret in clear text by mixing one allowed address with another.
+    let allowed = if secret {
+        secret_cleartext_allowed
+    } else {
+        cleartext_allowed
+    };
+    if tls.is_none() && ips.iter().any(|a| !allowed(a.ip())) {
         return Err(DialError::Refused);
     }
     let tcp = connect_any(ips, per_attempt).await?;

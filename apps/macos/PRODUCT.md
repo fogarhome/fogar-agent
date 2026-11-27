@@ -12,11 +12,11 @@ SwiftUI, macOS 14+, Swift Package (app target + a stand-in agent for development
 
 ## Users
 
-El dueño de una instalación casera de Fogar (hoy, una sola persona: Sito), en su Mac, en casa o fuera por Tailscale. Abre la app para saber si su Mac está unido a Fogar, para emparejarlo la primera vez con un código de 6 cifras y, rara vez, para desemparejarlo. La mira de reojo desde la barra de menús.
+El dueño de una instalación casera de Fogar (hoy, una sola persona: Sito), en su Mac, en casa o fuera por Tailscale. Abre la app para saber si su Mac está unido a Fogar, para iniciar sesión la primera vez con su usuario y su contraseña de Fogar y, rara vez, para cerrarla. La mira de reojo desde la barra de menús.
 
 ## Product Purpose
 
-Fogar Desktop es el programa de escritorio de Fogar: un agente Rust siempre vivo más esta app de compañía. La app enseña lo que el agente sabe (estado del enlace con el gateway, qué gateway, cómo se autenticó la app ante el agente) y hace lo poco que el agente permite: buscar gateways, emparejar, desemparejar. Tiene éxito cuando el dueño empareja su Mac sin abrir la terminal y, después, ve de un vistazo «Conectado a green-house».
+Fogar Desktop es el programa de escritorio de Fogar: un agente Rust siempre vivo más esta app de compañía. La app enseña lo que el agente sabe (estado del enlace con el gateway, qué gateway, cómo se autenticó la app ante el agente) y hace lo poco que el agente permite: buscar gateways, iniciar sesión, cerrar sesión. Tiene éxito cuando el dueño inicia sesión en su Mac sin abrir la terminal y, después, ve de un vistazo «Conectado a green-house».
 
 ## Positioning
 
@@ -25,15 +25,15 @@ Es la cara en el Mac del mismo asistente casero que el dashboard del gateway y l
 ## Operating Context
 
 - La app habla con el agente por un socket Unix local (`~/Library/Application Support/com.fogar.agent/run/agent.sock`), tramas de 4 bytes + JSON, protocolo IPC v3. Si el agente no corre, la app lo dice.
-- Pantallas del S1: Estado, Emparejar (gateways encontrados o dirección a mano + código), Ajustes (desemparejar). Vista rápida en la barra de menús.
+- Pantallas: Estado, Iniciar sesión (gateways encontrados o dirección a mano + usuario y contraseña), Ajustes (cerrar sesión). Vista rápida en la barra de menús.
 - Los slices siguientes añaden sesiones, chat, escucha y monitorización sobre la misma estructura.
 - Sin cuenta de Apple Developer de pago: firma ad hoc o Personal Team; bundle id `com.fogar.desktop` (GUESSED).
 
 ## Capabilities and Constraints
 
 - Solo enseña lo que el agente sabe hoy (`status`/`event`: fase, gateway, sesiones, turnos, modo de arranque, comprobación del par). Nada de secciones de relleno.
-- La clave del cliente nunca llega a la app. El código de emparejamiento cruza la IPC una vez y no se guarda.
-- Emparejar y desemparejar solo los acepta el agente si la app la firmó el mismo firmante; si no, `refused`.
+- La clave del cliente nunca llega a la app. La contraseña cruza la IPC una vez, no se guarda y solo viaja al gateway cifrada (https o Tailscale).
+- Iniciar y cerrar sesión solo los acepta el agente si la app la firmó el mismo firmante; si no, `refused`.
 - «Abrir al iniciar sesión» solo si es real (SMAppService); el empaquetado llega en el S7.
 - Coste en reposo: suscripción, sin sondeo; la app cerrada no despierta al agente.
 

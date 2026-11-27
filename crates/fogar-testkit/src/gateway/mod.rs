@@ -8,12 +8,12 @@
 //! 4096-char limit, `protocol: 5` (close 4003, checked before the key; `ready` repeats it, 5.0
 //! #417), credential in `token` (a handshake without it, e.g. the 4.x `client_key`, is 4000),
 //! key check (4010; the exact 1008 reasons with `m19 = false`) then 4011 `missing scope` when
-//! `MockConfig::missing_scope` [§1, §13]; `POST /pair` answers `token` + `scopes`; optional `status` before
+//! `MockConfig::missing_scope` [§1, §13]; `POST /auth/login` is scripted per test; optional `status` before
 //! `ready` [§5]; `end` -> `transcription_partial` + `transcription` [§7]; `send` replaces the
 //! active turn [§9]; `turn_start`/`token`/paced `0xA1` audio/`turn_end` [§7, §12]; `cancel` ->
 //! `turn_end` [§6]; idle close 1000 after client silence [§13]; malformed JSON ->
 //! `INVALID_MESSAGE` (non-fatal) [§6]; scripted closes with any code/reason and abrupt drops.
-//! The REST surface (`/.well-known/fogar-gateway`, `POST /pair`) is served on the same port as
+//! The REST surface (`/.well-known/fogar-gateway`, `/auth/*`) is served on the same port as
 //! scripted [`HttpRoutes`] (`MockGateway::routes`).
 //! A push waits behind the user's streaming turn; a push arriving while another push is open is
 //! dropped (3.0.1 §10: another conversation's push; the same conversation's would fold in).

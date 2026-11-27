@@ -3,35 +3,40 @@
 //! `MAX_FRAME_BYTES`, `"type"`-tagged, `deny_unknown_fields`, closed vocabulary.
 //!
 //! Sans-I/O: framing works on byte buffers; adapters own the socket and peer authentication.
-//! Pairing codes cross this layer once; the frame buffers holding them are wiped. serde_json's
-//! internal scratch for escaped strings is not (codes are 6 digits, never escaped). No key
-//! ever crosses IPC.
+//! Account passwords cross this layer once; in the agent the frame buffers holding them are
+//! wiped (`take_frame`, `Zeroizing` bodies, pre-sized encode and read buffers) and so is the
+//! decoded `WirePassword`. Known limit: serde_json's internal scratch for a string with escapes
+//! is not wiped: a password containing `"`, `\` or a control character leaves one unwiped copy
+//! in freed memory of the agent. The Swift app does not wipe at all: it gets a plain `String`
+//! (and Foundation's buffers), which must never be printed or logged. No key or token ever
+//! crosses IPC.
 
 use fogar_ports::{
     audio::MicPermission,
     ipc::{
         CaptureGesture, CaptureRefusal, CaptureThen, ConversationView, GatewayCandidate,
-        GatewayInfo, IpcError, IpcRequest, IpcResponse, LinkPhase, MAX_FRAME_BYTES, Notice,
-        PairCode, PairFailure, PeerCheck, ProgressKind, ServiceState, StatusReport, TextRefusal,
-        TurnAudio, TurnOutcome, TurnSource, TurnView, UserActivity, UserText,
+        GatewayInfo, IpcError, IpcRequest, IpcResponse, LinkPhase, LoginFailure, LoginForm,
+        MAX_FRAME_BYTES, Notice, Password, PeerCheck, ProgressKind, ServiceState, StatusReport,
+        TextRefusal, TurnAudio, TurnOutcome, TurnSource, TurnView, UserActivity, UserText,
     },
 };
 use secrecy::zeroize::{Zeroize, Zeroizing};
 use serde::{Deserialize, Serialize};
 
-/// The pairing code on the wire: redacted `Debug`, wiped on drop.
+/// The account password on the wire. In the agent: redacted `Debug`, wiped on drop. In the
+/// Swift app it is a plain `String` that is not wiped: never print or log it.
 #[cfg_attr(typeshare, typeshare)]
 #[derive(Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct WireCode(String);
+pub struct WirePassword(String);
 
-impl std::fmt::Debug for WireCode {
+impl std::fmt::Debug for WirePassword {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("<redacted>")
     }
 }
 
-impl Drop for WireCode {
+impl Drop for WirePassword {
     fn drop(&mut self) {
         self.0.zeroize();
     }
@@ -53,9 +58,10 @@ pub struct WireHello {
 #[cfg_attr(typeshare, typeshare)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WirePair {
+pub struct WireLogin {
     pub address: String,
-    pub code: WireCode,
+    pub username: String,
+    pub password: WirePassword,
 }
 
 #[cfg_attr(typeshare, typeshare)]
@@ -71,8 +77,8 @@ pub enum WireRequest {
     Status,
     Subscribe,
     Discover,
-    Pair(WirePair),
-    Unpair,
+    Login(WireLogin),
+    Logout,
     Reconnect,
     SubscribeConversation,
     SendText(WireSendText),
@@ -339,15 +345,18 @@ pub enum WirePeerCheck {
 #[cfg_attr(typeshare, typeshare)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WirePairFailure {
+pub enum WireLoginFailure {
     BadAddress,
-    BadCode,
+    NeedsSecureAddress,
+    BadCredentialsInput,
     Unreachable,
     NotAGateway,
-    InvalidCode,
+    InvalidCredentials,
+    InsecureTransport,
+    TooManyAttempts,
     GatewayError,
     StorageFailed,
-    AlreadyPaired,
+    AlreadySignedIn,
     Busy,
 }
 
@@ -359,6 +368,7 @@ pub struct WireGateway {
     pub name: String,
     pub version: String,
     pub client_name: String,
+    pub user: String,
 }
 
 #[cfg_attr(typeshare, typeshare)]
@@ -404,8 +414,15 @@ pub struct WireDiscovered {
 #[cfg_attr(typeshare, typeshare)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WirePairFailed {
-    pub reason: WirePairFailure,
+pub struct WireLoginFailed {
+    pub reason: WireLoginFailure,
+}
+
+#[cfg_attr(typeshare, typeshare)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireLoggedOut {
+    pub gateway_reached: bool,
 }
 
 #[cfg_attr(typeshare, typeshare)]
@@ -423,9 +440,9 @@ pub enum WireResponse {
     Subscribed,
     Event(WireStatus),
     Discovered(WireDiscovered),
-    Paired(WireGateway),
-    PairFailed(WirePairFailed),
-    Unpaired,
+    LoggedIn(WireGateway),
+    LoginFailed(WireLoginFailed),
+    LoggedOut(WireLoggedOut),
     Reconnecting,
     ConversationSubscribed,
     Conversation(WireConversation),
@@ -443,7 +460,7 @@ pub enum WireResponse {
 
 /// Pops one complete frame body from `buf` if present (leaves partial frames in place, so a
 /// reader that keeps `buf` across cancelled reads is cancel-safe).
-/// The returned body and the consumed bytes of `buf` are wiped (a pairing code may be inside).
+/// The returned body and the consumed bytes of `buf` are wiped (a password may be inside).
 pub fn take_frame(buf: &mut Vec<u8>) -> Result<Option<Zeroizing<Vec<u8>>>, IpcError> {
     let Some(hdr) = buf.first_chunk::<4>() else {
         return Ok(None);
@@ -489,11 +506,12 @@ pub fn decode_request(body: &[u8]) -> Result<IpcRequest, IpcError> {
             WireRequest::Status => IpcRequest::Status,
             WireRequest::Subscribe => IpcRequest::Subscribe,
             WireRequest::Discover => IpcRequest::Discover,
-            WireRequest::Pair(p) => IpcRequest::Pair {
-                code: PairCode::parse(&p.code.0),
-                address: p.address,
-            },
-            WireRequest::Unpair => IpcRequest::Unpair,
+            WireRequest::Login(l) => IpcRequest::Login(Box::new(LoginForm {
+                password: Password::parse(&l.password.0),
+                address: l.address,
+                username: l.username,
+            })),
+            WireRequest::Logout => IpcRequest::Logout,
             WireRequest::Reconnect => IpcRequest::Reconnect,
             WireRequest::SubscribeConversation => IpcRequest::SubscribeConversation,
             WireRequest::SendText(t) => IpcRequest::SendText {
@@ -526,15 +544,17 @@ pub fn encode_request(r: &IpcRequest) -> Result<Zeroizing<Vec<u8>>, IpcError> {
         IpcRequest::Status => WireRequest::Status,
         IpcRequest::Subscribe => WireRequest::Subscribe,
         IpcRequest::Discover => WireRequest::Discover,
-        IpcRequest::Pair { address, code } => WireRequest::Pair(WirePair {
-            address: address.clone(),
-            code: WireCode(
-                code.as_ref()
-                    .map(|c| c.digits().to_owned())
+        IpcRequest::Login(l) => WireRequest::Login(WireLogin {
+            address: l.address.clone(),
+            username: l.username.clone(),
+            password: WirePassword(
+                l.password
+                    .as_ref()
+                    .map(|p| p.expose().to_owned())
                     .unwrap_or_default(),
             ),
         }),
-        IpcRequest::Unpair => WireRequest::Unpair,
+        IpcRequest::Logout => WireRequest::Logout,
         IpcRequest::Reconnect => WireRequest::Reconnect,
         IpcRequest::SubscribeConversation => WireRequest::SubscribeConversation,
         IpcRequest::SendText { text } => WireRequest::SendText(WireSendText {
@@ -561,9 +581,15 @@ pub fn encode_request(r: &IpcRequest) -> Result<Zeroizing<Vec<u8>>, IpcError> {
         IpcRequest::RequestMicPermission => WireRequest::RequestMicPermission,
         _ => return Err(IpcError::Unsupported("request not in the wire vocabulary")),
     };
-    serde_json::to_vec(&w)
-        .map(Zeroizing::new)
-        .map_err(|_| IpcError::Malformed)
+    // Pre-sized for the worst case (every byte escaped as `\uXXXX`): a reallocation would free
+    // an unwiped copy of the password.
+    let cap = match &w {
+        WireRequest::Login(l) => (l.address.len() + l.username.len() + l.password.0.len()) * 6,
+        _ => 0,
+    } + 256;
+    let mut out = Zeroizing::new(Vec::with_capacity(cap));
+    serde_json::to_writer(&mut *out, &w).map_err(|_| IpcError::Malformed)?;
+    Ok(out)
 }
 
 // ---- responses ---------------------------------------------------------------------------
@@ -591,32 +617,38 @@ fn phase_from_wire(p: WirePhase) -> LinkPhase {
     }
 }
 
-fn failure_to_wire(f: PairFailure) -> WirePairFailure {
+fn login_failure_to_wire(f: LoginFailure) -> WireLoginFailure {
     match f {
-        PairFailure::BadAddress => WirePairFailure::BadAddress,
-        PairFailure::BadCode => WirePairFailure::BadCode,
-        PairFailure::Unreachable => WirePairFailure::Unreachable,
-        PairFailure::NotAGateway => WirePairFailure::NotAGateway,
-        PairFailure::InvalidCode => WirePairFailure::InvalidCode,
-        PairFailure::StorageFailed => WirePairFailure::StorageFailed,
-        PairFailure::AlreadyPaired => WirePairFailure::AlreadyPaired,
-        PairFailure::Busy => WirePairFailure::Busy,
+        LoginFailure::BadAddress => WireLoginFailure::BadAddress,
+        LoginFailure::NeedsSecureAddress => WireLoginFailure::NeedsSecureAddress,
+        LoginFailure::BadCredentialsInput => WireLoginFailure::BadCredentialsInput,
+        LoginFailure::Unreachable => WireLoginFailure::Unreachable,
+        LoginFailure::NotAGateway => WireLoginFailure::NotAGateway,
+        LoginFailure::InvalidCredentials => WireLoginFailure::InvalidCredentials,
+        LoginFailure::InsecureTransport => WireLoginFailure::InsecureTransport,
+        LoginFailure::TooManyAttempts => WireLoginFailure::TooManyAttempts,
+        LoginFailure::StorageFailed => WireLoginFailure::StorageFailed,
+        LoginFailure::AlreadySignedIn => WireLoginFailure::AlreadySignedIn,
+        LoginFailure::Busy => WireLoginFailure::Busy,
         // GatewayError and any future failure: "try again".
-        _ => WirePairFailure::GatewayError,
+        _ => WireLoginFailure::GatewayError,
     }
 }
 
-fn failure_from_wire(f: WirePairFailure) -> PairFailure {
+fn login_failure_from_wire(f: WireLoginFailure) -> LoginFailure {
     match f {
-        WirePairFailure::BadAddress => PairFailure::BadAddress,
-        WirePairFailure::BadCode => PairFailure::BadCode,
-        WirePairFailure::Unreachable => PairFailure::Unreachable,
-        WirePairFailure::NotAGateway => PairFailure::NotAGateway,
-        WirePairFailure::InvalidCode => PairFailure::InvalidCode,
-        WirePairFailure::GatewayError => PairFailure::GatewayError,
-        WirePairFailure::StorageFailed => PairFailure::StorageFailed,
-        WirePairFailure::AlreadyPaired => PairFailure::AlreadyPaired,
-        WirePairFailure::Busy => PairFailure::Busy,
+        WireLoginFailure::BadAddress => LoginFailure::BadAddress,
+        WireLoginFailure::NeedsSecureAddress => LoginFailure::NeedsSecureAddress,
+        WireLoginFailure::BadCredentialsInput => LoginFailure::BadCredentialsInput,
+        WireLoginFailure::Unreachable => LoginFailure::Unreachable,
+        WireLoginFailure::NotAGateway => LoginFailure::NotAGateway,
+        WireLoginFailure::InvalidCredentials => LoginFailure::InvalidCredentials,
+        WireLoginFailure::InsecureTransport => LoginFailure::InsecureTransport,
+        WireLoginFailure::TooManyAttempts => LoginFailure::TooManyAttempts,
+        WireLoginFailure::GatewayError => LoginFailure::GatewayError,
+        WireLoginFailure::StorageFailed => LoginFailure::StorageFailed,
+        WireLoginFailure::AlreadySignedIn => LoginFailure::AlreadySignedIn,
+        WireLoginFailure::Busy => LoginFailure::Busy,
     }
 }
 
@@ -626,11 +658,12 @@ fn gateway_to_wire(g: GatewayInfo) -> WireGateway {
         name: g.name,
         version: g.version,
         client_name: g.client_name,
+        user: g.user,
     }
 }
 
 fn gateway_from_wire(g: WireGateway) -> GatewayInfo {
-    GatewayInfo::new(g.address, g.name, g.version, g.client_name)
+    GatewayInfo::new(g.address, g.name, g.version, g.client_name).with_user(g.user)
 }
 
 fn service_to_wire(s: ServiceState) -> WireService {
@@ -892,7 +925,7 @@ fn status_to_wire(s: StatusReport) -> WireStatus {
     WireStatus {
         link: s.link,
         phase: phase_to_wire(s.phase),
-        gateway: s.gateway.map(gateway_to_wire),
+        gateway: s.gateway.map(|g| gateway_to_wire(*g)),
         sessions: s.sessions,
         turns_completed: s.turns_completed,
         boot_mode: s.boot_mode,
@@ -941,11 +974,13 @@ pub fn encode_response(r: IpcResponse) -> Result<Vec<u8>, IpcError> {
                 })
                 .collect(),
         }),
-        IpcResponse::Paired(g) => WireResponse::Paired(gateway_to_wire(g)),
-        IpcResponse::PairFailed(f) => WireResponse::PairFailed(WirePairFailed {
-            reason: failure_to_wire(f),
+        IpcResponse::LoggedIn(g) => WireResponse::LoggedIn(gateway_to_wire(*g)),
+        IpcResponse::LoginFailed(f) => WireResponse::LoginFailed(WireLoginFailed {
+            reason: login_failure_to_wire(f),
         }),
-        IpcResponse::Unpaired => WireResponse::Unpaired,
+        IpcResponse::LoggedOut { gateway_reached } => {
+            WireResponse::LoggedOut(WireLoggedOut { gateway_reached })
+        }
         IpcResponse::Reconnecting => WireResponse::Reconnecting,
         IpcResponse::ConversationSubscribed => WireResponse::ConversationSubscribed,
         IpcResponse::Conversation(c) => return encode_conversation(conversation_to_wire(c)),
@@ -986,9 +1021,13 @@ pub fn decode_response(body: &[u8]) -> Result<IpcResponse, IpcError> {
                     .map(|c| GatewayCandidate::new(c.address, c.name, c.version))
                     .collect(),
             ),
-            WireResponse::Paired(g) => IpcResponse::Paired(gateway_from_wire(g)),
-            WireResponse::PairFailed(f) => IpcResponse::PairFailed(failure_from_wire(f.reason)),
-            WireResponse::Unpaired => IpcResponse::Unpaired,
+            WireResponse::LoggedIn(g) => IpcResponse::LoggedIn(Box::new(gateway_from_wire(g))),
+            WireResponse::LoginFailed(f) => {
+                IpcResponse::LoginFailed(login_failure_from_wire(f.reason))
+            }
+            WireResponse::LoggedOut(o) => IpcResponse::LoggedOut {
+                gateway_reached: o.gateway_reached,
+            },
             WireResponse::Reconnecting => IpcResponse::Reconnecting,
             WireResponse::ConversationSubscribed => IpcResponse::ConversationSubscribed,
             WireResponse::Conversation(c) => IpcResponse::Conversation(conversation_from_wire(c)),
@@ -1016,12 +1055,15 @@ mod tests {
         StatusReport::new(
             "ready".into(),
             LinkPhase::Ready,
-            Some(GatewayInfo::new(
-                "http://green-house:8004".into(),
-                "green-house".into(),
-                "1.29.0".into(),
-                "Mac de Sito".into(),
-            )),
+            Some(
+                GatewayInfo::new(
+                    "http://green-house:8004".into(),
+                    "green-house".into(),
+                    "1.29.0".into(),
+                    "Mac de Sito".into(),
+                )
+                .with_user("Sito".into()),
+            ),
             3,
             7,
             "normal".into(),
@@ -1120,12 +1162,13 @@ mod tests {
             IpcRequest::Status,
             IpcRequest::Subscribe,
             IpcRequest::Discover,
-            IpcRequest::Unpair,
             IpcRequest::Reconnect,
-            IpcRequest::Pair {
-                address: "green-house".into(),
-                code: PairCode::parse("482 913"),
-            },
+            IpcRequest::Login(Box::new(LoginForm {
+                address: "https://casa".into(),
+                username: "sito".into(),
+                password: Password::parse(" con espacios \" y \\ "),
+            })),
+            IpcRequest::Logout,
         ]
         .into_iter()
         .chain(v4_requests())
@@ -1155,16 +1198,21 @@ mod tests {
         }
         assert!(decode_request(br#"{"type":"status","exec":"rm -rf"}"#).is_err());
         assert!(decode_request(br#"{"type":"run","data":{"cmd":"x"}}"#).is_err());
-        assert!(decode_request(br#"{"type":"pair","data":{"address":"x"}}"#).is_err());
         assert!(decode_request(br#"{"type":"hello","data":{"version":2,"admin":true}}"#).is_err());
-        // A typo is decoded (so the core can answer BadCode), not dropped as malformed.
-        assert_eq!(
-            decode_request(br#"{"type":"pair","data":{"address":"x","code":"12a456"}}"#).unwrap(),
-            IpcRequest::Pair {
-                address: "x".into(),
-                code: None
-            }
-        );
+        // v5: pairing left the vocabulary (signing in replaced it).
+        for gone in [
+            &br#"{"type":"pair","data":{"address":"x","code":"482913"}}"#[..],
+            br#"{"type":"unpair"}"#,
+        ] {
+            assert!(decode_request(gone).is_err());
+        }
+        for gone in [
+            &br#"{"type":"paired","data":{"address":"a","name":"n","version":"v","client_name":"c","user":"u"}}"#[..],
+            br#"{"type":"pair_failed","data":{"reason":"invalid_code"}}"#,
+            br#"{"type":"unpaired"}"#,
+        ] {
+            assert!(decode_response(gone).is_err());
+        }
     }
 
     #[test]
@@ -1179,9 +1227,13 @@ mod tests {
                 "green-house".into(),
                 "1.29.0".into(),
             )]),
-            IpcResponse::Paired(report().gateway.unwrap()),
-            IpcResponse::PairFailed(PairFailure::InvalidCode),
-            IpcResponse::Unpaired,
+            IpcResponse::LoggedIn(report().gateway.unwrap()),
+            IpcResponse::LoggedOut {
+                gateway_reached: true,
+            },
+            IpcResponse::LoggedOut {
+                gateway_reached: false,
+            },
             IpcResponse::Reconnecting,
             IpcResponse::ConversationSubscribed,
             IpcResponse::Conversation(conversation()),
@@ -1204,6 +1256,23 @@ mod tests {
                 CaptureRefusal::Busy,
             ]
             .map(IpcResponse::CaptureRefused),
+        )
+        .chain(
+            [
+                LoginFailure::BadAddress,
+                LoginFailure::NeedsSecureAddress,
+                LoginFailure::BadCredentialsInput,
+                LoginFailure::Unreachable,
+                LoginFailure::NotAGateway,
+                LoginFailure::InvalidCredentials,
+                LoginFailure::InsecureTransport,
+                LoginFailure::TooManyAttempts,
+                LoginFailure::GatewayError,
+                LoginFailure::StorageFailed,
+                LoginFailure::AlreadySignedIn,
+                LoginFailure::Busy,
+            ]
+            .map(IpcResponse::LoginFailed),
         )
         .chain(
             [
@@ -1317,7 +1386,7 @@ mod tests {
         let s = String::from_utf8(encode_response(IpcResponse::Event(report())).unwrap()).unwrap();
         assert_eq!(
             s,
-            r#"{"type":"event","data":{"link":"ready","phase":"ready","gateway":{"address":"http://green-house:8004","name":"green-house","version":"1.29.0","client_name":"Mac de Sito"},"sessions":3,"turns_completed":7,"boot_mode":"normal","peer_check":"same_signer","transcriber":"up","tts":"down"}}"#
+            r#"{"type":"event","data":{"link":"ready","phase":"ready","gateway":{"address":"http://green-house:8004","name":"green-house","version":"1.29.0","client_name":"Mac de Sito","user":"Sito"},"sessions":3,"turns_completed":7,"boot_mode":"normal","peer_check":"same_signer","transcriber":"up","tts":"down"}}"#
         );
         let s =
             String::from_utf8(encode_response(IpcResponse::Conversation(conversation())).unwrap())
@@ -1377,37 +1446,73 @@ mod tests {
                 json
             );
         }
-        let s = String::from_utf8(
-            encode_response(IpcResponse::PairFailed(PairFailure::InvalidCode)).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            s,
-            r#"{"type":"pair_failed","data":{"reason":"invalid_code"}}"#
-        );
         let s = String::from_utf8(encode_response(IpcResponse::Subscribed).unwrap()).unwrap();
         assert_eq!(s, r#"{"type":"subscribed"}"#);
+        // v5: the account.
+        let r = encode_request(&IpcRequest::Login(Box::new(LoginForm {
+            address: "https://casa.ts.net".into(),
+            username: "sito".into(),
+            password: Password::parse("p\"w"),
+        })))
+        .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&r).unwrap(),
+            r#"{"type":"login","data":{"address":"https://casa.ts.net","username":"sito","password":"p\"w"}}"#
+        );
+        let r = encode_request(&IpcRequest::Logout).unwrap();
+        assert_eq!(std::str::from_utf8(&r).unwrap(), r#"{"type":"logout"}"#);
+        for (resp, json) in [
+            (
+                IpcResponse::LoggedIn(report().gateway.unwrap()),
+                r#"{"type":"logged_in","data":{"address":"http://green-house:8004","name":"green-house","version":"1.29.0","client_name":"Mac de Sito","user":"Sito"}}"#,
+            ),
+            (
+                IpcResponse::LoginFailed(LoginFailure::NeedsSecureAddress),
+                r#"{"type":"login_failed","data":{"reason":"needs_secure_address"}}"#,
+            ),
+            (
+                IpcResponse::LoggedOut {
+                    gateway_reached: false,
+                },
+                r#"{"type":"logged_out","data":{"gateway_reached":false}}"#,
+            ),
+        ] {
+            assert_eq!(
+                String::from_utf8(encode_response(resp).unwrap()).unwrap(),
+                json
+            );
+        }
         let s = String::from_utf8(encode_response(IpcResponse::Reconnecting).unwrap()).unwrap();
         assert_eq!(s, r#"{"type":"reconnecting"}"#);
         let r = encode_request(&IpcRequest::Reconnect).unwrap();
         assert_eq!(std::str::from_utf8(&r).unwrap(), r#"{"type":"reconnect"}"#);
-        let r = encode_request(&IpcRequest::Pair {
-            address: "green-house".into(),
-            code: PairCode::parse("482913"),
-        })
-        .unwrap();
-        assert_eq!(
-            std::str::from_utf8(&r).unwrap(),
-            r#"{"type":"pair","data":{"address":"green-house","code":"482913"}}"#
-        );
     }
 
     #[test]
-    fn pair_code_never_prints() {
-        let r = IpcRequest::Pair {
-            address: "x".into(),
-            code: PairCode::parse("482913"),
-        };
-        assert!(!format!("{r:?}").contains("482913"));
+    fn wire_password_is_redacted_and_wiped() {
+        let r = IpcRequest::Login(Box::new(LoginForm {
+            address: "https://casa".into(),
+            username: "sito".into(),
+            password: Password::parse("hunter2 \"x\""),
+        }));
+        let body = encode_request(&r).unwrap();
+        let w: WireRequest = serde_json::from_slice(&body).unwrap();
+        assert!(!format!("{w:?}").contains("hunter2"));
+        let p = WirePassword("hunter2".into());
+        assert_eq!(format!("{p:?}"), "<redacted>");
+        // Drop wipes it (observing freed memory would need `unsafe`).
+        assert!(std::mem::needs_drop::<WirePassword>());
+        // Empty or over-long passwords decode to `None`: the core answers BadCredentialsInput
+        // without calling the gateway.
+        let long = "a".repeat(fogar_ports::ipc::PASSWORD_MAX_BYTES + 1);
+        for bad in ["", long.as_str()] {
+            let json = format!(
+                r#"{{"type":"login","data":{{"address":"x","username":"u","password":"{bad}"}}}}"#
+            );
+            assert!(matches!(
+                decode_request(json.as_bytes()).unwrap(),
+                IpcRequest::Login(l) if l.password.is_none()
+            ));
+        }
     }
 }

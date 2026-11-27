@@ -196,8 +196,9 @@ nonisolated func agenteConversacion(_ registro: Registro, inicial: WireConversat
     }
 
     /// The read-only status needs only the directory and user checks (an S1 agent not yet signed
-    /// still shows its state); pairing needs the signed agent and sends nothing otherwise.
-    @Test func elEstadoSiPeroEmparejarNo() async throws {
+    /// still shows its state); the account needs the signed agent and sends nothing otherwise
+    /// (the password never reaches a socket that is not provably our agent).
+    @Test func elEstadoSiPeroLaCuentaNo() async throws {
         let registro = Registro()
         let base = answers()
         let agent = try FakeAgent { req in registro.anotar(req); return base(req) }
@@ -206,10 +207,12 @@ nonisolated func agenteConversacion(_ registro: Registro, inicial: WireConversat
         estado.start()
         defer { estado.stop() }
         #expect(await waitFor(estado) { $0 == .live(ready) })
-        await #expect(throws: CommandError.notOurAgent) { _ = try await estado.pair(address: "green-house", code: "482913") }
-        await #expect(throws: CommandError.notOurAgent) { try await estado.unpair() }
-        #expect(!registro.pedidos.contains { if case .pair = $0 { true } else { false } })
-        #expect(!registro.pedidos.contains(.unpair))
+        await #expect(throws: CommandError.notOurAgent) {
+            _ = try await estado.login(address: "https://casa.ts.net", username: "sito", password: "fogar")
+        }
+        await #expect(throws: CommandError.notOurAgent) { _ = try await estado.logout() }
+        #expect(!registro.pedidos.contains { if case .login = $0 { true } else { false } })
+        #expect(!registro.pedidos.contains { if case .logout = $0 { true } else { false } })
     }
 
     @Test func soloParaLaAppFirmadaSinBucle() async throws {

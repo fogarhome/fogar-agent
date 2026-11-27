@@ -4,8 +4,9 @@
 
 import Foundation
 
-/// The pairing code on the wire: redacted `Debug`, wiped on drop.
-public typealias WireCode = String
+/// The account password on the wire. In the agent: redacted `Debug`, wiped on drop. In the
+/// Swift app it is a plain `String` that is not wiped: never print or log it.
+public typealias WirePassword = String
 
 public struct WireCandidate: Codable, Sendable, Equatable, Hashable {
 	public let address: String
@@ -185,12 +186,14 @@ public struct WireGateway: Codable, Sendable, Equatable, Hashable {
 	public let name: String
 	public let version: String
 	public let client_name: String
+	public let user: String
 
-	public init(address: String, name: String, version: String, client_name: String) {
+	public init(address: String, name: String, version: String, client_name: String, user: String) {
 		self.address = address
 		self.name = name
 		self.version = version
 		self.client_name = client_name
+		self.user = user
 	}
 }
 
@@ -202,41 +205,54 @@ public struct WireHello: Codable, Sendable, Equatable, Hashable {
 	}
 }
 
+public struct WireLoggedOut: Codable, Sendable, Equatable, Hashable {
+	public let gateway_reached: Bool
+
+	public init(gateway_reached: Bool) {
+		self.gateway_reached = gateway_reached
+	}
+}
+
+public struct WireLogin: Codable, Sendable, Equatable, Hashable {
+	public let address: String
+	public let username: String
+	public let password: WirePassword
+
+	public init(address: String, username: String, password: WirePassword) {
+		self.address = address
+		self.username = username
+		self.password = password
+	}
+}
+
+public enum WireLoginFailure: String, Codable, Sendable, Equatable, Hashable {
+	case badAddress = "bad_address"
+	case needsSecureAddress = "needs_secure_address"
+	case badCredentialsInput = "bad_credentials_input"
+	case unreachable
+	case notAGateway = "not_a_gateway"
+	case invalidCredentials = "invalid_credentials"
+	case insecureTransport = "insecure_transport"
+	case tooManyAttempts = "too_many_attempts"
+	case gatewayError = "gateway_error"
+	case storageFailed = "storage_failed"
+	case alreadySignedIn = "already_signed_in"
+	case busy
+}
+
+public struct WireLoginFailed: Codable, Sendable, Equatable, Hashable {
+	public let reason: WireLoginFailure
+
+	public init(reason: WireLoginFailure) {
+		self.reason = reason
+	}
+}
+
 public struct WireMicPermission: Codable, Sendable, Equatable, Hashable {
 	public let state: WireMic
 
 	public init(state: WireMic) {
 		self.state = state
-	}
-}
-
-public struct WirePair: Codable, Sendable, Equatable, Hashable {
-	public let address: String
-	public let code: WireCode
-
-	public init(address: String, code: WireCode) {
-		self.address = address
-		self.code = code
-	}
-}
-
-public enum WirePairFailure: String, Codable, Sendable, Equatable, Hashable {
-	case badAddress = "bad_address"
-	case badCode = "bad_code"
-	case unreachable
-	case notAGateway = "not_a_gateway"
-	case invalidCode = "invalid_code"
-	case gatewayError = "gateway_error"
-	case storageFailed = "storage_failed"
-	case alreadyPaired = "already_paired"
-	case busy
-}
-
-public struct WirePairFailed: Codable, Sendable, Equatable, Hashable {
-	public let reason: WirePairFailure
-
-	public init(reason: WirePairFailure) {
-		self.reason = reason
 	}
 }
 
@@ -322,8 +338,8 @@ public enum WireRequest: Codable, Sendable, Equatable, Hashable {
 	case status
 	case subscribe
 	case discover
-	case pair(WirePair)
-	case unpair
+	case login(WireLogin)
+	case logout
 	case reconnect
 	case subscribeConversation
 	case sendText(WireSendText)
@@ -338,8 +354,8 @@ public enum WireRequest: Codable, Sendable, Equatable, Hashable {
 			status,
 			subscribe,
 			discover,
-			pair,
-			unpair,
+			login,
+			logout,
 			reconnect,
 			subscribeConversation = "subscribe_conversation",
 			sendText = "send_text",
@@ -372,13 +388,13 @@ public enum WireRequest: Codable, Sendable, Equatable, Hashable {
 			case .discover:
 				self = .discover
 				return
-			case .pair:
-				if let content = try? container.decode(WirePair.self, forKey: .data) {
-					self = .pair(content)
+			case .login:
+				if let content = try? container.decode(WireLogin.self, forKey: .data) {
+					self = .login(content)
 					return
 				}
-			case .unpair:
-				self = .unpair
+			case .logout:
+				self = .logout
 				return
 			case .reconnect:
 				self = .reconnect
@@ -429,11 +445,11 @@ public enum WireRequest: Codable, Sendable, Equatable, Hashable {
 			try container.encode(CodingKeys.subscribe, forKey: .type)
 		case .discover:
 			try container.encode(CodingKeys.discover, forKey: .type)
-		case .pair(let content):
-			try container.encode(CodingKeys.pair, forKey: .type)
+		case .login(let content):
+			try container.encode(CodingKeys.login, forKey: .type)
 			try container.encode(content, forKey: .data)
-		case .unpair:
-			try container.encode(CodingKeys.unpair, forKey: .type)
+		case .logout:
+			try container.encode(CodingKeys.logout, forKey: .type)
 		case .reconnect:
 			try container.encode(CodingKeys.reconnect, forKey: .type)
 		case .subscribeConversation:
@@ -465,9 +481,9 @@ public enum WireResponse: Codable, Sendable, Equatable, Hashable {
 	case subscribed
 	case event(WireStatus)
 	case discovered(WireDiscovered)
-	case paired(WireGateway)
-	case pairFailed(WirePairFailed)
-	case unpaired
+	case loggedIn(WireGateway)
+	case loginFailed(WireLoginFailed)
+	case loggedOut(WireLoggedOut)
 	case reconnecting
 	case conversationSubscribed
 	case conversation(WireConversation)
@@ -487,9 +503,9 @@ public enum WireResponse: Codable, Sendable, Equatable, Hashable {
 			subscribed,
 			event,
 			discovered,
-			paired,
-			pairFailed = "pair_failed",
-			unpaired,
+			loggedIn = "logged_in",
+			loginFailed = "login_failed",
+			loggedOut = "logged_out",
 			reconnecting,
 			conversationSubscribed = "conversation_subscribed",
 			conversation,
@@ -539,19 +555,21 @@ public enum WireResponse: Codable, Sendable, Equatable, Hashable {
 					self = .discovered(content)
 					return
 				}
-			case .paired:
+			case .loggedIn:
 				if let content = try? container.decode(WireGateway.self, forKey: .data) {
-					self = .paired(content)
+					self = .loggedIn(content)
 					return
 				}
-			case .pairFailed:
-				if let content = try? container.decode(WirePairFailed.self, forKey: .data) {
-					self = .pairFailed(content)
+			case .loginFailed:
+				if let content = try? container.decode(WireLoginFailed.self, forKey: .data) {
+					self = .loginFailed(content)
 					return
 				}
-			case .unpaired:
-				self = .unpaired
-				return
+			case .loggedOut:
+				if let content = try? container.decode(WireLoggedOut.self, forKey: .data) {
+					self = .loggedOut(content)
+					return
+				}
 			case .reconnecting:
 				self = .reconnecting
 				return
@@ -618,14 +636,15 @@ public enum WireResponse: Codable, Sendable, Equatable, Hashable {
 		case .discovered(let content):
 			try container.encode(CodingKeys.discovered, forKey: .type)
 			try container.encode(content, forKey: .data)
-		case .paired(let content):
-			try container.encode(CodingKeys.paired, forKey: .type)
+		case .loggedIn(let content):
+			try container.encode(CodingKeys.loggedIn, forKey: .type)
 			try container.encode(content, forKey: .data)
-		case .pairFailed(let content):
-			try container.encode(CodingKeys.pairFailed, forKey: .type)
+		case .loginFailed(let content):
+			try container.encode(CodingKeys.loginFailed, forKey: .type)
 			try container.encode(content, forKey: .data)
-		case .unpaired:
-			try container.encode(CodingKeys.unpaired, forKey: .type)
+		case .loggedOut(let content):
+			try container.encode(CodingKeys.loggedOut, forKey: .type)
+			try container.encode(content, forKey: .data)
 		case .reconnecting:
 			try container.encode(CodingKeys.reconnecting, forKey: .type)
 		case .conversationSubscribed:

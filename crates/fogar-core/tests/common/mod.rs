@@ -3,8 +3,8 @@
 #![allow(dead_code)]
 
 use fogar_core::{
-    Agent, AgentPorts, Config, HealthProbe, LinkState, LinkView, NoHttp, NoIpc, NoTailnet,
-    PairingRecord, crashloop::BootMode,
+    AccountRecord, Agent, AgentPorts, Config, HealthProbe, LinkState, LinkView, NoHttp, NoIpc,
+    NoTailnet, crashloop::BootMode,
 };
 use fogar_ports::{
     gateway::{GatewayAddr, GatewayLink},
@@ -32,30 +32,31 @@ pub(crate) struct Rig<L: GatewayLink = FakeGatewayLink> {
     pub(crate) app: tokio::task::JoinSet<()>,
 }
 
-/// Address of the paired test gateway (the in-memory link ignores it; `FakeGatewayHttp`
+/// Address of the signed-in test gateway (the in-memory link ignores it; `FakeGatewayHttp`
 /// answers on it).
 pub(crate) const GW_ADDR: &str = "127.0.0.1:8004";
 
+/// Signing in over loopback is on: the fakes answer on `GW_ADDR` (127.0.0.1).
 pub(crate) fn test_config() -> Config {
-    Config::default()
+    Config {
+        login_over_loopback: true,
+        ..Config::default()
+    }
 }
 
-/// A pairing record for `GW_ADDR` with `key`.
-pub(crate) fn record(key: &str) -> PairingRecord {
-    PairingRecord::new(
+/// An account at `GW_ADDR` with token `key`.
+pub(crate) fn record(key: &str) -> AccountRecord {
+    AccountRecord::new(
         GatewayAddr::parse(GW_ADDR).unwrap(),
         "client-1".into(),
         key.to_owned().into(),
-        "green-house".into(),
-        "1.29.0".into(),
-        "Mac".into(),
     )
 }
 
-/// A store holding a pairing record with `key`.
+/// A store signed in with token `key`.
 pub(crate) fn paired_store(key: &str) -> MemorySecretStore {
     let s = MemorySecretStore::default();
-    s.put(SecretKey::GatewayPairing, record(key).encode())
+    s.put(SecretKey::GatewayAccount, record(key).encode())
         .unwrap();
     s
 }
@@ -77,13 +78,16 @@ pub(crate) struct RigBuilder<L: GatewayLink> {
     /// Addresses where a gateway answers `routes` (all share them).
     pub(crate) http_addrs: Vec<&'static str>,
     pub(crate) tailnet: FakeTailnet,
+    /// Host names resolve to a LAN IP: like the host adapter, every call carrying a secret to a
+    /// name is `Refused` (discovery still answers).
+    pub(crate) names_resolve_to_lan: bool,
 }
 
 /// Several `FakeGatewayHttp`s, one per address (discovery may find more than one gateway).
 /// An unknown address goes to the first one: it applies the cleartext policy, then answers
-/// `Unreachable`. `http_addrs` must not be empty.
+/// `Unreachable`. `http_addrs` must not be empty. The flag: `names_resolve_to_lan`.
 #[derive(Debug)]
-pub(crate) struct MultiHttp(Vec<FakeGatewayHttp>);
+pub(crate) struct MultiHttp(Vec<FakeGatewayHttp>, bool);
 
 impl MultiHttp {
     fn pick(&self, addr: &GatewayAddr) -> &FakeGatewayHttp {
@@ -102,6 +106,12 @@ impl GatewayHttp for MultiHttp {
         token: Option<&secrecy::SecretString>,
         body: Option<secrecy::zeroize::Zeroizing<Vec<u8>>>,
     ) -> Result<HttpReply, HttpError> {
+        if self.1
+            && addr.host().parse::<std::net::IpAddr>().is_err()
+            && !matches!(call, HttpCall::WellKnown | HttpCall::WellKnownLegacy)
+        {
+            return Err(HttpError::Refused);
+        }
         self.pick(addr).request(addr, call, token, body).await
     }
 
@@ -142,6 +152,7 @@ impl<L: GatewayLink + Clone> RigBuilder<L> {
             routes: HttpRoutes::fogar(),
             http_addrs: vec![GW_ADDR],
             tailnet: FakeTailnet::unsupported(),
+            names_resolve_to_lan: false,
         }
     }
 
@@ -166,6 +177,7 @@ impl<L: GatewayLink + Clone> RigBuilder<L> {
                         FakeGatewayHttp::at(self.routes.clone(), GatewayAddr::parse(a).unwrap())
                     })
                     .collect(),
+                self.names_resolve_to_lan,
             ),
             tailnet: self.tailnet,
             secrets: self.secrets.clone(),
