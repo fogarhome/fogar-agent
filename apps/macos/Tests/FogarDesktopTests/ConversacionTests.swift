@@ -49,6 +49,9 @@ nonisolated func resumen(_ id: String, _ titulo: String?, enMarcha: Bool = false
         #expect(Textos.notaMensaje(mensaje("hola", .pending)) == "Pendiente: va cuando Fogar termine.")
         #expect(Textos.notaMensaje(mensaje("hola", .failed, codigo: "missing_scope"))?.contains("no puede escribir") == true)
         #expect(Textos.notaMensaje(mensaje("hola", .failed, codigo: "not_sent"))?.hasPrefix("No se envió") == true)
+        #expect(Textos.tituloConversacion(resumen("c", "  La serie ")) == "La serie")
+        #expect(Textos.tituloConversacion(resumen("c", nil)) == "Conversación sin título")
+        #expect(Textos.tituloConversacion(resumen("c", " ")) == "Conversación sin título")
         #expect(Textos.autorMensaje(mensaje("x")) == "Tú")
         #expect(Textos.autorMensaje(mensaje("x", mio: false, de: String(repeating: "a", count: 60))).count == 40)
     }

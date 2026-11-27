@@ -102,15 +102,20 @@ The sign-in screen keeps the password only in its own state and empties it after
 and when it goes away. The app never prints or logs a `WireRequest`: `login` carries the password
 and the generated `WireLogin` has no redaction.
 
-Conversation (IPC v4, only with `--peer same_signer`, the default): typed text gets a scripted
-reply (preparing → thinking → «Usando ha_call_service…» → text); text with «error» or «lento» ends in
-an error or a timeout. The reply's audio «plays» only after the app's `turn_visible` and is dropped
-2 s later otherwise (the turn shows «sin sonido»). A take plays partials of a phrase, then goes quiet:
+Conversations (IPC v6, only with `--peer same_signer`, the default): two example conversations in
+the list; «Nueva» leaves nothing open and the next text creates one. Typed text gets a scripted
+reply (preparing → thinking → «Usando ha_call_service…» → text); the conversation shows «en marcha»
+and goes to the top meanwhile. A text sent while a reply runs waits («Pendiente») and is answered
+next; «Cancelar» withdraws it (it disappears). Text with «error» or «lento» ends in an error or a
+timeout. Nothing plays, and dictation is off until PR 5 (the microphone says «sin transcriptor»);
+`--transcriber up` brings the scripted take back to work on its look: partials of a phrase, then
 5 s later the agent cuts it to review. `--mic not_determined|granted|denied|restricted` (default
 `not_determined`), `--mic-deny` (the permission prompt says no), `--mic-prompt-secs N` (how long the
-prompt takes), `--no-mic`, `--transcriber down`, `--tts down`.
-On stdin: `push` (Fogar writes on its own), `dia` (a new day), `mic <state>`, `transcriber <state>`,
-`tts <state>`, `silencio` / `seguridad` (cut the open take), `frase_perdida`. Launch arguments `-seccion iniciarSesion` and `-apariencia clara|oscura|sistema` pick the
+prompt takes), `--no-mic`, `--transcriber up|down`, `--tts up|down` (status only).
+On stdin: `push` (Fogar writes on its own), `otro <texto>` (another device, «Cocina», writes in the
+open conversation), `solo_lectura` / `escritura` (the account loses / gets `conversations:write`),
+`mic <state>`, `transcriber <state>`, `tts <state>`, `silencio` / `seguridad` (cut the open take),
+`frase_perdida`. Launch arguments `-seccion iniciarSesion` and `-apariencia clara|oscura|sistema` pick the
 screen and appearance.
 
 ## Wire types

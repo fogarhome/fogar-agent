@@ -2,10 +2,11 @@ import AppKit
 import FogarWire
 import SwiftUI
 
-/// Conversación: today's conversation with Fogar, like Claude or Gemini. A text box with a
-/// microphone (click to talk and watch the transcript; send it, or stop and edit it), the reply as it arrives,
-/// what Fogar is doing meanwhile, and a way to cancel. Everything on screen is the agent's view; the
-/// app keeps nothing of its own and logs nothing of it.
+/// Conversación: the conversations with Fogar, like Claude or Gemini. The list on the left
+/// («Nueva», «en marcha»), the open one on the right: a text box with a microphone (off until the
+/// gateway has a transcriber again), each message with where it stands (pending, from another
+/// device, not sent), the reply as it arrives, what Fogar is doing meanwhile, and a way to cancel.
+/// Everything on screen is the agent's view; the app keeps nothing of its own and logs nothing of it.
 struct ConversacionView: View {
     @Environment(Conversacion.self) private var conv
     @Environment(AgentLink.self) private var link
@@ -15,22 +16,11 @@ struct ConversacionView: View {
     @State private var aparecida = false
 
     var body: some View {
-        let listo = link.state.status?.phase == .ready
-        ZStack(alignment: .bottom) {
-            // The fire warms up under the box while Fogar listens: the room's own light, no chrome.
-            FondoVivo(calor: conv.grabando ? 0.72 : 0.3, humo: 0.6)
-                .frame(height: 320)
-                .mask(LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom))
-                .opacity(0.55)
-                .animation(.easeInOut(duration: 1.2), value: conv.grabando)
-                .ignoresSafeArea()
-            VStack(spacing: 0) {
-                Hilo(vista: conv.vista)
-                Composicion(listo: listo, cajaEnfocada: $cajaEnfocada)
-                    .padding(.horizontal, 32)
-                    .padding(.bottom, 24)
-                    .padding(.top, 8)
-            }
+        HStack(spacing: 0) {
+            ListaConversaciones()
+                .frame(width: 260)
+            Rectangle().fill(Color.veta).frame(width: 1).ignoresSafeArea()
+            centro
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .navigationTitle("Conversación")
@@ -62,6 +52,28 @@ struct ConversacionView: View {
         .onChange(of: ultimaRespuesta) { _, r in
             if let r, !r.isEmpty { AccessibilityNotification.Announcement("Fogar: \(r)").post() }
         }
+    }
+
+    /// The open conversation and the box.
+    private var centro: some View {
+        let listo = link.state.status?.phase == .ready
+        return ZStack(alignment: .bottom) {
+            // The fire warms up under the box while Fogar listens: the room's own light, no chrome.
+            FondoVivo(calor: conv.grabando ? 0.72 : 0.3, humo: 0.6)
+                .frame(height: 320)
+                .mask(LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom))
+                .opacity(0.55)
+                .animation(.easeInOut(duration: 1.2), value: conv.grabando)
+                .ignoresSafeArea()
+            VStack(spacing: 0) {
+                Hilo(vista: conv.vista)
+                Composicion(listo: listo, cajaEnfocada: $cajaEnfocada)
+                    .padding(.horizontal, 32)
+                    .padding(.bottom, 24)
+                    .padding(.top, 8)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     /// The last finished reply (VoiceOver reads it once, when it is complete).
@@ -144,7 +156,7 @@ private struct Vacio: View {
                 .frame(width: 150)
                 .accessibilityHidden(true)
             Text("¿En qué te ayudo?").titularFogar(26)
-            Text("Escribe, o pulsa el micrófono y habla: verás el texto mientras hablas.")
+            Text("Escribe y Fogar te contesta aquí. Lo que escribas desde otro dispositivo también aparece.")
                 .font(Tipo.sub).suave()
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 440)
@@ -329,6 +341,7 @@ private struct Composicion: View {
     /// One line at most: the model's own feedback first, then the agent's notice, then the link.
     private var lineaArriba: Linea? {
         if let a = conv.aviso { return Linea(tono: .bad, texto: a) }
+        if conv.vivo, conv.vista?.read_only == true { return Linea(tono: .warn, texto: Textos.soloLectura) }
         if conv.vivo, let n = conv.vista?.notice { return Linea(tono: .warn, texto: Textos.aviso(n)) }
         if let e = Textos.enlace(conv.link.enlace, listo: listo) { return Linea(tono: .off, texto: e) }
         return nil

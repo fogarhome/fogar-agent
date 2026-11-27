@@ -59,7 +59,7 @@ extension Textos {
         case .listo: "Pulsa para hablar: verás el texto mientras hablas."
         case .sinConexion: "Sin conexión con Fogar: ahora no se puede grabar."
         case .soloAppFirmada: "La conversación solo funciona con la app de Fogar firmada como el agente."
-        case .sinTranscriptor: "El gateway no tiene transcriptor ahora. Puedes escribir."
+        case .sinTranscriptor: "Sin transcriptor: dictar llegará más adelante. De momento, escribe."
         case .pedirPermiso: "Fogar necesita tu permiso para usar el micrófono."
         case .denegado: microDenegado
         case .desconocido: "Fogar aún no sabe si puede usar el micrófono de este Mac. Puedes escribir."
@@ -125,6 +125,12 @@ extension Textos {
     }
 
     static let pushEtiqueta = "Fogar te escribió"
+
+    /// A conversation's name in the list (OpenClaw titles it from the first message).
+    static func tituloConversacion(_ c: WireSummary) -> String {
+        let t = c.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return t.isEmpty ? "Conversación sin título" : t
+    }
 
     /// Who wrote a message, for VoiceOver.
     static func autorMensaje(_ m: WireMessage) -> String {
