@@ -66,15 +66,16 @@ struct ConversacionView: View {
 
     /// The last finished reply (VoiceOver reads it once, when it is complete).
     private var ultimaRespuesta: String? {
-        guard let t = conv.vista?.turns.last, t.outcome == .done else { return nil }
+        guard case .turn(let t)? = conv.vista?.entries.last, t.outcome == .done, !t.turn_id.isEmpty else { return nil }
         return t.reply
     }
 }
 
 // MARK: El hilo
 
-/// The turns, newest at the bottom, in a reading column. Follows new text only while the person
-/// is at the bottom: scrolled up to read, it stays put. Tokens scroll without animation.
+/// The messages and Fogar's turns, newest at the bottom, in a reading column. Follows new text
+/// only while the person is at the bottom: scrolled up to read, it stays put. Tokens scroll
+/// without animation.
 private struct Hilo: View {
     let vista: WireConversation?
     @Environment(\.accessibilityReduceMotion) private var reduce
@@ -82,19 +83,22 @@ private struct Hilo: View {
     @State private var alFinal = true
 
     var body: some View {
-        let turnos = vista?.turns ?? []
+        let entradas = vista?.entries ?? []
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 26) {
-                    if turnos.isEmpty {
+                    if entradas.isEmpty {
                         Vacio().padding(.top, 96)
                     }
-                    ForEach(Array(turnos.enumerated()), id: \.element.turn_id) { i, t in
-                        if i > 0, let a = turnos[i - 1].conversation, let b = t.conversation, a != b {
-                            SeparadorDia()
+                    // By position: history entries have no id of their own.
+                    ForEach(Array(entradas.enumerated()), id: \.offset) { _, e in
+                        Group {
+                            switch e {
+                            case .message(let m): MensajeVista(mensaje: m)
+                            case .turn(let t): TurnoVista(turno: t)
+                            }
                         }
-                        TurnoVista(turno: t, hablando: vista?.speaking == true && i == turnos.count - 1)
-                            .transition(reduce ? .opacity : .opacity.combined(with: .offset(y: 10)))
+                        .transition(reduce ? .opacity : .opacity.combined(with: .offset(y: 10)))
                     }
                     Color.clear.frame(height: 1).id("fin")
                         .onAppear { alFinal = true }
@@ -106,25 +110,30 @@ private struct Hilo: View {
                 .frame(maxWidth: 760)
                 .frame(maxWidth: .infinity)
                 .animation(reduce ? .easeOut(duration: Medida.rapido) : .spring(response: 0.45, dampingFraction: 0.86),
-                           value: turnos.count)
+                           value: entradas.count)
             }
             .defaultScrollAnchor(.bottom)
             .scrollIndicators(.automatic)
-            // A new turn: always to the bottom (I just wrote, or Fogar wrote), gently.
-            .onChange(of: turnos.count) {
+            // A new entry: always to the bottom (I just wrote, or someone did), gently.
+            .onChange(of: entradas.count) {
                 withAnimation(reduce ? nil : .easeOut(duration: Medida.base)) { proxy.scrollTo("fin", anchor: .bottom) }
             }
+            // Another conversation opened: straight to its end.
+            .onChange(of: vista?.id) { proxy.scrollTo("fin", anchor: .bottom) }
             // New text in the last turn: follow it only from the bottom, without animating per token.
-            .onChange(of: firma(turnos)) {
+            .onChange(of: firma(entradas)) {
                 if alFinal { proxy.scrollTo("fin", anchor: .bottom) }
             }
         }
     }
 
-    /// Changes whenever the last turn grows (a token, a progress step, its end).
-    private func firma(_ t: [WireTurn]) -> String {
-        guard let u = t.last else { return "" }
-        return "\(u.turn_id).\(u.reply.utf8.count).\(u.progress?.rawValue ?? "").\(u.outcome?.rawValue ?? "")"
+    /// Changes whenever the last entry grows (a token, a progress step, its end, a state).
+    private func firma(_ e: [WireEntry]) -> String {
+        switch e.last {
+        case .turn(let u)?: "\(u.turn_id).\(u.reply.utf8.count).\(u.progress?.rawValue ?? "").\(u.outcome?.rawValue ?? "")"
+        case .message(let m)?: "\(m.id).\(m.state.rawValue)"
+        case nil: ""
+        }
     }
 }
 
@@ -146,23 +155,41 @@ private struct Vacio: View {
     }
 }
 
-private struct SeparadorDia: View {
+/// A person's message: a bubble on the right, and under it what is worth knowing: it waits for
+/// Fogar to finish, it came from another device, or it never left this Mac.
+private struct MensajeVista: View {
+    let mensaje: WireMessage
+
     var body: some View {
-        HStack(spacing: 12) {
-            Rectangle().fill(Color.veta).frame(height: 1)
-            Text(Textos.otroDia).meta().fixedSize()
-            Rectangle().fill(Color.veta).frame(height: 1)
+        let nota = Textos.notaMensaje(mensaje)
+        VStack(alignment: .trailing, spacing: 6) {
+            Text(mensaje.text)
+                .font(Tipo.cuerpo)
+                .foregroundStyle(Color.hueso)
+                .lineSpacing(3)
+                .textSelection(.enabled)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(RoundedRectangle(cornerRadius: Medida.radioVidrio).fill(Color.piedraAlta))
+                .opacity(mensaje.state == .pending ? 0.7 : 1)
+            if let nota {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    if mensaje.state == .failed { EstadoIcono(tono: .warn, tam: 11) }
+                    Text(nota).meta()
+                }
+            }
         }
+        .frame(maxWidth: 560, alignment: .trailing)
+        .frame(maxWidth: .infinity, alignment: .trailing)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(Textos.otroDia)
+        .accessibilityLabel("\(Textos.autorMensaje(mensaje)): \(mensaje.text)" + (nota.map { ". \($0)" } ?? ""))
     }
 }
 
-/// One turn: what I said (a bubble on the right), Fogar's reply (plain text on the left, like a
-/// page), what it is doing while no text arrives, and how it ended when that is news.
+/// One of Fogar's turns: the reply (plain text on the left, like a page), what it is doing while
+/// no text arrives, and how it ended when that is news.
 private struct TurnoVista: View {
     let turno: WireTurn
-    let hablando: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -172,19 +199,6 @@ private struct TurnoVista: View {
                     Text(Textos.pushEtiqueta).font(Tipo.texto(13, peso: 550)).foregroundStyle(Color.huesoSuave)
                 }
                 .accessibilityElement(children: .combine)
-            }
-            if !turno.mine.isEmpty {
-                Text(turno.mine)
-                    .font(Tipo.cuerpo)
-                    .foregroundStyle(Color.hueso)
-                    .lineSpacing(3)
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .background(RoundedRectangle(cornerRadius: Medida.radioVidrio).fill(Color.piedraAlta))
-                    .frame(maxWidth: 560, alignment: .trailing)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-                    .accessibilityLabel("Tú: \(turno.mine)")
             }
             VStack(alignment: .leading, spacing: 10) {
                 if !turno.reply.isEmpty {
@@ -206,22 +220,12 @@ private struct TurnoVista: View {
                     .accessibilityElement(children: .combine)
                     .accessibilityAddTraits(.updatesFrequently)
                 }
-                if hablando {
-                    HStack(spacing: 10) {
-                        Ondas()
-                        Text("Hablando").meta()
-                    }
-                    .accessibilityElement(children: .combine)
-                }
                 if let f = Textos.desenlace(turno) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         EstadoIcono(tono: turno.outcome == .cancelled || turno.outcome == .replaced ? .off : .warn, tam: 12)
                         Text(f).meta()
                     }
                     .accessibilityElement(children: .combine)
-                }
-                if turno.source == .push, turno.audio == .muted {
-                    Text(Textos.pushSinSonido).meta()
                 }
             }
         }
@@ -540,26 +544,6 @@ struct Brasa: View {
         guard !quieta else { respira = false; return }
         respira = false
         withAnimation(.easeOut(duration: 1.4).repeatForever(autoreverses: false)) { respira = true }
-    }
-}
-
-/// Three bars that move while Fogar speaks. Still under reduce motion.
-private struct Ondas: View {
-    @Environment(\.accessibilityReduceMotion) private var reduce
-    @Environment(\.ventanaVisible) private var visible
-
-    var body: some View {
-        TimelineView(.animation(minimumInterval: 1 / 20, paused: reduce || !visible)) { tl in
-            let t = tl.date.timeIntervalSinceReferenceDate
-            HStack(alignment: .center, spacing: 2) {
-                ForEach(0..<3, id: \.self) { i in
-                    Capsule().fill(Color.llama)
-                        .frame(width: 2.5, height: reduce ? 8 : 4 + 8 * abs(sin(t * 5.2 + Double(i) * 1.1)))
-                }
-            }
-            .frame(height: 12)
-        }
-        .accessibilityHidden(true)
     }
 }
 

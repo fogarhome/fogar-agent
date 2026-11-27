@@ -1,5 +1,5 @@
-//! Engine acceptance (S4 PR 4a Task 4), paused time over the `/events` hub. In-crate because
-//! opening a conversation has no IPC request until v6 (Task 5): these drive engine commands.
+//! Engine acceptance (S4 PR 4a Task 4), paused time over the `/events` hub. In-crate: these
+//! drive engine commands directly (the IPC side is `tests/conversation.rs`).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
 use super::*;
@@ -13,7 +13,7 @@ use crate::{
 };
 use fogar_ports::{
     gateway::GatewayAddr,
-    ipc::{CaptureGesture, TurnOutcome},
+    ipc::{CaptureGesture, MessageState, TurnOutcome, ViewEntry},
     secrets::{SecretKey, SecretStore},
 };
 use fogar_proto::events::decode_event;
@@ -131,14 +131,12 @@ impl Rig {
             .map(|o| o.entries)
             .unwrap_or_default()
     }
-    /// `(mine, reply)` of every turn of the view.
+    /// `(message, reply)` pairs of the view.
     fn shown(&self) -> Vec<(String, String)> {
-        self.health
-            .conversation()
-            .turns
-            .into_iter()
-            .map(|t| (t.mine, t.reply))
-            .collect()
+        crate::conversation::pairs(&self.health.conversation())
+    }
+    fn last_turn(&self) -> Option<fogar_ports::ipc::TurnView> {
+        crate::conversation::last_turn(&self.health.conversation()).cloned()
     }
     fn calls(&self, method: &str, prefix: &str) -> Vec<SeenRequest> {
         self.routes
@@ -191,6 +189,51 @@ async fn list_open_and_create_without_agent() {
         r.shown() == [pair("pon la serie", "puesta"), pair("otra", "Hola mundo")]
     })
     .await;
+    r.stop().await;
+}
+
+/// «Nueva»: nothing open, and a late state reply of the conversation it left never brings
+/// that one back.
+#[tokio::test(start_paused = true)]
+async fn new_conversation_ignores_a_late_open() {
+    let mut r = rig_with(|hub, routes| {
+        hub.seed_conversation("c-1", "Serie");
+        routes.set_delayed(
+            "GET",
+            "/conversations/c-1",
+            200,
+            r#"{"id":"c-1","agent":"main","created_at":"x","turn":null,"pending":[],"as_of":0}"#,
+            Duration::from_secs(3),
+        );
+    });
+    r.ready().await;
+    r.cmd(|tx| Command::Open("c-1".into(), tx)).await.unwrap();
+    eventually("opening", || r.health.conversation().id.is_some()).await;
+    r.cmd(Command::New).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    let v = r.health.conversation();
+    assert_eq!((v.id, v.entries.len()), (None, 0));
+    assert!(r.health.chat().open.is_none());
+    r.stop().await;
+}
+
+/// A create that fails with nothing open is shown (failed), and «Nueva» clears it.
+#[tokio::test(start_paused = true)]
+async fn failed_create_is_shown() {
+    let mut r = rig_with(|hub, routes| {
+        hub.seed_conversation("c-1", "Serie");
+        routes.set("POST", "/conversations", 500, "{}");
+    });
+    r.ready().await;
+    assert_eq!(r.send("hola").await, Some(Ok(())));
+    eventually("failed shown", || {
+        matches!(r.health.conversation().entries.as_slice(),
+            [ViewEntry::Message(m)] if m.text == "hola" && m.mine && m.state == MessageState::Failed)
+    })
+    .await;
+    assert_eq!(r.health.conversation().id, None);
+    r.cmd(Command::New).await.unwrap();
+    eventually("cleared", || r.health.conversation().entries.is_empty()).await;
     r.stop().await;
 }
 
@@ -291,8 +334,7 @@ async fn open_during_live_events_loses_nothing() {
         tokio::time::sleep(Duration::from_millis(wait_ms)).await;
         r.open("c-1").await;
         eventually("done", || {
-            r.health.conversation().turns.last().unwrap().outcome == Some(TurnOutcome::Done)
-                && r.shown().len() == 2
+            r.last_turn().unwrap().outcome == Some(TurnOutcome::Done) && r.shown().len() == 2
         })
         .await;
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -316,19 +358,13 @@ async fn stop_a_turn_started_elsewhere() {
     r.open("c-1").await;
     r.hub.other_device_send("c-1", "larga");
     eventually("running", || {
-        r.health
-            .conversation()
-            .turns
-            .last()
-            .unwrap()
-            .turn_id
-            .starts_with("turn")
+        r.last_turn().unwrap().turn_id.starts_with("turn")
     })
     .await;
     assert_eq!(r.cancel().await, Some(()));
     assert_eq!(r.calls("POST", "/conversations/c-1/cancel").len(), 1);
     eventually("cancelled", || {
-        r.health.conversation().turns.last().unwrap().outcome == Some(TurnOutcome::Cancelled)
+        r.last_turn().unwrap().outcome == Some(TurnOutcome::Cancelled)
     })
     .await;
     assert!(!r.health.chat().list[0].running);
@@ -372,6 +408,15 @@ async fn list_marks_running_and_moves_to_top() {
         ids(&r) == [("c-1".into(), true), ("c-2".into(), false)]
     })
     .await;
+    // The UI's list (its own watch) says the same.
+    let ui: Vec<(String, bool)> = r
+        .health
+        .list
+        .borrow()
+        .iter()
+        .map(|c| (c.id.clone(), c.running))
+        .collect();
+    assert_eq!(ui, ids(&r));
     eventually("ended", || ids(&r)[0] == ("c-1".into(), false)).await;
     // A conversation created elsewhere: the list is fetched once (debounced).
     let lists = r.calls("GET", "/conversations").len();
@@ -411,13 +456,14 @@ async fn view_stays_within_48_kib() {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     let v = r.health.conversation();
-    assert!(v.turns.len() <= fogar_ports::ipc::CONVERSATION_MAX_TURNS);
-    let text: usize = v.turns.iter().map(|t| t.mine.len() + t.reply.len()).sum();
+    assert!(v.entries.len() <= crate::conversation::MAX_ENTRIES);
+    let shown = r.shown();
+    let text: usize = shown.iter().map(|(m, t)| m.len() + t.len()).sum();
     assert!(
         text <= fogar_ports::ipc::CONVERSATION_MAX_TEXT_BYTES,
         "{text}"
     );
-    assert_eq!(v.turns.last().unwrap().mine, "vez 29");
+    assert_eq!(shown.last().unwrap().0, "vez 29");
     r.stop().await;
 }
 
@@ -449,14 +495,14 @@ async fn missing_scope_on_send_is_refused_once() {
     r.open("c-1").await;
     assert_eq!(r.send("hola").await, Some(Ok(())));
     eventually("failed", || {
-        r.health.conversation().turns.last().is_some_and(|t| {
-            t.outcome == Some(TurnOutcome::Error)
-                && t.error_code.as_deref() == Some("missing_scope")
+        r.health.conversation().entries.last().is_some_and(|e| {
+            matches!(e, ViewEntry::Message(m) if m.state == MessageState::Failed
+                && m.error_code.as_deref() == Some("missing_scope"))
         })
     })
     .await;
-    // shortcut: `NotReady` until IPC v6 adds `TextRefusal::MissingScope`.
-    assert_eq!(r.send("otra").await, Some(Err(TextRefusal::NotReady)));
+    assert!(r.health.conversation().read_only);
+    assert_eq!(r.send("otra").await, Some(Err(TextRefusal::MissingScope)));
     assert_eq!(r.cancel().await, Some(()));
     tokio::time::sleep(Duration::from_secs(30)).await;
     assert_eq!(r.calls("POST", "/conversations").len(), 1, "never retried");
@@ -478,7 +524,8 @@ async fn auth_me_without_write_scope_refuses_sends() {
         );
     });
     r.ready().await;
-    assert_eq!(r.send("hola").await, Some(Err(TextRefusal::NotReady)));
+    assert!(r.health.conversation().read_only);
+    assert_eq!(r.send("hola").await, Some(Err(TextRefusal::MissingScope)));
     assert!(r.calls("POST", "/conversations").is_empty());
     r.stop().await;
 }
@@ -581,6 +628,7 @@ async fn no_gateway_sequence_opens_the_microphone_or_sounds() {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(queues::ENGINE_COMMANDS);
         let (conv_tx, _conv) = watch::channel(ConversationView::default());
         let (chat_tx, _chat) = watch::channel(Chat::default());
+        let (list_tx, _list) = watch::channel(Vec::new());
         let engine = Engine {
             clock,
             cfg: cfg.clone(),
@@ -590,6 +638,7 @@ async fn no_gateway_sequence_opens_the_microphone_or_sounds() {
             cmd_rx,
             conv: conv_tx,
             chat: chat_tx,
+            list: list_tx,
         };
         let mic = FakeMic::healthy();
         let speaker = FakeSpeaker::healthy();

@@ -1,76 +1,136 @@
 import FogarWire
 import Foundation
 
-// The stand-in agent's conversation (IPC v4): the same rules the core applies, as a pure state
+// The stand-in agent's conversations (IPC v6): the same rules the core applies, as a pure state
 // machine with no clock and no socket, so `swift test` can check it. `fogar-standin` drives it with
 // timers (the scripted replies, partials and deadlines live there). Synthetic data only.
 
-/// Limits mirrored from `fogar_ports::ipc` (SEND_TEXT_MAX_BYTES, CONVERSATION_MAX_TURNS,
-/// CONVERSATION_MAX_TEXT_BYTES).
+/// Limits mirrored from `fogar_ports::ipc` / `fogar_core::conversation` (SEND_TEXT_MAX_BYTES,
+/// MAX_ENTRIES, CONVERSATION_MAX_TEXT_BYTES, LIST_MAX).
 public enum LimitesConversacion {
     public static let textoMaxBytes = 8 * 1024
-    public static let turnosMax = 20
+    public static let entradasMax = 40
     public static let textoVistaMaxBytes = 48 * 1024
+    public static let listaMax = 50
 }
 
 /// The answer the core gives to a conversation request from a peer that is not the signed app.
 public let soloAppFirmada = WireResponse.refused(WireRefused(reason: "needs the signed Fogar app"))
 
-/// What the agent knows of the conversation, and the single consent and output points' rules.
+/// What the agent knows of the conversations, and the single consent point's rules.
 public struct ConversacionSimulada: Sendable {
     public var activity = WireActivity.idle
     public var live = ""
     public var draft: String?
-    public private(set) var turns: [WireTurn] = []
-    public private(set) var speaking = false
-    public private(set) var awaitingVisible: String?
+    /// The conversation on screen; `nil` = none (the next text starts one).
+    public private(set) var abierta: String?
+    /// Newest first, like the core's list.
+    public private(set) var lista: [WireSummary] = []
+    /// Every conversation's entries (the stand-in keeps them all; the core fetches on open).
+    private var hilos: [String: [WireEntry]] = [:]
     public var mic: WireMic
     public var transcriber: WireService
+    /// Shown in the status only (nothing plays over `/events`).
     public var tts: WireService
     public var notice: WireNotice?
+    /// The account lacks `conversations:write`.
+    public var soloLectura = false
     /// Whether the link to the gateway is ready (text and takes need it).
     public var listo: Bool
     /// This machine has no microphone the agent can use.
     public var sinMicro = false
     /// The connection that owns the open take (it ends with `discard` if that connection goes).
     public private(set) var tomaDe: Int?
-    /// Turns confirmed on screen by the app (`turn_visible`): only their audio may play.
-    public private(set) var visibles: Set<String> = []
-    /// Audio dropped because nobody confirmed the turn in time (the core's counter).
-    public private(set) var audiosTirados = 0
     private var siguiente = 1
-    private var conversacionDelDia = "conv-2026-11-22"
 
-    public init(mic: WireMic = .notDetermined, transcriber: WireService = .up, tts: WireService = .up, listo: Bool = true) {
+    public init(mic: WireMic = .notDetermined, transcriber: WireService = .up, tts: WireService = .up, listo: Bool = true,
+                ejemplos: Bool = false) {
         self.mic = mic
         self.transcriber = transcriber
         self.tts = tts
         self.listo = listo
+        if ejemplos {
+            crear("conv-compra", titulo: "Lista de la compra", privada: true, cuando: "2026-11-26T19:12:00Z")
+            hilos["conv-compra"] = [
+                .message(WireMessage(id: "", text: "Añade leche y huevos", mine: false, from_name: nil, state: .past, error_code: nil)),
+                .turn(WireTurn(turn_id: "", source: .mine, by_name: nil, by_self: false, reply: "Añadidos: leche y huevos.",
+                               progress: nil, tool: nil, outcome: .done, error_code: nil)),
+            ]
+            crear("conv-serie", titulo: "La serie de esta noche", privada: false, cuando: "2026-11-27T09:40:00Z")
+            hilos["conv-serie"] = [
+                .message(WireMessage(id: "", text: "Pon la serie en el salón", mine: false, from_name: nil, state: .past, error_code: nil)),
+                .turn(WireTurn(turn_id: "", source: .mine, by_name: nil, by_self: false, reply: "Puesta en la tele del salón.",
+                               progress: nil, tool: nil, outcome: .done, error_code: nil)),
+            ]
+        }
     }
+
+    public var entries: [WireEntry] { abierta.flatMap { hilos[$0] } ?? [] }
 
     public var vista: WireConversation {
-        WireConversation(activity: activity, live: live, draft: draft, turns: turns, speaking: speaking,
-                         awaiting_visible: awaitingVisible, mic: mic, transcriber: transcriber, tts: tts, notice: notice)
+        WireConversation(id: abierta, activity: activity, live: live, draft: draft, entries: entries, mic: mic,
+                         transcriber: transcriber, notice: notice, read_only: soloLectura)
     }
 
-    public func turno(_ id: String) -> WireTurn? { turns.first { $0.turn_id == id } }
-    public var turnoAbierto: WireTurn? { turns.last { $0.outcome == nil } }
+    public func turno(_ id: String) -> WireTurn? {
+        for (_, h) in hilos {
+            for case .turn(let t) in h where t.turn_id == id { return t }
+        }
+        return nil
+    }
+
+    /// The turn running in `conversacion`, if any.
+    public func turnoAbierto(en conversacion: String) -> WireTurn? {
+        for case .turn(let t) in hilos[conversacion] ?? [] where t.outcome == nil && !t.turn_id.isEmpty { return t }
+        return nil
+    }
+
+    /// Where turn `id` runs.
+    public func conversacion(de id: String) -> String? {
+        hilos.first { _, h in h.contains { if case .turn(let t) = $0 { t.turn_id == id } else { false } } }?.key
+    }
 
     // MARK: Requests (the core's answers)
 
-    /// `send_text`: validated like `fogar-core::ipc::check_text`, then the engine's checks.
-    public mutating func enviarTexto(_ texto: String) -> WireResponse {
-        if texto.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return .textRefused(WireTextRefused(reason: .empty)) }
-        if texto.utf8.count > LimitesConversacion.textoMaxBytes { return .textRefused(WireTextRefused(reason: .tooLong)) }
-        if !listo { return .textRefused(WireTextRefused(reason: .notReady)) }
-        if activity == .recording { return .textRefused(WireTextRefused(reason: .recording)) }
+    /// `send_text`: validated like `fogar-core::ipc::check_text`, then the engine's checks. With
+    /// nothing open it creates a conversation (it opens). Returns where the text went, and whether
+    /// it reached the agent at once (`delivered`) or waits behind a running turn (`pending`).
+    public mutating func enviarTexto(_ texto: String) -> (respuesta: WireResponse, en: String?, entregado: Bool) {
+        if texto.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return (.textRefused(WireTextRefused(reason: .empty)), nil, false) }
+        if texto.utf8.count > LimitesConversacion.textoMaxBytes { return (.textRefused(WireTextRefused(reason: .tooLong)), nil, false) }
+        if activity == .recording { return (.textRefused(WireTextRefused(reason: .recording)), nil, false) }
+        if soloLectura { return (.textRefused(WireTextRefused(reason: .missingScope)), nil, false) }
+        if !listo { return (.textRefused(WireTextRefused(reason: .notReady)), nil, false) }
         notice = nil
         draft = nil
-        activity = .awaitingReply
-        return .textAccepted
+        let conv: String
+        if let a = abierta {
+            conv = a
+        } else {
+            conv = "conv-\(siguiente)"
+            siguiente += 1
+            crear(conv, titulo: String(texto.prefix(40)), privada: true, cuando: nil)
+            abierta = conv
+        }
+        let entregado = mensaje(texto, en: conv, mio: true, de: nil)
+        return (.textAccepted, conv, entregado)
+    }
+
+    /// A person's message in `conv` (another device's when `mio` is false). `true` = delivered (no
+    /// turn runs there), else pending behind it.
+    @discardableResult
+    public mutating func mensaje(_ texto: String, en conv: String, mio: Bool, de nombre: String?) -> Bool {
+        let entregado = turnoAbierto(en: conv) == nil
+        let id = "m\(siguiente)"
+        siguiente += 1
+        anadir(.message(WireMessage(id: id, text: texto, mine: mio, from_name: mio ? nil : nombre,
+                                    state: entregado ? .delivered : .pending, error_code: nil)), en: conv)
+        return entregado
     }
 
     /// `capture_start` from connection `conexion` (subscribed or not): the single consent point.
+    /// Dictation is off until PR 5: no gateway transcriber is ever `up`, so a ready Mac is refused
+    /// `no_transcriber` (`--transcriber up` lets the take's look be developed).
     public mutating func empezarToma(conexion: Int, suscrita: Bool) -> WireResponse {
         let motivo: WireCaptureRefusal? =
             if !suscrita { .notSubscribed }
@@ -79,7 +139,7 @@ public struct ConversacionSimulada: Sendable {
             else if mic == .denied || mic == .restricted { .permissionDenied }
             else if sinMicro { .noMicrophone }
             else if !listo { .notReady }
-            else if transcriber == .down { .noTranscriber }
+            else if transcriber != .up { .noTranscriber }
             else { nil }
         if let motivo { return .captureRefused(WireCaptureRefused(reason: motivo)) }
         tomaDe = conexion
@@ -108,18 +168,15 @@ public struct ConversacionSimulada: Sendable {
         let texto = live.trimmingCharacters(in: .whitespacesAndNewlines)
         tomaDe = nil
         live = ""
+        activity = .idle
         switch then {
         case .discard:
-            activity = .idle
             return (.captureEnded, nil)
         case .review:
-            activity = .idle
             draft = texto.isEmpty ? nil : texto
             return (.captureEnded, nil)
         case .send:
-            guard !texto.isEmpty else { activity = .idle; return (.captureEnded, nil) }
-            activity = .awaitingReply
-            return (.captureEnded, texto)
+            return (.captureEnded, texto.isEmpty ? nil : texto)
         }
     }
 
@@ -135,26 +192,27 @@ public struct ConversacionSimulada: Sendable {
         if tomaDe == conexion { _ = terminarToma(.discard) }
     }
 
-    /// `cancel_turn`: `cancel` to the gateway and silence at once.
+    /// `cancel_turn`: the open conversation's turn ends `cancelled`, and its pending messages are
+    /// withdrawn (they disappear, as in the gateway).
     public mutating func cancelar() -> WireResponse {
-        speaking = false
-        if activity == .awaitingReply || activity == .transcribing { activity = .idle }
-        if let t = turnoAbierto { cerrar(t.turn_id, .cancelled) }
-        awaitingVisible = nil
+        guard let conv = abierta else { return .turnCancelSent }
+        // Withdrawn first: ending the turn would deliver the next pending message.
+        hilos[conv]?.removeAll { if case .message(let m) = $0 { m.state == .pending } else { false } }
+        if let t = turnoAbierto(en: conv) { cerrar(t.turn_id, .cancelled) }
         return .turnCancelSent
     }
 
-    /// `turn_visible`: the app shows this turn, so its audio may play. Only from a connection
-    /// subscribed to the conversation (GUESSED answer for any other: `refused`).
-    public mutating func turnoVisible(_ id: String, suscrita: Bool = true) -> WireResponse {
-        guard suscrita else { return .refused(WireRefused(reason: "not subscribed")) }
-        guard turno(id) != nil else { return .turnVisibleNoted }
-        visibles.insert(id)
-        if awaitingVisible == id {
-            awaitingVisible = nil
-            if turno(id)?.outcome == nil { speaking = true }
-        }
-        return .turnVisibleNoted
+    /// `open_conversation`.
+    public mutating func abrir(_ id: String) -> WireResponse {
+        guard lista.contains(where: { $0.id == id }) else { return .refused(WireRefused(reason: "unknown conversation")) }
+        abierta = id
+        return .conversationOpened
+    }
+
+    /// `new_conversation`: nothing open.
+    public mutating func nueva() -> WireResponse {
+        abierta = nil
+        return .conversationOpened
     }
 
     /// `request_mic_permission`: the system prompt, answered `concede` or not.
@@ -165,19 +223,17 @@ public struct ConversacionSimulada: Sendable {
 
     // MARK: The gateway's side (scripted by the stand-in)
 
-    /// `turn_start`: a new turn, mine (with what I said) or a push.
-    public mutating func abrirTurno(source: WireSource, mine: String) -> String {
+    /// `turn_start` in `conv`: a person's turn (`por`: the device that started it, `nil` = this
+    /// Mac) or a push. The conversation is marked «en marcha» and goes to the top.
+    public mutating func abrirTurno(source: WireSource, en conv: String, por nombre: String? = nil) -> String {
         let id = "t\(siguiente)"
         siguiente += 1
-        if activity == .awaitingReply { activity = .idle }
-        turns.append(WireTurn(turn_id: id, conversation: conversacionDelDia, source: source, mine: mine, reply: "",
-                              progress: .preparing, tool: nil, outcome: nil, error_code: nil, audio: .none))
-        recortar()
+        anadir(.turn(WireTurn(turn_id: id, source: source, by_name: source == .push ? nil : nombre,
+                              by_self: source == .mine && nombre == nil, reply: "", progress: .preparing,
+                              tool: nil, outcome: nil, error_code: nil)), en: conv)
+        marcar(conv, enMarcha: true)
         return id
     }
-
-    /// A new day: later turns run in another gateway conversation.
-    public mutating func nuevoDia(_ conversacion: String) { conversacionDelDia = conversacion }
 
     public mutating func progreso(_ id: String, _ p: WireProgress, herramienta: String? = nil) {
         cambiar(id) { $0.progress = p; $0.tool = p == .tool ? herramienta : nil }
@@ -186,84 +242,92 @@ public struct ConversacionSimulada: Sendable {
     /// Reply tokens: progress clears once text flows.
     public mutating func texto(_ id: String, _ trozo: String) {
         cambiar(id) { $0.reply += trozo; $0.progress = nil; $0.tool = nil }
-        recortar()
     }
 
-    /// The first audio of a turn arrives: it plays only if the app already confirmed the turn;
-    /// otherwise it waits (bounded, see `plazoVencido`).
-    public mutating func llegaAudio(_ id: String) {
-        guard let t = turno(id), t.outcome == nil, t.audio == .none, tts != .down else { return }
-        if visibles.contains(id) { speaking = true } else { awaitingVisible = id }
-    }
-
-    /// 2 s passed with no `turn_visible` (or the 3 s buffer filled): the turn stays text only.
-    public mutating func plazoVencido(_ id: String) {
-        guard awaitingVisible == id else { return }
-        awaitingVisible = nil
-        audiosTirados += 1
-        cambiar(id) { $0.audio = .muted }
-    }
-
-    /// The audio of the turn finished playing.
-    public mutating func audioTermina(_ id: String) {
-        guard speaking, turno(id)?.audio == WireAudio.none else { return }
-        speaking = false
-        cambiar(id) { $0.audio = .played }
-    }
-
-    /// `turn_end`.
-    public mutating func cerrar(_ id: String, _ outcome: WireOutcome, codigo: String? = nil) {
-        guard turno(id)?.outcome == nil else { return }
-        let esperaba = awaitingVisible == id
+    /// `turn_end`. The first message waiting in that conversation is delivered: its text is
+    /// returned (the stand-in answers it next).
+    @discardableResult
+    public mutating func cerrar(_ id: String, _ outcome: WireOutcome, codigo: String? = nil) -> String? {
+        guard turno(id)?.outcome == nil, let conv = conversacion(de: id) else { return nil }
         cambiar(id) {
             $0.outcome = outcome
             $0.progress = nil
             $0.tool = nil
             $0.error_code = outcome == .error ? codigo : nil
-            if esperaba { $0.audio = .muted }
         }
-        if esperaba { awaitingVisible = nil; audiosTirados += 1 }
-        if outcome != .done { speaking = false }
+        marcar(conv, enMarcha: false)
+        guard let i = hilos[conv]?.firstIndex(where: { if case .message(let m) = $0 { m.state == .pending } else { false } }),
+              case .message(let m)? = hilos[conv]?[i]
+        else { return nil }
+        hilos[conv]?[i] = .message(WireMessage(id: m.id, text: m.text, mine: m.mine, from_name: m.from_name,
+                                               state: .delivered, error_code: nil))
+        return m.text
     }
 
     // MARK: Helpers
 
-    private mutating func cambiar(_ id: String, _ f: (inout Turno) -> Void) {
-        guard let i = turns.firstIndex(where: { $0.turn_id == id }) else { return }
-        var t = Turno(turns[i])
-        f(&t)
-        turns[i] = t.wire
+    private mutating func crear(_ id: String, titulo: String, privada: Bool, cuando: String?) {
+        lista.insert(WireSummary(id: id, title: titulo, private: privada, last_turn_at: cuando, running: false), at: 0)
+        if lista.count > LimitesConversacion.listaMax { lista.removeLast() }
+        hilos[id] = hilos[id] ?? []
     }
 
-    /// Bounded like the core's view: at most 20 turns and 48 KB of text, oldest dropped first.
-    private mutating func recortar() {
-        while turns.count > LimitesConversacion.turnosMax { turns.removeFirst() }
-        while turns.count > 1, turns.reduce(0, { $0 + $1.mine.utf8.count + $1.reply.utf8.count }) > LimitesConversacion.textoVistaMaxBytes {
-            turns.removeFirst()
+    private mutating func marcar(_ conv: String, enMarcha: Bool) {
+        guard let i = lista.firstIndex(where: { $0.id == conv }) else { return }
+        let c = lista.remove(at: i)
+        let nueva = WireSummary(id: c.id, title: c.title, private: c.private,
+                                last_turn_at: enMarcha ? c.last_turn_at : "2026-11-27T12:00:00Z", running: enMarcha)
+        lista.insert(nueva, at: enMarcha ? 0 : i)
+    }
+
+    private mutating func anadir(_ e: WireEntry, en conv: String) {
+        var h = hilos[conv] ?? []
+        h.append(e)
+        // Bounded like the core's store: at most 40 entries and 48 KB of text, oldest first.
+        while h.count > LimitesConversacion.entradasMax { h.removeFirst() }
+        while h.count > 1, h.reduce(0, { $0 + Self.bytes($1) }) > LimitesConversacion.textoVistaMaxBytes { h.removeFirst() }
+        hilos[conv] = h
+    }
+
+    static func bytes(_ e: WireEntry) -> Int {
+        switch e {
+        case .message(let m): m.text.utf8.count
+        case .turn(let t): t.reply.utf8.count
+        }
+    }
+
+    private mutating func cambiar(_ id: String, _ f: (inout Turno) -> Void) {
+        guard let conv = conversacion(de: id), var h = hilos[conv],
+              let i = h.firstIndex(where: { if case .turn(let t) = $0 { t.turn_id == id } else { false } }),
+              case .turn(let w) = h[i]
+        else { return }
+        var t = Turno(w)
+        f(&t)
+        h[i] = .turn(t.wire)
+        hilos[conv] = h
+        // The text bound holds as replies grow, too.
+        while h.count > 1, h.reduce(0, { $0 + Self.bytes($1) }) > LimitesConversacion.textoVistaMaxBytes {
+            h.removeFirst()
+            hilos[conv] = h
         }
     }
 }
 
 /// A mutable copy of a `WireTurn` (the generated struct has `let` fields).
 struct Turno {
-    var turn_id: String
-    var conversation: String?
-    var source: WireSource
-    var mine: String
+    var w: WireTurn
     var reply: String
     var progress: WireProgress?
     var tool: String?
     var outcome: WireOutcome?
     var error_code: String?
-    var audio: WireAudio
 
     init(_ t: WireTurn) {
-        turn_id = t.turn_id; conversation = t.conversation; source = t.source; mine = t.mine; reply = t.reply
-        progress = t.progress; tool = t.tool; outcome = t.outcome; error_code = t.error_code; audio = t.audio
+        w = t; reply = t.reply; progress = t.progress; tool = t.tool; outcome = t.outcome; error_code = t.error_code
     }
 
     var wire: WireTurn {
-        WireTurn(turn_id: turn_id, conversation: conversation, source: source, mine: mine, reply: reply,
-                 progress: progress, tool: tool, outcome: outcome, error_code: error_code, audio: audio)
+        WireTurn(turn_id: w.turn_id, source: w.source, by_name: w.by_name, by_self: w.by_self, reply: reply,
+                 progress: progress, tool: tool, outcome: outcome, error_code: error_code)
     }
 }

@@ -20,12 +20,16 @@
 // is never printed.
 // Typed on stdin: a phase name (above) switches the live state; `quit` stops.
 //
-// Conversation (IPC v4, only for a `same_signer` peer, like the core): typed text gets a scripted
-// reply (preparing, thinking, a tool, then the text, with audio that plays only after the app's
-// `turn_visible`, or is dropped 2 s later). Text with «error» ends in an error, «lento» in a
-// timeout. A take plays partials of a scripted phrase, then stops hearing: 5 s later the agent
-// cuts it to review (silence_cut). `--mic-deny` answers the permission prompt with «no».
-// More stdin words: `push` (Fogar writes on its own), `dia` (a new gateway conversation),
+// Conversations (IPC v6, only for a `same_signer` peer, like the core): two example conversations
+// in the list; typed text goes to the open one (or creates one) and gets a scripted reply
+// (preparing, thinking, a tool, then the text). A text sent while a turn runs waits («pendiente»)
+// and is answered next; «Cancelar» withdraws it. Text with «error» ends in an error, «lento» in a
+// timeout. Dictation is off until PR 5 (the transcriber is `unknown`: takes are refused
+// `no_transcriber`); `--transcriber up` brings the scripted take back to develop its look: partials
+// of a phrase, then 5 s later the agent cuts it to review (silence_cut). `--mic-deny` answers the
+// permission prompt with «no».
+// More stdin words: `push` (Fogar writes on its own), `otro <texto>` (another device, «Cocina»,
+// writes in the open conversation), `solo_lectura` / `escritura` (the account's write scope),
 // `mic <state>`, `transcriber <state>`, `tts <state>`, `silencio`, `seguridad`, `frase_perdida`.
 import FogarStandinKit
 import FogarWire
@@ -46,8 +50,8 @@ struct Options {
     var old = false
     var mic = WireMic.notDetermined
     var micDeny = false
-    var transcriber = WireService.up
-    var tts = WireService.up
+    var transcriber = WireService.unknown
+    var tts = WireService.unknown
     /// How long the «system prompt» takes to answer `request_mic_permission`.
     var micPromptSecs = 0.7
     var noMic = false
@@ -94,13 +98,16 @@ actor StandIn {
     private var iniciando = false
     private var sim: ConversacionSimulada
     private var conversacion: [Int: FramedConnection] = [:]
+    /// Connections subscribed to the list, and the list they were last sent.
+    private var listas: [Int: FramedConnection] = [:]
+    private var ultimaLista: [WireSummary]?
 
     init(_ options: Options) {
         self.options = options
         link = options.phase
         gateway = options.phase == "not_paired" ? nil : greenHouse
         sim = ConversacionSimulada(mic: options.mic, transcriber: options.transcriber, tts: options.tts,
-                                   listo: options.phase == "ready")
+                                   listo: options.phase == "ready", ejemplos: true)
         sim.sinMicro = options.noMic
     }
 
@@ -129,14 +136,14 @@ actor StandIn {
             link: link == "reconnecting" ? "backoff" : link, phase: phase, gateway: gateway,
             sessions: phase == .ready ? 3 : 0, turns_completed: 7,
             boot_mode: options.boot, peer_check: options.peer,
-            transcriber: phase == .ready ? sim.transcriber : .unknown, tts: phase == .ready ? sim.tts : .unknown)
+            transcriber: phase == .ready ? sim.transcriber : .unknown, tts: phase == .ready ? sim.tts : .unknown,
+            read_only: sim.soloLectura)
     }
 
     func set(link: String) async {
         self.link = link
         if link == "not_paired" { gateway = nil } else if gateway == nil { gateway = greenHouse }
         sim.listo = link == "ready"
-        if !sim.listo, let t = sim.turnoAbierto { sim.cerrar(t.turn_id, .closed) }
         await broadcast()
         await difundir()
     }
@@ -217,9 +224,18 @@ actor StandIn {
             }
             return .reconnecting
         case .subscribeConversation, .sendText, .captureStart, .captureEnd, .cancelTurn,
-             .turnVisible, .requestMicPermission:
+             .requestMicPermission, .listConversations, .openConversation, .newConversation:
             // Like the core: the conversation is strictly for the signed app (no dev opt-in).
             return .refused(WireRefused(reason: "needs the signed Fogar app"))
+        }
+    }
+
+    /// The requests `conversar` answers (strictly for the signed app).
+    static func esDeConversacion(_ r: WireRequest) -> Bool {
+        switch r {
+        case .subscribeConversation, .sendText, .captureStart, .captureEnd, .cancelTurn, .requestMicPermission,
+             .listConversations, .openConversation, .newConversation: true
+        default: false
         }
     }
 
@@ -233,7 +249,7 @@ actor StandIn {
         return host.hasSuffix(".ts.net") || host.hasPrefix("100.")
     }
 
-    // MARK: Conversation (IPC v4)
+    // MARK: Conversations (IPC v6)
 
     /// A conversation request from connection `id` (`suscrita`: it sent `subscribe_conversation`).
     /// Like the core, the view that changed is pushed AFTER the answer (`serve` calls `difundir`).
@@ -243,20 +259,29 @@ actor StandIn {
         switch request {
         case .subscribeConversation:
             return .conversationSubscribed // the view follows from `serve`
+        case .listConversations:
+            return .listSubscribed // the list follows from `serve`
+        case .openConversation(let o):
+            respuesta = sim.abrir(o.id)
+        case .newConversation:
+            respuesta = sim.nueva()
         case .sendText(let t):
-            respuesta = sim.enviarTexto(t.text)
-            if case .textAccepted = respuesta { responder(a: t.text) }
+            let r = sim.enviarTexto(t.text)
+            respuesta = r.respuesta
+            if let en = r.en, r.entregado { responder(a: t.text, en: en) }
         case .captureStart:
             respuesta = sim.empezarToma(conexion: id, suscrita: suscrita)
             if case .captureStarted = respuesta { escuchar() }
         case .captureEnd(let e):
             let (r, enviar) = sim.terminarToma(e.then, conexion: id)
             respuesta = r
-            if let enviar { responder(a: enviar) }
+            // Like the core's take: a sent transcript is typed text.
+            if let enviar {
+                let r = sim.enviarTexto(enviar)
+                if let en = r.en, r.entregado { responder(a: enviar, en: en) }
+            }
         case .cancelTurn:
             respuesta = sim.cancelar()
-        case .turnVisible(let v):
-            respuesta = sim.turnoVisible(v.turn_id, suscrita: suscrita)
         case .requestMicPermission:
             try? await Task.sleep(for: .seconds(options.micPromptSecs)) // the system prompt
             respuesta = sim.pedirPermiso(concede: !options.micDeny)
@@ -271,13 +296,20 @@ actor StandIn {
         return .conversation(sim.vista)
     }
 
+    func suscribirLista(_ id: Int, _ c: FramedConnection) -> WireResponse {
+        listas[id] = c
+        return .conversations(WireConversations(conversations: sim.lista))
+    }
+
     func soltar(_ id: Int) async {
         conversacion[id] = nil
+        listas[id] = nil
         sim.conexionPerdida(id)
         await difundir()
     }
 
-    /// Latest view to every conversation subscriber (a slow one is dropped, like the core).
+    /// Latest view to every conversation subscriber, and the list when it changed (a slow one is
+    /// dropped, like the core).
     func difundir() async {
         let push = WireResponse.conversation(sim.vista)
         for (id, c) in conversacion {
@@ -287,6 +319,15 @@ actor StandIn {
                 sim.conexionPerdida(id)
             }
         }
+        guard sim.lista != ultimaLista else { return }
+        ultimaLista = sim.lista
+        let lista = WireResponse.conversations(WireConversations(conversations: sim.lista))
+        for (id, c) in listas {
+            do { try await withDeadline(.seconds(2)) { try await c.send(WireCodec.encode(lista)) } } catch {
+                listas[id] = nil
+                c.cancel()
+            }
+        }
     }
 
     private func cambiar(_ f: (inout ConversacionSimulada) -> Void) async {
@@ -294,14 +335,15 @@ actor StandIn {
         await difundir()
     }
 
-    /// The scripted reply to a sent text: preparing, thinking, a tool, then the words.
-    private func responder(a texto: String, push: Bool = false) {
+    /// The scripted reply to a text delivered in `conv` (`por`: the device that sent it, `nil` =
+    /// this Mac): preparing, thinking, a tool, then the words. The next pending text follows.
+    private func responder(a texto: String, en conv: String, push: Bool = false, por nombre: String? = nil) {
         let n = registrar()
         tareas[n] = Task {
             defer { olvidar(n) }
             try? await Task.sleep(for: .milliseconds(push ? 0 : 400))
             var abierto = ""
-            await cambiar { abierto = $0.abrirTurno(source: push ? .push : .mine, mine: push ? "" : texto) }
+            await cambiar { abierto = $0.abrirTurno(source: push ? .push : .mine, en: conv, por: nombre) }
             let id = abierto
             let minusculas = texto.lowercased()
             if !push {
@@ -313,8 +355,8 @@ actor StandIn {
                 await cambiar { $0.progreso(id, .tool, herramienta: "ha_call_service") }
                 try? await Task.sleep(for: .milliseconds(1000))
             }
-            if minusculas.contains("error") { await cambiar { $0.cerrar(id, .error, codigo: "upstream_unavailable") }; return }
-            if minusculas.contains("lento") { await cambiar { $0.cerrar(id, .timeout) }; return }
+            if minusculas.contains("error") { await terminar(id, en: conv, .error, codigo: "upstream_unavailable"); return }
+            if minusculas.contains("lento") { await terminar(id, en: conv, .timeout); return }
             let respuesta = push ? "Te recuerdo que a las 19:00 tienes que sacar la ropa de la lavadora."
                 : minusculas.contains("luz") ? "Hecho: he encendido la luz del salón al 60 %. ¿Quieres que la baje más tarde?"
                 : "Aquí tienes una respuesta de prueba del agente sustituto. Llega por trozos, como la del gateway, para ver cómo se va escribiendo en la conversación."
@@ -322,21 +364,18 @@ actor StandIn {
             for palabra in respuesta.split(separator: " ") {
                 guard sigueAbierto(id) else { return }
                 await cambiar { $0.texto(id, primero ? String(palabra) : " " + palabra) }
-                if primero {
-                    primero = false
-                    await cambiar { $0.llegaAudio(id) }
-                    let m = registrar()
-                    tareas[m] = Task {
-                        defer { olvidar(m) }
-                        try? await Task.sleep(for: .seconds(2))
-                        await cambiar { $0.plazoVencido(id) }
-                    }
-                }
+                primero = false
                 try? await Task.sleep(for: .milliseconds(70))
             }
-            try? await Task.sleep(for: .milliseconds(1200)) // the audio runs a little past the text
-            await cambiar { $0.audioTermina(id); $0.cerrar(id, .done) }
+            await terminar(id, en: conv, .done)
         }
+    }
+
+    /// `turn_end`; a text that waited behind it is delivered and answered.
+    private func terminar(_ id: String, en conv: String, _ o: WireOutcome, codigo: String? = nil) async {
+        var siguiente: String?
+        await cambiar { siguiente = $0.cerrar(id, o, codigo: codigo) }
+        if let siguiente { responder(a: siguiente, en: conv) }
     }
 
     private func sigueAbierto(_ id: String) -> Bool { sim.turno(id)?.outcome == nil }
@@ -363,8 +402,17 @@ actor StandIn {
     /// A word typed on the stand-in's stdin. Returns false when it is not a conversation word.
     func orden(_ palabras: [String]) async -> Bool {
         switch (palabras.first ?? "", palabras.dropFirst().first) {
-        case ("push", _): responder(a: "", push: true)
-        case ("dia", _): await cambiar { $0.nuevoDia("conv-\(UUID().uuidString.prefix(6))") }
+        case ("push", _):
+            guard let conv = sim.abierta ?? sim.lista.first?.id else { return true }
+            responder(a: "", en: conv, push: true)
+        case ("otro", _):
+            guard let conv = sim.abierta ?? sim.lista.first?.id else { return true }
+            let texto = palabras.dropFirst().joined(separator: " ")
+            var entregado = false
+            await cambiar { entregado = $0.mensaje(texto.isEmpty ? "¿Qué tiempo hace?" : texto, en: conv, mio: false, de: "Cocina") }
+            if entregado { responder(a: texto, en: conv, por: "Cocina") }
+        case ("solo_lectura", _): await cambiar { $0.soloLectura = true }; await broadcast()
+        case ("escritura", _): await cambiar { $0.soloLectura = false }; await broadcast()
         case ("mic", let e?): await cambiar { $0.mic = WireMic(rawValue: e) ?? $0.mic }
         case ("transcriber", let e?): await cambiar { $0.transcriber = WireService(rawValue: e) ?? $0.transcriber }; await broadcast()
         case ("tts", let e?): await cambiar { $0.tts = WireService(rawValue: e) ?? $0.tts }; await broadcast()
@@ -402,12 +450,10 @@ func serve(_ c: FramedConnection, _ agent: StandIn) async {
             if case .hello = request { saludado = true } else if !saludado { return }
             let response: WireResponse
             var conversacion = false
-            switch request {
-            case .subscribeConversation, .sendText, .captureStart, .captureEnd, .cancelTurn, .turnVisible,
-                 .requestMicPermission:
+            if StandIn.esDeConversacion(request) {
                 response = await agent.conversar(request, conexion: id, suscrita: suscrita)
                 conversacion = true
-            default:
+            } else {
                 response = await agent.answer(request)
             }
             // Every write has a deadline: a client that stops reading is dropped, like the core.
@@ -419,6 +465,8 @@ func serve(_ c: FramedConnection, _ agent: StandIn) async {
             if case .conversationSubscribed = response {
                 suscrita = true
                 try await enviar(c, await agent.suscribirConversacion(id, c))
+            } else if case .listSubscribed = response {
+                try await enviar(c, await agent.suscribirLista(id, c))
             } else if conversacion {
                 // Like the core: the changed view follows the answer.
                 await agent.difundir()

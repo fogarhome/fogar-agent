@@ -94,8 +94,8 @@ enum IconoModo: Equatable {
     case reposo, desconectado, grabando, hablando
 
     init(_ state: AgentState, _ c: Conversacion) {
+        // shortcut: nothing plays over `/events`, so `hablando` never shows until PR 5's voice.
         if c.grabando { self = .grabando }
-        else if c.vivo, c.vista?.speaking == true { self = .hablando }
         else { self = state.status?.phase == .ready ? .reposo : .desconectado }
     }
 

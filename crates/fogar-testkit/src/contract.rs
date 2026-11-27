@@ -962,9 +962,9 @@ pub mod ipc_server {
     //! yields a client speaking the adapter's wire format through [`IpcTestClient`].
     use fogar_ports::audio::MicPermission;
     use fogar_ports::ipc::{
-        CaptureGesture, CaptureThen, ConversationView, GatewayInfo, IpcConn, IpcRequest,
-        IpcResponse, IpcServer, LinkPhase, LoginFailure, LoginForm, Password, PeerCheck,
-        StatusReport, TurnView, UserText,
+        CaptureGesture, CaptureThen, ConversationSummary, ConversationView, GatewayInfo, IpcConn,
+        IpcRequest, IpcResponse, IpcServer, LinkPhase, LoginFailure, LoginForm, MessageState,
+        MessageView, Password, PeerCheck, StatusReport, TurnView, UserText, ViewEntry,
     };
     use std::{future::Future, time::Duration};
 
@@ -1057,9 +1057,17 @@ pub mod ipc_server {
                     then: CaptureThen::Review,
                 } => IpcResponse::CaptureEnded,
                 IpcRequest::CancelTurn => IpcResponse::TurnCancelSent,
-                IpcRequest::TurnVisible { turn_id } if turn_id == "t-9" => {
-                    IpcResponse::TurnVisibleNoted
+                IpcRequest::ListConversations => {
+                    conn.send(IpcResponse::ListSubscribed).await.expect("send");
+                    conn.send(IpcResponse::Conversations(list()))
+                        .await
+                        .expect("push the list");
+                    continue;
                 }
+                IpcRequest::OpenConversation { id } if id == "c-9" => {
+                    IpcResponse::ConversationOpened
+                }
+                IpcRequest::NewConversation => IpcResponse::ConversationOpened,
                 IpcRequest::RequestMicPermission => {
                     IpcResponse::MicPermission(MicPermission::NotDetermined)
                 }
@@ -1075,14 +1083,31 @@ pub mod ipc_server {
 
     /// A view whose frame is close to `MAX_FRAME_BYTES` but fits untouched.
     fn big_view() -> ConversationView {
+        let mut m = MessageView::default();
+        m.id = "r-9".into();
+        m.text = USER_TEXT.into();
+        m.mine = true;
+        m.state = MessageState::Pending;
         let mut t = TurnView::default();
         t.turn_id = "t-9".into();
-        t.mine = USER_TEXT.into();
+        t.by_name = Some("Cocina".into());
         t.reply = "x".repeat(60 * 1024);
         let mut v = ConversationView::default();
-        v.turns = vec![t];
+        v.id = Some("c-9".into());
+        v.entries = vec![ViewEntry::Message(m), ViewEntry::Turn(t)];
         v.live = "pon".into();
         v
+    }
+
+    /// IPC v6: the conversation list.
+    fn list() -> Vec<ConversationSummary> {
+        let mut c = ConversationSummary::default();
+        c.id = "c-9".into();
+        c.title = Some(USER_TEXT.into());
+        c.private = true;
+        c.last_turn_at = Some("2026-11-27T10:00:00Z".into());
+        c.running = true;
+        vec![c, ConversationSummary::default()]
     }
 
     /// IPC v4: every conversation request and answer crosses the adapter intact, including a
@@ -1122,11 +1147,10 @@ pub mod ipc_server {
                 ),
                 (IpcRequest::CancelTurn, IpcResponse::TurnCancelSent),
                 (
-                    IpcRequest::TurnVisible {
-                        turn_id: "t-9".into(),
-                    },
-                    IpcResponse::TurnVisibleNoted,
+                    IpcRequest::OpenConversation { id: "c-9".into() },
+                    IpcResponse::ConversationOpened,
                 ),
+                (IpcRequest::NewConversation, IpcResponse::ConversationOpened),
                 (
                     IpcRequest::RequestMicPermission,
                     IpcResponse::MicPermission(MicPermission::NotDetermined),
@@ -1134,6 +1158,11 @@ pub mod ipc_server {
             ] {
                 assert_eq!(c.request(req).await, Some(want));
             }
+            assert_eq!(
+                c.request(IpcRequest::ListConversations).await,
+                Some(IpcResponse::ListSubscribed)
+            );
+            assert_eq!(c.next().await, Some(IpcResponse::Conversations(list())));
             drop(c);
         };
         bounded(async { tokio::join!(serve_one(&server, 0), client) }).await;

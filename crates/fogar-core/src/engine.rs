@@ -15,8 +15,9 @@
 //!   {message}` and the new one opens. Answered once the call is admitted (`TextAccepted` =
 //!   "accepted by the agent"); my text then appears from its `message` event (no local echo); a
 //!   failed post shows as a failed message. `CancelTurn`: `POST …/cancel` of the open one.
-//! - `403 missing_scope` on a write is remembered: later writes are refused without a call.
-//!   shortcut: refused `NotReady` until IPC v6 (Task 5) adds `TextRefusal::MissingScope`.
+//! - `403 missing_scope` on a write (or `/auth/me` without `conversations:write`) is
+//!   remembered: later texts are refused `MissingScope` without a call; the view says
+//!   `read_only`.
 //! - Dictation is off until PR 5: no link reports a transcriber, so the consent gate refuses
 //!   every take `NoTranscriber`. Nothing plays: no path feeds the playback gate.
 //!
@@ -42,7 +43,10 @@ use fogar_ports::{
     audio::MicPermission,
     clock::{Clock, Mono},
     gateway_http::{GatewayHttp, HttpCall, HttpReply, PathId},
-    ipc::{CaptureRefusal, CaptureThen, ConversationView, Notice, TextRefusal, UserActivity},
+    ipc::{
+        CaptureRefusal, CaptureThen, ConversationSummary, ConversationView, Notice, TextRefusal,
+        UserActivity,
+    },
 };
 use fogar_proto::{
     account::{Me, Scope},
@@ -70,9 +74,9 @@ pub(crate) enum Command {
     SendText(String, oneshot::Sender<Result<(), TextRefusal>>),
     Cancel(oneshot::Sender<()>),
     /// Show this conversation (state + history, then live).
-    // shortcut: no IPC request sends it until IPC v6 (S4 PR 4a Task 5); tests do.
-    #[cfg_attr(not(test), allow(dead_code))]
     Open(String, oneshot::Sender<()>),
+    /// Nothing open: the next text starts a new conversation.
+    New(oneshot::Sender<()>),
     /// The person pressed the microphone button (only `ipc.rs` can build the `Start`). `owner`
     /// closes when the connection that asked goes away.
     CaptureStart {
@@ -82,9 +86,6 @@ pub(crate) enum Command {
     },
     CaptureEnd(CaptureThen, oneshot::Sender<()>),
     RequestMicPermission(oneshot::Sender<MicPermission>),
-    /// The app shows this turn (its id as the view carries it): its audio may play. Answered
-    /// `false` when the id names more than one entry of the view (ambiguous: refused).
-    TurnVisible(String, oneshot::Sender<bool>),
 }
 
 /// Redacting `Debug`: the text is the user's.
@@ -94,10 +95,10 @@ impl std::fmt::Debug for Command {
             Command::SendText(t, _) => write!(f, "SendText(<redacted {} bytes>)", t.len()),
             Command::Cancel(_) => f.write_str("Cancel"),
             Command::Open(id, _) => write!(f, "Open({id})"),
+            Command::New(_) => f.write_str("New"),
             Command::CaptureStart { start, .. } => write!(f, "CaptureStart({start:?})"),
             Command::CaptureEnd(then, _) => write!(f, "CaptureEnd({then:?})"),
             Command::RequestMicPermission(_) => f.write_str("RequestMicPermission"),
-            Command::TurnVisible(id, _) => write!(f, "TurnVisible({} bytes)", id.len()),
         }
     }
 }
@@ -111,6 +112,8 @@ pub(crate) struct Engine<C, H> {
     pub(crate) cmd_rx: mpsc::Receiver<Command>,
     pub(crate) conv: watch::Sender<ConversationView>,
     pub(crate) chat: watch::Sender<Chat>,
+    /// The list as the UI draws it (its own watch: a token never wakes a list subscriber).
+    pub(crate) list: watch::Sender<Vec<ConversationSummary>>,
 }
 
 /// What a REST call was for. Holds the user's text for a write (never printed).
@@ -248,8 +251,16 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
         if changed {
             let chat = self.chat.borrow();
             self.conv.send_if_modified(|v| chat.render(v));
+            self.list.send_if_modified(|l| chat.render_list(l));
         }
         out
+    }
+
+    /// `write_denied` changed (or may have): the view and the status say so.
+    fn publish_read_only(&self, st: &State) {
+        let r = st.write_denied;
+        self.conv
+            .send_if_modified(|v| conversation::set_read_only(v, r));
     }
 
     fn publish_activity(&self, st: &State) {
@@ -374,8 +385,11 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
                     let _ = reply.send(Err(TextRefusal::Recording));
                     return;
                 }
-                // shortcut: `TextRefusal::MissingScope` arrives with IPC v6 (Task 5).
-                if !st.online || st.write_denied || st.creating {
+                if st.write_denied {
+                    let _ = reply.send(Err(TextRefusal::MissingScope));
+                    return;
+                }
+                if !st.online || st.creating {
                     let _ = reply.send(Err(TextRefusal::NotReady));
                     return;
                 }
@@ -450,6 +464,19 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
                 self.open(st, &id);
                 let _ = reply.send(());
             }
+            Command::New(reply) => {
+                if reply.is_closed() {
+                    return;
+                }
+                // A late state, history or reopen of the old one must not bring it back.
+                st.open_seq += 1;
+                st.reopen_at = None;
+                if let Some(step) = st.open_step.take() {
+                    step.abort();
+                }
+                self.store(|c| ((), c.close()));
+                let _ = reply.send(());
+            }
             Command::CaptureStart {
                 start,
                 owner,
@@ -477,28 +504,6 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
                 if !reply.is_closed() {
                     st.capture.ask_permission(reply);
                 }
-            }
-            Command::TurnVisible(id, reply) => {
-                // The IPC gave up (and counted it as busy): never act on it late.
-                if reply.is_closed() {
-                    return;
-                }
-                // Review F2 of #32: the confirmation must name ONE entry of the view without
-                // ambiguity (ids are compared as the view shows them, truncated included).
-                let entries = self
-                    .conv
-                    .borrow()
-                    .turns
-                    .iter()
-                    .filter(|t| !id.is_empty() && t.turn_id == id)
-                    .count();
-                if entries > 1 {
-                    Stats::inc(&self.stats.turn_visible_refused);
-                    let _ = reply.send(false);
-                    return;
-                }
-                let _ = reply.send(true);
-                st.playback.visible(&id, self.clock.now());
             }
         }
     }
@@ -570,6 +575,7 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
                         c.create_failed();
                         ((), false)
                     });
+                    self.publish_read_only(st);
                     self.call(st, Job::Me, HttpCall::Me, None);
                     self.refresh_list(st);
                     self.reopen(st);
@@ -604,6 +610,7 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
                 st.creating = false;
                 st.write_denied = false;
                 self.close_take(st);
+                self.publish_read_only(st);
                 self.store(|c| ((), c.clear()));
             }
             Inbound::Resync => {
@@ -660,6 +667,7 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
         if class == HttpClass::MissingScope && job.is_write() {
             Stats::inc(&self.stats.writes_missing_scope);
             st.write_denied = true;
+            self.publish_read_only(st);
         }
         let reply = reply.filter(|_| ok);
         match job {
@@ -678,6 +686,7 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
                     && !me.scopes.is_empty()
                 {
                     st.write_denied = !me.scopes.contains(&Scope::ConversationsWrite);
+                    self.publish_read_only(st);
                 }
             }
             Job::State { id, seq } if seq == st.open_seq => {
@@ -743,13 +752,12 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
                         self.effect(st, fx);
                     }
                     None => {
+                        // Shown as a failed message while nothing is open.
                         self.store(|c| {
                             c.create_failed();
-                            ((), false)
+                            let changed = c.send_failed(&text, failure_code(class));
+                            ((), changed)
                         });
-                        // shortcut: with nothing open the failed text is not shown (IPC v6
-                        // carries the refusal, Task 5); counted in `rest_failures`.
-                        drop(text);
                     }
                 }
             }

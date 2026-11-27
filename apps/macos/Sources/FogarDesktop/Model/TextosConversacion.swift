@@ -37,6 +37,7 @@ extension Textos {
         case .tooLong: "Es demasiado largo para un mensaje. Pártelo en dos."
         case .notReady: "Fogar no está conectado al gateway ahora. Tu texto sigue en la caja."
         case .recording: "Termina de grabar antes de enviar texto."
+        case .missingScope: soloLectura
         }
     }
 
@@ -124,6 +125,31 @@ extension Textos {
     }
 
     static let pushEtiqueta = "Fogar te escribió"
-    static let pushSinSonido = "Sin sonido: no tenías la conversación delante."
-    static let otroDia = "Otro día"
+
+    /// Who wrote a message, for VoiceOver.
+    static func autorMensaje(_ m: WireMessage) -> String {
+        if m.mine { return "Tú" }
+        return m.from_name.flatMap(nombreDispositivo) ?? "Alguien de casa"
+    }
+
+    /// The line under a message, when there is something to say.
+    static func notaMensaje(_ m: WireMessage) -> String? {
+        switch m.state {
+        case .pending: return "Pendiente: va cuando Fogar termine."
+        case .failed:
+            return m.error_code == "missing_scope" ? "No se envió: tu cuenta no puede escribir."
+                : "No se envió. Escríbelo otra vez cuando Fogar vuelva."
+        case .delivered, .past:
+            guard !m.mine, let nombre = m.from_name.flatMap(nombreDispositivo) else { return nil }
+            return "Enviado desde \(nombre)"
+        }
+    }
+
+    /// A device name is the person's own text (they named the device): shown as it is, cut to
+    /// 40 characters, never empty.
+    static func nombreDispositivo(_ s: String) -> String? {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? nil : String(t.prefix(40))
+    }
+    static let soloLectura = "Tu cuenta puede leer las conversaciones, pero no escribir. Pídeselo a quien administra Fogar."
 }

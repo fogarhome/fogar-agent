@@ -4,9 +4,8 @@
 //! - [`PlaybackGate`] is the only owner of the speaker port: `AgentPorts` hands it the
 //!   `AudioSink` and the engine keeps only the gate (archtest R12: no other file names the port).
 //! - A turn's audio reaches the speaker only after the app confirms it is SHOWING that turn
-//!   (`IpcRequest::TurnVisible`, from a same-signer connection subscribed to the conversation;
-//!   `ipc.rs` checks both). The app confirms its own turns at `turn_start`, and a push only while
-//!   the conversation window is on screen; the core treats both alike.
+//!   (IPC v5's `TurnVisible`; IPC v6 has no confirmation and nothing feeds the gate until PR 5,
+//!   which decides how the app confirms). [`PlaybackGate::visible`] is that one entry.
 //! - Until then the turn's audio waits in a bounded buffer of [`UNSEEN_MAX_SAMPLES`] (3 s at
 //!   24 kHz, ~144 KB). If no confirmation arrives within [`VISIBLE_DEADLINE`] (2 s from the
 //!   `turn_start`), or the buffer fills, the turn's audio is discarded (counted in
@@ -43,8 +42,15 @@ use crate::{capture::spawn_device_job, conversation, stats::Stats, time::sleep_u
 use fogar_ports::{
     audio::{ActivePlayback, AudioError, AudioFormat, AudioSink, OPEN_BLOCK_MAX},
     clock::{Clock, Mono},
-    ipc::TurnAudio,
 };
+
+/// Whether a turn's reply was heard (IPC v5 showed it; v6 has no audio mark until PR 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnAudio {
+    Played,
+    /// Audio arrived but nobody confirmed the turn was on screen: text only.
+    Muted,
+}
 use fogar_proto::audio::{TTS_RATE_HZ, TtsFrame};
 use std::{sync::Arc, time::Duration};
 use tokio::task::JoinSet;

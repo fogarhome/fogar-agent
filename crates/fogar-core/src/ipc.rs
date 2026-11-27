@@ -36,7 +36,8 @@ use fogar_ports::{
     gateway_http::GatewayHttp,
     ipc::{
         CaptureGesture, CaptureRefusal, IPC_VERSION, IpcConn, IpcError, IpcRequest, IpcResponse,
-        IpcServer, LoginForm, PeerCheck, SEND_TEXT_MAX_BYTES, StatusReport, TextRefusal,
+        IpcServer, LoginForm, PeerCheck, SEND_TEXT_MAX_BYTES, ServiceState, StatusReport,
+        TextRefusal,
     },
     tailnet::TailnetPeers,
 };
@@ -142,9 +143,9 @@ struct Conn<K, C, H, T> {
 
 fn report(health: &HealthProbe, v: &LinkView, peer_check: PeerCheck) -> StatusReport {
     let s = health.stats.snapshot();
-    let (transcriber, tts) = {
+    let (transcriber, read_only) = {
         let c = health.conversation.borrow();
-        (c.transcriber, c.tts)
+        (c.transcriber, c.read_only)
     };
     StatusReport::new(
         v.state.label().to_owned(),
@@ -155,7 +156,9 @@ fn report(health: &HealthProbe, v: &LinkView, peer_check: PeerCheck) -> StatusRe
         health.boot_mode.to_owned(),
         peer_check,
     )
-    .with_voice(transcriber, tts)
+    // No TTS is heard of over `/events` (PR 5 brings the voice back).
+    .with_voice(transcriber, ServiceState::Unknown)
+    .with_read_only(read_only)
 }
 
 impl<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers> Conn<K, C, H, T> {
@@ -253,8 +256,10 @@ async fn recv_within<C: Clock, K: IpcConn>(
 async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Conn<K, C, H, T>) {
     let mut view = c.health.view.clone();
     let mut conv = c.health.conversation.clone();
+    let mut list = c.health.list.clone();
     let mut subscribed = false;
     let mut conv_subscribed = false;
+    let mut list_subscribed = false;
     // A peer that said another version is told ours, then refused (it must not guess).
     let mut version_ok = true;
     let mut last_pushed: Option<StatusReport> = None;
@@ -273,7 +278,7 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
                 () = c.cancel.cancelled() => return,
                 // Requests BEFORE pushes (review M2): a dense token stream must never starve a
                 // CancelTurn/SendText on a subscribed connection.
-                r = recv_within(&*c.clock, &mut c.conn, (!subscribed && !conv_subscribed).then_some(c.limits.idle_timeout)) => match r {
+                r = recv_within(&*c.clock, &mut c.conn, (!subscribed && !conv_subscribed && !list_subscribed).then_some(c.limits.idle_timeout)) => match r {
                     Some(Ok(Some(req))) => req,
                     // Idle, peer gone or a bad frame: close the connection (dropping it).
                     None | Some(Ok(None) | Err(_)) => return,
@@ -300,15 +305,15 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
                     let (latest, voice) = {
                         let v = conv.borrow_and_update();
                         // Status only: mark seen, no copy of the view.
-                        (conv_subscribed.then(|| v.clone()), (v.transcriber, v.tts))
+                        (conv_subscribed.then(|| v.clone()), (v.transcriber, v.read_only))
                     };
                     if let Some(latest) = latest
                         && !c.send(IpcResponse::Conversation(latest)).await
                     {
                         return;
                     }
-                    // Only a voice change rebuilds the status report (tokens alone never do).
-                    let pushed_voice = last_pushed.as_ref().map(|r| (r.transcriber, r.tts));
+                    // Only a change of what the status shows rebuilds it (tokens never do).
+                    let pushed_voice = last_pushed.as_ref().map(|r| (r.transcriber, r.read_only));
                     if subscribed && pushed_voice != Some(voice) {
                         let rep = report(&c.health, &view.borrow(), c.peer_check);
                         if last_pushed.as_ref() != Some(&rep) {
@@ -320,6 +325,17 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
                     }
                     continue;
                 }
+                // The list (its own watch: tokens never wake this branch).
+                r = list.changed(), if list_subscribed => {
+                    if r.is_err() {
+                        return;
+                    }
+                    let latest = list.borrow_and_update().clone();
+                    if !c.send(IpcResponse::Conversations(latest)).await {
+                        return;
+                    }
+                    continue;
+                }
             }
         };
         let resp = match req {
@@ -328,6 +344,7 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
                 // A peer speaking another version gets no more pushes either.
                 subscribed &= version_ok;
                 conv_subscribed &= version_ok;
+                list_subscribed &= version_ok;
                 if !conv_subscribed {
                     take_owner = None;
                 }
@@ -355,8 +372,10 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
             | IpcRequest::CancelTurn
             | IpcRequest::CaptureStart { .. }
             | IpcRequest::CaptureEnd { .. }
-            | IpcRequest::TurnVisible { .. }
             | IpcRequest::RequestMicPermission
+            | IpcRequest::ListConversations
+            | IpcRequest::OpenConversation { .. }
+            | IpcRequest::NewConversation
                 if c.peer_check != PeerCheck::SameSigner =>
             {
                 IpcResponse::Refused {
@@ -383,6 +402,29 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
             },
             IpcRequest::CancelTurn => match c.ask(Command::Cancel).await {
                 Some(()) => IpcResponse::TurnCancelSent,
+                None => BUSY,
+            },
+            IpcRequest::ListConversations => {
+                if !c.send(IpcResponse::ListSubscribed).await {
+                    return;
+                }
+                list_subscribed = true;
+                IpcResponse::Conversations(list.borrow_and_update().clone())
+            }
+            // Never an id the list could hold (the engine checks the path shape too).
+            IpcRequest::OpenConversation { id } if id.is_empty() || id.len() > ID_MAX_BYTES => {
+                IpcResponse::Refused {
+                    reason: "unknown conversation",
+                }
+            }
+            IpcRequest::OpenConversation { id } => {
+                match c.ask(|reply| Command::Open(id, reply)).await {
+                    Some(()) => IpcResponse::ConversationOpened,
+                    None => BUSY,
+                }
+            }
+            IpcRequest::NewConversation => match c.ask(Command::New).await {
+                Some(()) => IpcResponse::ConversationOpened,
                 None => BUSY,
             },
             IpcRequest::Discover => match op(&c.cancel, c.account.discover(c.may_pair())).await {
@@ -489,24 +531,6 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
                     Some(p) => IpcResponse::MicPermission(p),
                     // Not answered in time: the status as it stands (never a guess).
                     None => IpcResponse::MicPermission(conv.borrow().mic),
-                }
-            }
-            // Spec S2 «Punto único de salida»: only a connection that shows the conversation can
-            // say a turn is on screen.
-            IpcRequest::TurnVisible { .. } if !conv_subscribed => IpcResponse::Refused {
-                reason: "not subscribed to the conversation",
-            },
-            // An id longer than the view ever shows matches no turn: noted, nothing to do.
-            IpcRequest::TurnVisible { turn_id } if turn_id.len() > ID_MAX_BYTES => {
-                IpcResponse::TurnVisibleNoted
-            }
-            IpcRequest::TurnVisible { turn_id } => {
-                match c.ask(|reply| Command::TurnVisible(turn_id, reply)).await {
-                    Some(true) => IpcResponse::TurnVisibleNoted,
-                    Some(false) => IpcResponse::Refused {
-                        reason: "ambiguous turn",
-                    },
-                    None => BUSY,
                 }
             }
             _ => IpcResponse::Refused {

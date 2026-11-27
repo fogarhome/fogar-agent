@@ -7,10 +7,11 @@ import Testing
 /// app must parse and produce. If Rust changes it, IPC_VERSION bumps and these fail.
 @Suite struct GoldenJSON {
     @Test func eventDecodes() throws {
-        let json = #"{"type":"event","data":{"link":"ready","phase":"ready","gateway":{"address":"http://green-house:8004","name":"green-house","version":"1.29.0","client_name":"Mac de Sito","user":"Sito"},"sessions":3,"turns_completed":7,"boot_mode":"normal","peer_check":"same_signer","transcriber":"up","tts":"down"}}"#
+        let json = #"{"type":"event","data":{"link":"ready","phase":"ready","gateway":{"address":"http://green-house:8004","name":"green-house","version":"1.29.0","client_name":"Mac de Sito","user":"Sito"},"sessions":3,"turns_completed":7,"boot_mode":"normal","peer_check":"same_signer","transcriber":"up","tts":"down","read_only":false}}"#
         guard case .event(let s) = try WireCodec.decodeResponse(Data(json.utf8)) else {
             Issue.record("not an event"); return
         }
+        #expect(!s.read_only)
         #expect(s.phase == .ready)
         #expect(s.gateway?.name == "green-house")
         #expect(s.gateway?.client_name == "Mac de Sito")
@@ -52,23 +53,41 @@ import Testing
     }
 
     @Test func notPairedStatusHasNullGateway() throws {
-        let json = #"{"type":"status","data":{"link":"not_paired","phase":"not_paired","gateway":null,"sessions":0,"turns_completed":0,"boot_mode":"safe","peer_check":"uid_only","transcriber":"unknown","tts":"unknown"}}"#
+        let json = #"{"type":"status","data":{"link":"not_paired","phase":"not_paired","gateway":null,"sessions":0,"turns_completed":0,"boot_mode":"safe","peer_check":"uid_only","transcriber":"unknown","tts":"unknown","read_only":true}}"#
         guard case .status(let s) = try WireCodec.decodeResponse(Data(json.utf8)) else {
             Issue.record("not a status"); return
         }
         #expect(s.gateway == nil && s.peer_check == .uidOnly && s.boot_mode == "safe")
     }
 
-    /// IPC v4: the conversation view and the v4 answers.
+    /// IPC v6: the conversation view (messages and turns as entries) and the answers.
     @Test func conversationDecodes() throws {
-        let json = #"{"type":"conversation","data":{"activity":"recording","live":"pon la","draft":"borrador","turns":[{"turn_id":"t-3","conversation":"0b9d","source":"mine","mine":"¿qué tiempo hace?","reply":"Soleado.","progress":"tool","tool":"ha_call_service","outcome":null,"error_code":null,"audio":"none"},{"turn_id":"t-4","conversation":null,"source":"push","mine":"","reply":"Recuerda la cita.","progress":null,"tool":null,"outcome":"error","error_code":"TURN_ERROR","audio":"muted"}],"speaking":true,"awaiting_visible":"t-4","mic":"granted","transcriber":"degraded","tts":"up","notice":"silence_cut"}}"#
+        let json = #"{"type":"conversation","data":{"id":"0b9d","activity":"recording","live":"pon la","draft":"borrador","entries":[{"type":"message","data":{"id":"r-1","text":"¿qué tiempo hace?","mine":false,"from_name":"Cocina","state":"pending","error_code":null}},{"type":"turn","data":{"turn_id":"t-3","source":"mine","by_name":"Cocina","by_self":false,"reply":"Soleado.","progress":"tool","tool":"ha_call_service","outcome":null,"error_code":null}},{"type":"turn","data":{"turn_id":"t-4","source":"push","by_name":null,"by_self":false,"reply":"Recuerda la cita.","progress":null,"tool":null,"outcome":"error","error_code":"TURN_ERROR"}},{"type":"message","data":{"id":"","text":"otra","mine":true,"from_name":null,"state":"failed","error_code":"missing_scope"}}],"mic":"granted","transcriber":"degraded","notice":"silence_cut","read_only":true}}"#
         guard case .conversation(let c) = try WireCodec.decodeResponse(Data(json.utf8)) else {
             Issue.record("not a conversation"); return
         }
-        #expect(c.activity == .recording && c.live == "pon la" && c.draft == "borrador")
-        #expect(c.turns.count == 2 && c.turns[0].tool == "ha_call_service" && c.turns[0].progress == .tool)
-        #expect(c.turns[1].source == .push && c.turns[1].outcome == .error && c.turns[1].audio == .muted)
-        #expect(c.awaiting_visible == "t-4" && c.mic == .granted && c.notice == .silenceCut)
+        #expect(c.id == "0b9d" && c.activity == .recording && c.live == "pon la" && c.draft == "borrador")
+        #expect(c.entries.count == 4 && c.read_only && c.mic == .granted && c.notice == .silenceCut)
+        guard case .message(let m) = c.entries[0], case .turn(let t) = c.entries[1], case .turn(let p) = c.entries[2],
+              case .message(let f) = c.entries[3] else {
+            Issue.record("entries"); return
+        }
+        #expect(m.state == .pending && m.from_name == "Cocina" && !m.mine)
+        #expect(t.tool == "ha_call_service" && t.progress == .tool && t.by_name == "Cocina")
+        #expect(p.source == .push && p.outcome == .error)
+        #expect(f.state == .failed && f.error_code == "missing_scope" && f.mine)
+        guard case .conversations(let l) = try WireCodec.decodeResponse(Data(#"{"type":"conversations","data":{"conversations":[{"id":"0b9d","title":"La serie","private":false,"last_turn_at":"2026-11-27T10:00:00Z","running":true},{"id":"c-2","title":null,"private":true,"last_turn_at":null,"running":false}]}}"#.utf8)) else {
+            Issue.record("not conversations"); return
+        }
+        #expect(l.conversations.count == 2 && l.conversations[0].running && l.conversations[1].private)
+        for (json, ok) in [(#"{"type":"list_subscribed"}"#, WireResponse.listSubscribed),
+                           (#"{"type":"conversation_opened"}"#, .conversationOpened),
+                           (#"{"type":"text_refused","data":{"reason":"missing_scope"}}"#,
+                            .textRefused(WireTextRefused(reason: .missingScope)))] {
+            #expect(try WireCodec.decodeResponse(Data(json.utf8)) == ok)
+        }
+        // v6: the turn confirmation left the vocabulary.
+        #expect(throws: (any Error).self) { try WireCodec.decodeResponse(Data(#"{"type":"turn_visible_noted"}"#.utf8)) }
         guard case .captureRefused(let r) = try WireCodec.decodeResponse(
             Data(#"{"type":"capture_refused","data":{"reason":"permission_not_determined"}}"#.utf8)) else {
             Issue.record("not capture_refused"); return
@@ -95,8 +114,10 @@ import Testing
         (.captureStart(WireCaptureStart(gesture: .hold)), #"{"type":"capture_start","data":{"gesture":"hold"}}"#),
         (.captureEnd(WireCaptureEnd(then: .review)), #"{"type":"capture_end","data":{"then":"review"}}"#),
         (.cancelTurn, #"{"type":"cancel_turn"}"#),
-        (.turnVisible(WireTurnVisible(turn_id: "t-4")), #"{"type":"turn_visible","data":{"turn_id":"t-4"}}"#),
         (.requestMicPermission, #"{"type":"request_mic_permission"}"#),
+        (.listConversations, #"{"type":"list_conversations"}"#),
+        (.openConversation(WireOpen(id: "0b9d")), #"{"type":"open_conversation","data":{"id":"0b9d"}}"#),
+        (.newConversation, #"{"type":"new_conversation"}"#),
     ])
     func requestsMatchRust(request: WireRequest, golden: String) throws {
         let ours = try JSONSerialization.jsonObject(with: WireCodec.encode(request)) as? NSDictionary

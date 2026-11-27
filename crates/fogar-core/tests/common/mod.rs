@@ -224,30 +224,13 @@ impl<L: GatewayLink> RigBuilder<L> {
     }
 }
 
-/// What the real app does with its conversation on screen: subscribe, and confirm each turn
-/// the agent says waits for it (`awaiting_visible`). Ends when the agent closes the connection.
+/// What the real app does with its conversation on screen: subscribe and read every push (IPC
+/// v6 has no turn confirmation). Ends when the agent closes the connection.
 async fn app_confirming_turns(mut c: fogar_testkit::FakeIpcClient) {
-    async fn send(c: &mut fogar_testkit::FakeIpcClient, r: IpcRequest) {
-        c.send_half(&r, true).await;
-        c.send_half(&r, false).await;
-    }
-    send(&mut c, IpcRequest::SubscribeConversation).await;
-    let mut confirmed = String::new();
-    while let Some(m) = c.next().await {
-        if let IpcResponse::Conversation(v) = m
-            && let Some(id) = v.awaiting_visible
-            && id != confirmed
-        {
-            send(
-                &mut c,
-                IpcRequest::TurnVisible {
-                    turn_id: id.clone(),
-                },
-            )
-            .await;
-            confirmed = id;
-        }
-    }
+    let r = IpcRequest::SubscribeConversation;
+    c.send_half(&r, true).await;
+    c.send_half(&r, false).await;
+    while c.next().await.is_some() {}
 }
 
 /// `start_no_ipc` exists so tests without IPC do not need a FakeIpc type parameter.

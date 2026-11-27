@@ -76,7 +76,9 @@ pub struct HealthProbe {
     pub(crate) boot_mode: &'static str,
     /// The conversation view the engine publishes (also the voice state for `StatusReport`).
     pub(crate) conversation: watch::Receiver<ConversationView>,
-    /// The conversation store: the list and the open conversation (IPC v6 shows them, Task 5).
+    /// The conversation list as the UI draws it (IPC v6 `Conversations`).
+    pub(crate) list: watch::Receiver<Vec<fogar_ports::ipc::ConversationSummary>>,
+    /// The conversation store: the list and the open conversation (for tests).
     chat: watch::Receiver<Chat>,
     probe_caps: Option<ProbeCaps>,
     in_tx: mpsc::WeakSender<Inbound>,
@@ -154,7 +156,7 @@ pub struct Agent<C> {
     health: HealthProbe,
     heartbeat: Arc<Heartbeat>,
     view_tx: watch::Sender<LinkView>,
-    /// In-crate tests drive engine commands IPC v5 has no request for (opening).
+    /// In-crate tests drive engine commands directly.
     #[cfg(test)]
     pub(crate) cmds: mpsc::Sender<crate::engine::Command>,
 }
@@ -186,11 +188,14 @@ impl<C: Clock> Agent<C> {
         let (conv_tx, conv_rx) = watch::channel(ConversationView::default());
         // The conversation store (`queues`: watch, coalescing).
         let (chat_tx, chat_rx) = watch::channel(Chat::default());
+        // The list as the UI draws it (`queues`: watch, coalescing).
+        let (list_tx, list_rx) = watch::channel(Vec::new());
         let health = HealthProbe {
             stats: stats.clone(),
             view: view_rx,
             boot_mode: boot.label(),
             conversation: conv_rx,
+            list: list_rx,
             chat: chat_rx,
             probe_caps: ports.probe.as_ref().map(|p| p.capabilities()),
             in_tx: in_tx.downgrade(),
@@ -217,6 +222,7 @@ impl<C: Clock> Agent<C> {
             cmd_rx,
             conv: conv_tx,
             chat: chat_tx,
+            list: list_tx,
         };
         // The microphone goes straight to the consent gate: the engine never holds it.
         let capture = CaptureGate::new(ports.audio_in, &cfg, stats.clone());

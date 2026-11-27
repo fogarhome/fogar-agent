@@ -33,8 +33,9 @@
 use fogar_ports::{
     audio::MicPermission,
     ipc::{
-        CONVERSATION_MAX_TEXT_BYTES, CONVERSATION_MAX_TURNS, ConversationView, Notice,
-        ProgressKind, TurnOutcome, TurnSource, TurnView,
+        CONVERSATION_MAX_TEXT_BYTES, CONVERSATION_MAX_TURNS, ConversationSummary, ConversationView,
+        MessageState, MessageView, Notice, ProgressKind, TurnOutcome, TurnSource, TurnView,
+        ViewEntry,
     },
 };
 use fogar_proto::{
@@ -64,7 +65,7 @@ fn bounded(s: &str) -> &str {
     cut(s, ID_MAX_BYTES)
 }
 
-/// A gateway id as the view shows it (and as the app sends it back in `TurnVisible`).
+/// A gateway id as the store keeps it (the playback gate follows turns by it).
 // shortcut: only the playback gate's turn following uses it, idle until PR 5.
 #[allow(dead_code)]
 pub(crate) fn bounded_id(s: &str) -> &str {
@@ -321,6 +322,8 @@ pub struct Chat {
     running: VecDeque<String>,
     /// Events of unknown conversations while a `POST /conversations` is in flight.
     creating: Option<Buffer>,
+    /// The text of a create that failed, shown while nothing is open (at most one entry).
+    unsent: Vec<Entry>,
 }
 
 fn conv_of(ev: &Event) -> Option<&str> {
@@ -557,6 +560,7 @@ impl Chat {
 
     /// Starts opening `id` (its state is asked next). What was shown goes.
     pub fn open(&mut self, id: &str) -> bool {
+        self.unsent.clear();
         self.open = Some(OpenConv {
             id: bounded(id).to_owned(),
             entries: Vec::new(),
@@ -567,14 +571,16 @@ impl Chat {
         true
     }
 
-    /// Nothing open any more (signed out, or the conversation is gone).
+    /// Nothing open any more (a new conversation, or this one is gone).
     pub fn close(&mut self) -> bool {
-        self.open.take().is_some()
+        let had_unsent = !self.unsent.is_empty();
+        self.unsent.clear();
+        self.open.take().is_some() || had_unsent
     }
 
     /// Signed out: forget everything.
     pub fn clear(&mut self) -> bool {
-        let changed = !self.list.is_empty() || self.open.is_some();
+        let changed = !self.list.is_empty() || self.open.is_some() || !self.unsent.is_empty();
         *self = Chat::default();
         changed
     }
@@ -794,20 +800,26 @@ impl Chat {
         }
     }
 
-    /// Our `POST` of `text` failed with `code`: shown (never sent) instead of vanishing.
+    /// Our `POST` of `text` failed with `code`: shown (never sent) instead of vanishing. With
+    /// nothing open (a create failed) it is the only thing shown, until something opens.
     pub fn send_failed(&mut self, text: &str, code: &str) -> bool {
-        let Some(o) = self.open.as_mut() else {
-            return false;
-        };
-        o.entries.push(Entry::Msg(MsgEntry {
+        let failed = Entry::Msg(MsgEntry {
             id: String::new(),
             text: text.to_owned(),
             mine: true,
             from_name: None,
             status: MsgStatus::Failed,
             error_code: Some(bounded(code).to_owned()),
-        }));
-        trim(&mut o.entries);
+        });
+        let entries = match self.open.as_mut() {
+            Some(o) => &mut o.entries,
+            None => {
+                self.unsent.clear();
+                &mut self.unsent
+            }
+        };
+        entries.push(failed);
+        trim(entries);
         true
     }
 
@@ -845,91 +857,125 @@ impl Chat {
         fx
     }
 
-    /// The open conversation as the UI draws it today (IPC v5): a person's message and the turn
-    /// it started share one `TurnView` (`mine` + `reply`). GUESSED pairing (run ids are not turn
-    /// ids): a person's turn takes the last delivered message before it.
+    /// The open conversation as the UI draws it (IPC v6): one view entry per store entry, in
+    /// order (the store already holds the view's bounds). With nothing open, a create that
+    /// failed shows its text.
     pub fn render(&self, v: &mut ConversationView) -> bool {
-        let mut out: Vec<TurnView> = Vec::new();
-        if let Some(o) = &self.open {
-            let conv = Some(o.id.clone());
-            // Indices in `out` of messages that may still get their turn.
-            let mut waiting: Vec<usize> = Vec::new();
-            for e in &o.entries {
-                match e {
-                    Entry::Msg(m) => {
-                        let mut tv = TurnView::default();
-                        tv.conversation = conv.clone();
-                        tv.source = TurnSource::Mine;
-                        tv.mine = m.text.clone();
-                        match m.status {
-                            MsgStatus::Pending => {}
-                            MsgStatus::Delivered => waiting.push(out.len()),
-                            MsgStatus::Past => {
-                                tv.outcome = Some(TurnOutcome::Done);
-                                waiting.push(out.len());
-                            }
-                            MsgStatus::Failed => {
-                                tv.outcome = Some(TurnOutcome::Error);
-                                tv.error_code = m.error_code.clone();
-                            }
-                        }
-                        out.push(tv);
-                    }
-                    Entry::Turn(t) => {
-                        let slot = if t.push { None } else { waiting.pop() };
-                        // Earlier messages that got no turn of their own joined one: done.
-                        for i in waiting.drain(..) {
-                            out[i].outcome.get_or_insert(TurnOutcome::Done);
-                        }
-                        let tv = match slot {
-                            Some(i) => &mut out[i],
-                            None => {
-                                let mut tv = TurnView::default();
-                                tv.conversation = conv.clone();
-                                tv.source = if t.push {
-                                    TurnSource::Push
-                                } else {
-                                    TurnSource::Mine
-                                };
-                                out.push(tv);
-                                let last = out.len() - 1;
-                                &mut out[last]
-                            }
-                        };
-                        tv.turn_id = t.turn_id.clone();
-                        tv.reply = t.reply.clone();
-                        tv.progress = t.progress;
-                        tv.tool = t.tool.clone();
-                        tv.outcome = t.outcome;
-                        tv.error_code = t.error_code.clone();
-                    }
-                }
-            }
-        }
-        trim_view(&mut out);
-        set(&mut v.turns, out)
+        let entries: &[Entry] = match &self.open {
+            Some(o) => &o.entries,
+            None => self.unsent.as_slice(),
+        };
+        let out: Vec<ViewEntry> = entries.iter().map(view_entry).collect();
+        set(&mut v.id, self.open.as_ref().map(|o| o.id.clone())) | set(&mut v.entries, out)
     }
+
+    /// The list as the UI draws it. Compared before it is built: a token never allocates here.
+    pub fn render_list(&self, l: &mut Vec<ConversationSummary>) -> bool {
+        let same = l.len() == self.list.len()
+            && l.iter().zip(&self.list).all(|(a, b)| {
+                a.id == b.id
+                    && a.title == b.title
+                    && a.private == b.private
+                    && a.last_turn_at == b.last_turn_at
+                    && a.running == b.running
+            });
+        if same {
+            return false;
+        }
+        *l = self
+            .list
+            .iter()
+            .map(|c| {
+                let mut s = ConversationSummary::default();
+                s.id = c.id.clone();
+                s.title = c.title.clone();
+                s.private = c.private;
+                s.last_turn_at = c.last_turn_at.clone();
+                s.running = c.running;
+                s
+            })
+            .collect();
+        true
+    }
+}
+
+fn view_entry(e: &Entry) -> ViewEntry {
+    match e {
+        Entry::Msg(m) => {
+            let mut v = MessageView::default();
+            v.id = m.id.clone();
+            v.text = m.text.clone();
+            v.mine = m.mine;
+            v.from_name = m.from_name.clone();
+            v.state = match m.status {
+                MsgStatus::Pending => MessageState::Pending,
+                MsgStatus::Delivered => MessageState::Delivered,
+                MsgStatus::Past => MessageState::Past,
+                MsgStatus::Failed => MessageState::Failed,
+            };
+            v.error_code = m.error_code.clone();
+            ViewEntry::Message(v)
+        }
+        Entry::Turn(t) => {
+            let mut v = TurnView::default();
+            v.turn_id = t.turn_id.clone();
+            v.source = if t.push {
+                TurnSource::Push
+            } else {
+                TurnSource::Mine
+            };
+            v.by_name = t.by_name.clone();
+            v.by_self = t.by_self;
+            v.reply = t.reply.clone();
+            v.progress = t.progress;
+            v.tool = t.tool.clone();
+            v.outcome = t.outcome;
+            v.error_code = t.error_code.clone();
+            ViewEntry::Turn(v)
+        }
+    }
+}
+
+/// Tests: `(message, reply)` pairs of the view, a person's turn joined to the message just
+/// before it (as the app draws them next to each other).
+#[cfg(test)]
+pub(crate) fn pairs(v: &ConversationView) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut joinable = false;
+    for e in &v.entries {
+        match e {
+            ViewEntry::Message(m) => {
+                out.push((m.text.clone(), String::new()));
+                joinable = true;
+            }
+            ViewEntry::Turn(t) => {
+                match out.last_mut() {
+                    Some(last) if joinable && t.source != TurnSource::Push => {
+                        last.1 = t.reply.clone();
+                    }
+                    _ => out.push((String::new(), t.reply.clone())),
+                }
+                joinable = false;
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Tests: the last turn of the view.
+#[cfg(test)]
+pub(crate) fn last_turn(v: &ConversationView) -> Option<&TurnView> {
+    v.entries.iter().rev().find_map(|e| match e {
+        ViewEntry::Turn(t) => Some(t),
+        _ => None,
+    })
 }
 
 // ---- the view's other fields ------------------------------------------------------------
 
-fn view_text_bytes(turns: &[TurnView]) -> usize {
-    turns.iter().map(|t| t.mine.len() + t.reply.len()).sum()
-}
-
-/// Drops the oldest turns until both bounds of the view hold; a single turn over the text bound
-/// has its reply cut (at a char boundary).
-fn trim_view(turns: &mut Vec<TurnView>) {
-    let excess = turns.len().saturating_sub(CONVERSATION_MAX_TURNS);
-    turns.drain(..excess);
-    while turns.len() > 1 && view_text_bytes(turns) > CONVERSATION_MAX_TEXT_BYTES {
-        turns.remove(0);
-    }
-    if let Some(t) = turns.first_mut() {
-        truncate(&mut t.mine, CONVERSATION_MAX_TEXT_BYTES);
-        let room = CONVERSATION_MAX_TEXT_BYTES.saturating_sub(t.mine.len());
-        truncate(&mut t.reply, room);
-    }
+pub fn set_read_only(v: &mut ConversationView, r: bool) -> bool {
+    set(&mut v.read_only, r)
 }
 
 pub fn set_mic(v: &mut ConversationView, m: MicPermission) -> bool {
@@ -1019,7 +1065,19 @@ mod tests {
     fn shown(c: &Chat) -> Vec<(String, String)> {
         let mut v = ConversationView::default();
         c.render(&mut v);
-        v.turns.into_iter().map(|t| (t.mine, t.reply)).collect()
+        pairs(&v)
+    }
+    /// The turns of the view, in order.
+    fn turns(c: &Chat) -> Vec<TurnView> {
+        let mut v = ConversationView::default();
+        c.render(&mut v);
+        v.entries
+            .into_iter()
+            .filter_map(|e| match e {
+                ViewEntry::Turn(t) => Some(t),
+                _ => None,
+            })
+            .collect()
     }
     fn pair(m: &str, r: &str) -> (String, String) {
         (m.to_owned(), r.to_owned())
@@ -1088,13 +1146,9 @@ mod tests {
             shown(&c),
             [pair("uno", "Hola mundo!"), pair("otra", "vale")]
         );
-        let mut v = ConversationView::default();
-        c.render(&mut v);
-        assert_eq!(v.turns[0].outcome, Some(TurnOutcome::Done));
-        assert_eq!(
-            (v.turns[1].turn_id.as_str(), v.turns[1].outcome),
-            ("t-2", None)
-        );
+        let t = turns(&c);
+        assert_eq!(t[0].outcome, Some(TurnOutcome::Done));
+        assert_eq!((t[1].turn_id.as_str(), t[1].outcome), ("t-2", None));
     }
 
     /// The rule for a turn ending while the conversation opens (GUESSED order): ended before
@@ -1279,25 +1333,57 @@ mod tests {
                 "turn_id":"t-2","conversation":"c-1"}),
             ),
         );
+        let t = turns(&c);
+        assert_eq!(t[0].source, TurnSource::Push);
+        assert_eq!(t[0].reply, "recordatorio");
+        assert_eq!(
+            (t[1].by_name.as_deref(), t[1].by_self),
+            (Some("Cocina"), false)
+        );
+        assert_eq!(
+            (t[1].outcome, t[1].error_code.as_deref()),
+            (Some(TurnOutcome::Error), Some("orchestrator_unavailable"))
+        );
+        assert_eq!(shown(&c)[1], pair("hola", ""));
+        assert!(c.send_failed("no salió", "missing_scope"));
         let mut v = ConversationView::default();
         c.render(&mut v);
-        assert_eq!(v.turns[0].source, TurnSource::Push);
-        assert_eq!(v.turns[0].reply, "recordatorio");
-        assert_eq!(
-            (
-                v.turns[1].mine.as_str(),
-                v.turns[1].outcome,
-                v.turns[1].error_code.as_deref()
-            ),
-            (
-                "hola",
-                Some(TurnOutcome::Error),
-                Some("orchestrator_unavailable")
-            )
-        );
-        assert!(c.send_failed("no salió", "missing_scope"));
-        c.render(&mut v);
-        assert_eq!(v.turns[2].error_code.as_deref(), Some("missing_scope"));
+        assert!(matches!(v.entries.last(), Some(ViewEntry::Message(m))
+            if m.state == MessageState::Failed && m.mine
+                && m.error_code.as_deref() == Some("missing_scope")));
+        assert_eq!(v.id.as_deref(), Some("c-1"));
+    }
+
+    /// A create that failed shows its text while nothing is open; opening clears it.
+    #[test]
+    fn failed_create_shows_while_nothing_is_open() {
+        let mut c = Chat::default();
+        c.begin_create();
+        c.create_failed();
+        assert!(c.send_failed("hola", "not_sent"));
+        let mut v = ConversationView::default();
+        assert!(c.render(&mut v));
+        assert_eq!((v.id.as_deref(), shown(&c)), (None, vec![pair("hola", "")]));
+        assert!(c.close());
+        assert!(shown(&c).is_empty());
+        c.send_failed("otra", "not_sent");
+        c.open("c-1");
+        assert!(shown(&c).is_empty());
+    }
+
+    /// The list for the UI changes only when the list does (a token never rebuilds it).
+    #[test]
+    fn list_render_only_on_change() {
+        let mut c = opened(1, &[]);
+        let mut l = Vec::new();
+        assert!(c.render_list(&mut l));
+        assert_eq!((l.len(), l[0].id.as_str(), l[0].running), (1, "c-1", false));
+        assert!(!c.render_list(&mut l));
+        c.on_event(Some(2), start("c-1", "t-1"));
+        assert!(c.render_list(&mut l));
+        assert!(l[0].running);
+        c.on_event(Some(3), token("c-1", "t-1", "x"));
+        assert!(!c.render_list(&mut l));
     }
 
     /// Review focus 5: the view stays within 48 KiB (and 20 turns) whatever arrives.
@@ -1321,8 +1407,11 @@ mod tests {
         }
         let mut v = ConversationView::default();
         c.render(&mut v);
-        assert!(v.turns.len() <= CONVERSATION_MAX_TURNS);
-        assert!(view_text_bytes(&v.turns) <= CONVERSATION_MAX_TEXT_BYTES);
+        let text = |v: &ConversationView| -> usize {
+            pairs(v).iter().map(|(m, r)| m.len() + r.len()).sum()
+        };
+        assert!(v.entries.len() <= MAX_ENTRIES);
+        assert!(text(&v) <= CONVERSATION_MAX_TEXT_BYTES);
         // One reply alone over the bound is cut at a char boundary.
         let mut c = opened(1, &[]);
         c.on_event(Some(2), push_start("c-1", "t"));
@@ -1330,9 +1419,9 @@ mod tests {
             c.on_event(Some(3 + i), token("c-1", "t", &chunk));
         }
         c.render(&mut v);
-        assert_eq!(v.turns.len(), 1);
-        assert!(view_text_bytes(&v.turns) <= CONVERSATION_MAX_TEXT_BYTES);
-        assert!(v.turns[0].reply.chars().all(|ch| ch == 'é'));
+        assert_eq!(v.entries.len(), 1);
+        assert!(text(&v) <= CONVERSATION_MAX_TEXT_BYTES);
+        assert!(turns(&c)[0].reply.chars().all(|ch| ch == 'é'));
     }
 
     #[test]
