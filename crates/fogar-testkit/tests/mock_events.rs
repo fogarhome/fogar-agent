@@ -158,6 +158,10 @@ async fn post_message_produces_message_and_turn() {
     assert_eq!(evs[4].1["reason"], "done");
     let ids: Vec<u64> = evs.iter().map(num).collect();
     assert!(ids.windows(2).all(|w| w[0] < w[1]), "ids only go up");
+    assert!(
+        ids.windows(2).any(|w| w[1] - w[0] > 1),
+        "ids are not contiguous: a client cannot assume +1"
+    );
     // The reply is in history under ids of its own.
     let (_, h) = call_json(
         &http,
@@ -325,6 +329,79 @@ async fn a_long_gap_loses_the_buffer_and_revoking_cuts_streams() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn stop_before_the_turn_starts_withdraws_the_message() {
+    let (hub, http) = rig();
+    hub.seed_conversation("c1", "x");
+    let mut c = open(&http, None).await;
+    c.events(1).await;
+    let (_, m) = c.post(post_msg("c1"), json!({"text": "uno"})).await;
+    let mid = m["message_id"].clone();
+    let sent = c.events(1).await;
+    assert_eq!(sent[0].1["state"], "delivered");
+    // Delivered but not started: stop withdraws it, with no turn events.
+    let (_, r) = call_json(&http, HttpCall::Cancel { id: id("c1") }, None).await;
+    assert_eq!(r["cancelled"], true);
+    let w = c.events(1).await;
+    assert_eq!(
+        (&w[0].1["type"], &w[0].1["state"]),
+        (&json!("message"), &json!("withdrawn"))
+    );
+    assert_eq!(w[0].1["id"], mid);
+    let quiet = tokio::time::timeout(Duration::from_secs(10), c.next()).await;
+    assert!(quiet.is_err(), "no turn_start / turn_end follows");
+    let (_, live) = call_json(&http, HttpCall::GetConversation { id: id("c1") }, None).await;
+    assert!(live["turn"].is_null());
+    assert_eq!(live["turn_count"], 0);
+    let (_, r) = call_json(&http, HttpCall::Cancel { id: id("c1") }, None).await;
+    assert_eq!(r["cancelled"], false);
+}
+
+#[tokio::test(start_paused = true)]
+async fn list_order_changes_when_the_turn_starts() {
+    let (hub, http) = rig();
+    hub.seed_conversation("c1", "uno");
+    hub.seed_conversation("c2", "dos");
+    hub.set_reply(&["a"], Duration::from_secs(5));
+    let mut c = open(&http, None).await;
+    c.events(1).await;
+    c.post(post_msg("c1"), json!({"text": "hola"})).await;
+    let (_, l) = call_json(&http, HttpCall::ListConversations, None).await;
+    assert_eq!(l[0]["id"], "c2", "nothing has talked yet");
+    c.until_type("turn_start").await;
+    // The turn is still running (5 s before its first token).
+    let (_, l) = call_json(&http, HttpCall::ListConversations, None).await;
+    assert_eq!(l[0]["id"], "c1");
+    assert!(l[0]["last_turn_at"].is_string() && l[1]["last_turn_at"].is_null());
+    assert_eq!(l[0]["turn_count"], 1);
+    // `last_turn_at` is orderable: a second conversation talking later sorts after it.
+    hub.push("c2", "x", false);
+    let (_, l2) = call_json(&http, HttpCall::ListConversations, None).await;
+    assert!(l2[0]["last_turn_at"].as_str() > l2[1]["last_turn_at"].as_str());
+}
+
+#[tokio::test(start_paused = true)]
+async fn rotation_ends_at_the_deadline_under_a_backlog() {
+    let (hub, http) = rig();
+    hub.seed_conversation("c1", "x");
+    let mut c = open(&http, None).await;
+    for _ in 0..5 {
+        hub.push("c1", "x", false);
+    }
+    tokio::time::sleep(Duration::from_secs(26)).await;
+    let mut seen = Vec::new();
+    while let Some(b) = c.next().await {
+        seen.extend(b.into_iter().flatten().map(|e| e.1["type"].clone()));
+    }
+    assert_eq!(
+        seen,
+        [json!("ready")],
+        "the backlog waits for the next stream"
+    );
+    let mut c2 = open(&http, None).await;
+    assert_eq!(c2.events(1).await[0].1["type"], "ready");
+}
+
+#[tokio::test(start_paused = true)]
 async fn pings_and_rotation() {
     let (hub, http) = rig();
     let mut c = open(&http, None).await;
@@ -392,6 +469,23 @@ async fn lists_and_creates_conversations() {
         .await;
     assert_eq!(st, 201);
     assert!(v["message_id"].is_string());
+    assert!(v["title"].is_null(), "a new conversation has no title yet");
+    let (st, bare) = c.post(HttpCall::CreateConversation, json!({})).await;
+    assert_eq!(st, 201);
+    assert!(bare.as_object().unwrap().contains_key("message_id"));
+    assert!(bare["message_id"].is_null());
+    hub.seed_history_without_id("c1", "assistant", "sin id");
+    let (_, h) = call_json(
+        &http,
+        HttpCall::GetMessages {
+            id: id("c1"),
+            before: None,
+            limit: 50,
+        },
+        None,
+    )
+    .await;
+    assert!(h["messages"][1]["id"].is_null());
     let new = v["id"].as_str().unwrap().to_owned();
     c.until_type("turn_end").await;
     let (_, l) = call_json(&http, HttpCall::ListConversations, None).await;

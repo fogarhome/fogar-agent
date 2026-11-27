@@ -109,9 +109,6 @@ impl HttpRoutes {
     pub(crate) fn set_hook(&self, hook: Arc<dyn RouteHook>) {
         *self.hook.lock().unwrap() = Some(hook);
     }
-    pub(crate) fn record_flag(&self) -> Arc<AtomicBool> {
-        self.no_record.clone()
-    }
     /// Switches the `seen` log on or off (default on).
     pub fn set_record(&self, on: bool) {
         self.no_record.store(!on, Ordering::SeqCst);

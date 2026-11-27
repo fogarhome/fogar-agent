@@ -19,6 +19,9 @@
 //! private conversations, `allowed_agents`, `push_enabled`, tool calls and `turn_progress`,
 //! `/speech`, `speak`, steering (`absorbed`), the 502/503 send errors, the title cache.
 //!
+//! Keep an `EventsHub` handle alive while the routes are in use: the routes hold the hub weakly,
+//! so once the last handle drops they answer 404 and the turn drivers stop.
+//!
 //! Everything is bounded: [`QUEUE_MAX`] events per stream, [`RING_MAX`] in the ring, 1000 history
 //! messages per conversation. No task of its own except the per-conversation turn driver, which
 //! lives in an owned `JoinSet` (aborted when the last hub handle drops).
@@ -70,6 +73,10 @@ pub struct HubConfig {
     /// The scripted reply: one `token` per entry, `token_gap` before each.
     pub reply: Vec<String>,
     pub token_gap: Duration,
+    /// From a message queued (or the turn before ending) to its `turn_start`: the window in
+    /// which "stop" withdraws the message instead of stopping a turn. GUESSED: the gateway's
+    /// real delay is OpenClaw's; non-zero so the window exists.
+    pub first_token_after: Duration,
     /// This device (`self` in `from`/`by` is relative to it).
     pub device_id: String,
     pub device_name: String,
@@ -85,6 +92,7 @@ impl Default for HubConfig {
             stream_for: Duration::from_secs(25),
             reply: vec!["Hola".into(), " mundo".into()],
             token_gap: Duration::ZERO,
+            first_token_after: Duration::from_millis(200),
             device_id: "dev-mac".into(),
             device_name: "Mac".into(),
             audio_to_all: false,
@@ -126,13 +134,14 @@ struct Turn {
     by: Option<(String, String)>,
     text: String,
     cancel: CancellationToken,
-    /// Set before `cancel` fires: `cancelled` | `interrupted`.
+    /// Set before `cancel` fires: `cancelled`.
     reason: Option<&'static str>,
 }
 
 #[derive(Debug)]
 struct HistMsg {
-    id: String,
+    /// `None`: OpenClaw gave the message no id (the field is optional).
+    id: Option<String>,
     role: &'static str,
     text: String,
 }
@@ -141,8 +150,8 @@ struct HistMsg {
 struct Conv {
     id: String,
     agent: String,
-    title: String,
-    created_seq: u64,
+    /// `None`: OpenClaw has no title yet (a new conversation).
+    title: Option<String>,
     /// Ordering of the list: the last to talk goes first.
     talked_seq: u64,
     turn_count: u32,
@@ -188,8 +197,6 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     drivers: Mutex<JoinSet<()>>,
-    /// The routes' request log switch (`HttpRoutes::set_record`), once installed.
-    record: Mutex<Option<Arc<AtomicBool>>>,
     opens: std::sync::atomic::AtomicUsize,
 }
 
@@ -237,7 +244,9 @@ impl State {
     /// Gives `data` the next id, keeps it in the ring and queues it to every stream. A stream
     /// whose queue is full is cut (it will resume from the ring).
     fn publish(&mut self, data: &Value) {
-        self.last_id += 1;
+        // Ids only go up, not by one (the gateway's are µs clocks): 1, 2 or 3 at a time, so a
+        // client cannot assume contiguity.
+        self.last_id += 1 + self.last_id % 3;
         let id = self.last_id;
         let line = sse(data, Some(id));
         if self.ring.len() == RING_MAX
@@ -310,22 +319,23 @@ impl State {
             "kind": "created",
             "day": null,
             "created_at": "2026-11-27T09:00:00+00:00",
-            "last_turn_at": (c.talked_seq > c.created_seq)
-                .then_some("2026-11-27T10:00:00+00:00"),
+            // Set when a turn STARTS (`note_turn`); distinct and orderable (nanoseconds).
+            "last_turn_at": (c.turn_count > 0)
+                .then(|| format!("2026-11-27T10:00:00.{:09}+00:00", c.talked_seq)),
             "turn_count": c.turn_count,
             "title": c.title,
             "owner_user_id": null,
+            "message_id": null,
         })
     }
 
-    fn new_conv(&mut self, id: String, agent: &str, title: &str) -> usize {
+    fn new_conv(&mut self, id: String, agent: &str, title: Option<&str>) -> usize {
         self.counter += 1;
         let seq = self.counter;
         self.convs.push(Conv {
             id,
             agent: agent.into(),
-            title: title.into(),
-            created_seq: seq,
+            title: title.map(Into::into),
             talked_seq: seq,
             turn_count: 0,
             history: VecDeque::new(),
@@ -337,7 +347,11 @@ impl State {
     }
 
     fn add_history(&mut self, ix: usize, role: &'static str, text: &str) {
-        let id = self.next_n("hist");
+        let id = Some(self.next_n("hist"));
+        self.push_history(ix, id, role, text);
+    }
+
+    fn push_history(&mut self, ix: usize, id: Option<String>, role: &'static str, text: &str) {
         let h = &mut self.convs[ix].history;
         if h.len() == HISTORY_MAX {
             h.pop_front();
@@ -350,17 +364,11 @@ impl State {
     }
 
     /// Queues a message of `device`; `true` when a driver must be spawned for it.
-    /// `interrupt`: cuts the running turn and goes first.
-    fn send(
-        &mut self,
-        ix: usize,
-        device: (String, String),
-        text: &str,
-        interrupt: bool,
-    ) -> (String, bool) {
+    /// (`interrupt` / "send now" is PR 4b: not modelled, the field is ignored.)
+    fn send(&mut self, ix: usize, device: (String, String), text: &str) -> (String, bool) {
         let id = self.next_n("run");
         let busy = self.convs[ix].driver;
-        let state = if busy && !interrupt {
+        let state = if busy {
             MsgState::Pending
         } else {
             MsgState::Delivered
@@ -375,13 +383,7 @@ impl State {
         let conv_id = self.convs[ix].id.clone();
         let ev = self.msg_json(&m, &conv_id);
         let c = &mut self.convs[ix];
-        if interrupt && let Some(t) = c.turn.as_mut() {
-            t.reason = Some("interrupted");
-            t.cancel.cancel();
-            c.queue.push_front(m);
-        } else {
-            c.queue.push_back(m);
-        }
+        c.queue.push_back(m);
         let spawn = !std::mem::replace(&mut c.driver, true);
         self.publish(&ev);
         (id, spawn)
@@ -410,7 +412,13 @@ impl State {
         };
         let ev = self.turn_json(&turn, conv_id);
         let cancel = turn.cancel.clone();
-        self.convs[ix].turn = Some(turn);
+        // `note_turn` (conversations.py): the conversation talked when the turn STARTS.
+        self.counter += 1;
+        let n = self.counter;
+        let c = &mut self.convs[ix];
+        c.turn = Some(turn);
+        c.turn_count += 1;
+        c.talked_seq = n;
         self.add_history(ix, "user", &m.text);
         self.publish(&ev);
         Some((self.cfg.reply.clone(), self.cfg.token_gap, cancel))
@@ -428,30 +436,35 @@ impl State {
         self.publish(&ev);
     }
 
-    fn end_turn(&mut self, conv_id: &str) {
+    /// Ends the turn; `true` when more messages are queued (the driver goes on).
+    fn end_turn(&mut self, conv_id: &str) -> bool {
         let Some(ix) = self.conv_ix(conv_id) else {
-            return;
+            return false;
         };
         let Some(t) = self.convs[ix].turn.take() else {
-            return;
+            return false;
         };
         let reason = t.reason.unwrap_or("done");
         if reason == "done" {
             self.add_history(ix, "assistant", &t.text);
         }
-        self.counter += 1;
-        let c = &mut self.convs[ix];
-        c.turn_count += 1;
-        c.talked_seq = self.counter;
         let ev = json!({
             "type": "turn_end", "turn_id": t.id, "conversation": conv_id, "reason": reason,
         });
+        let more = !self.convs[ix].queue.is_empty();
+        self.convs[ix].driver = more;
         self.publish(&ev);
+        more
     }
 }
 
 async fn drive(shared: Weak<Shared>, conv_id: String) {
     loop {
+        let Some(s) = shared.upgrade() else { return };
+        let lead = s.state.lock().unwrap().cfg.first_token_after;
+        drop(s);
+        // The window in which "stop" withdraws the message (no turn yet).
+        sleep(lead).await;
         let step = {
             let Some(s) = shared.upgrade() else { return };
             s.state.lock().unwrap().start_turn(&conv_id)
@@ -468,7 +481,10 @@ async fn drive(shared: Weak<Shared>, conv_id: String) {
             s.state.lock().unwrap().token(&conv_id, &tok);
         }
         let Some(s) = shared.upgrade() else { return };
-        s.state.lock().unwrap().end_turn(&conv_id);
+        // An idle conversation has no driver: a message sent now is `delivered`, not `pending`.
+        if !s.state.lock().unwrap().end_turn(&conv_id) {
+            return;
+        }
     }
 }
 
@@ -508,8 +524,20 @@ impl LiveStream {
             if self.ended {
                 return None;
             }
+            // The deadline comes first: constant input cannot keep a stream open past it.
             tokio::select! {
                 biased;
+                () = sleep_until(self.deadline) => {
+                    if self.silent.load(Ordering::SeqCst) {
+                        self.deadline = Instant::now() + self.stream_for;
+                        continue;
+                    }
+                    // The gateway's loop waits `min(left, 15 s)` and answers a timeout with
+                    // `: ping`, so a quiet stream always ends with one more ping. With events
+                    // waiting (no timeout in the gateway) it just ends.
+                    self.ended = true;
+                    return self.rx.is_empty().then(|| b": ping\n\n".to_vec());
+                }
                 item = self.rx.recv() => {
                     // `None`: dropped by the hub (`drop_streams`, overflow): the stream ends.
                     let line = item?;
@@ -518,16 +546,6 @@ impl LiveStream {
                     }
                     self.next_ping = Instant::now() + self.ping_every;
                     return Some(line.into_bytes());
-                }
-                () = sleep_until(self.deadline) => {
-                    if self.silent.load(Ordering::SeqCst) {
-                        self.deadline = Instant::now() + self.stream_for;
-                        continue;
-                    }
-                    // The gateway's loop waits `min(left, 15 s)` and answers a timeout with
-                    // `: ping`, so a quiet stream always ends with one more ping.
-                    self.ended = true;
-                    return Some(": ping\n\n".into());
                 }
                 () = sleep_until(self.next_ping) => {
                     self.next_ping = Instant::now() + self.ping_every;
@@ -573,7 +591,6 @@ impl EventsHub {
             shared: Arc::new(Shared {
                 state: Mutex::new(st),
                 drivers: Mutex::new(JoinSet::new()),
-                record: Mutex::new(None),
                 opens: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
@@ -581,7 +598,6 @@ impl EventsHub {
 
     /// Serves the hub from `routes` (scripted routes still win, so a test can override a path).
     pub fn install(&self, routes: &HttpRoutes) {
-        *self.shared.record.lock().unwrap() = Some(routes.record_flag());
         routes.set_hook(Arc::new(Hook {
             shared: Arc::downgrade(&self.shared),
         }));
@@ -607,7 +623,7 @@ impl EventsHub {
 
     /// A conversation that already exists (no events).
     pub fn seed_conversation(&self, id: &str, title: &str) {
-        self.st().new_conv(id.into(), "main", title);
+        self.st().new_conv(id.into(), "main", Some(title));
     }
 
     /// History the conversation already has (no events).
@@ -618,12 +634,20 @@ impl EventsHub {
         }
     }
 
+    /// A history message OpenClaw gave no id (`id: null`).
+    pub fn seed_history_without_id(&self, conv: &str, role: &'static str, text: &str) {
+        let mut st = self.st();
+        if let Some(ix) = st.conv_ix(conv) {
+            st.push_history(ix, None, role, text);
+        }
+    }
+
     /// Another device writes into `conv`; returns its `message_id`.
     pub fn other_device_send(&self, conv: &str, text: &str) -> String {
         let (id, spawn) = {
             let mut st = self.st();
             let ix = st.conv_ix(conv).expect("known conversation");
-            st.send(ix, ("dev-other".into(), "Cocina".into()), text, false)
+            st.send(ix, ("dev-other".into(), "Cocina".into()), text)
         };
         if spawn {
             self.shared.spawn_driver(conv);
@@ -647,6 +671,11 @@ impl EventsHub {
             reason: None,
         };
         let ev = st.turn_json(&turn, conv);
+        st.counter += 1; // `note_turn` at the start
+        let n = st.counter;
+        let c = &mut st.convs[ix];
+        c.turn_count += 1;
+        c.talked_seq = n;
         st.publish(&ev);
         st.publish(
             &json!({"type": "token", "turn_id": turn_id, "conversation": conv, "text": text}),
@@ -658,11 +687,6 @@ impl EventsHub {
             }));
         }
         st.add_history(ix, "assistant", text);
-        st.counter += 1;
-        let n = st.counter;
-        let c = &mut st.convs[ix];
-        c.turn_count += 1;
-        c.talked_seq = n;
         st.publish(&json!({
             "type": "turn_end", "turn_id": turn_id, "conversation": conv, "reason": "done",
         }));
@@ -709,13 +733,6 @@ impl EventsHub {
     /// Undoes `revoke` and `missing_scope`.
     pub fn restore(&self) {
         self.st().auth = Auth::default();
-    }
-
-    /// `false`: the routes keep no request log (soaks). Needs `install` first.
-    pub fn record(&self, on: bool) {
-        if let Some(flag) = self.shared.record.lock().unwrap().as_ref() {
-            flag.store(!on, Ordering::SeqCst);
-        }
     }
 
     /// Streams currently open (the leak canary's probe).
@@ -825,13 +842,13 @@ impl RouteHook for Hook {
                 }
                 let id = st.next_n("c");
                 let agent = body["agent"].as_str().unwrap_or("main").to_owned();
-                let ix = st.new_conv(id.clone(), &agent, "");
+                let ix = st.new_conv(id.clone(), &agent, None);
                 let mut v = st.conv_json(&st.convs[ix]);
                 if let Some(text) = body["message"].as_str() {
                     if text.trim().is_empty() {
                         return Some(detail(422, "empty_message"));
                     }
-                    let (mid, sp) = st.send(ix, me, text, false);
+                    let (mid, sp) = st.send(ix, me, text);
                     v["message_id"] = json!(mid);
                     spawn = sp.then_some(id);
                 }
@@ -871,8 +888,7 @@ impl RouteHook for Hook {
                     None => detail(422, "invalid_body"),
                     Some(t) if t.trim().is_empty() => detail(422, "empty_message"),
                     Some(t) => {
-                        let interrupt = body["interrupt"].as_bool().unwrap_or(false);
-                        let (mid, sp) = st.send(ix, me, t, interrupt);
+                        let (mid, sp) = st.send(ix, me, t);
                         spawn = sp.then(|| id.to_owned());
                         ok(202, &json!({ "message_id": mid }))
                     }
@@ -908,13 +924,12 @@ impl RouteHook for Hook {
                     t.reason = Some("cancelled");
                     t.cancel.cancel();
                     true
-                } else if let Some(p) = c.queue.iter().position(|m| m.state == MsgState::Pending) {
-                    // GUESSED: with no turn open, the next unstarted message is withdrawn.
-                    if let Some(mut m) = c.queue.remove(p) {
-                        m.state = MsgState::Withdrawn;
-                        let ev = st.msg_json(&m, id);
-                        st.publish(&ev);
-                    }
+                } else if let Some(mut m) = c.queue.pop_front() {
+                    // channel.py `cancel_head`: with no turn open, the first run that has not
+                    // started (pending OR delivered) is withdrawn; no turn events follow.
+                    m.state = MsgState::Withdrawn;
+                    let ev = st.msg_json(&m, id);
+                    st.publish(&ev);
                     true
                 } else {
                     false
@@ -938,7 +953,7 @@ fn history(c: &Conv, query: &str) -> HookReply {
     let all: Vec<&HistMsg> = c.history.iter().collect();
     let (end, has_more_before) = match parse_query(query, "before") {
         None => (all.len(), false),
-        Some(b) => match all.iter().position(|m| m.id == b) {
+        Some(b) => match all.iter().position(|m| m.id.as_deref() == Some(b.as_str())) {
             None => return detail(404, "message_not_found"),
             Some(i) => (i, false),
         },
