@@ -127,6 +127,7 @@ counters! {
     rest_calls: "conversation REST calls made by the engine (list, open, history, send, create, cancel, /auth/me)",
     rest_failures: "engine REST calls that failed: transport, deadline, non-2xx or undecodable body",
     rest_busy: "sends, creates or cancels refused because `REST_IN_FLIGHT` writes were in flight",
+    rest_stale_writes: "write results that arrived after a sign-out or a fresh link (dropped, not shown)",
     writes_missing_scope: "writes answered `403 missing_scope` (later sends are refused without a call)",
     open_overflows: "open/create buffers that overflowed (the conversation is opened again)",
     list_refreshes: "`GET /conversations` asked for (fresh link, resync, unknown conversation)",

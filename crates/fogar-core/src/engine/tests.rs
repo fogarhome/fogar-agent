@@ -572,6 +572,293 @@ async fn dictation_is_refused_until_pr5() {
     r.stop().await;
 }
 
+// ---- Task 4 review ----------------------------------------------------------------------
+
+/// Texts of the open conversation, messages and replies in order.
+fn order(r: &Rig) -> Vec<String> {
+    r.entries()
+        .into_iter()
+        .map(|e| match e {
+            Entry::Msg(m) => m.text,
+            Entry::Turn(t) => t.reply,
+        })
+        .collect()
+}
+
+/// A failed (or unknown) entry of mine, with its code.
+fn failed(r: &Rig) -> Vec<(String, Option<String>)> {
+    r.entries()
+        .into_iter()
+        .filter_map(|e| match e {
+            Entry::Msg(m) if m.status == MsgStatus::Failed => Some((m.text, m.error_code)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Review H1: two texts typed during a reply; each reply shows right after its own message.
+#[tokio::test(start_paused = true)]
+async fn texts_typed_during_a_reply_each_get_theirs_next() {
+    let mut r = rig();
+    r.hub.set_reply(&["a", "b", "c"], Duration::from_secs(1));
+    r.ready().await;
+    r.open("c-1").await;
+    r.send("uno").await.unwrap().unwrap();
+    eventually("running", || r.health.chat().list[0].running).await;
+    r.send("dos").await.unwrap().unwrap();
+    r.send("tres").await.unwrap().unwrap();
+    eventually("three replies", || {
+        order(&r)[2..] == ["uno", "abc", "dos", "abc", "tres", "abc"]
+    })
+    .await;
+    r.stop().await;
+}
+
+/// Review M1: a `turn_end` the link never saw (the gateway forgot our place) leaves no
+/// «running» mark after the resync.
+#[tokio::test(start_paused = true)]
+async fn resync_forgets_running_marks() {
+    let mut r = rig_with(|hub, _| {
+        hub.seed_conversation("c-1", "uno");
+        hub.seed_conversation("c-2", "dos");
+    });
+    r.hub.set_reply(&["a", "b", "c"], Duration::from_secs(3));
+    r.ready().await;
+    r.hub.other_device_send("c-2", "larga");
+    eventually("running", || r.health.chat().list[0].running).await;
+    r.hub.go_silent();
+    tokio::time::sleep(Duration::from_secs(15)).await; // the turn ends unseen
+    r.hub.forget_buffer();
+    eventually("resync", || r.health.snapshot().stats.events_resync == 1).await;
+    eventually("no stale mark", || {
+        r.health.chat().list.iter().all(|c| !c.running)
+    })
+    .await;
+    r.stop().await;
+}
+
+/// Review M2a: a post with no answer within our deadline may have arrived: «unknown», not
+/// «not sent».
+#[tokio::test(start_paused = true)]
+async fn a_post_past_the_deadline_is_unknown() {
+    let mut r = rig();
+    r.routes.set_delayed(
+        "POST",
+        "/conversations/c-1/messages",
+        202,
+        r#"{"message_id":"run-x"}"#,
+        Duration::from_secs(60),
+    );
+    r.ready().await;
+    r.open("c-1").await;
+    r.send("hola").await.unwrap().unwrap();
+    eventually("failed", || !failed(&r).is_empty()).await;
+    assert_eq!(failed(&r), [("hola".into(), Some("unknown".into()))]);
+    r.stop().await;
+}
+
+/// Review M2b: a failure shows only in the conversation it was posted to.
+#[tokio::test(start_paused = true)]
+async fn a_failed_post_shows_only_in_its_conversation() {
+    let mut r = rig_with(|hub, routes| {
+        hub.seed_conversation("c-1", "uno");
+        hub.seed_conversation("c-2", "dos");
+        routes.set("POST", "/conversations/c-1/messages", 500, "{}");
+    });
+    r.ready().await;
+    r.open("c-1").await;
+    r.cmd(|tx| Command::SendText("hola".into(), tx))
+        .await
+        .unwrap()
+        .unwrap();
+    // Another one opened before the answer is handled.
+    r.cmd(|tx| Command::Open("c-2".into(), tx)).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(r.health.chat().open_id(), Some("c-2"));
+    assert!(failed(&r).is_empty(), "{:?}", r.entries());
+    assert!(r.health.snapshot().stats.rest_failures >= 1);
+    r.stop().await;
+}
+
+/// Review M2c and M4: a resync of the open conversation keeps a failed text, and what was
+/// shown stays until the history replaces it.
+#[tokio::test(start_paused = true)]
+async fn a_resync_keeps_the_screen_and_a_failed_text() {
+    let mut r = rig_with(|hub, routes| {
+        hub.seed_conversation("c-1", "uno");
+        hub.seed_conversation("c-2", "dos");
+        hub.seed_history("c-1", "user", "pon la serie");
+        hub.seed_history("c-1", "assistant", "puesta");
+        routes.set("POST", "/conversations/c-1/messages", 500, "{}");
+        // The re-open's history is slow: the screen must not go blank meanwhile.
+    });
+    r.ready().await;
+    r.open("c-1").await;
+    r.send("no salió").await.unwrap().unwrap();
+    eventually("failed", || !failed(&r).is_empty()).await;
+    r.routes.set_delayed(
+        "GET",
+        "/conversations/c-1/messages?limit=50",
+        200,
+        r#"{"conversation_id":"c-1","messages":[{"id":"h1","role":"user","text":"pon la serie"},{"id":"h2","role":"assistant","text":"puesta"}],"has_more":false}"#,
+        Duration::from_secs(3),
+    );
+    r.hub.drop_streams();
+    r.hub.other_device_send("c-2", "missed");
+    r.hub.forget_buffer();
+    eventually("resync", || r.health.snapshot().stats.events_resync == 1).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!r.health.chat().open.unwrap().is_live(), "still loading");
+    assert_eq!(order(&r), ["pon la serie", "puesta", "no salió"], "kept");
+    eventually("live", || r.health.chat().open.unwrap().is_live()).await;
+    assert_eq!(order(&r), ["pon la serie", "puesta", "no salió"]);
+    r.stop().await;
+}
+
+/// Review L5: an unlisted conversation that keeps streaming asks for the list at most once
+/// per 30 s.
+#[tokio::test(start_paused = true)]
+async fn an_unlisted_conversation_refreshes_the_list_rarely() {
+    let mut r = rig_with(|hub, routes| {
+        hub.seed_conversation("c-9", "fuera");
+        routes.set("GET", "/conversations", 200, "[]");
+    });
+    r.hub.set_reply(&["a"; 30], Duration::from_secs(3));
+    r.ready().await;
+    let before = r.calls("GET", "/conversations").len();
+    r.hub.other_device_send("c-9", "habla");
+    tokio::time::sleep(Duration::from_secs(91)).await;
+    let n = r.calls("GET", "/conversations").len() - before;
+    assert!((2..=4).contains(&n), "{n} list calls in 91 s");
+    r.stop().await;
+}
+
+/// Review L9: a scope granted later (seen on `/auth/me` at a resync) lets texts through again.
+#[tokio::test(start_paused = true)]
+async fn a_granted_scope_is_seen_at_the_next_resync() {
+    const READ_ONLY: &str = r#"{"user":{"id":"u","username":"s","display_name":"S","role":"member"},"scopes":["conversations:read"]}"#;
+    const WRITE: &str = r#"{"user":{"id":"u","username":"s","display_name":"S","role":"member"},"scopes":["conversations:read","conversations:write"]}"#;
+    let mut r = rig_with(|hub, routes| {
+        hub.seed_conversation("c-1", "Serie");
+        hub.seed_conversation("c-2", "otra");
+        routes.set("GET", "/auth/me", 200, READ_ONLY);
+    });
+    r.ready().await;
+    r.open("c-1").await;
+    assert_eq!(r.send("hola").await, Some(Err(TextRefusal::MissingScope)));
+    r.routes.set("GET", "/auth/me", 200, WRITE);
+    r.hub.drop_streams();
+    r.hub.other_device_send("c-2", "missed");
+    r.hub.forget_buffer();
+    eventually("resync", || r.health.snapshot().stats.events_resync == 1).await;
+    eventually("me again", || r.calls("GET", "/auth/me").len() == 2).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(r.send("hola").await, Some(Ok(())));
+    r.stop().await;
+}
+
+/// The engine over the hub's routes, fed link events by hand (to bump the account epoch).
+struct Alone {
+    in_tx: mpsc::Sender<Inbound>,
+    cmd_tx: mpsc::Sender<Command>,
+    chat: watch::Receiver<Chat>,
+    stats: Arc<Stats>,
+    stop: CancellationToken,
+    tasks: JoinSet<()>,
+}
+
+fn alone(routes: &HttpRoutes) -> Alone {
+    let cfg = Arc::new(Config::default());
+    let stats = Arc::new(Stats::default());
+    let (in_tx, in_rx) = mpsc::channel(queues::INBOUND);
+    let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(queues::ENGINE_COMMANDS);
+    let (conv_tx, _conv) = watch::channel(ConversationView::default());
+    let (chat_tx, chat) = watch::channel(Chat::default());
+    let (list_tx, _list) = watch::channel(Vec::new());
+    let engine = Engine {
+        clock: Arc::new(TestClock::new()),
+        cfg: cfg.clone(),
+        stats: stats.clone(),
+        http: Arc::new(FakeGatewayHttp::at(
+            routes.clone(),
+            GatewayAddr::parse(GW).unwrap(),
+        )),
+        in_rx,
+        cmd_rx,
+        conv: conv_tx,
+        chat: chat_tx,
+        list: list_tx,
+    };
+    let capture = CaptureGate::new(Arc::new(FakeMic::healthy()), &cfg, stats.clone());
+    let playback = PlaybackGate::new(Arc::new(FakeSpeaker::healthy()), stats.clone());
+    let stop = CancellationToken::new();
+    let mut tasks = JoinSet::new();
+    tasks.spawn(engine.run(capture, playback, stop.clone()));
+    Alone {
+        in_tx,
+        cmd_tx,
+        chat,
+        stats,
+        stop,
+        tasks,
+    }
+}
+
+fn fresh_up() -> Inbound {
+    Inbound::Up {
+        api: Api {
+            addr: GatewayAddr::parse(GW).unwrap(),
+            token: "t".to_owned().into(),
+        },
+        resumed: false,
+    }
+}
+
+impl Alone {
+    async fn stop(mut self) {
+        self.stop.cancel();
+        while self.tasks.join_next().await.is_some() {}
+    }
+}
+
+/// Review M2d and L6: a fresh link empties the store (nothing from before survives), and a
+/// write answered after it is dropped and counted.
+#[tokio::test(start_paused = true)]
+async fn a_fresh_link_starts_empty_and_drops_late_writes() {
+    let routes = HttpRoutes::fogar();
+    let hub = EventsHub::new();
+    hub.install(&routes);
+    hub.seed_conversation("c-1", "Serie");
+    routes.set_delayed("POST", "/conversations", 500, "{}", Duration::from_secs(5));
+    let a = alone(&routes);
+    a.in_tx.send(fresh_up()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(a.chat.borrow().list.len(), 1);
+    let (tx, rx) = oneshot::channel();
+    a.cmd_tx
+        .send(Command::SendText("hola".into(), tx))
+        .await
+        .unwrap();
+    assert_eq!(rx.await.unwrap(), Ok(()));
+    // The list fails from now on: whatever is shown after the fresh link is new.
+    routes.set("GET", "/conversations", 500, "{}");
+    a.in_tx.send(fresh_up()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(a.chat.borrow().list.is_empty(), "the old list went");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(a.stats.snapshot().rest_stale_writes, 1);
+    assert!(
+        a.chat.borrow().open.is_none(),
+        "the late failure is not shown"
+    );
+    let mut v = ConversationView::default();
+    assert!(
+        !a.chat.borrow().render(&mut v),
+        "nothing unsent shown either"
+    );
+    a.stop().await;
+}
+
 // ---- the engine alone, fed directly (no link) --------------------------------------------
 
 struct Rng(u64);
@@ -694,6 +981,7 @@ async fn no_gateway_sequence_opens_the_microphone_or_sounds() {
                     let ev = Inbound::Event {
                         ev: decode_event(&json),
                         id: Some(r.next() % 100),
+                        bytes: json.len(),
                         charge,
                     };
                     in_tx.send(ev).await.unwrap();

@@ -24,6 +24,12 @@
 //!   new conversation then opens live from its first event, without a re-fetch (it has no
 //!   history yet). If that buffer overflowed it is opened like any other.
 //! - Other conversations' events never keep text. A withdrawn message disappears (Sito).
+//! - A message going `delivered` moves to the end: the gateway announces it right before that
+//!   run's `turn_start` (`_open_run`), so each reply follows its own message.
+//! - A text of mine whose post failed or got no answer stays as `Failed` (code `unknown` when
+//!   it may have arrived); my own live `message` with the same text replaces it. Re-opening
+//!   the same conversation keeps what is shown (failed texts included) until the history
+//!   replaces it.
 //!
 //! Bounds: list ≤ [`LIST_MAX`]; open entries ≤ [`MAX_ENTRIES`] and ≤ `CONVERSATION_MAX_TEXT_BYTES`
 //! of text (oldest first); buffers ≤ [`BUFFER_EVENTS`] / [`BUFFER_BYTES`]; gateway ids, codes and
@@ -241,12 +247,11 @@ fn ev_bytes(ev: &Event) -> usize {
 }
 
 impl Buffer {
-    /// `true` when this push overflowed it (the first time only).
-    fn push(&mut self, id: Option<u64>, ev: Event) -> bool {
+    /// Holds `ev`, charged `n` bytes. `true` when this push overflowed it (the first time only).
+    fn push(&mut self, id: Option<u64>, ev: Event, n: usize) -> bool {
         if self.overflowed {
             return false;
         }
-        let n = ev_bytes(&ev);
         if self.evs.len() >= BUFFER_EVENTS || self.bytes + n > BUFFER_BYTES {
             self.evs = Vec::new();
             self.bytes = 0;
@@ -322,6 +327,8 @@ pub struct Chat {
     running: VecDeque<String>,
     /// Events of unknown conversations while a `POST /conversations` is in flight.
     creating: Option<Buffer>,
+    /// The list's ids when that create started (≤ `LIST_MAX`).
+    known_at_create: Vec<String>,
     /// The text of a create that failed, shown while nothing is open (at most one entry).
     unsent: Vec<Entry>,
 }
@@ -456,16 +463,32 @@ fn apply(entries: &mut Vec<Entry>, ev: &Event) -> bool {
                     true
                 }
                 (None, MsgState::Withdrawn) => false,
-                (Some(i), state) => match &mut entries[i] {
-                    Entry::Msg(x) if state == MsgState::Pending => {
-                        set(&mut x.status, MsgStatus::Pending)
-                    }
-                    Entry::Msg(x) if state == MsgState::Delivered => {
-                        set(&mut x.status, MsgStatus::Delivered)
-                    }
-                    _ => false,
+                (Some(i), MsgState::Pending) => match &mut entries[i] {
+                    Entry::Msg(x) => set(&mut x.status, MsgStatus::Pending),
+                    Entry::Turn(_) => false,
                 },
+                (Some(i), MsgState::Delivered) => {
+                    // The gateway announces `delivered` right before that run's `turn_start`
+                    // (`_open_run`): the message moves to the end, so its reply follows it.
+                    let mut e = entries.remove(i);
+                    if let Entry::Msg(x) = &mut e {
+                        x.status = MsgStatus::Delivered;
+                    }
+                    entries.push(e);
+                    true
+                }
+                (Some(_), _) => false,
                 (None, _) => {
+                    // My own text whose post failed or timed out (it may have reached the
+                    // gateway after all): the live message replaces it.
+                    if m.from.self_
+                        && let Some(i) = entries.iter().position(|e| {
+                            matches!(e, Entry::Msg(x)
+                                if x.status == MsgStatus::Failed && x.mine && x.text == m.text)
+                        })
+                    {
+                        entries.remove(i);
+                    }
                     entries.push(Entry::Msg(msg_entry(m)));
                     true
                 }
@@ -558,17 +581,34 @@ impl Chat {
         self.open.as_ref().map(|o| o.id.as_str())
     }
 
-    /// Starts opening `id` (its state is asked next). What was shown goes.
+    /// Starts opening `id` (its state is asked next). Another conversation's entries go; the
+    /// same one's stay on screen until its history replaces them (a resync, a retry).
     pub fn open(&mut self, id: &str) -> bool {
         self.unsent.clear();
+        let id = bounded(id);
+        let entries = match self.open.take() {
+            Some(o) if o.id == id => o.entries,
+            _ => Vec::new(),
+        };
         self.open = Some(OpenConv {
-            id: bounded(id).to_owned(),
-            entries: Vec::new(),
+            id: id.to_owned(),
+            entries,
             phase: Phase::State {
                 buf: Buffer::default(),
             },
         });
         true
+    }
+
+    /// Forgets every running mark (`GET /conversations` has none; after a resync or a fresh
+    /// link the marks may be stale; the open one's state marks it again).
+    pub fn forget_running(&mut self) -> bool {
+        self.running.clear();
+        let mut changed = false;
+        for c in &mut self.list {
+            changed |= set(&mut c.running, false);
+        }
+        changed
     }
 
     /// Nothing open any more (a new conversation, or this one is gone).
@@ -732,6 +772,13 @@ impl Chat {
                 .filter(|m| !claimed.contains(&m.id.as_str()))
                 .map(Entry::Msg),
         );
+        // My texts that never reached the gateway are in no history: they stay (a re-open of
+        // the same conversation, a resync).
+        entries.extend(
+            open.entries
+                .drain(..)
+                .filter(|e| matches!(e, Entry::Msg(m) if m.status == MsgStatus::Failed)),
+        );
         trim(&mut entries);
         for (_, e) in &buf.evs {
             let skip = match e {
@@ -747,14 +794,17 @@ impl Chat {
         true
     }
 
-    /// A `POST /conversations` is in flight: hold the events of unknown conversations.
+    /// A `POST /conversations` is in flight: hold the events of conversations the list does not
+    /// have now (also once a refresh lists the new one before the 201 arrives).
     pub fn begin_create(&mut self) {
         self.creating = Some(Buffer::default());
+        self.known_at_create = self.list.iter().map(|c| c.id.clone()).collect();
     }
 
     /// The create failed: nothing to hold any more.
     pub fn create_failed(&mut self) {
         self.creating = None;
+        self.known_at_create = Vec::new();
     }
 
     /// The `201` of our create: the new conversation goes to the top and opens. With its early
@@ -762,6 +812,7 @@ impl Chat {
     /// open.
     pub fn created(&mut self, c: &Conversation) -> Effect {
         let buf = self.creating.take().unwrap_or_default();
+        self.known_at_create = Vec::new();
         let id = bounded(&c.id).to_owned();
         let mut list = vec![ConvItem {
             id: id.clone(),
@@ -776,6 +827,8 @@ impl Chat {
         list.extend(self.list.drain(..).filter(|x| x.id != id));
         list.truncate(LIST_MAX);
         self.list = list;
+        // A fresh start: nothing of whatever was open before.
+        self.open = None;
         self.open(&id);
         if buf.overflowed {
             return Effect {
@@ -798,6 +851,15 @@ impl Chat {
             list: true,
             ..Effect::default()
         }
+    }
+
+    /// A post to `conv` failed: shown only while `conv` is the open conversation. `false` =
+    /// another one is open (the caller counts it).
+    pub fn send_failed_in(&mut self, conv: &str, text: &str, code: &str) -> bool {
+        if self.open_id() != Some(bounded(conv)) {
+            return false;
+        }
+        self.send_failed(text, code)
     }
 
     /// Our `POST` of `text` failed with `code`: shown (never sent) instead of vanishing. With
@@ -823,8 +885,16 @@ impl Chat {
         true
     }
 
-    /// One `/events` event (`id`: its SSE id).
+    /// One `/events` event (`id`: its SSE id), charged by its decoded texts.
     pub fn on_event(&mut self, id: Option<u64>, ev: Event) -> Effect {
+        let n = ev_bytes(&ev);
+        self.on_event_sized(id, ev, n)
+    }
+
+    /// One `/events` event whose SSE data was `bytes` long: a buffered event is charged that
+    /// (at least), so the buffers really stay within [`BUFFER_BYTES`] of wire data.
+    pub fn on_event_sized(&mut self, id: Option<u64>, ev: Event, bytes: usize) -> Effect {
+        let n = bytes.max(ev_bytes(&ev));
         let mut fx = Effect::default();
         let Some(conv) = conv_of(&ev).map(|c| bounded(c).to_owned()) else {
             return fx;
@@ -839,10 +909,10 @@ impl Chat {
         fx.refresh_list = !known && !is_open;
         if let Some(o) = self.open.as_mut().filter(|_| is_open) {
             match &mut o.phase {
-                Phase::State { buf } => fx.reopen = buf.push(id, ev),
+                Phase::State { buf } => fx.reopen = buf.push(id, ev, n),
                 Phase::History { as_of, buf, .. } => {
                     if id.is_none_or(|i| i > *as_of) {
-                        fx.reopen = buf.push(id, ev);
+                        fx.reopen = buf.push(id, ev, n);
                     }
                 }
                 Phase::Live { as_of } => {
@@ -851,8 +921,10 @@ impl Chat {
                     }
                 }
             }
-        } else if let Some(buf) = self.creating.as_mut().filter(|_| !known) {
-            buf.push(id, ev);
+        } else if let Some(buf) = self.creating.as_mut()
+            && !self.known_at_create.contains(&conv)
+        {
+            buf.push(id, ev, n);
         }
         fx
     }
@@ -1446,5 +1518,156 @@ mod tests {
         assert!(c.clear());
         assert_eq!(c, Chat::default());
         assert!(!c.clear());
+    }
+
+    /// Texts in the order of the view (messages and replies).
+    fn order(c: &Chat) -> Vec<String> {
+        c.open
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| match e {
+                Entry::Msg(m) => m.text.clone(),
+                Entry::Turn(t) => t.reply.clone(),
+            })
+            .collect()
+    }
+
+    /// Review H1: the gateway announces `delivered` right before that run's `turn_start`, so a
+    /// message moves to the end when delivered and each reply follows its own message.
+    #[test]
+    fn each_reply_follows_its_own_message() {
+        // Two texts typed during a reply.
+        let mut c = opened(1, &[]);
+        c.on_event(Some(2), msg("c-1", "r-1", "uno", "delivered", true));
+        c.on_event(Some(3), start("c-1", "t-1"));
+        c.on_event(Some(4), msg("c-1", "r-2", "dos", "pending", true));
+        c.on_event(Some(5), msg("c-1", "r-3", "tres", "pending", true));
+        c.on_event(Some(6), token("c-1", "t-1", "R1"));
+        c.on_event(Some(7), end_ev("c-1", "t-1"));
+        c.on_event(Some(8), msg("c-1", "r-2", "dos", "delivered", true));
+        c.on_event(Some(9), start("c-1", "t-2"));
+        c.on_event(Some(10), token("c-1", "t-2", "R2"));
+        c.on_event(Some(11), end_ev("c-1", "t-2"));
+        c.on_event(Some(12), msg("c-1", "r-3", "tres", "delivered", true));
+        c.on_event(Some(13), start("c-1", "t-3"));
+        c.on_event(Some(14), token("c-1", "t-3", "R3"));
+        assert_eq!(order(&c), ["uno", "R1", "dos", "R2", "tres", "R3"]);
+        // A message pending before the turn_start of an earlier queued run.
+        let mut c = opened(1, &[]);
+        c.on_event(Some(2), msg("c-1", "r-1", "uno", "delivered", true));
+        c.on_event(Some(3), msg("c-1", "r-2", "dos", "pending", true));
+        c.on_event(Some(4), start("c-1", "t-1"));
+        c.on_event(Some(5), token("c-1", "t-1", "R1"));
+        c.on_event(Some(6), end_ev("c-1", "t-1"));
+        c.on_event(Some(7), msg("c-1", "r-2", "dos", "delivered", true));
+        c.on_event(Some(8), start("c-1", "t-2"));
+        c.on_event(Some(9), token("c-1", "t-2", "R2"));
+        assert_eq!(order(&c), ["uno", "R1", "dos", "R2"]);
+    }
+
+    /// Review M2a: a send whose outcome is unknown, then its own `message`: one entry, live.
+    #[test]
+    fn own_message_replaces_its_failed_entry() {
+        let mut c = opened(1, &[]);
+        c.send_failed("hola", "unknown");
+        c.send_failed("otra", "not_sent");
+        c.on_event(Some(2), msg("c-1", "r-1", "hola", "delivered", true));
+        assert_eq!(order(&c), ["otra", "hola"]);
+        let Entry::Msg(m) = &c.open.as_ref().unwrap().entries[1] else {
+            panic!()
+        };
+        assert_eq!((m.status, m.id.as_str()), (MsgStatus::Delivered, "r-1"));
+        // Another device's same text replaces nothing.
+        c.on_event(Some(3), msg("c-1", "r-2", "otra", "delivered", false));
+        assert_eq!(order(&c), ["otra", "hola", "otra"]);
+    }
+
+    /// Review M4 and M2c: opening the same conversation again keeps what is shown until the
+    /// history replaces it, and a failed text survives the re-open.
+    #[test]
+    fn reopening_keeps_the_screen_and_failed_texts() {
+        let mut c = opened(1, &[("user", "uno"), ("assistant", "R1")]);
+        c.send_failed("no salió", "not_sent");
+        c.open("c-1");
+        assert_eq!(order(&c), ["uno", "R1", "no salió"], "kept while loading");
+        c.on_state("c-1", state("c-1", 5, None, &[]));
+        assert_eq!(order(&c), ["uno", "R1", "no salió"]);
+        c.on_history(
+            "c-1",
+            history(
+                "c-1",
+                &[("user", "uno"), ("assistant", "R1"), ("user", "dos")],
+            ),
+        );
+        assert_eq!(order(&c), ["uno", "R1", "dos", "no salió"]);
+        // Another conversation starts empty.
+        c.open("c-2");
+        assert!(order(&c).is_empty());
+    }
+
+    /// Review M2b: a failure is shown only in the conversation it was sent to.
+    #[test]
+    fn a_failed_send_shows_only_in_its_conversation() {
+        let mut c = opened(1, &[]);
+        assert!(!c.send_failed_in("c-2", "hola", "not_sent"));
+        assert!(order(&c).is_empty());
+        assert!(c.send_failed_in("c-1", "hola", "not_sent"));
+        assert_eq!(order(&c), ["hola"]);
+    }
+
+    /// Review M1: `GET /conversations` has no running flag; a resync forgets the marks.
+    #[test]
+    fn running_marks_can_be_forgotten() {
+        let mut c = Chat::default();
+        c.set_list(&[conv("c-1"), conv("c-2")]);
+        c.on_event(Some(1), start("c-2", "t-1"));
+        assert!(c.list[0].running);
+        assert!(c.forget_running());
+        assert!(c.list.iter().all(|i| !i.running));
+        c.set_list(&[conv("c-2"), conv("c-1")]);
+        assert!(
+            c.list.iter().all(|i| !i.running),
+            "not back after a refresh"
+        );
+        assert!(!c.forget_running());
+    }
+
+    /// Review L1: a created conversation that the list learnt about before the 201 still gets
+    /// its early events.
+    #[test]
+    fn created_conversation_listed_early_keeps_its_events() {
+        let mut c = Chat::default();
+        c.set_list(&[conv("c-1")]);
+        c.begin_create();
+        c.on_event(Some(5), msg("c-new", "r-1", "hola", "delivered", true));
+        c.set_list(&[conv("c-new"), conv("c-1")]); // the debounced refresh lands first
+        c.on_event(Some(6), start("c-new", "t-1"));
+        c.created(&conv("c-new"));
+        c.on_event(Some(7), token("c-new", "t-1", "buenas"));
+        assert_eq!(order(&c), ["hola", "buenas"]);
+        let Entry::Turn(t) = &c.open.as_ref().unwrap().entries[1] else {
+            panic!()
+        };
+        assert_eq!(
+            t.by_name.as_deref(),
+            Some("Cocina"),
+            "its turn_start was kept"
+        );
+    }
+
+    /// Review L4: the open buffer is charged by the SSE data length.
+    #[test]
+    fn open_buffer_counts_the_wire_bytes() {
+        let mut c = Chat::default();
+        c.set_list(&[conv("c-1")]);
+        c.open("c-1");
+        let small = token("c-1", "t", "x");
+        let mut reopen = false;
+        for i in 0..20 {
+            reopen |= c.on_event_sized(Some(i), small.clone(), 8 * 1024).reopen;
+        }
+        assert!(reopen, "20 x 8 KiB of data overflow 64 KiB");
     }
 }

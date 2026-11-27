@@ -64,6 +64,8 @@ use tokio_util::sync::CancellationToken;
 /// An unknown conversation in an event: the list is fetched once this much later (several
 /// events of a new conversation make one call).
 const LIST_DEBOUNCE: Duration = Duration::from_secs(1);
+/// ... and never more often than this for unknown conversations.
+const UNKNOWN_REFRESH_EVERY: Duration = Duration::from_secs(30);
 /// A failed open step is tried again after this (the conversation stays on screen as it was).
 const REOPEN_AFTER: Duration = Duration::from_secs(5);
 
@@ -120,10 +122,22 @@ pub(crate) struct Engine<C, H> {
 enum Job {
     List,
     Me,
-    State { id: String, seq: u64 },
-    History { id: String, seq: u64 },
-    Send { text: String },
-    Create { text: String },
+    State {
+        id: String,
+        seq: u64,
+    },
+    History {
+        id: String,
+        seq: u64,
+    },
+    /// `conv`: where it was posted (a failure shows only there).
+    Send {
+        conv: String,
+        text: String,
+    },
+    Create {
+        text: String,
+    },
     Cancel,
 }
 
@@ -157,6 +171,8 @@ struct State {
     list_in_flight: bool,
     list_again: bool,
     list_at: Option<Mono>,
+    /// When the last refresh asked by an unknown conversation was due.
+    unknown_refreshed: Option<Mono>,
     reopen_at: Option<Mono>,
     creating: bool,
     /// A write got `403 missing_scope` (or `/auth/me` lacks `conversations:write`).
@@ -197,6 +213,7 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
             list_in_flight: false,
             list_again: false,
             list_at: None,
+            unknown_refreshed: None,
             reopen_at: None,
             creating: false,
             write_denied: false,
@@ -365,7 +382,19 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
 
     fn effect(&self, st: &mut State, fx: Effect) {
         if fx.refresh_list && st.list_at.is_none() {
-            st.list_at = Some(self.clock.now().saturating_add(LIST_DEBOUNCE));
+            // A conversation that stays unlisted (beyond `LIST_MAX`, or one the gateway does
+            // not list us) while it streams asks again at most every `UNKNOWN_REFRESH_EVERY`.
+            let now = self.clock.now();
+            let soon = now.saturating_add(LIST_DEBOUNCE);
+            let at = match st.unknown_refreshed {
+                Some(last) => {
+                    let next = last.saturating_add(UNKNOWN_REFRESH_EVERY);
+                    if next.0 > soon.0 { next } else { soon }
+                }
+                None => soon,
+            };
+            st.list_at = Some(at);
+            st.unknown_refreshed = Some(at);
         }
         if fx.reopen {
             Stats::inc(&self.stats.open_overflows);
@@ -401,10 +430,10 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
                             interrupt: None,
                         });
                         match (PathId::new(&id), body) {
-                            (Some(id), Ok(body)) => self.call(
+                            (Some(path), Ok(body)) => self.call(
                                 st,
-                                Job::Send { text },
-                                HttpCall::PostMessage { id },
+                                Job::Send { conv: id, text },
+                                HttpCall::PostMessage { id: path },
                                 Some(body),
                             ),
                             _ => false,
@@ -571,14 +600,16 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
                     st.list_in_flight = false;
                     st.creating = false;
                     st.write_denied = false;
-                    self.store(|c| {
-                        c.create_failed();
-                        ((), false)
-                    });
+                    // Nothing shown may come from before (another account, a lost place): the
+                    // store starts empty and the open conversation is fetched again.
+                    let open = self.chat.borrow().open_id().map(str::to_owned);
+                    self.store(|c| ((), c.clear()));
                     self.publish_read_only(st);
                     self.call(st, Job::Me, HttpCall::Me, None);
                     self.refresh_list(st);
-                    self.reopen(st);
+                    if let Some(id) = open {
+                        self.open(st, &id);
+                    }
                 } else if st.open_step.is_none()
                     && self
                         .chat
@@ -614,17 +645,32 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
                 self.store(|c| ((), c.clear()));
             }
             Inbound::Resync => {
+                // Missed `turn_end`s would leave marks for good; the open one's state marks it
+                // again.
+                self.store(|c| {
+                    let changed = c.forget_running();
+                    ((), changed)
+                });
+                // A scope granted meanwhile shows on `/auth/me` (once per resync, only then).
+                if st.write_denied {
+                    self.call(st, Job::Me, HttpCall::Me, None);
+                }
                 self.refresh_list(st);
                 self.reopen(st);
             }
-            Inbound::Event { ev, id, charge } => {
+            Inbound::Event {
+                ev,
+                id,
+                bytes,
+                charge,
+            } => {
                 match &ev {
                     Event::TurnStart(_) => Stats::inc(&self.stats.turns_started),
                     Event::TurnEnd(_) => Stats::inc(&self.stats.turns_completed),
                     _ => {}
                 }
                 let fx = self.store(|c| {
-                    let fx = c.on_event(id, ev);
+                    let fx = c.on_event_sized(id, ev, bytes);
                     (fx, fx.view || fx.list)
                 });
                 // The store copied what it keeps: the queued bytes are released.
@@ -655,11 +701,20 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
             st.writes = st.writes.saturating_sub(1);
         }
         if epoch != st.epoch {
+            if job.is_write() {
+                Stats::inc(&self.stats.rest_stale_writes);
+            }
             return;
         }
         let class = reply.as_ref().map_or(HttpClass::Retry, |r| {
             classify_http(r.status, Some(r.body.as_slice()))
         });
+        // No answer at all (our deadline, a cut connection): the gateway may have it.
+        let code = if reply.is_none() {
+            "unknown"
+        } else {
+            failure_code(class)
+        };
         let ok = class == HttpClass::Ok;
         if !ok {
             Stats::inc(&self.stats.rest_failures);
@@ -735,10 +790,12 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
             }
             // A newer open replaced it.
             Job::State { .. } | Job::History { .. } => {}
-            Job::Send { text } => {
+            Job::Send { conv, text } => {
+                // Shown only in its own conversation (else counted in `rest_failures` only);
+                // if it did arrive, its `message` replaces the failed entry.
                 if reply.is_none() {
                     self.store(|c| {
-                        let changed = c.send_failed(&text, failure_code(class));
+                        let changed = c.send_failed_in(&conv, &text, code);
                         (changed, changed)
                     });
                 }
@@ -755,7 +812,7 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
                         // Shown as a failed message while nothing is open.
                         self.store(|c| {
                             c.create_failed();
-                            let changed = c.send_failed(&text, failure_code(class));
+                            let changed = c.send_failed(&text, code);
                             ((), changed)
                         });
                     }

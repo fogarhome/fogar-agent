@@ -70,10 +70,11 @@ pub(crate) enum Inbound {
     Up { api: Api, resumed: bool },
     /// The stream is gone and the planned rotation could not replace it in time.
     Down,
-    /// `id`: the SSE id (`None` for events without one).
+    /// `id`: the SSE id (`None` for events without one); `bytes`: its SSE data length.
     Event {
         ev: Event,
         id: Option<u64>,
+        bytes: usize,
         charge: Charge,
     },
     /// Re-fetch what is shown: the gateway lost our place, or an event was too big to read.
@@ -632,7 +633,16 @@ impl<C: Clock, H: GatewayHttp> LinkCtx<C, H> {
                     return false;
                 };
                 if !self
-                    .forward(in_tx, Inbound::Event { ev, id, charge }, egress)
+                    .forward(
+                        in_tx,
+                        Inbound::Event {
+                            ev,
+                            id,
+                            bytes,
+                            charge,
+                        },
+                        egress,
+                    )
                     .await
                 {
                     return false;
