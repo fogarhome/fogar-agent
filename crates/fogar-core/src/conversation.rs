@@ -34,7 +34,7 @@ use fogar_ports::{
     audio::MicPermission,
     ipc::{
         CONVERSATION_MAX_TEXT_BYTES, CONVERSATION_MAX_TURNS, ConversationView, Notice,
-        ProgressKind, ServiceState, TurnAudio, TurnOutcome, TurnSource, TurnView,
+        ProgressKind, TurnOutcome, TurnSource, TurnView,
     },
 };
 use fogar_proto::{
@@ -65,6 +65,8 @@ fn bounded(s: &str) -> &str {
 }
 
 /// A gateway id as the view shows it (and as the app sends it back in `TurnVisible`).
+// shortcut: only the playback gate's turn following uses it, idle until PR 5.
+#[allow(dead_code)]
 pub(crate) fn bounded_id(s: &str) -> &str {
     bounded(s)
 }
@@ -930,21 +932,6 @@ fn trim_view(turns: &mut Vec<TurnView>) {
     }
 }
 
-/// The session ended: every open turn is `Closed`, the voice state is unknown again.
-// shortcut: the engine of PR 4a Task 4 stops calling it (a resumed `/events` replays what was
-// missed); removed with the old engine wiring.
-pub fn link_down(v: &mut ConversationView) -> bool {
-    let mut changed = false;
-    for t in v.turns.iter_mut().filter(|t| t.outcome.is_none()) {
-        t.outcome = Some(TurnOutcome::Closed);
-        t.progress = None;
-        t.tool = None;
-        changed = true;
-    }
-    changed |= set(&mut v.transcriber, ServiceState::Unknown);
-    changed | set(&mut v.tts, ServiceState::Unknown)
-}
-
 pub fn set_mic(v: &mut ConversationView, m: MicPermission) -> bool {
     set(&mut v.mic, m)
 }
@@ -961,61 +948,6 @@ pub fn take_ended(v: &mut ConversationView, notice: Option<Notice>) -> bool {
         changed |= set(&mut v.notice, notice);
     }
     changed
-}
-
-/// The wait for our turn ended without a `turn_start`.
-// shortcut: only the old turn machine calls it; removed with it (PR 4a Task 4).
-pub fn wait_ended(v: &mut ConversationView, o: TurnOutcome) -> bool {
-    match v
-        .turns
-        .iter_mut()
-        .rev()
-        .find(|t| t.turn_id.is_empty() && t.outcome.is_none() && !t.mine.is_empty())
-    {
-        Some(t) => {
-            t.outcome = Some(o);
-            true
-        }
-        None => false,
-    }
-}
-
-/// Ends every open turn that has a gateway id.
-// shortcut: only the old turn machine calls it; removed with it (PR 4a Task 4).
-pub fn end_open(v: &mut ConversationView, o: TurnOutcome) -> bool {
-    let mut changed = false;
-    for t in v
-        .turns
-        .iter_mut()
-        .filter(|t| t.outcome.is_none() && !t.turn_id.is_empty())
-    {
-        t.outcome = Some(o);
-        changed = true;
-    }
-    changed
-}
-
-/// The playback gate's state: whether audio plays now and which turn waits for `TurnVisible`.
-pub fn playback(v: &mut ConversationView, speaking: bool, awaiting: Option<&str>) -> bool {
-    let mut changed = set(&mut v.speaking, speaking);
-    if v.awaiting_visible.as_deref() != awaiting {
-        v.awaiting_visible = awaiting.map(str::to_owned);
-        changed = true;
-    }
-    changed
-}
-
-/// The audio of turn `view_id` (as the view shows it) played, or was muted. `Played` is never
-/// turned into `Muted`.
-pub fn turn_audio(v: &mut ConversationView, view_id: &str, audio: TurnAudio) -> bool {
-    if view_id.is_empty() {
-        return false;
-    }
-    match v.turns.iter_mut().rev().find(|t| t.turn_id == view_id) {
-        Some(t) if t.audio == TurnAudio::Played => false,
-        Some(t) => set(&mut t.audio, audio),
-        None => false,
-    }
 }
 
 #[cfg(test)]

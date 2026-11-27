@@ -1,6 +1,6 @@
 //! The conversation over IPC: who may use it and what is refused, never touching the
-//! microphone. S4 PR 4a, Task 3: the WebSocket chat cases left with the WebSocket chat; the
-//! conversation over `/events` comes back with the store (Task 4).
+//! microphone. The chat itself (list, open, send, stop over `/events`) is tested in-crate
+//! (`engine/tests.rs`): opening has no IPC request until v6.
 #![allow(clippy::disallowed_methods)] // the harness drives tokio's paused clock directly
 #![allow(clippy::unwrap_used)]
 
@@ -38,9 +38,41 @@ fn rig_with(mock: MockConfig) -> RigBuilder<fogar_testkit::FakeGatewayLink> {
     b
 }
 
-/// Nothing but `GET /events` reached the gateway.
+/// No write reached the gateway (a fresh link only reads: `/events`, the list, `/auth/me`).
 fn nothing_sent(rig: &Rig) -> bool {
-    rest(&rig.routes).is_empty()
+    rig.routes.seen().iter().all(|r| r.method == "GET")
+}
+
+/// IPC-2: a plain status subscription (all a uid-only peer may have: `SubscribeConversation`
+/// is refused to it, above) never carries the conversation, even while the conversation
+/// changes.
+#[tokio::test(start_paused = true)]
+async fn status_subscriber_never_receives_the_conversation() {
+    let mut rig = rig_with(MockConfig::default()).start();
+    wait_ready(&mut rig.health).await;
+    let mut c = rig.ipc.as_ref().unwrap().client().await;
+    assert_eq!(
+        c.request(IpcRequest::Subscribe).await,
+        Some(IpcResponse::Subscribed)
+    );
+    // The view changes: another connection's text creates and opens a conversation.
+    let mut other = rig.ipc.as_ref().unwrap().client().await;
+    assert_eq!(
+        other.request(text("hola")).await,
+        Some(IpcResponse::TextAccepted)
+    );
+    let until = tokio::time::Instant::now() + Duration::from_secs(10);
+    while let Ok(Some(m)) = tokio::time::timeout_at(until, c.next()).await {
+        assert!(
+            matches!(m, IpcResponse::Event(_)),
+            "a uid-only subscriber got {m:?}"
+        );
+    }
+    assert!(
+        !rig.health.conversation().turns.is_empty(),
+        "the view did change"
+    );
+    assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
 
 #[tokio::test(start_paused = true)]

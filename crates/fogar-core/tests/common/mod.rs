@@ -322,12 +322,17 @@ pub(crate) async fn say<L: GatewayLink>(rig: &Rig<L>, text: &str) {
     assert_eq!(r, Some(IpcResponse::TextAccepted));
 }
 
-/// Every request but the `/events` stream (the link opens it whenever there is an account).
+/// Every request but what a signed-in agent makes on its own: the `/events` stream and the
+/// chat reads of a fresh link (`GET /auth/me`, `GET /conversations…`).
 pub(crate) fn rest(routes: &HttpRoutes) -> Vec<fogar_testkit::gateway::SeenRequest> {
     routes
         .seen()
         .into_iter()
-        .filter(|r| !r.path.starts_with("/events"))
+        .filter(|r| {
+            !(r.path.starts_with("/events")
+                || (r.method == "GET"
+                    && (r.path == "/auth/me" || r.path.starts_with("/conversations"))))
+        })
         .collect()
 }
 

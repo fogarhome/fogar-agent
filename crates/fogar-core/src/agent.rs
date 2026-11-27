@@ -19,6 +19,7 @@ use crate::{
     account::Account,
     capture::CaptureGate,
     config::Config,
+    conversation::Chat,
     crashloop::BootMode,
     engine::Engine,
     heartbeat::Heartbeat,
@@ -75,6 +76,8 @@ pub struct HealthProbe {
     pub(crate) boot_mode: &'static str,
     /// The conversation view the engine publishes (also the voice state for `StatusReport`).
     pub(crate) conversation: watch::Receiver<ConversationView>,
+    /// The conversation store: the list and the open conversation (IPC v6 shows them, Task 5).
+    chat: watch::Receiver<Chat>,
     probe_caps: Option<ProbeCaps>,
     in_tx: mpsc::WeakSender<Inbound>,
 }
@@ -94,6 +97,11 @@ impl HealthProbe {
     /// Latest conversation view (for the composition root and tests).
     pub fn conversation(&self) -> ConversationView {
         self.conversation.borrow().clone()
+    }
+
+    /// Latest conversation store (the list, the open conversation).
+    pub fn chat(&self) -> Chat {
+        self.chat.borrow().clone()
     }
 
     pub fn probe_caps(&self) -> Option<ProbeCaps> {
@@ -146,6 +154,9 @@ pub struct Agent<C> {
     health: HealthProbe,
     heartbeat: Arc<Heartbeat>,
     view_tx: watch::Sender<LinkView>,
+    /// In-crate tests drive engine commands IPC v5 has no request for (opening).
+    #[cfg(test)]
+    pub(crate) cmds: mpsc::Sender<crate::engine::Command>,
 }
 
 impl<C: Clock> Agent<C> {
@@ -170,12 +181,17 @@ impl<C: Clock> Agent<C> {
         let (reconnect_tx, reconnect_rx) = watch::channel(());
         let (in_tx, in_rx) = mpsc::channel::<Inbound>(queues::INBOUND);
         let (cmd_tx, cmd_rx) = mpsc::channel(queues::ENGINE_COMMANDS);
+        #[cfg(test)]
+        let cmds = cmd_tx.clone();
         let (conv_tx, conv_rx) = watch::channel(ConversationView::default());
+        // The conversation store (`queues`: watch, coalescing).
+        let (chat_tx, chat_rx) = watch::channel(Chat::default());
         let health = HealthProbe {
             stats: stats.clone(),
             view: view_rx,
             boot_mode: boot.label(),
             conversation: conv_rx,
+            chat: chat_rx,
             probe_caps: ports.probe.as_ref().map(|p| p.capabilities()),
             in_tx: in_tx.downgrade(),
         };
@@ -191,13 +207,16 @@ impl<C: Clock> Agent<C> {
         );
         let heartbeat = Arc::new(Heartbeat::new(ms(&*ports.clock)));
 
+        let http = Arc::new(ports.http);
         let engine = Engine {
             clock: ports.clock.clone(),
             cfg: cfg.clone(),
             stats: stats.clone(),
+            http: http.clone(),
             in_rx,
             cmd_rx,
             conv: conv_tx,
+            chat: chat_tx,
         };
         // The microphone goes straight to the consent gate: the engine never holds it.
         let capture = CaptureGate::new(ports.audio_in, &cfg, stats.clone());
@@ -205,7 +224,6 @@ impl<C: Clock> Agent<C> {
         let playback = PlaybackGate::new(ports.audio_out, stats.clone());
         data.spawn(engine.run(capture, playback, ingress.clone()));
 
-        let http = Arc::new(ports.http);
         let link = LinkCtx {
             clock: ports.clock.clone(),
             http: http.clone(),
@@ -272,6 +290,8 @@ impl<C: Clock> Agent<C> {
             health,
             heartbeat,
             view_tx,
+            #[cfg(test)]
+            cmds,
         }
     }
 
@@ -344,6 +364,30 @@ async fn beat<C: Clock>(
             () = clock.sleep(every) => hb.beat(ms(&*clock)),
         }
     }
+}
+
+/// In-crate tests: the agent over in-memory fakes (the ports are handed over here only, archtest
+/// R11/R12).
+#[cfg(test)]
+pub(crate) fn start_for_test(
+    http: fogar_testkit::FakeGatewayHttp,
+    secrets: Arc<dyn SecretStore>,
+    mic: fogar_testkit::FakeMic,
+    speaker: fogar_testkit::FakeSpeaker,
+) -> Agent<fogar_testkit::TestClock> {
+    let ports: AgentPorts<_, _, NoIpc, _, NoTailnet> = AgentPorts {
+        clock: Arc::new(fogar_testkit::TestClock::new()),
+        link: fogar_testkit::FakeGatewayLink::new(fogar_testkit::MockConfig::default()),
+        ipc: None,
+        http,
+        tailnet: NoTailnet,
+        secrets,
+        random: Arc::new(fogar_testkit::SeededRandom::new(7)),
+        audio_in: Arc::new(mic),
+        audio_out: Arc::new(speaker),
+        probe: None,
+    };
+    Agent::start(ports, Config::default(), BootMode::Normal)
 }
 
 /// For builds without a local UI socket: `accept` never resolves.

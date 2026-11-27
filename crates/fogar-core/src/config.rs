@@ -1,6 +1,6 @@
 //! Engine configuration, injected by the composition root (core never reads env or files).
 
-use crate::{backoff::BackoffPolicy, turn::TurnTimeouts, vad::VadConfig};
+use crate::{backoff::BackoffPolicy, vad::VadConfig};
 use fogar_proto::{InputMode, OutputMode, limits};
 use std::time::Duration;
 
@@ -61,7 +61,6 @@ pub struct Config {
     /// clients cannot hold the `IPC_MAX_CONNS` slots (review code#3/sec#5).
     pub ipc_idle_timeout: Duration,
     pub vad: VadConfig,
-    pub turn: TurnTimeouts,
     /// Capture rate the engine streams as-is (f32le 16 kHz mono is all v1 accepts). The adapter
     /// resamples; a capture delivered at another format is closed and the take refused.
     pub upload_rate_hz: u32,
@@ -111,7 +110,6 @@ impl Default for Config {
             backoff: BackoffPolicy::default(),
             ipc_idle_timeout: Duration::from_secs(30),
             vad: VadConfig::default(),
-            turn: TurnTimeouts::default(),
             upload_rate_hz: fogar_proto::audio::UPLOAD_RATE_HZ,
             heartbeat_every: Duration::from_secs(10),
             capture_silence_cut: Duration::from_secs(5),

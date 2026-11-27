@@ -110,6 +110,35 @@ async fn rotation_is_invisible() {
     assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
 }
 
+/// A text typed right when a stream rotates (the old one ended, the new one not ready yet) is
+/// accepted and posted: the rotation is invisible to the engine too. Deferred from Task 3.
+#[tokio::test(start_paused = true)]
+async fn send_during_rotation_gap_is_accepted() {
+    let mut b = RigBuilder::fake(MockConfig::default());
+    b.with_ipc = true;
+    let mut rig = b.start();
+    wait_ready(&mut rig.health).await;
+    // The first stream ends at 25 s; aim at both sides of it and right on it.
+    tokio::time::sleep(Duration::from_millis(24_990)).await;
+    for _ in 0..4 {
+        say(&rig, "ahora").await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    eventually(Duration::from_secs(5), || {
+        rig.routes
+            .seen()
+            .iter()
+            .filter(|r| r.method == "POST" && r.path.starts_with("/conversations"))
+            .count()
+            == 4
+    })
+    .await;
+    let s = rig.health.snapshot().stats;
+    assert!(s.stream_rotations >= 1, "{s:?}");
+    assert_eq!(s.sessions_started, 1, "{s:?}");
+    assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
+}
+
 /// Review focus 1: events published before, during and between rotations all arrive, once.
 #[tokio::test(start_paused = true)]
 async fn rotation_resumes_without_gaps() {

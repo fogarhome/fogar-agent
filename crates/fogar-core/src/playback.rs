@@ -35,6 +35,10 @@
 //!
 //! **No content kept.** Samples are held only while they wait (bounded); `Debug` shows sizes.
 
+// shortcut: nothing feeds the gate in S4 PR 4a (no turn is followed, no audio plays), so the
+// turn-following half is unused outside its tests; PR 5's voice link calls it again.
+#![allow(dead_code)]
+
 use crate::{capture::spawn_device_job, conversation, stats::Stats, time::sleep_until_opt};
 use fogar_ports::{
     audio::{ActivePlayback, AudioError, AudioFormat, AudioSink, OPEN_BLOCK_MAX},

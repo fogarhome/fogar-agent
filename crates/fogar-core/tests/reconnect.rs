@@ -123,25 +123,36 @@ async fn reconnect_needs_the_signed_app() {
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
 
-/// A request the gateway refuses for good (404, another 403): parked, and Reconnect cannot help.
+/// Review M1 of Task 3: a 404 on `/events` (a proxy while the gateway restarts) never parks the
+/// daemon: it backs off (capped, jittered; Reconnect has nothing to do) and comes back by
+/// itself once the gateway answers.
 #[tokio::test(start_paused = true)]
-async fn reconnect_does_not_retry_a_client_bug() {
+async fn events_404_backs_off_until_the_gateway_answers() {
     let mut rig = rig(true);
     rig.routes
         .set("GET", "/events", 404, r#"{"detail":"Not Found"}"#);
-    wait_state(&mut rig.health, |v| {
-        v.state
-            == LinkState::Parked {
-                reason: CloseAction::FixClient,
-            }
-    })
-    .await;
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    let n = rest_events(&rig);
+    assert!((3..=12).contains(&n), "{n} opens in 60 s: backed off");
+    assert!(matches!(
+        rig.health.snapshot().link,
+        LinkState::Backoff { .. } | LinkState::Connecting { .. }
+    ));
     let mut c = client(&rig).await;
     assert!(matches!(
         c.request(IpcRequest::Reconnect).await,
         Some(IpcResponse::Refused { .. })
     ));
-    no_new_streams(&rig).await;
+    rig.routes.set_stream(
+        "GET",
+        "/events",
+        200,
+        vec![
+            StreamStep::Bytes(b"id: 7\ndata: {\"type\":\"ready\",\"protocol\":5}\n\n".to_vec()),
+            StreamStep::HoldOpen,
+        ],
+    );
+    wait_ready(&mut rig.health).await;
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
 

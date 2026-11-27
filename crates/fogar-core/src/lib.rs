@@ -1,4 +1,4 @@
-//! fogar-core: the engine. Pure policy (backoff, VAD, turn state machine, crash-loop breaker) plus
+//! fogar-core: the engine. Pure policy (backoff, VAD, conversation store, crash-loop breaker) plus
 //! orchestration over ports (link supervisor, engine, IPC service, ordered shutdown).
 //!
 //! **Architecture invariants** (mechanically enforced: archtest R1/R4/R5, clippy.toml):
@@ -17,7 +17,6 @@ pub mod crashloop;
 pub mod heartbeat;
 pub mod queues;
 pub mod stats;
-pub mod turn;
 pub mod vad;
 
 mod capture;

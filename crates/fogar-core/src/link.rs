@@ -49,8 +49,7 @@ use tokio_util::sync::CancellationToken;
 
 /// What the engine needs to make REST calls for the signed-in account. `Debug` shows the
 /// address only.
-// shortcut: carried but not read until the engine makes REST calls (S4 PR 4a Task 4).
-#[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct Api {
     pub(crate) addr: GatewayAddr,
     pub(crate) token: SecretString,
@@ -64,8 +63,6 @@ impl std::fmt::Debug for Api {
 
 /// Link -> engine. `Event` carries the [`Charge`] of its bytes against `queues::INBOUND_BYTES`;
 /// it is released when the engine drops the message. `Debug` hides every text (`Event`'s own).
-// shortcut: the payloads are read by the conversation store (S4 PR 4a Task 4).
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum Inbound {
     /// A stream reached `ready` after a `Down` (or for the first time). `resumed`: it was asked
@@ -97,7 +94,7 @@ pub struct LinkView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HttpClass {
     Ok,
-    /// 401: the token is dead (`not_authenticated`): sign out.
+    /// `401 not_authenticated`: the token is dead: sign out.
     Revoked,
     /// `403 missing_scope`: the token is valid but lacks the scope; never retried.
     MissingScope,
@@ -111,7 +108,11 @@ pub(crate) enum HttpClass {
 pub(crate) fn classify_http(status: u16, body: Option<&[u8]>) -> HttpClass {
     match status {
         200..=299 => HttpClass::Ok,
-        401 => HttpClass::Revoked,
+        // Only the gateway's own answer signs out; any other 401 (a proxy page) backs off.
+        401 => match body.and_then(|b| serde_json::from_slice::<ApiError>(b).ok()) {
+            Some(e) if e.code() == Some("not_authenticated") => HttpClass::Revoked,
+            _ => HttpClass::Retry,
+        },
         403 => match body.and_then(|b| serde_json::from_slice::<ApiError>(b).ok()) {
             Some(e) if e.code() == Some("missing_scope") => HttpClass::MissingScope,
             Some(_) => HttpClass::Fatal,
@@ -507,8 +508,9 @@ impl<C: Clock, H: GatewayHttp> LinkCtx<C, H> {
             return Err(match classify_http(reply.status, bytes.as_deref()) {
                 HttpClass::Revoked => Outcome::Revoked,
                 HttpClass::MissingScope => Outcome::Park(CloseAction::MissingScope),
-                HttpClass::Fatal => Outcome::Park(CloseAction::FixClient),
-                HttpClass::Ok | HttpClass::Retry => Outcome::ConnectFailed,
+                // A proxy's 404 while the gateway restarts must not park the daemon for good:
+                // anything but 401/403 backs off (capped, jittered).
+                HttpClass::Fatal | HttpClass::Ok | HttpClass::Retry => Outcome::ConnectFailed,
             });
         }
         let ready_by = opened.saturating_add(self.cfg.ready_timeout);
@@ -707,10 +709,14 @@ mod tests {
     fn statuses_are_classified() {
         let scope = Some(br#"{"detail":"missing_scope"}"#.as_slice());
         let other = Some(br#"{"detail":"forbidden"}"#.as_slice());
+        let auth = Some(br#"{"detail":"not_authenticated"}"#.as_slice());
         for (status, body, want) in [
             (200, None, HttpClass::Ok),
             (202, None, HttpClass::Ok),
-            (401, None, HttpClass::Revoked),
+            (401, auth, HttpClass::Revoked),
+            (401, None, HttpClass::Retry),
+            (401, other, HttpClass::Retry),
+            (401, Some(b"<html>".as_slice()), HttpClass::Retry),
             (403, scope, HttpClass::MissingScope),
             (403, other, HttpClass::Fatal),
             (403, Some(b"<html>".as_slice()), HttpClass::Retry),

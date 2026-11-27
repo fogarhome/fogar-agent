@@ -33,7 +33,9 @@ struct Outcome {
 /// real, linear leak in the TEST harness), used by the canary to prove the heap probe works.
 async fn run_soak(hours: u32, planted_leak: bool) -> Outcome {
     let baseline_tasks = alive_tasks();
-    let mut rig = RigBuilder::fake(MockConfig::default()).start();
+    let mut b = RigBuilder::fake(MockConfig::default());
+    b.with_ipc = true;
+    let mut rig = b.start();
     rig.routes.set_record(planted_leak);
     // The hub keeps a bounded ring (2000 events) and history (1000 per conversation): fill both
     // during the warm-up so only the agent can grow after it.
@@ -45,6 +47,20 @@ async fn run_soak(hours: u32, planted_leak: bool) -> Outcome {
     for _ in 0..450 {
         rig.hub.other_device_send("c-1", "pon la serie");
     }
+    // The agent's own conversation (created by the first text, then open): filled past its
+    // bounds during the warm-up so it can only stay flat after.
+    for _ in 0..30 {
+        say(&rig, "apaga la luz").await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    // The hub's own history of it (1000 kept) is full too, like c-1's.
+    let mine = rig.health.chat().open_id().map(str::to_owned);
+    let mine = mine
+        .as_deref()
+        .unwrap_or_else(|| panic!("no open conversation"));
+    for _ in 0..1000 {
+        rig.hub.seed_history(mine, "user", "apaga la luz");
+    }
     // Let those turns finish, then empty the ring: the hourly `forget_buffer` would otherwise
     // free it at hour 2 and hide up to ~250 KB of agent growth behind that drop.
     tokio::time::sleep(Duration::from_secs(600)).await;
@@ -54,6 +70,7 @@ async fn run_soak(hours: u32, planted_leak: bool) -> Outcome {
     for hour in 0..hours {
         for _half in 0..2 {
             rig.hub.other_device_send("c-1", "pon la serie");
+            say(&rig, "apaga la luz").await;
             tokio::time::sleep(Duration::from_secs(30 * 60)).await;
         }
         match hour % 3 {
@@ -94,9 +111,9 @@ async fn seventy_two_simulated_hours_without_growth() {
     let o = run_soak(72, false).await;
     let s = o.stats;
     assert!(s.stream_rotations > 72 * 100, "{s:?}");
-    // One real reconnect per silent hour; a drop that lands on a stream younger than
-    // `stable_stream` is a real one too (by design), so at most one per fault.
-    assert!((1 + 24..=1 + 72).contains(&s.sessions_started), "{s:?}");
+    // Deterministic (paused clock, seeded jitter): one real reconnect per silent hour and per
+    // hour whose drop lands on a stream younger than `stable_stream` (by design).
+    assert_eq!(s.sessions_started, 49, "{s:?}");
     assert!(s.events_resync >= 24, "{s:?}");
     assert!(s.events_received > 144 * 5, "{s:?}");
     assert_eq!(s.inbound_invalid + s.events_oversize, 0, "{s:?}");
