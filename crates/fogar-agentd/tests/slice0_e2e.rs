@@ -40,7 +40,11 @@ async fn chat_over_events_against_the_mock_gateway() {
     gw.routes()
         .set("POST", "/auth/login", 201, login_ok("key-1"));
     let baseline = alive_tasks();
-    let (agent, _secrets, ipc) = start_agent();
+    // Streams live 2 s here: only one older than `stable_stream` is a rotation (invisible),
+    // a younger one is a real `Down` that would start a new session.
+    let mut cfg = fast_config();
+    cfg.stable_stream = Duration::from_secs(1);
+    let (agent, _secrets, ipc) = start_agent_with(cfg);
     let mut h = agent.health();
     let mut app = ipc.client().await;
     login(&mut app, &gw.addr().to_string(), "sito", "contraseña-1").await;
@@ -118,10 +122,13 @@ async fn chat_over_events_against_the_mock_gateway() {
         last_turn(&a.view) == Some(("abcd", Some(TurnOutcome::Done)))
     })
     .await;
-    assert!(matches!(
-        h.snapshot().link,
-        fogar_core::LinkState::Ready { .. }
-    ));
+    let snap = h.snapshot();
+    assert_eq!(
+        snap.link,
+        fogar_core::LinkState::Ready { session: 1 },
+        "rotations, never a new session"
+    );
+    assert!(snap.stats.stream_rotations >= 2, "{:?}", snap.stats);
 
     drop(chat);
     drop(app);

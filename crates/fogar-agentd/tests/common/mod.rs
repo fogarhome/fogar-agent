@@ -114,6 +114,11 @@ pub(crate) fn alive_tasks() -> usize {
 
 /// A signed-out agent on the real adapters, with a counting store and a signed fake IPC.
 pub(crate) fn start_agent() -> (Agent<TokioClock>, Arc<CountingStore>, FakeIpc) {
+    start_agent_with(fast_config())
+}
+
+/// [`start_agent`] with its own config.
+pub(crate) fn start_agent_with(cfg: Config) -> (Agent<TokioClock>, Arc<CountingStore>, FakeIpc) {
     let secrets = Arc::new(CountingStore::default());
     let ipc = FakeIpc::signed();
     let ports = AgentPorts {
@@ -128,7 +133,7 @@ pub(crate) fn start_agent() -> (Agent<TokioClock>, Arc<CountingStore>, FakeIpc) 
         audio_out: Arc::new(FakeSpeaker::minimal()),
         probe: None,
     };
-    let agent = Agent::start(ports, fast_config(), BootMode::Normal);
+    let agent = Agent::start(ports, cfg, BootMode::Normal);
     (agent, secrets, ipc)
 }
 
