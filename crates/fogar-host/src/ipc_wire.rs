@@ -510,6 +510,7 @@ pub enum WireResponse {
     TextAccepted,
     TextRefused(WireTextRefused),
     TurnCancelSent,
+    TurnCancelNotReady,
     MicPermission(WireMicPermission),
     ListSubscribed,
     Conversations(WireConversations),
@@ -1131,6 +1132,7 @@ pub fn encode_response(r: IpcResponse) -> Result<Vec<u8>, IpcError> {
             reason: text_refusal_to_wire(r),
         }),
         IpcResponse::TurnCancelSent => WireResponse::TurnCancelSent,
+        IpcResponse::TurnCancelNotReady => WireResponse::TurnCancelNotReady,
         IpcResponse::MicPermission(m) => WireResponse::MicPermission(WireMicPermission {
             state: mic_to_wire(m),
         }),
@@ -1184,6 +1186,7 @@ pub fn decode_response(body: &[u8]) -> Result<IpcResponse, IpcError> {
                 IpcResponse::TextRefused(text_refusal_from_wire(r.reason))
             }
             WireResponse::TurnCancelSent => IpcResponse::TurnCancelSent,
+            WireResponse::TurnCancelNotReady => IpcResponse::TurnCancelNotReady,
             WireResponse::MicPermission(m) => IpcResponse::MicPermission(mic_from_wire(m.state)),
             WireResponse::ListSubscribed => IpcResponse::ListSubscribed,
             WireResponse::Conversations(l) => IpcResponse::Conversations(
@@ -1417,6 +1420,7 @@ mod tests {
             IpcResponse::CaptureEnded,
             IpcResponse::TextAccepted,
             IpcResponse::TurnCancelSent,
+            IpcResponse::TurnCancelNotReady,
             IpcResponse::ListSubscribed,
             IpcResponse::Conversations(list()),
             IpcResponse::Conversations(Vec::new()),
@@ -1621,6 +1625,10 @@ mod tests {
             (
                 IpcResponse::TurnCancelSent,
                 r#"{"type":"turn_cancel_sent"}"#,
+            ),
+            (
+                IpcResponse::TurnCancelNotReady,
+                r#"{"type":"turn_cancel_not_ready"}"#,
             ),
             (IpcResponse::ListSubscribed, r#"{"type":"list_subscribed"}"#),
             (

@@ -381,6 +381,8 @@ pub enum IpcResponse {
     TextRefused(TextRefusal),
     /// `CancelTurn` handled: `cancel` sent if a turn of the open conversation may run.
     TurnCancelSent,
+    /// `CancelTurn` with a conversation open but no link to the gateway: nothing was sent.
+    TurnCancelNotReady,
     /// `ListConversations` accepted; one `Conversations` follows, then one per change.
     ListSubscribed,
     /// Pushed WITHOUT a request after `ListConversations`: the latest list (watch, no backlog).
@@ -598,7 +600,8 @@ pub enum MessageState {
     Delivered,
     /// From history.
     Past,
-    /// Our send failed (`MessageView::error_code` says why): it never reached the gateway.
+    /// Our send failed (`MessageView::error_code` says why). Code `unknown`: no answer in
+    /// time, it may have reached the gateway; any other code: it did not.
     Failed,
 }
 

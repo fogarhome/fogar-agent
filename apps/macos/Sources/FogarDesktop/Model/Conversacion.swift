@@ -233,6 +233,7 @@ final class Conversacion {
         do {
             switch try await link.pedir(.cancelTurn) {
             case .turnCancelSent: break
+            case .turnCancelNotReady: aviso = Textos.cancelarSinConexion
             case .refused(let r): aviso = Textos.rechazo(r.reason)
             default: aviso = Textos.fallo(CommandError.unexpected)
             }

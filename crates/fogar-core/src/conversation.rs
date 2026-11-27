@@ -33,7 +33,8 @@
 //!
 //! Bounds: list ≤ [`LIST_MAX`]; open entries ≤ [`MAX_ENTRIES`] and ≤ `CONVERSATION_MAX_TEXT_BYTES`
 //! of text (oldest first); buffers ≤ [`BUFFER_EVENTS`] / [`BUFFER_BYTES`]; gateway ids, codes and
-//! names cut to [`ID_MAX_BYTES`], titles to [`TITLE_MAX_BYTES`]. `Debug` prints sizes, never text,
+//! names cut to [`ID_MAX_BYTES`], titles to [`TITLE_MAX_BYTES`]; names and titles lose control,
+//! bidi and invisible characters (UI spoofing). `Debug` prints sizes, never text,
 //! titles or names.
 
 use fogar_ports::{
@@ -66,16 +67,10 @@ pub const BUFFER_BYTES: usize = 64 * 1024;
 /// History asked for when opening (PR 3 carry-over).
 pub const HISTORY_LIMIT: u16 = 50;
 
-/// `s` cut to [`ID_MAX_BYTES`] at a char boundary.
-fn bounded(s: &str) -> &str {
+/// `s` cut to [`ID_MAX_BYTES`] at a char boundary (a gateway id as the store and the view keep
+/// it; the playback gate follows turns by it).
+pub(crate) fn bounded(s: &str) -> &str {
     cut(s, ID_MAX_BYTES)
-}
-
-/// A gateway id as the store keeps it (the playback gate follows turns by it).
-// shortcut: only the playback gate's turn following uses it, idle until PR 5.
-#[allow(dead_code)]
-pub(crate) fn bounded_id(s: &str) -> &str {
-    bounded(s)
 }
 
 /// `s` cut to `max` bytes at a char boundary.
@@ -88,6 +83,19 @@ fn cut(s: &str, max: usize) -> &str {
         n -= 1;
     }
     &s[..n]
+}
+
+/// A gateway name or title as shown: no control, bidi or invisible characters, cut to `max`
+/// bytes.
+fn clean(s: &str, max: usize) -> String {
+    if !s.chars().any(crate::discovery::spoofing) {
+        return cut(s, max).to_owned();
+    }
+    let s: String = s
+        .chars()
+        .filter(|&c| !crate::discovery::spoofing(c))
+        .collect();
+    cut(&s, max).to_owned()
 }
 
 fn truncate(s: &mut String, max: usize) {
@@ -135,7 +143,8 @@ pub enum MsgStatus {
     Delivered,
     /// From history.
     Past,
-    /// Our `POST` failed (`MsgEntry::error_code` says why); it never reached the gateway.
+    /// Our `POST` failed (`MsgEntry::error_code` says why). With code `unknown` (no answer in
+    /// time) it may have reached the gateway; any other code means it did not.
     Failed,
 }
 
@@ -363,7 +372,7 @@ fn msg_entry(m: &MessageEv) -> MsgEntry {
         id: bounded(&m.id).to_owned(),
         text: m.text.clone(),
         mine: m.from.self_,
-        from_name: m.from.name.as_deref().map(|n| bounded(n).to_owned()),
+        from_name: m.from.name.as_deref().map(|n| clean(n, ID_MAX_BYTES)),
         status: match m.state {
             MsgState::Pending => MsgStatus::Pending,
             _ => MsgStatus::Delivered,
@@ -376,7 +385,7 @@ fn turn_entry(t: &TurnStartEv) -> TurnEntry {
     TurnEntry {
         turn_id: bounded(&t.turn_id).to_owned(),
         push: t.origin == Some(TurnOrigin::Push),
-        by_name: t.by.as_ref().map(|b| bounded(&b.name).to_owned()),
+        by_name: t.by.as_ref().map(|b| clean(&b.name, ID_MAX_BYTES)),
         by_self: t.by.as_ref().is_some_and(|b| b.self_),
         reply: t.text.clone().unwrap_or_default(),
         progress: None,
@@ -647,6 +656,21 @@ impl Chat {
         }
     }
 
+    /// Marks `id` running where it is in the list. `true` = the list changed.
+    fn mark_running(&mut self, id: &str) -> bool {
+        if self.running.iter().any(|r| r == id) {
+            return false;
+        }
+        if self.running.len() >= LIST_MAX {
+            self.running.pop_front();
+        }
+        self.running.push_back(id.to_owned());
+        self.list
+            .iter_mut()
+            .find(|c| c.id == id)
+            .is_some_and(|c| set(&mut c.running, true))
+    }
+
     /// `GET /conversations` (gateway order), the first [`LIST_MAX`] kept.
     pub fn set_list(&mut self, items: &[Conversation]) -> bool {
         let list: Vec<ConvItem> = items
@@ -654,10 +678,7 @@ impl Chat {
             .take(LIST_MAX)
             .map(|c| ConvItem {
                 id: bounded(&c.id).to_owned(),
-                title: c
-                    .title
-                    .as_deref()
-                    .map(|t| cut(t, TITLE_MAX_BYTES).to_owned()),
+                title: c.title.as_deref().map(|t| clean(t, TITLE_MAX_BYTES)),
                 private: c.owner_user_id.is_some(),
                 last_turn_at: c.last_turn_at.as_deref().map(|t| bounded(t).to_owned()),
                 running: self.running.iter().any(|r| *r == bounded(&c.id)),
@@ -816,10 +837,7 @@ impl Chat {
         let id = bounded(&c.id).to_owned();
         let mut list = vec![ConvItem {
             id: id.clone(),
-            title: c
-                .title
-                .as_deref()
-                .map(|t| cut(t, TITLE_MAX_BYTES).to_owned()),
+            title: c.title.as_deref().map(|t| clean(t, TITLE_MAX_BYTES)),
             private: c.owner_user_id.is_some(),
             last_turn_at: c.last_turn_at.as_deref().map(|t| bounded(t).to_owned()),
             running: self.running.contains(&id),
@@ -855,14 +873,24 @@ impl Chat {
 
     /// A post to `conv` failed: shown only while `conv` is the open conversation. `false` =
     /// another one is open (the caller counts it).
+    /// An `unknown` outcome whose own `message` already arrived (a live entry of mine with that
+    /// text) did reach the gateway: nothing to add.
     pub fn send_failed_in(&mut self, conv: &str, text: &str, code: &str) -> bool {
-        if self.open_id() != Some(bounded(conv)) {
+        let Some(open) = self.open.as_ref().filter(|o| o.id == bounded(conv)) else {
+            return false;
+        };
+        if code == "unknown"
+            && open
+                .entries
+                .iter()
+                .any(|e| matches!(e, Entry::Msg(m) if m.mine && !m.id.is_empty() && m.text == text))
+        {
             return false;
         }
         self.send_failed(text, code)
     }
 
-    /// Our `POST` of `text` failed with `code`: shown (never sent) instead of vanishing. With
+    /// Our `POST` of `text` failed with `code`: shown as failed instead of vanishing. With
     /// nothing open (a create failed) it is the only thing shown, until something opens.
     pub fn send_failed(&mut self, text: &str, code: &str) -> bool {
         let failed = Entry::Msg(MsgEntry {
@@ -885,7 +913,8 @@ impl Chat {
         true
     }
 
-    /// One `/events` event (`id`: its SSE id), charged by its decoded texts.
+    /// Tests: one `/events` event (`id`: its SSE id), charged by its decoded texts.
+    #[cfg(test)]
     pub fn on_event(&mut self, id: Option<u64>, ev: Event) -> Effect {
         let n = ev_bytes(&ev);
         self.on_event_sized(id, ev, n)
@@ -902,6 +931,9 @@ impl Chat {
         match &ev {
             Event::TurnStart(_) => fx.list = self.set_running(&conv, true),
             Event::TurnEnd(_) => fx.list = self.set_running(&conv, false),
+            // A turn runs (its `turn_start` came before a resync forgot the marks): marked
+            // again, without moving it (two streaming conversations must not swap per token).
+            Event::Token(_) | Event::TurnProgress(_) => fx.list = self.mark_running(&conv),
             _ => {}
         }
         let is_open = self.open_id() == Some(conv.as_str());
@@ -1655,6 +1687,84 @@ mod tests {
             Some("Cocina"),
             "its turn_start was kept"
         );
+    }
+
+    /// PR 4a review M-1: a send that timed out (`unknown`) whose own `message` already arrived
+    /// is not shown twice; a send that surely failed still is.
+    #[test]
+    fn an_unknown_send_that_arrived_is_not_doubled() {
+        let mut c = opened(1, &[]);
+        c.on_event(Some(2), msg("c-1", "r-1", "hola", "delivered", true));
+        assert!(!c.send_failed_in("c-1", "hola", "unknown"));
+        assert_eq!(order(&c), ["hola"]);
+        assert!(c.send_failed_in("c-1", "otra", "unknown"), "not arrived");
+        assert!(c.send_failed_in("c-1", "hola", "not_sent"));
+        assert_eq!(order(&c), ["hola", "otra", "hola"]);
+    }
+
+    /// PR 4a security L1: gateway names and titles lose control, bidi and invisible characters
+    /// (UI spoofing) and keep their byte caps; ids are untouched.
+    #[test]
+    fn names_and_titles_are_cleaned() {
+        let dirty = "Coc\u{202E}ina\nfalsa\u{200B}";
+        let mut c = Chat::default();
+        let item: Conversation = serde_json::from_value(
+            json!({"id":"c-1","agent":"main","created_at":"x","title":dirty}),
+        )
+        .unwrap();
+        c.set_list(std::slice::from_ref(&item));
+        assert_eq!(c.list[0].title.as_deref(), Some("Cocinafalsa"));
+        c.begin_create();
+        c.created(&item);
+        assert_eq!(c.list[0].title.as_deref(), Some("Cocinafalsa"));
+        c.on_event(
+            Some(1),
+            ev(
+                json!({"type":"message","id":"r-1","conversation":"c-1","text":"x","state":"delivered",
+                "from":{"source":"device","device_id":"d","name":dirty,"self":false}}),
+            ),
+        );
+        c.on_event(
+            Some(2),
+            ev(
+                json!({"type":"turn_start","turn_id":"t-1","conversation":"c-1","origin":"user",
+                "by":{"device_id":"d","name":dirty,"self":false}}),
+            ),
+        );
+        let entries = &c.open.as_ref().unwrap().entries;
+        assert!(
+            matches!(&entries[0], Entry::Msg(m) if m.from_name.as_deref() == Some("Cocinafalsa"))
+        );
+        assert!(
+            matches!(&entries[1], Entry::Turn(t) if t.by_name.as_deref() == Some("Cocinafalsa"))
+        );
+        // Byte caps hold after cleaning.
+        let long: Conversation = serde_json::from_value(
+            json!({"id":"c-2","agent":"main","created_at":"x","title":"ñ".repeat(400)}),
+        )
+        .unwrap();
+        c.set_list(&[long]);
+        assert!(c.list[0].title.as_ref().unwrap().len() <= TITLE_MAX_BYTES);
+    }
+
+    /// PR 4a review L: after a resync forgot the marks, a token or progress of a turn still
+    /// running marks its conversation again, without moving it.
+    #[test]
+    fn a_streaming_turn_is_marked_again_after_a_resync() {
+        let mut c = Chat::default();
+        c.set_list(&[conv("c-1"), conv("c-2"), conv("c-3")]);
+        c.on_event(Some(1), start("c-3", "t-1"));
+        c.on_event(Some(2), start("c-2", "t-2"));
+        c.forget_running();
+        let fx = c.on_event(Some(3), token("c-3", "t-1", "x"));
+        assert!(fx.list);
+        let progress = ev(
+            json!({"type":"turn_progress","turn_id":"t-2","conversation":"c-2","phase":"thinking"}),
+        );
+        assert!(c.on_event(Some(4), progress).list);
+        let ids: Vec<_> = c.list.iter().map(|i| (i.id.as_str(), i.running)).collect();
+        assert_eq!(ids, [("c-2", true), ("c-3", true), ("c-1", false)]);
+        assert!(!c.on_event(Some(5), token("c-3", "t-1", "y")).list, "once");
     }
 
     /// Review L4: the open buffer is charged by the SSE data length.

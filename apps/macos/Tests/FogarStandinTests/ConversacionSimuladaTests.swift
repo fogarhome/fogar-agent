@@ -56,6 +56,9 @@ import Testing
         _ = c.abrir("conv-serie")
         let t = c.abrirTurno(source: .mine, en: "conv-serie")
         _ = c.enviarTexto("me arrepiento")
+        c.listo = false
+        #expect(c.cancelar() == .turnCancelNotReady)
+        c.listo = true
         #expect(c.cancelar() == .turnCancelSent)
         #expect(c.turno(t)?.outcome == .cancelled)
         #expect(!c.entries.contains { if case .message(let m) = $0 { m.text == "me arrepiento" } else { false } })

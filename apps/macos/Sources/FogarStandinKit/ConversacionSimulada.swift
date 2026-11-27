@@ -196,6 +196,7 @@ public struct ConversacionSimulada: Sendable {
     /// withdrawn (they disappear, as in the gateway).
     public mutating func cancelar() -> WireResponse {
         guard let conv = abierta else { return .turnCancelSent }
+        guard listo else { return .turnCancelNotReady }
         // Withdrawn first: ending the turn would deliver the next pending message.
         hilos[conv]?.removeAll { if case .message(let m) = $0 { m.state == .pending } else { false } }
         if let t = turnoAbierto(en: conv) { cerrar(t.turn_id, .cancelled) }

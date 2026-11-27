@@ -74,7 +74,9 @@ const REOPEN_AFTER: Duration = Duration::from_secs(5);
 /// (`is_closed`) instead of acting on a request the UI was told failed.
 pub(crate) enum Command {
     SendText(String, oneshot::Sender<Result<(), TextRefusal>>),
-    Cancel(oneshot::Sender<()>),
+    /// `true`: handled (sent, or nothing to stop); `false`: a conversation is open but there is
+    /// no link, so nothing could be asked to stop.
+    Cancel(oneshot::Sender<bool>),
     /// Show this conversation (state + history, then live).
     Open(String, oneshot::Sender<()>),
     /// Nothing open: the next text starts a new conversation.
@@ -171,6 +173,9 @@ struct State {
     list_in_flight: bool,
     list_again: bool,
     list_at: Option<Mono>,
+    /// One `/auth/me` at a time (`queues`); one asked meanwhile runs after it.
+    me_in_flight: bool,
+    me_again: bool,
     /// When the last refresh asked by an unknown conversation was due.
     unknown_refreshed: Option<Mono>,
     reopen_at: Option<Mono>,
@@ -213,6 +218,8 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
             list_in_flight: false,
             list_again: false,
             list_at: None,
+            me_in_flight: false,
+            me_again: false,
             unknown_refreshed: None,
             reopen_at: None,
             creating: false,
@@ -337,6 +344,15 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
         st.list_in_flight = self.call(st, Job::List, HttpCall::ListConversations, None);
     }
 
+    /// `/auth/me` (the write scope); one asked while one runs is folded into one more after it.
+    fn refresh_me(&self, st: &mut State) {
+        if st.me_in_flight {
+            st.me_again = true;
+            return;
+        }
+        st.me_in_flight = self.call(st, Job::Me, HttpCall::Me, None);
+    }
+
     /// (Re)opens `id`: its state is asked first.
     fn open(&self, st: &mut State, id: &str) {
         st.reopen_at = None;
@@ -418,8 +434,12 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
                     let _ = reply.send(Err(TextRefusal::MissingScope));
                     return;
                 }
-                if !st.online || st.creating {
+                if !st.online {
                     let _ = reply.send(Err(TextRefusal::NotReady));
+                    return;
+                }
+                // A create in flight: the dropped reply is "busy" for the IPC (try again soon).
+                if st.creating {
                     return;
                 }
                 let open = self.chat.borrow().open_id().map(str::to_owned);
@@ -474,15 +494,19 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
                 }
                 let open = self.chat.borrow().open_id().and_then(PathId::new);
                 match open {
-                    Some(id) if st.online && !st.write_denied => {
+                    Some(_) if !st.online && !st.write_denied => {
+                        let _ = reply.send(false);
+                    }
+                    Some(id) if !st.write_denied => {
                         if self.call(st, Job::Cancel, HttpCall::Cancel { id }, None) {
                             Stats::inc(&self.stats.cancels_sent);
-                            let _ = reply.send(());
+                            let _ = reply.send(true);
                         }
+                        // Not started (writes at their cap): the dropped reply is "busy".
                     }
-                    // Nothing to cancel (or no way to): handled.
+                    // Nothing to cancel (or no right to): handled.
                     _ => {
-                        let _ = reply.send(());
+                        let _ = reply.send(true);
                     }
                 }
             }
@@ -598,6 +622,8 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
                     // A fresh stream (first connect, new account, lost place): fetch all once.
                     st.epoch += 1;
                     st.list_in_flight = false;
+                    st.me_in_flight = false;
+                    st.me_again = false;
                     st.creating = false;
                     st.write_denied = false;
                     // Nothing shown may come from before (another account, a lost place): the
@@ -605,7 +631,7 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
                     let open = self.chat.borrow().open_id().map(str::to_owned);
                     self.store(|c| ((), c.clear()));
                     self.publish_read_only(st);
-                    self.call(st, Job::Me, HttpCall::Me, None);
+                    self.refresh_me(st);
                     self.refresh_list(st);
                     if let Some(id) = open {
                         self.open(st, &id);
@@ -636,6 +662,8 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
                 st.open_step = None;
                 st.list_in_flight = false;
                 st.list_again = false;
+                st.me_in_flight = false;
+                st.me_again = false;
                 st.list_at = None;
                 st.reopen_at = None;
                 st.creating = false;
@@ -653,7 +681,7 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
                 });
                 // A scope granted meanwhile shows on `/auth/me` (once per resync, only then).
                 if st.write_denied {
-                    self.call(st, Job::Me, HttpCall::Me, None);
+                    self.refresh_me(st);
                 }
                 self.refresh_list(st);
                 self.reopen(st);
@@ -736,12 +764,16 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
                 }
             }
             Job::Me => {
+                st.me_in_flight = false;
                 // Unknown scopes (an old gateway, an odd body) deny nothing.
                 if let Some(me) = reply.as_ref().and_then(decode::<Me>)
                     && !me.scopes.is_empty()
                 {
                     st.write_denied = !me.scopes.contains(&Scope::ConversationsWrite);
                     self.publish_read_only(st);
+                }
+                if std::mem::take(&mut st.me_again) && st.write_denied {
+                    self.refresh_me(st);
                 }
             }
             Job::State { id, seq } if seq == st.open_seq => {
@@ -804,15 +836,18 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
                 st.creating = false;
                 match reply.as_ref().and_then(decode::<Conversation>) {
                     Some(conv) => {
+                        // The person's text started it: the view switches to the new
+                        // conversation even if another was opened meanwhile.
                         let fx = self.store(|c| (c.created(&conv), true));
                         st.open_seq += 1;
                         self.effect(st, fx);
                     }
                     None => {
-                        // Shown as a failed message while nothing is open.
+                        // Shown as a failed message only while nothing is open (opened
+                        // meanwhile: counted in `rest_failures` only, never shown in another).
                         self.store(|c| {
                             c.create_failed();
-                            let changed = c.send_failed(&text, code);
+                            let changed = c.open_id().is_none() && c.send_failed(&text, code);
                             ((), changed)
                         });
                     }

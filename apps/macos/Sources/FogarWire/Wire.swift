@@ -594,6 +594,7 @@ public enum WireResponse: Codable, Sendable, Equatable, Hashable {
 	case textAccepted
 	case textRefused(WireTextRefused)
 	case turnCancelSent
+	case turnCancelNotReady
 	case micPermission(WireMicPermission)
 	case listSubscribed
 	case conversations(WireConversations)
@@ -618,6 +619,7 @@ public enum WireResponse: Codable, Sendable, Equatable, Hashable {
 			textAccepted = "text_accepted",
 			textRefused = "text_refused",
 			turnCancelSent = "turn_cancel_sent",
+			turnCancelNotReady = "turn_cancel_not_ready",
 			micPermission = "mic_permission",
 			listSubscribed = "list_subscribed",
 			conversations,
@@ -708,6 +710,9 @@ public enum WireResponse: Codable, Sendable, Equatable, Hashable {
 			case .turnCancelSent:
 				self = .turnCancelSent
 				return
+			case .turnCancelNotReady:
+				self = .turnCancelNotReady
+				return
 			case .micPermission:
 				if let content = try? container.decode(WireMicPermission.self, forKey: .data) {
 					self = .micPermission(content)
@@ -779,6 +784,8 @@ public enum WireResponse: Codable, Sendable, Equatable, Hashable {
 			try container.encode(content, forKey: .data)
 		case .turnCancelSent:
 			try container.encode(CodingKeys.turnCancelSent, forKey: .type)
+		case .turnCancelNotReady:
+			try container.encode(CodingKeys.turnCancelNotReady, forKey: .type)
 		case .micPermission(let content):
 			try container.encode(CodingKeys.micPermission, forKey: .type)
 			try container.encode(content, forKey: .data)

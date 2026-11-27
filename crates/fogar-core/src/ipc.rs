@@ -401,7 +401,8 @@ async fn serve<K: IpcConn, C: Clock, H: GatewayHttp, T: TailnetPeers>(mut c: Con
                 },
             },
             IpcRequest::CancelTurn => match c.ask(Command::Cancel).await {
-                Some(()) => IpcResponse::TurnCancelSent,
+                Some(true) => IpcResponse::TurnCancelSent,
+                Some(false) => IpcResponse::TurnCancelNotReady,
                 None => BUSY,
             },
             IpcRequest::ListConversations => {
@@ -557,7 +558,7 @@ mod tests {
         let (clock, stats) = (TestClock::new(), Stats::default());
         let mut parked = Vec::new();
         for _ in 0..ENGINE_COMMANDS {
-            let (r, keep) = oneshot::channel::<()>();
+            let (r, keep) = oneshot::channel::<bool>();
             tx.try_send(Command::Cancel(r)).unwrap();
             parked.push(keep);
         }

@@ -10,13 +10,20 @@
 //! Deviation: `id` is the event's OWN `id:` line, not the browser's sticky `lastEventId`. The
 //! gateway sends `ready` without an id on resume and push `audio` without one between numbered
 //! events; neither must look like it carries the previous event's id. The caller keeps
-//! `Last-Event-ID` itself. An `id` containing NUL is ignored (as in the spec).
+//! `Last-Event-ID` itself. An `id` containing NUL is ignored (as in the spec), and so is one
+//! longer than [`MAX_ID_BYTES`] (the gateway's ids are `u64`s).
 //!
 //! Bounded: line, data and id share one budget of [`MAX_EVENT_BYTES`] (capacity, not just length).
-//! A bigger event is reported once as [`SseItem::Oversize`] and its bytes are dropped up to its
-//! blank line without being buffered.
+//! A `data` line that outgrows it drops its whole event: reported once as [`SseItem::Oversize`]
+//! when that line ends (only then is its field name surely known, whatever the chunking), and
+//! its bytes are dropped up to its blank line without being buffered. Any other line that
+//! outgrows it (a comment, an unknown field) is just dropped. Data that is not UTF-8 is reported
+//! as [`SseItem::Oversize`] too (never decoded lossily).
 
-use alloc::{string::String, vec::Vec};
+use alloc::vec::Vec;
+
+/// Longest `id` kept: `u64::MAX` has 20 digits.
+pub const MAX_ID_BYTES: usize = 20;
 
 /// Largest event (all its lines) the reader keeps. GUESSED: push `audio` events (base64 PCM
 /// frames, `services/events.py`) are the largest the gateway sends; the doc gives no size.
@@ -28,12 +35,13 @@ pub const MAX_LINE_BYTES: usize = MAX_EVENT_BYTES;
 /// One thing found in the stream. Borrowed from the reader: valid only during the callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SseItem<'a> {
-    /// A dispatched event. `data` is lossy UTF-8 (invalid sequences become U+FFFD, as browsers do).
+    /// A dispatched event (strict UTF-8 `data`).
     Event { id: Option<&'a str>, data: &'a str },
     /// A `:` line (the gateway's `: ping` keepalive).
     Comment,
-    /// An event over [`MAX_EVENT_BYTES`] was dropped (reported once per event).
-    Oversize,
+    /// An event was dropped (reported once per event): its `data` outgrew [`MAX_EVENT_BYTES`]
+    /// or was not UTF-8. `id`: the event's id if its `id:` line came before the drop.
+    Oversize { id: Option<&'a str> },
 }
 
 /// Incremental SSE parser. One per connection: a new stream starts with a new reader, so no
@@ -52,6 +60,9 @@ pub struct SseReader {
     skipping: bool,
     /// While skipping: the current line has content (so its end is not the blank line).
     skip_line_has_bytes: bool,
+    /// The current line outgrew the budget: only its first bytes are kept (`head`, `len`), and
+    /// at its end they say whether it was `data` (the event is dropped) or not (the line is).
+    overlong: Option<([u8; 8], usize)>,
 }
 
 impl core::fmt::Debug for SseReader {
@@ -82,6 +93,7 @@ impl SseReader {
             at_start: true,
             skipping: false,
             skip_line_has_bytes: false,
+            overlong: None,
         }
     }
 
@@ -95,7 +107,7 @@ impl SseReader {
             }
         }
         while let Some(i) = rest.iter().position(|&b| b == b'\n' || b == b'\r') {
-            self.push(&rest[..i], out);
+            self.push(&rest[..i]);
             let cr = rest[i] == b'\r';
             rest = &rest[i + 1..];
             if cr {
@@ -107,15 +119,16 @@ impl SseReader {
             }
             self.end_line(out);
         }
-        self.push(rest, out);
+        self.push(rest);
     }
 
     fn used(&self) -> usize {
         self.buf.len() + self.id.as_ref().map_or(0, Vec::len)
     }
 
-    /// Appends part of the current line, or starts skipping when the event outgrows the budget.
-    fn push(&mut self, part: &[u8], out: &mut impl FnMut(SseItem<'_>)) {
+    /// Appends part of the current line; a line that outgrows the budget keeps only its head
+    /// (decided at its end).
+    fn push(&mut self, part: &[u8]) {
         if part.is_empty() {
             return;
         }
@@ -123,13 +136,32 @@ impl SseReader {
             self.skip_line_has_bytes = true;
             return;
         }
+        if let Some((head, n)) = self.overlong.as_mut() {
+            for &b in part {
+                if *n == head.len() {
+                    break;
+                }
+                head[*n] = b;
+                *n += 1;
+            }
+            return;
+        }
         let need = self.used() + part.len();
         if need > MAX_EVENT_BYTES {
-            self.reset();
-            self.skipping = true;
-            self.skip_line_has_bytes = true;
-            self.at_start = false;
-            out(SseItem::Oversize);
+            // Decided at the line's end, whatever the chunking (the field name may not be
+            // here yet).
+            let mut head = [0u8; 8];
+            let mut n = 0;
+            for &b in self.buf[self.data_len..]
+                .iter()
+                .chain(part)
+                .take(head.len())
+            {
+                head[n] = b;
+                n += 1;
+            }
+            self.buf.truncate(self.data_len);
+            self.overlong = Some((head, n));
             return;
         }
         if self.buf.len() + part.len() > self.buf.capacity() {
@@ -154,6 +186,24 @@ impl SseReader {
             self.skip_line_has_bytes = false;
             return;
         }
+        if let Some((head, n)) = self.overlong.take() {
+            let mut head = &head[..n];
+            if self.at_start {
+                self.at_start = false;
+                head = head.strip_prefix(BOM).unwrap_or(head);
+            }
+            if head.starts_with(b"data:") || head == b"data" {
+                // The rest of this event is skipped up to its blank line.
+                let id = self.id.take();
+                self.reset();
+                self.skipping = true;
+                self.skip_line_has_bytes = false;
+                out(SseItem::Oversize {
+                    id: id.as_deref().and_then(|v| core::str::from_utf8(v).ok()),
+                });
+            }
+            return;
+        }
         let mut start = self.data_len;
         if self.at_start {
             self.at_start = false;
@@ -164,12 +214,14 @@ impl SseReader {
         let line = &self.buf[start..];
         if line.is_empty() {
             if self.data_len > 0 {
-                let data = String::from_utf8_lossy(&self.buf[..self.data_len - 1]);
-                let id = self.id.as_deref().map(String::from_utf8_lossy);
-                out(SseItem::Event {
-                    id: id.as_deref(),
-                    data: &data,
-                });
+                let id = self
+                    .id
+                    .as_deref()
+                    .and_then(|v| core::str::from_utf8(v).ok());
+                match core::str::from_utf8(&self.buf[..self.data_len - 1]) {
+                    Ok(data) => out(SseItem::Event { id, data }),
+                    Err(_) => out(SseItem::Oversize { id }),
+                }
             }
             self.reset();
             return;
@@ -204,7 +256,7 @@ impl SseReader {
             }
             b"id" => {
                 let v = &self.buf[value..];
-                if !v.contains(&0) {
+                if !v.contains(&0) && v.len() <= MAX_ID_BYTES {
                     self.id = Some(v.to_vec());
                 }
             }
@@ -218,6 +270,62 @@ impl SseReader {
 mod tests {
     use super::*;
 
+    use alloc::{
+        format,
+        string::{String, ToString},
+    };
+
+    /// Every item, owned: `(id, data)`, data `None` for a dropped event.
+    fn items(input: &[u8]) -> Vec<(Option<String>, Option<String>)> {
+        let mut out = Vec::new();
+        SseReader::new().feed(input, &mut |it| match it {
+            SseItem::Event { id, data } => {
+                out.push((id.map(ToString::to_string), Some(data.to_string())));
+            }
+            SseItem::Oversize { id } => out.push((id.map(ToString::to_string), None)),
+            SseItem::Comment => {}
+        });
+        out
+    }
+
+    /// Review L1: invalid UTF-8 is never decoded lossily; an id over 20 bytes is ignored.
+    #[test]
+    fn strict_utf8_and_short_ids() {
+        assert_eq!(
+            items(b"id: 7\ndata: \xff\xfe\n\ndata: ok\n\n"),
+            [(Some("7".into()), None), (None, Some("ok".into()))]
+        );
+        let long = format!("id: {}\ndata: x\n\n", "1".repeat(21));
+        assert_eq!(items(long.as_bytes()), [(None, Some("x".into()))]);
+        let max = format!("id: {}\ndata: x\n\n", u64::MAX);
+        assert_eq!(
+            items(max.as_bytes()),
+            [(Some(u64::MAX.to_string()), Some("x".into()))]
+        );
+    }
+
+    /// Review L3/L2: only an overflowing `data` line drops its event (reported with the id
+    /// seen before it); an overlong comment or unknown field is just dropped.
+    #[test]
+    fn only_an_overflowing_data_line_drops_the_event() {
+        let big = "y".repeat(MAX_EVENT_BYTES);
+        let comment = format!("id: 3\n: {big}\ndata: kept\n\n");
+        assert_eq!(
+            items(comment.as_bytes()),
+            [(Some("3".into()), Some("kept".into()))]
+        );
+        let field = format!("id: 4\nnoise: {big}\ndata: kept\n\n");
+        assert_eq!(
+            items(field.as_bytes()),
+            [(Some("4".into()), Some("kept".into()))]
+        );
+        let data = format!("id: 5\ndata: {big}\ndata: more\n\ndata: next\n\n");
+        assert_eq!(
+            items(data.as_bytes()),
+            [(Some("5".into()), None), (None, Some("next".into()))]
+        );
+    }
+
     #[test]
     fn memory_stays_within_the_budget() {
         let mut r = SseReader::new();
@@ -228,7 +336,8 @@ mod tests {
             r.feed(&chunk, &mut |_| items += 1);
             assert!(r.buf.capacity() <= MAX_EVENT_BYTES, "{}", r.buf.capacity());
         }
-        assert_eq!(items, 1, "reported once");
+        r.feed(b"\n", &mut |_| items += 1);
+        assert_eq!(items, 1, "reported once, at the line's end");
         // Many short lines too: data plus the current line stay within the budget.
         let mut r = SseReader::new();
         for _ in 0..100_000 {

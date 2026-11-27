@@ -86,9 +86,8 @@ impl ByteBudget {
             .clamp(1, self.total.max(1))
     }
 
-    /// Non-blocking (audio: shed when over budget).
-    // shortcut: no inbound audio is queued in S4 PR 4a; PR 5's voice link sheds with it again.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Tests: non-blocking charge (PR 5's voice link may shed audio with it again).
+    #[cfg(test)]
     pub(crate) fn try_charge(&self, bytes: usize) -> Option<Charge> {
         self.sem
             .clone()

@@ -85,9 +85,6 @@ enum Visible {
 /// The turn whose audio the gate handles (the turn machine's current or last turn).
 #[derive(Debug)]
 struct TurnPlay {
-    // shortcut: read by `follow`'s callers in PR 5 (the voice link).
-    #[allow(dead_code)]
-    turn_id: String,
     turn_seq: u16,
     /// The id as the view shows it (and the app confirms it).
     view_id: String,
@@ -133,8 +130,6 @@ pub(crate) struct PlaybackGate {
     speaking: bool,
     drain_at: Option<Mono>,
     idle_close_at: Option<Mono>,
-    /// A view change the engine must publish (turn id as the view shows it).
-    mark: Option<(String, TurnAudio)>,
 }
 
 impl std::fmt::Debug for PlaybackGate {
@@ -189,7 +184,6 @@ impl PlaybackGate {
             speaking: false,
             drain_at: None,
             idle_close_at: None,
-            mark: None,
         }
     }
 
@@ -202,13 +196,6 @@ impl PlaybackGate {
             || (self.seen() && !self.pending.is_empty())
     }
 
-    /// For the view: audio is playing now.
-    // shortcut: IPC v6 shows no playback state until PR 5.
-    #[allow(dead_code)]
-    pub(crate) fn speaking(&self) -> bool {
-        self.speaking
-    }
-
     /// For the view: the turn whose audio waits for `TurnVisible`.
     // shortcut: IPC v6 shows no playback state until PR 5.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -217,13 +204,6 @@ impl PlaybackGate {
             .as_ref()
             .filter(|t| matches!(t.visible, Visible::Waiting { .. }))
             .map(|t| t.view_id.as_str())
-    }
-
-    /// A turn's audio changed state (played or muted) since the last call.
-    // shortcut: IPC v6 has no audio mark until PR 5.
-    #[allow(dead_code)]
-    pub(crate) fn take_mark(&mut self) -> Option<(String, TurnAudio)> {
-        self.mark.take()
     }
 
     fn seen(&self) -> bool {
@@ -240,7 +220,9 @@ impl PlaybackGate {
         // Review F1 of #32: a `turn_start` repeating the (id, seq) of a turn that already ended
         // (turn_end, Cancel, barge-in) is a NEW turn: it waits for its own confirmation.
         let same = match (turn, self.turn.as_ref()) {
-            (Some((id, seq)), Some(t)) => t.turn_seq == seq && t.turn_id == id && !t.over,
+            (Some((id, seq)), Some(t)) => {
+                t.turn_seq == seq && t.view_id == conversation::bounded(id) && !t.over
+            }
             _ => false,
         };
         match turn {
@@ -248,9 +230,8 @@ impl PlaybackGate {
             Some((id, seq)) => {
                 self.discard_pending();
                 self.turn = Some(TurnPlay {
-                    turn_id: id.to_owned(),
                     turn_seq: seq,
-                    view_id: conversation::bounded_id(id).to_owned(),
+                    view_id: conversation::bounded(id).to_owned(),
                     visible: Visible::Waiting {
                         until: now.saturating_add(VISIBLE_DEADLINE),
                     },
@@ -415,7 +396,6 @@ impl PlaybackGate {
         {
             t.marked = Some(TurnAudio::Muted);
             Stats::inc(&self.stats.tts_turns_muted);
-            self.mark = Some((t.view_id.clone(), TurnAudio::Muted));
         }
     }
 
@@ -424,7 +404,6 @@ impl PlaybackGate {
             && t.marked.is_none()
         {
             t.marked = Some(TurnAudio::Played);
-            self.mark = Some((t.view_id.clone(), TurnAudio::Played));
         }
     }
 
@@ -557,7 +536,6 @@ impl PlaybackGate {
         {
             t.marked = Some(TurnAudio::Muted);
             Stats::inc(&self.stats.tts_turns_unplayed);
-            self.mark = Some((t.view_id.clone(), TurnAudio::Muted));
         }
     }
 

@@ -49,6 +49,8 @@ nonisolated func resumen(_ id: String, _ titulo: String?, enMarcha: Bool = false
         #expect(Textos.notaMensaje(mensaje("hola", .pending)) == "Pendiente: va cuando Fogar termine.")
         #expect(Textos.notaMensaje(mensaje("hola", .failed, codigo: "missing_scope"))?.contains("no puede escribir") == true)
         #expect(Textos.notaMensaje(mensaje("hola", .failed, codigo: "not_sent"))?.hasPrefix("No se envió") == true)
+        #expect(Textos.notaMensaje(mensaje("hola", .failed, codigo: "unknown"))
+            == "Puede que se enviara: Fogar tardó en contestar. Mira si aparece antes de volver a escribirlo.")
         #expect(Textos.tituloConversacion(resumen("c", "  La serie ")) == "La serie")
         #expect(Textos.tituloConversacion(resumen("c", nil)) == "Conversación sin título")
         #expect(Textos.tituloConversacion(resumen("c", " ")) == "Conversación sin título")
@@ -150,6 +152,7 @@ nonisolated func agenteConversacion(_ registro: Registro, inicial: WireConversat
                                     lista: [WireSummary] = [resumen("c1", "La serie")],
                                     captura: WireResponse = .captureStarted,
                                     texto: WireResponse = .textAccepted,
+                                    cancelar: WireResponse = .turnCancelSent,
                                     vistaDespues: Bool = true) -> @Sendable (WireRequest) -> [WireResponse] {
     { req in
         registro.anotar(req)
@@ -168,7 +171,7 @@ nonisolated func agenteConversacion(_ registro: Registro, inicial: WireConversat
             return [captura]
         case .captureEnd(let e):
             return con(vista(draft: e.then == .review ? "enciende la luz" : nil), .captureEnded)
-        case .cancelTurn: return [.turnCancelSent]
+        case .cancelTurn: return [cancelar]
         case .requestMicPermission: return [.micPermission(WireMicPermission(state: .granted))]
         default: return [.refused(WireRefused(reason: "x"))]
         }
@@ -336,6 +339,15 @@ nonisolated func agenteConversacion(_ registro: Registro, inicial: WireConversat
         #expect(conv.texto == "  enciende la luz  ")
         #expect(conv.aviso == Textos.rechazoTexto(.notReady))
         #expect(registro.pedidos.contains(.sendText(WireSendText(text: "enciende la luz"))))
+    }
+
+    /// Stop while the agent has no link: an honest line, not silence.
+    @Test func pararSinConexionLoDice() async throws {
+        let agent = try FakeAgent(agenteConversacion(Registro(), cancelar: .turnCancelNotReady))
+        let (link, conv) = try await conectar(agent)
+        defer { link.stop() }
+        await conv.cancelar()
+        #expect(conv.aviso == "Fogar no está conectado: no se pudo parar.")
     }
 
     /// Click the microphone, then stop: the transcript waits in the box (`review`), never sent.

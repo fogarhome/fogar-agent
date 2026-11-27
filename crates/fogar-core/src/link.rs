@@ -195,7 +195,8 @@ enum Item {
         id: Option<u64>,
         bytes: usize,
     },
-    Oversize,
+    /// A dropped event, with its id when it came before the drop.
+    Oversize(Option<u64>),
 }
 
 /// Feeds `bytes` to the reader and appends what it found. One chunk is at most
@@ -207,7 +208,7 @@ fn collect(reader: &mut SseReader, bytes: &[u8], items: &mut Vec<Item>) {
             id: id.and_then(|s| s.parse().ok()),
             bytes: data.len(),
         }),
-        SseItem::Oversize => items.push(Item::Oversize),
+        SseItem::Oversize { id } => items.push(Item::Oversize(id.and_then(|s| s.parse().ok()))),
         SseItem::Comment => {}
     });
 }
@@ -257,6 +258,9 @@ impl<C: Clock, H: GatewayHttp> LinkCtx<C, H> {
         // The account the resume point belongs to, and the resume point.
         let mut owner: Option<AccountRecord> = None;
         let mut last_id: Option<u64> = None;
+        // A `SignedOut` the stalled engine missed: delivered before the next `Up`, so the
+        // engine never keeps the old account's handle or conversation into a new one.
+        let mut signed_out_owed = false;
         loop {
             if egress.is_cancelled() || in_tx.is_closed() {
                 break;
@@ -274,7 +278,8 @@ impl<C: Clock, H: GatewayHttp> LinkCtx<C, H> {
                         v.state = LinkState::NotPaired;
                         v.gateway = None;
                     });
-                    if !self.forward(&in_tx, Inbound::SignedOut, &egress).await
+                    signed_out_owed = !self.forward(&in_tx, Inbound::SignedOut, &egress).await;
+                    if signed_out_owed
                         && !matches!(self.not_delivered(&in_tx, &egress), Outcome::Ended)
                     {
                         break;
@@ -300,6 +305,19 @@ impl<C: Clock, H: GatewayHttp> LinkCtx<C, H> {
                     break;
                 }
             };
+            if signed_out_owed {
+                if !self.forward(&in_tx, Inbound::SignedOut, &egress).await {
+                    if !matches!(self.not_delivered(&in_tx, &egress), Outcome::Ended) {
+                        break;
+                    }
+                    let d = self.backoff(&mut attempt);
+                    if self.wait(d, &egress).await {
+                        continue;
+                    }
+                    break;
+                }
+                signed_out_owed = false;
+            }
             if !owner.as_ref().is_some_and(|o| o.same_as(&record)) {
                 last_id = None;
             }
@@ -607,12 +625,19 @@ impl<C: Clock, H: GatewayHttp> LinkCtx<C, H> {
         egress: &CancellationToken,
     ) -> bool {
         let (ev, id, bytes) = match item {
-            Item::Oversize => {
+            Item::Oversize(id) => {
                 Stats::inc(&self.stats.events_oversize);
                 if !self.forward(in_tx, Inbound::Resync, egress).await {
                     return false;
                 }
                 Stats::inc(&self.stats.events_resync);
+                // Resume past it: the resync re-fetched what it carried, and the gateway would
+                // replay the same too-big event at every rotation.
+                if let Some(id) = id
+                    && last_id.is_none_or(|l| id > l)
+                {
+                    *last_id = Some(id);
+                }
                 return true;
             }
             Item::Ev { ev, id, bytes } => (ev, id, bytes),
@@ -762,6 +787,8 @@ mod tests {
         egress: CancellationToken,
         tasks: tokio_util::task::TaskTracker,
         view_rx: watch::Receiver<LinkView>,
+        /// Signals "the account changed" (as `Login` does).
+        account: watch::Sender<()>,
     }
 
     /// `in_cap`: inbound queue capacity; `prefill`: messages already queued (an engine that
@@ -794,6 +821,7 @@ mod tests {
             reconnect,
             _reconnect_keep: reconnect_keep,
         };
+        let account_tx = ctx._account_keep.clone();
         let (in_tx, in_rx) = mpsc::channel(in_cap);
         for _ in 0..prefill {
             in_tx.try_send(Inbound::Down).unwrap();
@@ -811,7 +839,30 @@ mod tests {
             egress,
             tasks,
             view_rx,
+            account: account_tx,
         }
+    }
+
+    /// Review L2 (security): a `SignedOut` the stalled engine missed is not lost: it arrives
+    /// before the next account's `Up`.
+    #[tokio::test(start_paused = true)]
+    async fn a_missed_sign_out_comes_before_the_next_up() {
+        let store = Arc::new(MemorySecretStore::default());
+        let mut r = start(1, 1, store.clone());
+        r.clock.sleep(Duration::from_secs(30)).await; // past `inbound_deadline`: missed
+        assert!(
+            matches!(r.in_rx.recv().await, Some(Inbound::Down)),
+            "prefill"
+        );
+        store
+            .put(SecretKey::GatewayClientKey, "k".to_owned().into())
+            .unwrap();
+        account::adopt_stored_token(&*store, GatewayAddr::parse("127.0.0.1:8004").unwrap())
+            .unwrap();
+        r.account.send_replace(());
+        assert!(matches!(r.in_rx.recv().await, Some(Inbound::SignedOut)));
+        assert!(matches!(r.in_rx.recv().await, Some(Inbound::Up { .. })));
+        stop(r).await;
     }
 
     fn signed_in() -> Arc<dyn SecretStore> {

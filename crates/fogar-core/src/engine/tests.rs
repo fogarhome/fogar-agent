@@ -119,7 +119,7 @@ impl Rig {
         tokio::time::sleep(Duration::from_millis(1)).await;
         r
     }
-    async fn cancel(&self) -> Option<()> {
+    async fn cancel(&self) -> Option<bool> {
         let r = self.cmd(Command::Cancel).await;
         tokio::time::sleep(Duration::from_millis(1)).await;
         r
@@ -361,7 +361,7 @@ async fn stop_a_turn_started_elsewhere() {
         r.last_turn().unwrap().turn_id.starts_with("turn")
     })
     .await;
-    assert_eq!(r.cancel().await, Some(()));
+    assert_eq!(r.cancel().await, Some(true));
     assert_eq!(r.calls("POST", "/conversations/c-1/cancel").len(), 1);
     eventually("cancelled", || {
         r.last_turn().unwrap().outcome == Some(TurnOutcome::Cancelled)
@@ -503,7 +503,7 @@ async fn missing_scope_on_send_is_refused_once() {
     .await;
     assert!(r.health.conversation().read_only);
     assert_eq!(r.send("otra").await, Some(Err(TextRefusal::MissingScope)));
-    assert_eq!(r.cancel().await, Some(()));
+    assert_eq!(r.cancel().await, Some(true));
     tokio::time::sleep(Duration::from_secs(30)).await;
     assert_eq!(r.calls("POST", "/conversations").len(), 1, "never retried");
     let s = r.health.snapshot().stats;
@@ -663,7 +663,14 @@ async fn a_failed_post_shows_only_in_its_conversation() {
     let mut r = rig_with(|hub, routes| {
         hub.seed_conversation("c-1", "uno");
         hub.seed_conversation("c-2", "dos");
-        routes.set("POST", "/conversations/c-1/messages", 500, "{}");
+        // Fails only after the other conversation is open (a real race).
+        routes.set_delayed(
+            "POST",
+            "/conversations/c-1/messages",
+            500,
+            "{}",
+            Duration::from_secs(1),
+        );
     });
     r.ready().await;
     r.open("c-1").await;
@@ -856,6 +863,114 @@ async fn a_fresh_link_starts_empty_and_drops_late_writes() {
         !a.chat.borrow().render(&mut v),
         "nothing unsent shown either"
     );
+    a.stop().await;
+}
+
+// ---- PR 4a final review -----------------------------------------------------------------
+
+const READ_ONLY_ME: &str = r#"{"user":{"id":"u","username":"s","display_name":"S","role":"member"},"scopes":["conversations:read"]}"#;
+
+/// Security M1: a flood of `resync` on a read-only account never runs more than one
+/// `/auth/me` at a time (`queues`), even when the gateway never answers it.
+#[tokio::test(start_paused = true)]
+async fn a_resync_flood_runs_one_auth_me_at_a_time() {
+    let routes = HttpRoutes::fogar();
+    let hub = EventsHub::new();
+    hub.install(&routes);
+    hub.seed_conversation("c-1", "Serie");
+    routes.set("GET", "/auth/me", 200, READ_ONLY_ME);
+    let a = alone(&routes);
+    a.in_tx.send(fresh_up()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let me = || {
+        routes
+            .seen()
+            .iter()
+            .filter(|r| r.method == "GET" && r.path == "/auth/me")
+            .count()
+    };
+    assert_eq!(me(), 1, "the fresh link's");
+    routes.set_delayed(
+        "GET",
+        "/auth/me",
+        200,
+        READ_ONLY_ME,
+        Duration::from_secs(3600),
+    );
+    for _ in 0..1000 {
+        a.in_tx.send(Inbound::Resync).await.unwrap();
+    }
+    // Well within `http_timeout`: the first resync's call still runs.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(me(), 2, "one in flight, the rest folded");
+    a.stop().await;
+}
+
+/// Review M-2: a create that fails after the person opened another conversation is never
+/// shown there (counted only); a send meanwhile is refused busy (the reply is dropped).
+#[tokio::test(start_paused = true)]
+async fn a_failed_create_never_shows_in_another_conversation() {
+    let mut r = rig_with(|hub, routes| {
+        hub.seed_conversation("c-1", "Serie");
+        routes.set_delayed("POST", "/conversations", 500, "{}", Duration::from_secs(2));
+    });
+    r.ready().await;
+    assert_eq!(r.send("hola").await, Some(Ok(())));
+    assert_eq!(r.send("otra").await, None, "busy while the create runs");
+    r.open("c-1").await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(r.health.chat().open_id(), Some("c-1"));
+    assert!(failed(&r).is_empty(), "{:?}", r.entries());
+    assert!(r.health.snapshot().stats.rest_failures >= 1);
+    assert_eq!(r.calls("POST", "/conversations").len(), 1);
+    r.stop().await;
+}
+
+/// Review M-2: a create that succeeds takes the view, even if another conversation was
+/// opened meanwhile (the person's text started it).
+#[tokio::test(start_paused = true)]
+async fn a_created_conversation_takes_the_view() {
+    let mut r = rig_with(|hub, routes| {
+        hub.seed_conversation("c-1", "Serie");
+        routes.set_delayed(
+            "POST",
+            "/conversations",
+            201,
+            r#"{"id":"c-new","agent":"main","created_at":"x","title":null}"#,
+            Duration::from_secs(2),
+        );
+    });
+    r.ready().await;
+    assert_eq!(r.send("hola").await, Some(Ok(())));
+    r.open("c-1").await;
+    eventually("switched", || r.health.chat().open_id() == Some("c-new")).await;
+    assert_eq!(r.health.conversation().id.as_deref(), Some("c-new"));
+    r.stop().await;
+}
+
+/// Review L8: stop with a conversation open but no link is answered honestly (nothing was
+/// sent), not as if it had been; with nothing open it is simply handled.
+#[tokio::test(start_paused = true)]
+async fn cancel_while_offline_says_so() {
+    let routes = HttpRoutes::fogar();
+    let a = alone(&routes);
+    let ask = |make: fn(oneshot::Sender<bool>) -> Command| {
+        let (tx, rx) = oneshot::channel();
+        let cmd_tx = a.cmd_tx.clone();
+        async move {
+            cmd_tx.send(make(tx)).await.unwrap();
+            rx.await.unwrap()
+        }
+    };
+    assert!(ask(Command::Cancel).await, "nothing open: handled");
+    let (tx, rx) = oneshot::channel();
+    a.cmd_tx
+        .send(Command::Open("c-1".into(), tx))
+        .await
+        .unwrap();
+    rx.await.unwrap();
+    assert!(!ask(Command::Cancel).await, "open, no link");
+    assert!(routes.seen().is_empty(), "nothing was sent");
     a.stop().await;
 }
 

@@ -366,6 +366,30 @@ async fn oversize_triggers_resync() {
     assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
 }
 
+/// Review L2 (T3): a too-big event that was the last one seen is resumed past once its
+/// resync was accepted, so the gateway does not replay it (and a resync) at every reconnect.
+#[tokio::test(start_paused = true)]
+async fn oversize_event_is_resumed_past() {
+    let mut rig = rig();
+    let big = format!(
+        r#"{{"type":"token","turn_id":"t","conversation":"c-1","text":"{}"}}"#,
+        "x".repeat(fogar_proto::sse::MAX_EVENT_BYTES)
+    );
+    rig.routes.set_stream(
+        "GET",
+        "/events",
+        200,
+        vec![
+            StreamStep::Bytes([sse(Some(41), READY), sse(Some(42), &big)].concat()),
+            StreamStep::HoldOpen,
+        ],
+    );
+    wait_ready(&mut rig.health).await;
+    eventually(Duration::from_secs(120), || opens(&rig.routes).len() >= 2).await;
+    assert_eq!(opens(&rig.routes)[1].as_deref(), Some("42"));
+    assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
+}
+
 /// A rotation whose resume point the gateway no longer keeps: still invisible as a link change,
 /// but the engine is asked to re-fetch. A stream cut young (< `stable_stream`) is a real `Down`.
 #[tokio::test(start_paused = true)]

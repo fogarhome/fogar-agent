@@ -27,17 +27,20 @@ const MAX_LABEL_CHARS: usize = 128;
 /// Gateway-supplied text shown in the UI and stored in the account: no control, bidi or
 /// invisible format characters (UI spoofing), at most `MAX_LABEL_CHARS`.
 pub(crate) fn label(s: String) -> String {
-    let bidi = |c: char| {
-        matches!(c, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
-    };
-    if s.chars().count() <= MAX_LABEL_CHARS && !s.chars().any(|c| c.is_control() || bidi(c)) {
+    if s.chars().count() <= MAX_LABEL_CHARS && !s.chars().any(spoofing) {
         return s;
     }
     s.chars()
-        .filter(|&c| !c.is_control() && !bidi(c))
+        .filter(|&c| !spoofing(c))
         .take(MAX_LABEL_CHARS)
         .collect()
+}
+
+/// A control, bidi or invisible format character: never shown from gateway text (UI spoofing).
+pub(crate) fn spoofing(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
 }
 
 pub(crate) enum Probe {

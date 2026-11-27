@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::events::{MessageEv, TurnStartEv};
 
 /// One item of `GET /conversations`, or the `201` of `POST /conversations`. `Debug` hides
-/// `title`: OpenClaw derives it from the user's text.
+/// `title` (OpenClaw derives it from the user's text) and `client_name` (the person named
+/// the device).
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct Conversation {
     pub id: String,
@@ -43,7 +44,7 @@ impl fmt::Debug for Conversation {
         f.debug_struct("Conversation")
             .field("id", &self.id)
             .field("client_id", &self.client_id)
-            .field("client_name", &self.client_name)
+            .field("client_name_bytes", &self.client_name.len())
             .field("agent", &self.agent)
             .field("kind", &self.kind)
             .field("day", &self.day)

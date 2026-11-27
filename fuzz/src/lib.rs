@@ -27,11 +27,13 @@ pub fn sse_reader(data: &[u8]) {
             r.feed(c, &mut |it| {
                 out.push(match it {
                     SseItem::Event { id, data } => {
-                        assert!(data.len() <= MAX_EVENT_BYTES * 3, "lossy UTF-8 may grow 3x");
+                        assert!(data.len() <= MAX_EVENT_BYTES, "strict UTF-8: never grows");
                         (id.map(String::from), Some(String::from(data)))
                     }
                     SseItem::Comment => (None, None),
-                    SseItem::Oversize => (Some(String::from("<oversize>")), None),
+                    SseItem::Oversize { id } => {
+                        (Some(format!("<oversize {}>", id.unwrap_or("-"))), None)
+                    }
                 })
             });
         }

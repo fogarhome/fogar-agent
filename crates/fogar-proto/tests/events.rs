@@ -11,7 +11,7 @@ use std::borrow::Cow;
 enum Item {
     Event { id: Option<String>, data: String },
     Comment,
-    Oversize,
+    Oversize(Option<String>),
 }
 
 fn feed_all(r: &mut SseReader, chunk: &[u8], out: &mut Vec<Item>) {
@@ -22,7 +22,7 @@ fn feed_all(r: &mut SseReader, chunk: &[u8], out: &mut Vec<Item>) {
                 data: String::from(data),
             },
             SseItem::Comment => Item::Comment,
-            SseItem::Oversize => Item::Oversize,
+            SseItem::Oversize { id } => Item::Oversize(id.map(String::from)),
         })
     });
 }
@@ -183,13 +183,14 @@ fn oversize_event_is_skipped_and_next_parses() {
         many.extend_from_slice(b"data: xx\n");
     }
     many.extend_from_slice(b"\nid: 4\ndata: ok\n\n");
-    for (s, next) in [
-        (&stream, ev(Some("2"), "{\"type\":\"resync\"}")),
-        (&many, ev(Some("4"), "ok")),
+    for (s, id, next) in [
+        (&stream, "1", ev(Some("2"), "{\"type\":\"resync\"}")),
+        (&many, "3", ev(Some("4"), "ok")),
     ] {
+        let dropped = Item::Oversize(Some(id.into()));
         let chunks: Vec<&[u8]> = s.chunks(1000).collect();
-        assert_eq!(items(&chunks), vec![Item::Oversize, next.clone()]);
-        assert_eq!(items(&[s]), vec![Item::Oversize, next]);
+        assert_eq!(items(&chunks), vec![dropped.clone(), next.clone()]);
+        assert_eq!(items(&[s]), vec![dropped, next]);
     }
     // Just under the cap still parses.
     let mut fits = b"data: ".to_vec();
@@ -350,6 +351,10 @@ fn conversation_state_decodes() {
     .unwrap();
     assert_eq!(s.conversation.id, "c1");
     assert_eq!(s.conversation.agent, "main");
+    assert!(
+        !format!("{:?}", s.conversation).contains("Mac"),
+        "client_name redacted"
+    );
     assert_eq!(s.as_of, 1_795_689_600_000_003);
     let t = s.turn.unwrap();
     assert_eq!(t.turn_id, "9f3c…");

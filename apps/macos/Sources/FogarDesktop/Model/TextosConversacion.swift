@@ -31,6 +31,9 @@ extension Textos {
         }
     }
 
+    /// `CancelTurn` while the agent has no link: nothing could be asked to stop.
+    static let cancelarSinConexion = "Fogar no está conectado: no se pudo parar."
+
     static func rechazoTexto(_ r: WireTextRefusal) -> String {
         switch r {
         case .empty: "Escribe algo antes de enviarlo."
@@ -143,8 +146,12 @@ extension Textos {
         switch m.state {
         case .pending: return "Pendiente: va cuando Fogar termine."
         case .failed:
-            return m.error_code == "missing_scope" ? "No se envió: tu cuenta no puede escribir."
-                : "No se envió. Escríbelo otra vez cuando Fogar vuelva."
+            switch m.error_code {
+            case "missing_scope": return "No se envió: tu cuenta no puede escribir."
+            // Our deadline passed with no answer: the gateway may have it.
+            case "unknown": return "Puede que se enviara: Fogar tardó en contestar. Mira si aparece antes de volver a escribirlo."
+            default: return "No se envió. Escríbelo otra vez cuando Fogar vuelva."
+            }
         case .delivered, .past:
             guard !m.mine, let nombre = m.from_name.flatMap(nombreDispositivo) else { return nil }
             return "Enviado desde \(nombre)"
