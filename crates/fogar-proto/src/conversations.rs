@@ -6,6 +6,8 @@ use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::fmt;
 use serde::{Deserialize, Serialize};
 
+use crate::events::{MessageEv, TurnStartEv};
+
 /// One item of `GET /conversations`, or the `201` of `POST /conversations`. `Debug` hides
 /// `title`: OpenClaw derives it from the user's text.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
@@ -111,6 +113,51 @@ impl fmt::Debug for HistoryMessage {
             .field("timestamp", &self.timestamp)
             .finish()
     }
+}
+
+/// `GET /conversations/{id}` (§16): the list item plus its live state. Drop this conversation's
+/// `/events` events with an SSE id `<= as_of`. The flattened part is buffered by serde while
+/// parsing: callers cap the body size before decoding.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ConversationState {
+    #[serde(flatten)]
+    pub conversation: Conversation,
+    /// The running turn with the text it has so far, or `None`.
+    #[serde(default, deserialize_with = "crate::events::lenient_obj")]
+    pub turn: Option<TurnSnapshot>,
+    /// Its pending messages.
+    #[serde(default)]
+    pub pending: Vec<MessageEv>,
+    /// The id of the last `/events` event this state includes.
+    pub as_of: u64,
+}
+
+/// The `turn` of [`ConversationState`]: a `turn_start` plus the text so far.
+pub type TurnSnapshot = TurnStartEv;
+
+/// `POST /conversations/{id}/messages`. Absent fields are not sent (no `speak` until voice).
+/// `Debug` hides `text`.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct PostMessage<'a> {
+    pub text: Cow<'a, str>,
+    /// `true`: «send now» (cuts the running turn).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interrupt: Option<bool>,
+}
+
+impl fmt::Debug for PostMessage<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PostMessage")
+            .field("text", &"<redacted>")
+            .field("interrupt", &self.interrupt)
+            .finish()
+    }
+}
+
+/// `202` of `POST …/messages`: the id its `message` event carries.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Accepted {
+    pub message_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

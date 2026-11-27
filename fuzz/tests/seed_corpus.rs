@@ -39,3 +39,13 @@ fn ipc_frames() {
 fn gateway_addr() {
     run("gateway_addr", fogar_fuzz::gateway_addr);
 }
+
+#[test]
+fn sse_reader() {
+    run("sse_reader", fogar_fuzz::sse_reader);
+}
+
+#[test]
+fn decode_event() {
+    run("decode_event", fogar_fuzz::decode_event);
+}

@@ -23,8 +23,10 @@ pub mod audio;
 pub mod client;
 pub mod close;
 pub mod conversations;
+pub mod events;
 pub mod pairing;
 pub mod server;
+pub mod sse;
 
 mod codec;
 

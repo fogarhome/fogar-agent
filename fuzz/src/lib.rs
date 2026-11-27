@@ -16,6 +16,38 @@ pub fn decode_server(data: &[u8]) {
     }
 }
 
+/// `/events` body bytes -> SSE items. Feeding the input whole or split at its midpoint gives the
+/// same items, and every dispatched event fits the cap.
+pub fn sse_reader(data: &[u8]) {
+    use fogar_proto::sse::{MAX_EVENT_BYTES, SseItem, SseReader};
+    fn run(chunks: &[&[u8]]) -> Vec<(Option<String>, Option<String>)> {
+        let mut r = SseReader::new();
+        let mut out = Vec::new();
+        for c in chunks {
+            r.feed(c, &mut |it| {
+                out.push(match it {
+                    SseItem::Event { id, data } => {
+                        assert!(data.len() <= MAX_EVENT_BYTES * 3, "lossy UTF-8 may grow 3x");
+                        (id.map(String::from), Some(String::from(data)))
+                    }
+                    SseItem::Comment => (None, None),
+                    SseItem::Oversize => (Some(String::from("<oversize>")), None),
+                })
+            });
+        }
+        out
+    }
+    let (a, b) = data.split_at(data.len() / 2);
+    assert_eq!(run(&[data]), run(&[a, b]));
+}
+
+/// One `/events` event's `data` -> `Event`. Never panics; `Debug` works on every result.
+pub fn decode_event(data: &[u8]) {
+    if let Ok(text) = core::str::from_utf8(data) {
+        let _ = format!("{:?}", fogar_proto::events::decode_event(text));
+    }
+}
+
 /// Gateway binary frame -> TTS frame. Round-trips through the encoder when the PCM is even.
 pub fn tts_frame(data: &[u8]) {
     match parse_tts_frame(data) {
