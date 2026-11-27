@@ -3,7 +3,8 @@
 //! against two gateways:
 //! - the Rust mock (`MockGateway` + `EventsHub`), which serves `/auth/*` and `/events` on one
 //!   loopback port like the real one: always runs;
-//! - the REAL fogar-gateway (Python) with its own fake OpenClaw and no STT/TTS, started by
+//! - the REAL fogar-gateway (Python) with its own fake OpenClaw and no STT/TTS (which answers a
+//!   text, so the chat over `/events` is checked there too: send, reply, list, reopen), started by
 //!   `real_gateway/launch.py` from the checkout in `FOGAR_GATEWAY_DIR` (skipped when unset; CI
 //!   job `.github/workflows/e2e-gateway.yml` checks out the commit in `real_gateway/GATEWAY_REF`).
 //!
@@ -12,131 +13,15 @@
 //! cannot accept a test binary). Real sockets, so real time, not paused time.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use fogar_core::{Agent, AgentPorts, Config, HealthProbe, LinkState, crashloop::BootMode};
-use fogar_host::{HttpConfig, HttpGateway, TokioClock, WsConfig, WsGatewayLink};
+mod common;
+use common::*;
+use fogar_core::LinkState;
 use fogar_ports::{
-    ipc::{GatewayInfo, IpcRequest, IpcResponse, LinkPhase, LoginForm, Password},
-    secrets::{SecretCaps, SecretError, SecretKey, SecretStore, SecretString},
+    ipc::{IpcRequest, IpcResponse, LinkPhase, MessageState, TurnOutcome, ViewEntry},
+    secrets::SecretKey,
 };
-use fogar_testkit::{
-    EventsHub, FakeIpc, FakeIpcClient, FakeMic, FakeSpeaker, MemorySecretStore, MockConfig,
-    MockGateway, SeededRandom,
-};
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
-    },
-    time::Duration,
-};
-
-/// Memory store that counts deletions of the account.
-#[derive(Debug, Default)]
-struct CountingStore {
-    inner: MemorySecretStore,
-    account_deletes: AtomicU32,
-}
-
-impl SecretStore for CountingStore {
-    fn capabilities(&self) -> SecretCaps {
-        self.inner.capabilities()
-    }
-    fn get(&self, key: SecretKey) -> Result<Option<SecretString>, SecretError> {
-        self.inner.get(key)
-    }
-    fn put(&self, key: SecretKey, value: SecretString) -> Result<(), SecretError> {
-        self.inner.put(key, value)
-    }
-    fn delete(&self, key: SecretKey) -> Result<(), SecretError> {
-        if key == SecretKey::GatewayAccount && self.inner.contains(key) {
-            self.account_deletes.fetch_add(1, Ordering::SeqCst);
-        }
-        self.inner.delete(key)
-    }
-}
-
-fn fast_config() -> Config {
-    let mut c = Config::default();
-    c.backoff.base = Duration::from_millis(20);
-    c.backoff.cap = Duration::from_millis(200);
-    c.backoff.floor = Duration::from_millis(5);
-    // The mock and the real gateway listen on 127.0.0.1 (the dev-login-over-loopback switch).
-    c.login_over_loopback = true;
-    c
-}
-
-/// The gateway's `201` for `POST /auth/login`, handing out `token`.
-fn login_ok(token: &str) -> String {
-    format!(
-        r#"{{"client_id":"c-1","token":"{token}","scopes":["conversations:read","conversations:write"],"user":{{"id":"u-1","username":"sito","display_name":"Sito","role":"member"}},"home":{{"id":"home","name":"mock"}}}}"#
-    )
-}
-
-async fn within<F: std::future::Future>(d: Duration, f: F) -> F::Output {
-    tokio::time::timeout(d, f).await.expect("timed out")
-}
-
-async fn ready(h: &mut HealthProbe, session: u64) {
-    within(
-        Duration::from_secs(10),
-        h.wait_link(|v| v.state == LinkState::Ready { session }),
-    )
-    .await;
-}
-
-async fn login(c: &mut FakeIpcClient, address: &str, user: &str, password: &str) -> GatewayInfo {
-    let r = c
-        .request(IpcRequest::Login(Box::new(LoginForm {
-            address: address.into(),
-            username: user.into(),
-            password: Password::parse(password),
-        })))
-        .await;
-    match r {
-        Some(IpcResponse::LoggedIn(info)) => *info,
-        other => panic!("{other:?}"),
-    }
-}
-
-async fn logout(c: &mut FakeIpcClient) -> bool {
-    match c.request(IpcRequest::Logout).await {
-        Some(IpcResponse::LoggedOut { gateway_reached }) => gateway_reached,
-        other => panic!("{other:?}"),
-    }
-}
-
-async fn phase(c: &mut FakeIpcClient) -> LinkPhase {
-    match c.request(IpcRequest::Status).await {
-        Some(IpcResponse::Status(s)) => s.phase,
-        other => panic!("expected Status, got {other:?}"),
-    }
-}
-
-fn alive_tasks() -> usize {
-    tokio::runtime::Handle::current()
-        .metrics()
-        .num_alive_tasks()
-}
-
-/// A signed-out agent on the real adapters, with a counting store and a signed fake IPC.
-fn start_agent() -> (Agent<TokioClock>, Arc<CountingStore>, FakeIpc) {
-    let secrets = Arc::new(CountingStore::default());
-    let ipc = FakeIpc::signed();
-    let ports = AgentPorts {
-        clock: Arc::new(TokioClock::new()),
-        link: WsGatewayLink::new(WsConfig::default()),
-        ipc: Some(ipc.clone()),
-        http: HttpGateway::new(HttpConfig::default()),
-        tailnet: fogar_core::NoTailnet,
-        secrets: secrets.clone(),
-        random: Arc::new(SeededRandom::new(11)),
-        audio_in: Arc::new(FakeMic::minimal()),
-        audio_out: Arc::new(FakeSpeaker::minimal()),
-        probe: None,
-    };
-    let agent = Agent::start(ports, fast_config(), BootMode::Normal);
-    (agent, secrets, ipc)
-}
+use fogar_testkit::{EventsHub, MockConfig, MockGateway};
+use std::{sync::atomic::Ordering, time::Duration};
 
 /// signed out -> login -> ready -> stream lost -> ready again -> revoked (401) -> account deleted
 /// once, signed out, no retry -> login again with a new token -> ready -> logout (gateway told
@@ -353,6 +238,56 @@ async fn pairing_lifecycle_against_the_real_gateway() {
     assert_eq!(info.user, "Sito");
     assert!(!info.name.is_empty(), "the home's name: {info:?}");
     ready(&mut h, 1).await;
+
+    // S4 PR 4a, the chat over `/events`: with nothing open a text creates a conversation; its
+    // `message` and the turn the gateway's fake OpenClaw answers (`ok`: one delta and a final)
+    // arrive over the stream; the list shows it; «Nueva», then opening it again shows its
+    // history (`GET /conversations/{id}` + `…/messages`).
+    let mut chat = App::open(&ipc).await;
+    assert_eq!(
+        chat.ask(IpcRequest::SendText {
+            text: fogar_ports::ipc::UserText("ok".into()),
+        })
+        .await,
+        IpcResponse::TextAccepted
+    );
+    chat.until("the reply", Duration::from_secs(30), |a| {
+        let mine = a.view.entries.iter().any(|e| {
+            matches!(e, ViewEntry::Message(m) if m.mine && m.text == "ok" && m.state == MessageState::Delivered)
+        });
+        let done = a.view.entries.iter().any(|e| {
+            matches!(e, ViewEntry::Turn(t) if t.outcome == Some(TurnOutcome::Done) && !t.reply.is_empty())
+        });
+        mine && done
+    })
+    .await;
+    let id = chat.view.id.clone().expect("the new conversation is open");
+    chat.until("listed, not running", Duration::from_secs(30), |a| {
+        a.list.iter().any(|c| c.id == id && !c.running)
+    })
+    .await;
+    assert_eq!(
+        chat.ask(IpcRequest::NewConversation).await,
+        IpcResponse::ConversationOpened
+    );
+    chat.until("nothing open", Duration::from_secs(10), |a| {
+        a.view.id.is_none() && a.view.entries.is_empty()
+    })
+    .await;
+    assert_eq!(
+        chat.ask(IpcRequest::OpenConversation { id: id.clone() })
+            .await,
+        IpcResponse::ConversationOpened
+    );
+    chat.until("its history", Duration::from_secs(30), |a| {
+        a.view.id.as_deref() == Some(id.as_str())
+            && a.view.entries.iter().any(|e| {
+                matches!(e, ViewEntry::Message(m) if m.text == "ok" && m.state == MessageState::Past)
+            })
+            && a.view.entries.iter().any(|e| matches!(e, ViewEntry::Turn(t) if !t.reply.is_empty()))
+    })
+    .await;
+    drop(chat);
 
     // Restart: the `/events` stream ends; the link reconnects by itself once the gateway is
     // back, same token.
