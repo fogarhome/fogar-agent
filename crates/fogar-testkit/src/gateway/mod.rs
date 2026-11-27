@@ -17,6 +17,9 @@
 //! scripted [`HttpRoutes`] (`MockGateway::routes`).
 //! A push waits behind the user's streaming turn; a push arriving while another push is open is
 //! dropped (3.0.1 §10: another conversation's push; the same conversation's would fold in).
+//! The chat over HTTP (5.0, §16) is [`EventsHub`]: a stateful `GET /events` + conversations
+//! gateway installed into the same `HttpRoutes` (`EventsHub::install`), so `FakeGatewayHttp`
+//! and `MockHttpServer` serve it alike.
 //! NOT modelled: STT/barge-in from audio partials, conversations, tool calls, pipeline events,
 //! `phrase_interrupted`.
 //!
@@ -31,6 +34,7 @@ pub const SPEC_GATEWAY_COMMIT: &str = "290efa0f8df7c72dec453ca491b6117225f5a2f9"
 pub const SPEC_BLOB: &str = "55168f0e78f4f563a4e5c05efcd692541a7582a2";
 
 mod driver;
+mod events;
 mod http;
 mod memory;
 mod ws;
@@ -39,6 +43,7 @@ pub use driver::{
     Ctl, GatewayLog, MockConfig, REASON_BAD_JSON, REASON_BAD_KEY, REASON_NOT_TEXT, REASON_PROTOCOL,
     REASON_TIMEOUT, REASON_TOO_LARGE,
 };
+pub use events::{EventsHub, HubConfig, QUEUE_MAX, RING_MAX, Scope};
 pub use http::{
     FakeGatewayHttp, FakeStreamBody, HttpRoutes, MockHttpServer, SeenRequest, StreamStep,
 };

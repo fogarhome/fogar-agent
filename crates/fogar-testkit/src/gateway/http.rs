@@ -9,6 +9,7 @@
 //! `Transfer-Encoding: chunked` (one wire chunk per `Bytes`), in the fake through a bounded
 //! channel of `FAKE_STREAM_DEPTH` (a full channel makes the script wait, never drop).
 
+use super::events::LiveStream;
 use fogar_ports::{
     gateway::GatewayAddr,
     gateway_http::{
@@ -21,7 +22,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -72,15 +73,49 @@ struct Reply {
     stream: Option<Vec<StreamStep>>,
 }
 
+/// What a [`RouteHook`] answers.
+pub(crate) enum HookReply {
+    Plain {
+        status: u16,
+        body: Vec<u8>,
+    },
+    /// A live SSE stream (200): the transport pulls bytes from it.
+    Stream(LiveStream),
+}
+
+/// A stateful handler behind the scripted routes (the `/events` hub): asked only for requests
+/// no scripted route matches, so a test can still override one path.
+pub(crate) trait RouteHook: Send + Sync + std::fmt::Debug {
+    fn handle(&self, req: &SeenRequest) -> Option<HookReply>;
+}
+
+enum Answered {
+    Reply(Reply),
+    Live(LiveStream),
+}
+
 /// Scripted routes shared by the fake and the real-socket mock. Unknown routes answer 404.
 #[derive(Debug, Clone, Default)]
 pub struct HttpRoutes {
     routes: Arc<Mutex<HashMap<(String, String), Reply>>>,
     seen: Arc<Mutex<Vec<SeenRequest>>>,
     disconnects: Arc<AtomicUsize>,
+    hook: Arc<Mutex<Option<Arc<dyn RouteHook>>>>,
+    /// Soaks switch the request log off (it grows with every call).
+    no_record: Arc<AtomicBool>,
 }
 
 impl HttpRoutes {
+    pub(crate) fn set_hook(&self, hook: Arc<dyn RouteHook>) {
+        *self.hook.lock().unwrap() = Some(hook);
+    }
+    pub(crate) fn record_flag(&self) -> Arc<AtomicBool> {
+        self.no_record.clone()
+    }
+    /// Switches the `seen` log on or off (default on).
+    pub fn set_record(&self, on: bool) {
+        self.no_record.store(!on, Ordering::SeqCst);
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -171,19 +206,36 @@ impl HttpRoutes {
     pub fn seen(&self) -> Vec<SeenRequest> {
         self.seen.lock().unwrap().clone()
     }
-    fn answer(&self, req: SeenRequest) -> Reply {
+    fn answer(&self, req: SeenRequest) -> Answered {
         let key = (req.method.clone(), req.path.clone());
-        self.seen.lock().unwrap().push(req);
-        self.routes
-            .lock()
-            .unwrap()
-            .get(&key)
-            .cloned()
-            .unwrap_or(Reply {
-                status: 404,
-                body: br#"{"detail":"Not Found"}"#.to_vec(),
-                ..Reply::default()
-            })
+        let hook = self.hook.lock().unwrap().clone();
+        // Hook first would hide scripted overrides: scripted routes win.
+        let scripted = self.routes.lock().unwrap().get(&key).cloned();
+        let answered = match (scripted, hook) {
+            (Some(r), _) => Answered::Reply(r),
+            (None, Some(h)) => match h.handle(&req) {
+                Some(HookReply::Plain { status, body }) => Answered::Reply(Reply {
+                    status,
+                    body,
+                    ..Reply::default()
+                }),
+                Some(HookReply::Stream(s)) => Answered::Live(s),
+                None => Answered::Reply(not_found()),
+            },
+            (None, None) => Answered::Reply(not_found()),
+        };
+        if !self.no_record.load(Ordering::SeqCst) {
+            self.seen.lock().unwrap().push(req);
+        }
+        answered
+    }
+}
+
+fn not_found() -> Reply {
+    Reply {
+        status: 404,
+        body: br#"{"detail":"Not Found"}"#.to_vec(),
+        ..Reply::default()
     }
 }
 
@@ -244,7 +296,7 @@ impl GatewayHttp for FakeGatewayHttp {
         if *addr != self.addr {
             return Err(HttpError::Unreachable);
         }
-        let r = self.routes.answer(SeenRequest {
+        let r = match self.routes.answer(SeenRequest {
             method: call.method().into(),
             path: call.path(),
             content_type: body.is_some().then(|| "application/json".into()),
@@ -252,7 +304,11 @@ impl GatewayHttp for FakeGatewayHttp {
             last_event_id: None,
             accept: None,
             body: body.map(|b| b.to_vec()).unwrap_or_default(),
-        });
+        }) {
+            Answered::Reply(r) => r,
+            // A hook streams only for stream calls, which `request` refused above.
+            Answered::Live(_) => return Err(HttpError::Refused),
+        };
         if let Some(d) = r.delay {
             tokio::time::sleep(d).await;
         }
@@ -285,7 +341,7 @@ impl GatewayHttp for FakeGatewayHttp {
         if *addr != self.addr {
             return Err(HttpError::Unreachable);
         }
-        let r = self.routes.answer(SeenRequest {
+        let r = match self.routes.answer(SeenRequest {
             method: call.method().into(),
             path: call.path(),
             content_type: body.is_some().then(|| "application/json".into()),
@@ -293,7 +349,15 @@ impl GatewayHttp for FakeGatewayHttp {
             last_event_id: last_event_id.map(Into::into),
             accept: None,
             body: body.map(|b| b.to_vec()).unwrap_or_default(),
-        });
+        }) {
+            Answered::Reply(r) => r,
+            Answered::Live(live) => {
+                return Ok(StreamReply {
+                    status: 200,
+                    body: FakeStreamBody(Inner::Live(live)),
+                });
+            }
+        };
         let script = r
             .stream
             .unwrap_or_else(|| vec![StreamStep::Bytes(r.chunks.map_or(r.body, |c| c.concat()))]);
@@ -321,19 +385,28 @@ impl GatewayHttp for FakeGatewayHttp {
         });
         Ok(StreamReply {
             status: r.status,
-            body: FakeStreamBody(rx),
+            body: FakeStreamBody(Inner::Script(rx)),
         })
     }
 }
 
-/// The fake's streamed body: the script's bytes through a bounded channel.
+/// The fake's streamed body: a script's bytes through a bounded channel, or a live hub stream.
 #[derive(Debug)]
-pub struct FakeStreamBody(tokio::sync::mpsc::Receiver<Vec<u8>>);
+pub struct FakeStreamBody(Inner);
+
+#[derive(Debug)]
+enum Inner {
+    Script(tokio::sync::mpsc::Receiver<Vec<u8>>),
+    Live(LiveStream),
+}
 
 impl ResponseBody for FakeStreamBody {
     async fn chunk(&mut self) -> Result<Option<Vec<u8>>, HttpError> {
-        // `recv` is cancel-safe.
-        Ok(self.0.recv().await)
+        // Both `recv` and `LiveStream::next` are cancel-safe.
+        match &mut self.0 {
+            Inner::Script(rx) => Ok(rx.recv().await),
+            Inner::Live(live) => Ok(live.next().await),
+        }
     }
 }
 
@@ -390,7 +463,10 @@ pub(crate) async fn serve_http(mut sock: TcpStream, routes: HttpRoutes) {
     let Some(req) = read_request(&mut sock).await else {
         return;
     };
-    let rep = routes.answer(req);
+    let rep = match routes.answer(req) {
+        Answered::Reply(r) => r,
+        Answered::Live(live) => return serve_live(sock, live).await,
+    };
     if let Some(d) = rep.delay {
         tokio::time::sleep(d).await;
     }
@@ -465,6 +541,25 @@ async fn serve_stream(
                 routes.disconnects.fetch_add(1, Ordering::SeqCst);
                 return;
             }
+        }
+    }
+    let _ = sock.write_all(b"0\r\n\r\n").await;
+    let _ = sock.shutdown().await;
+}
+
+/// Plays a live hub stream as a `Transfer-Encoding: chunked` reply until it ends or the client
+/// goes (a failed write, seen at the next ping at the latest).
+async fn serve_live(mut sock: TcpStream, mut live: LiveStream) {
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    if sock.write_all(head.as_bytes()).await.is_err() {
+        return;
+    }
+    while let Some(b) = live.next().await {
+        let mut wire = format!("{:x}\r\n", b.len()).into_bytes();
+        wire.extend_from_slice(&b);
+        wire.extend_from_slice(b"\r\n");
+        if sock.write_all(&wire).await.is_err() {
+            return;
         }
     }
     let _ = sock.write_all(b"0\r\n\r\n").await;
