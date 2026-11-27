@@ -1,11 +1,13 @@
-//! 72 simulated hours: hourly gateway drops (alternating 1012 restart / abrupt 1006 / 1011),
-//! a conversation every 30 minutes, keepalives in between. Asserts that tasks, queues and heap
-//! (counting allocator) do not grow. Runs in a few seconds of wall time (paused clock).
+//! 72 simulated hours over `/events` (S4 PR 4a): a 25 s rotation every stream (~10 000 streams),
+//! hourly faults (all streams dropped / a silent stream / the buffer forgotten -> `resync`),
+//! another device talking every 30 minutes. Asserts that tasks, queues, open streams and heap
+//! (counting allocator) do not grow. Same bounds as the WebSocket soak it replaces. Runs in a
+//! few seconds of wall time (paused clock).
 #![allow(clippy::disallowed_methods)] // the harness drives tokio's paused clock directly
 
 mod common;
 use common::*;
-use fogar_testkit::{FakeSpeaker, MockConfig, gateway::Ctl};
+use fogar_testkit::MockConfig;
 use std::time::Duration;
 
 #[global_allocator]
@@ -18,8 +20,8 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 struct Sample {
     tasks: usize,
     heap: isize,
-    out_q: usize,
     in_q: usize,
+    streams: usize,
 }
 
 struct Outcome {
@@ -27,54 +29,57 @@ struct Outcome {
     stats: fogar_core::StatsSnapshot,
 }
 
-/// `planted_leak`: the mock gateway keeps a per-message log (a real, linear leak in the TEST
-/// harness), used by the canary test to prove the heap probe detects growth.
+/// `planted_leak`: the routes keep their request log (one entry per stream and per call: a
+/// real, linear leak in the TEST harness), used by the canary to prove the heap probe works.
 async fn run_soak(hours: u32, planted_leak: bool) -> Outcome {
     let baseline_tasks = alive_tasks();
-    let mut b = RigBuilder::fake(MockConfig {
-        tts_frames: 10,
-        record: planted_leak,
-        ..MockConfig::default()
-    });
-    b.speaker = FakeSpeaker::healthy().without_recording();
-    let b = b.app_on_screen();
-    let mut rig = b.start();
+    let mut rig = RigBuilder::fake(MockConfig::default()).start();
+    rig.routes.set_record(planted_leak);
+    // The hub keeps a bounded ring (2000 events) and history (1000 per conversation): fill both
+    // during the warm-up so only the agent can grow after it.
+    rig.hub.seed_conversation("c-1", "Serie");
+    for _ in 0..1000 {
+        rig.hub.seed_history("c-1", "user", "pon la serie");
+    }
     wait_ready(&mut rig.health).await;
+    for _ in 0..450 {
+        rig.hub.other_device_send("c-1", "pon la serie");
+    }
+    // Let those turns finish, then empty the ring: the hourly `forget_buffer` would otherwise
+    // free it at hour 2 and hide up to ~250 KB of agent growth behind that drop.
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    rig.hub.forget_buffer();
 
     let mut samples: Vec<Sample> = Vec::with_capacity(80);
     for hour in 0..hours {
         for _half in 0..2 {
-            say(&rig, "pon la serie").await;
-            tokio::time::sleep(Duration::from_secs(29 * 60)).await;
-            rig.speaker.drain();
+            rig.hub.other_device_send("c-1", "pon la serie");
+            tokio::time::sleep(Duration::from_secs(30 * 60)).await;
         }
         match hour % 3 {
-            0 => assert_eq!(rig.link.close_all(1012, ""), 1),
-            1 => assert_eq!(rig.link.control(Ctl::Abort), 1),
-            _ => assert_eq!(
-                rig.link.close_all(1011, "Servicio crítico no disponible."),
-                1
-            ),
+            0 => rig.hub.drop_streams(),
+            1 => rig.hub.go_silent(),
+            // Missed events the gateway no longer keeps: the resume gets `resync`.
+            _ => {
+                rig.hub.drop_streams();
+                rig.hub.other_device_send("c-1", "pon la serie");
+                rig.hub.forget_buffer();
+            }
         }
-        let want = u64::from(hour) + 2;
-        eventually(Duration::from_secs(120), || {
-            rig.health.snapshot().stats.sessions_started == want
-        })
-        .await;
-        // Let the dead session's server task finish before sampling.
-        eventually(Duration::from_secs(5), || rig.link.live_server_tasks() == 1).await;
+        // Past the read timeout of a silent stream and its reconnect.
+        tokio::time::sleep(Duration::from_secs(60)).await;
         let h = rig.health.snapshot();
         samples.push(Sample {
             tasks: alive_tasks(),
             heap: fogar_testalloc::live_bytes(),
-            out_q: h.out_queue_len,
             in_q: h.in_queue_len,
+            streams: rig.hub.subscribers(),
         });
     }
     let stats = rig.health.snapshot().stats;
     let report = rig.agent.shutdown(Duration::from_secs(5)).await;
     assert!(report.clean, "{report:?}");
-    eventually(Duration::from_secs(5), || rig.link.live_server_tasks() == 0).await;
+    eventually(Duration::from_secs(5), || rig.hub.subscribers() == 0).await;
     eventually(Duration::from_secs(5), || alive_tasks() == baseline_tasks).await;
     Outcome { samples, stats }
 }
@@ -88,36 +93,34 @@ async fn seventy_two_simulated_hours_without_growth() {
     let _serial = SERIAL.lock().await;
     let o = run_soak(72, false).await;
     let s = o.stats;
-    assert_eq!(s.sessions_started, 73);
-    assert_eq!(s.turns_completed, 144, "{s:?}");
-    assert!(
-        s.keepalives_sent > 72 * 10,
-        "keepalives kept every session alive between turns"
-    );
-    assert_eq!(
-        s.uplink_control_dropped + s.inbound_audio_shed + s.uplink_audio_shed,
-        0
-    );
+    assert!(s.stream_rotations > 72 * 100, "{s:?}");
+    // One real reconnect per silent hour; a drop that lands on a stream younger than
+    // `stable_stream` is a real one too (by design), so at most one per fault.
+    assert!((1 + 24..=1 + 72).contains(&s.sessions_started), "{s:?}");
+    assert!(s.events_resync >= 24, "{s:?}");
+    assert!(s.events_received > 144 * 5, "{s:?}");
+    assert_eq!(s.inbound_invalid + s.events_oversize, 0, "{s:?}");
 
-    // After a 1-hour warm-up: flat tasks, empty queues, heap within a small band.
+    // After a 1-hour warm-up: flat tasks, empty queues, one stream, heap within a small band.
     let warm = o.samples[1];
     for (i, smp) in o.samples.iter().enumerate().skip(1) {
         assert_eq!(
             smp.tasks, warm.tasks,
             "hour {i}: live tasks changed {smp:?} vs {warm:?}"
         );
-        assert_eq!(
-            (smp.out_q, smp.in_q),
-            (0, 0),
-            "hour {i}: queues not drained"
-        );
+        assert_eq!(smp.in_q, 0, "hour {i}: queue not drained");
+        assert_eq!(smp.streams, 1, "hour {i}: open streams {smp:?}");
     }
     let growth = heap_growth(&o);
     eprintln!(
-        "soak: 72 h, 73 sessions, 144 turns; live heap hour1 -> hour72: {} -> {} bytes (growth {growth})",
-        warm.heap, o.samples[71].heap
+        "soak: 72 h, {} rotations, {} streams; live heap hour1 -> hour72: {} -> {} bytes (growth {growth})",
+        s.stream_rotations, s.sessions_started, warm.heap, o.samples[71].heap
     );
     assert!(growth < 16 * 1024, "heap grew {growth} bytes over 71 h");
+    // Flat, not just ending low: every settled hour within the same 16 KiB band.
+    let heaps = o.samples[1..].iter().map(|s| s.heap);
+    let band = heaps.clone().max().unwrap_or(0) - heaps.min().unwrap_or(0);
+    assert!(band < 16 * 1024, "heap band {band} bytes over 71 h");
 }
 
 /// Leak canary (fogar-longrun-reliability soak checklist): the same probe MUST catch a planted

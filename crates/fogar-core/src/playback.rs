@@ -182,6 +182,8 @@ impl PlaybackGate {
     }
 
     /// Audio is playing or about to (for barge-in: a new text or take cuts it).
+    // shortcut: barge-in has nothing to cut in S4 PR 4a; Task 4 / PR 5 call it again.
+    #[allow(dead_code)]
     pub(crate) fn playing(&self) -> bool {
         self.speaking
             || self.device.as_ref().is_some_and(|d| d.queued_samples() > 0)
@@ -268,6 +270,8 @@ impl PlaybackGate {
     }
 
     /// One TTS frame of the current turn (the engine already checked its `turn_seq`).
+    // shortcut: nothing feeds the gate in S4 PR 4a (no audio is played); PR 5 calls it again.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn on_frame(&mut self, frame: &TtsFrame<'_>, now: Mono) {
         self.scratch.clear();
         self.scratch.extend(frame.samples());

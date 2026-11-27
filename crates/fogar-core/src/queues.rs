@@ -7,10 +7,10 @@
 //! | mic chunks (`EventStream<AudioChunk>`) | audio adapter -> capture gate | `MIC_CHUNKS` (~1 s of 20 ms chunks) | adapter drops NEWEST, counts (`EventStream::dropped`); never blocks the audio thread. Only open while a take is open (`capture.rs`, the consent gate) |
 //! | capture device jobs (blocking `AudioSource::open` / drop of `ActiveCapture`, issue #24) | capture gate -> tokio blocking pool, one owned `JoinSet` | `CAPTURE_JOBS` opens in flight, plus the releases | admission control: a `CaptureStart` while an open runs (also a late one past its deadline) is refused `Busy` at once; a release is never refused (one per take); a start arriving while the previous take's release runs waits for it (still under `capture::OPEN_DEADLINE` from the request) so the device is never opened while closing; each job is bounded by the adapter (`OPEN_BLOCK_MAX` / `DROP_BLOCK_MAX`) and an open also by `capture::OPEN_DEADLINE` on the core side (late result released); on stop the gate waits `capture::RELEASE_WAIT_ON_STOP`, then detaches |
 //! | permission request waiters | IPC `RequestMicPermission` -> capture gate | `IPC_MAX_CONNS` on one pending prompt | an extra waiter is answered at once with the current status; each waiter's IPC side gives up after `Config::mic_permission_wait` and gets the current status |
-//! | uplink audio (`out` channel, `Frame::Binary`) | engine -> link session | shares `OUTBOUND` | shed NEWEST, count `uplink_audio_shed` (`try_send`); the gateway would close a slow client anyway. Produced only while a take records |
-//! | uplink control (`out` channel, `Frame::Text`) | engine -> link session | shares `OUTBOUND` | must-deliver while connected: `reserve()` with `write_timeout`; on deadline count `uplink_control_dropped` and return the turn machine to Idle (the session itself is kept) |
-//! | inbound JSON events | link session -> engine | `INBOUND` messages AND `INBOUND_BYTES` bytes | must-deliver: byte charge + `reserve()` with `inbound_deadline` (< gateway `CLIENT_SEND_TIMEOUT_S` = 10 s); on deadline the session ends as `EngineStalled` and reconnects |
-//! | inbound TTS audio | link session -> engine | shares `INBOUND` and `INBOUND_BYTES` | shed NEWEST, count `inbound_audio_shed` (`try_send` / `try_charge`); the session never waits on audio |
+//! | uplink (S4 PR 4a) | — | none | there is no uplink queue: the chat link is `GET /events` (read only); the turn machine's sends fail at once and count `uplink_control_dropped` (none happen while no take can open). PR 5's voice link brings one back |
+//! | `/events` reader (`SseReader`) | stream body -> link | `fogar_proto::sse::MAX_EVENT_BYTES` (128 KiB, GUESSED) per event, one chunk (`MAX_CHUNK_BYTES`) of parsed items at a time | an oversize event is skipped without buffering, counted (`events_oversize`) and turned into a must-deliver `Inbound::Resync` (re-fetch) |
+//! | inbound events (`Inbound`) | link -> engine | `INBOUND` messages AND `INBOUND_BYTES` bytes (each `Event` charged by its data length) | must-deliver: byte charge + `reserve()`, each under `inbound_deadline`; the resume id (`Last-Event-ID`) advances only after the engine accepted the event. On deadline the stream is dropped and resumed after a backoff from the last accepted id (the gateway replays, nothing is lost) |
+//! | push `audio` events | link | none | dropped in the link and counted (`events_audio_dropped`): nothing plays in 4a |
 //! | unseen TTS buffer (one turn's audio waiting for `TurnVisible`, or for the output to open) | engine -> playback gate (`playback.rs`) | `playback::UNSEEN_MAX_SAMPLES` (3 s at 24 kHz, ~144 KB) | unconfirmed: the turn is MUTED, its audio discarded and counted (`tts_turns_muted`, `tts_samples_muted`); also when `playback::VISIBLE_DEADLINE` (2 s from `turn_start`) passes. Confirmed but the device is not ready: drop NEWEST, count `tts_samples_dropped`; a failed or late open drops what waited (counted) |
 //! | playback device jobs (blocking `AudioSink::open` / drop of `ActivePlayback`, issues #24/#25) | playback gate -> tokio blocking pool, one owned `JoinSet` (through `capture::spawn_device_job`, issue #31) | one open in flight, plus the releases | no second open while one runs (also a late one past `playback::OPEN_DEADLINE`, whose result is released) or while a release runs; opens only for confirmed audio and after the backoff (500 ms doubling to 8 s) of a failed open or a dead output; a release is never refused (one per opened output); on stop the gate waits 500 ms, then detaches |
 //! | playback buffer | playback gate -> audio sink adapter | adapter-owned, bounded | `ActivePlayback::write` accepts what fits; the gate counts the rest in `tts_samples_dropped`; a dead output (`is_alive` false) gets nothing and is released |
@@ -23,9 +23,6 @@
 //! | reconnect request | IPC reconnect -> parked link | `watch` (1) | coalesce: many clicks are one new attempt; a request seen before the link parked is discarded |
 //! | discovery probes | IPC `Discover` -> gateway `/.well-known` | one `JoinSet` per request, at most `MAX_TAILNET_PEERS + 2` probes (saved, local, tailnet peers) | no queue: every probe runs at once under `probe_timeout`, after the tailnet query under `tailnet_timeout`; a cancelled request drops the set and aborts them |
 //! | account operations | IPC connections -> gateway `/auth/login`, `/auth/logout` | `ACCOUNT` in flight | admission control: a second `Login` gets `LoginFailure::Busy` at once (`try_acquire`); `Logout` waits for the running one, which is bounded by its deadlines (tailnet check, probe, `account_timeout`) |
-//!
-//! Stale uplink frames left in the `out` channel when a session dies are discarded (and counted)
-//! before the next session starts: they belonged to a turn that no longer exists.
 
 use std::{num::NonZeroUsize, sync::Arc};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -41,9 +38,7 @@ const fn nz(n: usize) -> NonZeroUsize {
 pub const MIC_CHUNKS: NonZeroUsize = nz(50);
 /// Blocking capture opens in flight at once (`capture.rs`); releases are never refused.
 pub const CAPTURE_JOBS: usize = 1;
-/// Engine -> link session.
-pub const OUTBOUND: usize = 64;
-/// Link session -> engine.
+/// Link -> engine.
 pub const INBOUND: usize = 128;
 /// IPC -> engine commands. With `IPC_MAX_CONNS` connections answering one request at a time it
 /// fills only while the engine is stalled (abandoned commands wait to be skipped).
@@ -86,6 +81,8 @@ impl ByteBudget {
     }
 
     /// Non-blocking (audio: shed when over budget).
+    // shortcut: no inbound audio is queued in S4 PR 4a; PR 5's voice link sheds with it again.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn try_charge(&self, bytes: usize) -> Option<Charge> {
         self.sem
             .clone()

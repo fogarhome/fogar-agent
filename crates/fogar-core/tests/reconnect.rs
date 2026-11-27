@@ -1,6 +1,7 @@
-//! User-initiated reconnect (IPC `Reconnect`): after the gateway closes 4011 ("missing scope",
-//! spec §13) or 4020/4021 the link parks and only the person may bring it
-//! back. Paused time, in-memory gateway, IPC through the fake adapter.
+//! User-initiated reconnect (IPC `Reconnect`): after `/events` answers `403 missing_scope`, a
+//! newer protocol, or a request we got wrong, the link parks and only the person may bring it
+//! back (and only for the reasons they can settle). Paused time, the `/events` hub, IPC through
+//! the fake adapter.
 #![allow(
     clippy::disallowed_methods,
     clippy::disallowed_types,
@@ -16,7 +17,7 @@ use fogar_ports::{
     secrets::SecretKey,
 };
 use fogar_proto::CloseAction;
-use fogar_testkit::{FakeIpcClient, MockConfig};
+use fogar_testkit::{FakeIpcClient, MockConfig, Scope, StreamStep};
 use std::time::Duration;
 
 fn rig(signed: bool) -> Rig {
@@ -40,29 +41,10 @@ async fn client(rig: &Rig) -> FakeIpcClient {
     c
 }
 
-/// Closes the live session with `code` and waits until the link parks for `reason`.
-async fn park(rig: &mut Rig, code: u16, text: &str, reason: CloseAction) {
-    assert_eq!(rig.link.close_all(code, text), 1);
-    wait_state(&mut rig.health, |v| v.state == LinkState::Parked { reason }).await;
-}
-
-/// No new attempt for an hour.
-async fn no_new_attempts(rig: &Rig, attempts: u64) {
-    tokio::time::sleep(Duration::from_secs(3600)).await;
-    assert_eq!(rig.health.snapshot().stats.connect_attempts, attempts);
-}
-
-/// 4011 (5.0 §13): the key stays valid, so it is never deleted; the link parks without retrying
-/// and the app asks the person to have the scope granted.
-#[tokio::test(start_paused = true)]
-async fn close_4011_parks_and_keeps_the_key() {
-    let mut b = RigBuilder::fake(MockConfig {
-        missing_scope: true,
-        ..MockConfig::default()
-    });
-    b.with_ipc = true;
-    b.signed_peer = true;
-    let mut rig = b.start();
+/// The stream ends and every reopen gets `403 missing_scope`: the link parks.
+async fn park_missing_scope(rig: &mut Rig) {
+    rig.hub.missing_scope(Scope::Read);
+    rig.hub.drop_streams();
     wait_state(&mut rig.health, |v| {
         v.state
             == LinkState::Parked {
@@ -70,19 +52,43 @@ async fn close_4011_parks_and_keeps_the_key() {
             }
     })
     .await;
+}
+
+/// No new stream for an hour.
+async fn no_new_streams(rig: &Rig) {
+    let n = rig.hub.stream_opens() + rest_events(rig);
+    tokio::time::sleep(Duration::from_secs(3600)).await;
+    assert_eq!(rig.hub.stream_opens() + rest_events(rig), n);
+}
+
+/// `GET /events` answered by scripted routes (not counted by the hub).
+fn rest_events(rig: &Rig) -> usize {
+    rig.routes
+        .seen()
+        .iter()
+        .filter(|r| r.path.starts_with("/events"))
+        .count()
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_scope_parks_and_keeps_the_key() {
+    let mut rig = rig(true);
+    wait_ready(&mut rig.health).await;
+    park_missing_scope(&mut rig).await;
     assert_eq!(rig.health.snapshot().link.label(), "parked_missing_scope");
-    tokio::time::sleep(Duration::from_secs(600)).await;
-    assert_eq!(rig.health.snapshot().stats.connect_attempts, 1);
+    no_new_streams(&rig).await;
     assert!(rig.secrets.contains(SecretKey::GatewayAccount));
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
 
 #[tokio::test(start_paused = true)]
-async fn close_4011_then_reconnect_is_ready_again() {
+async fn missing_scope_then_reconnect_is_ready_again() {
     let mut rig = rig(true);
     wait_ready(&mut rig.health).await;
-    park(&mut rig, 4011, "missing scope", CloseAction::MissingScope).await;
-    no_new_attempts(&rig, 1).await;
+    park_missing_scope(&mut rig).await;
+    no_new_streams(&rig).await;
+    // The admin granted the scope; the person clicks Reconnect.
+    rig.hub.restore();
     let mut c = client(&rig).await;
     assert_eq!(
         c.request(IpcRequest::Reconnect).await,
@@ -92,47 +98,14 @@ async fn close_4011_then_reconnect_is_ready_again() {
         matches!(v.state, LinkState::Ready { session: 2 })
     })
     .await;
-    assert_eq!(rig.health.snapshot().stats.connect_attempts, 2);
     // Ready again: one more click has nothing to do.
     assert!(matches!(
         c.request(IpcRequest::Reconnect).await,
         Some(IpcResponse::Refused { .. })
     ));
     // Refused again: parked again, and the click that ended the first park does not end this one.
-    park(&mut rig, 4011, "missing scope", CloseAction::MissingScope).await;
-    no_new_attempts(&rig, 2).await;
-    assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
-}
-
-#[tokio::test(start_paused = true)]
-async fn agent_refused_gets_one_attempt_per_reconnect() {
-    let mut rig = rig(true);
-    wait_ready(&mut rig.health).await;
-    park(
-        &mut rig,
-        4020,
-        "agent not permitted",
-        CloseAction::AgentRefused,
-    )
-    .await;
-    let mut c = client(&rig).await;
-    assert_eq!(
-        c.request(IpcRequest::Reconnect).await,
-        Some(IpcResponse::Reconnecting)
-    );
-    // More clicks either coalesce (link still parked) or are refused (it already left). Here
-    // this only shows 4020 takes a reconnect; the stale-click rule is covered by the 4011 test.
-    for _ in 0..2 {
-        assert!(matches!(
-            c.request(IpcRequest::Reconnect).await,
-            Some(IpcResponse::Reconnecting | IpcResponse::Refused { .. })
-        ));
-    }
-    wait_state(&mut rig.health, |v| {
-        matches!(v.state, LinkState::Ready { session: 2 })
-    })
-    .await;
-    no_new_attempts(&rig, 2).await;
+    park_missing_scope(&mut rig).await;
+    no_new_streams(&rig).await;
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
 
@@ -140,62 +113,66 @@ async fn agent_refused_gets_one_attempt_per_reconnect() {
 async fn reconnect_needs_the_signed_app() {
     let mut rig = rig(false);
     wait_ready(&mut rig.health).await;
-    park(&mut rig, 4011, "missing scope", CloseAction::MissingScope).await;
+    park_missing_scope(&mut rig).await;
     let mut c = client(&rig).await;
     assert!(matches!(
         c.request(IpcRequest::Reconnect).await,
         Some(IpcResponse::Refused { .. })
     ));
-    no_new_attempts(&rig, 1).await;
+    no_new_streams(&rig).await;
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
 
+/// A request the gateway refuses for good (404, another 403): parked, and Reconnect cannot help.
 #[tokio::test(start_paused = true)]
 async fn reconnect_does_not_retry_a_client_bug() {
     let mut rig = rig(true);
-    wait_ready(&mut rig.health).await;
-    park(&mut rig, 4000, "invalid handshake", CloseAction::FixClient).await;
+    rig.routes
+        .set("GET", "/events", 404, r#"{"detail":"Not Found"}"#);
+    wait_state(&mut rig.health, |v| {
+        v.state
+            == LinkState::Parked {
+                reason: CloseAction::FixClient,
+            }
+    })
+    .await;
     let mut c = client(&rig).await;
     assert!(matches!(
         c.request(IpcRequest::Reconnect).await,
         Some(IpcResponse::Refused { .. })
     ));
-    no_new_attempts(&rig, 1).await;
+    no_new_streams(&rig).await;
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }
 
+/// `ready.protocol` newer than ours: parked until the person updates (one attempt per click).
 #[tokio::test(start_paused = true)]
-async fn close_4003_parks_without_retry() {
+async fn newer_protocol_parks_without_retry() {
+    let newer = || {
+        vec![
+            StreamStep::Bytes(b"id: 7\ndata: {\"type\":\"ready\",\"protocol\":6}\n\n".to_vec()),
+            StreamStep::HoldOpen,
+        ]
+    };
     let mut rig = rig(true);
-    wait_ready(&mut rig.health).await;
-    park(
-        &mut rig,
-        4003,
-        "protocol version not supported",
-        CloseAction::UpgradeClient,
-    )
-    .await;
+    rig.routes.set_stream("GET", "/events", 200, newer());
+    let parked = |v: &fogar_core::LinkView| {
+        v.state
+            == LinkState::Parked {
+                reason: CloseAction::UpgradeClient,
+            }
+    };
+    wait_state(&mut rig.health, parked).await;
     assert_eq!(rig.health.snapshot().link.label(), "parked_upgrade_client");
-    tokio::time::sleep(Duration::from_secs(600)).await;
-    assert_eq!(rig.health.snapshot().stats.connect_attempts, 1);
-    // Only the person lifts it, and one Reconnect is exactly one attempt.
+    no_new_streams(&rig).await;
+    // The person updated the gateway... which still says 6: one click is one attempt.
     let mut c = client(&rig).await;
     assert_eq!(
         c.request(IpcRequest::Reconnect).await,
         Some(IpcResponse::Reconnecting)
     );
-    wait_state(&mut rig.health, |v| {
-        matches!(v.state, LinkState::Ready { session: 2 })
-    })
-    .await;
-    // The gateway answers 4003 again: parked again, no further attempt by itself.
-    park(
-        &mut rig,
-        4003,
-        "protocol version not supported",
-        CloseAction::UpgradeClient,
-    )
-    .await;
-    no_new_attempts(&rig, 2).await;
+    eventually(Duration::from_secs(5), || rest_events(&rig) == 2).await;
+    wait_state(&mut rig.health, parked).await;
+    no_new_streams(&rig).await;
     assert!(rig.agent.shutdown(Duration::from_secs(5)).await.clean);
 }

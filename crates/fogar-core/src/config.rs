@@ -30,9 +30,21 @@ pub struct Config {
     /// `status` is requested for `turn_progress` and the voice services' `status` (S2); it also
     /// brings one `pipeline_event` per STT partial (spec §7), which the engine ignores.
     pub output_mode: Vec<OutputMode>,
+    /// Opening `/events` (dial, request, response head).
     pub connect_timeout: Duration,
-    /// Handshake sent -> `ready` received (the gateway's own handshake limit is 5 s).
+    /// Stream opened -> its `ready` event received.
     pub ready_timeout: Duration,
+    /// No byte at all on `/events` (not even `: ping`, sent every 15 s) for this long: the
+    /// stream is dead, reconnect.
+    pub events_read_timeout: Duration,
+    /// An `/events` stream that lasted this long and ended cleanly was a planned rotation (the
+    /// gateway ends each one after ~25 s): reopen at once. Shorter streams back off. GUESSED.
+    pub stable_stream: Duration,
+    /// A planned rotation that reaches `ready` again within this is invisible above the link;
+    /// a slower one is a real `Down`. GUESSED.
+    pub rotation_grace: Duration,
+    /// Each REST call to the gateway, and reading a non-2xx body.
+    pub http_timeout: Duration,
     /// Each transport write and each enqueue of a must-deliver uplink message.
     pub write_timeout: Duration,
     /// Graceful close handshake on shutdown. Must stay below half the shutdown budget (the egress
@@ -88,6 +100,10 @@ impl Default for Config {
             output_mode: vec![OutputMode::Audio, OutputMode::Text, OutputMode::Status],
             connect_timeout: Duration::from_secs(10),
             ready_timeout: Duration::from_secs(10),
+            events_read_timeout: Duration::from_secs(40),
+            stable_stream: Duration::from_secs(5),
+            rotation_grace: Duration::from_secs(3),
+            http_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(5),
             close_timeout: Duration::from_secs(1),
             inbound_deadline: Duration::from_secs(5),

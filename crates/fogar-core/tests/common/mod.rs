@@ -3,8 +3,8 @@
 #![allow(dead_code)]
 
 use fogar_core::{
-    AccountRecord, Agent, AgentPorts, Config, HealthProbe, LinkState, LinkView, NoHttp, NoIpc,
-    NoTailnet, crashloop::BootMode,
+    AccountRecord, Agent, AgentPorts, Config, HealthProbe, LinkState, LinkView, NoIpc, NoTailnet,
+    crashloop::BootMode,
 };
 use fogar_ports::{
     gateway::{GatewayAddr, GatewayLink},
@@ -13,8 +13,8 @@ use fogar_ports::{
     secrets::{SecretKey, SecretStore},
 };
 use fogar_testkit::{
-    FakeGatewayHttp, FakeGatewayLink, FakeIpc, FakeMic, FakeSpeaker, FakeSystemProbe, FakeTailnet,
-    HttpRoutes, MemorySecretStore, MockConfig, SeededRandom, TestClock,
+    EventsHub, FakeGatewayHttp, FakeGatewayLink, FakeIpc, FakeMic, FakeSpeaker, FakeSystemProbe,
+    FakeTailnet, HttpRoutes, MemorySecretStore, MockConfig, SeededRandom, TestClock,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -28,6 +28,8 @@ pub(crate) struct Rig<L: GatewayLink = FakeGatewayLink> {
     pub(crate) secrets: Arc<MemorySecretStore>,
     pub(crate) ipc: Option<FakeIpc>,
     pub(crate) routes: HttpRoutes,
+    /// The chat gateway (`/events` and the conversations) served from `routes`.
+    pub(crate) hub: EventsHub,
     /// The app with its conversation on screen (`RigBuilder::app_on_screen`).
     pub(crate) app: tokio::task::JoinSet<()>,
 }
@@ -75,6 +77,8 @@ pub(crate) struct RigBuilder<L: GatewayLink> {
     /// it nothing sounds.
     pub(crate) app_on_screen: bool,
     pub(crate) routes: HttpRoutes,
+    /// Installed into `routes` by `start` (a test that swaps `routes` keeps the hub).
+    pub(crate) hub: EventsHub,
     /// Addresses where a gateway answers `routes` (all share them).
     pub(crate) http_addrs: Vec<&'static str>,
     pub(crate) tailnet: FakeTailnet,
@@ -150,6 +154,7 @@ impl<L: GatewayLink + Clone> RigBuilder<L> {
             signed_peer: true,
             app_on_screen: false,
             routes: HttpRoutes::fogar(),
+            hub: EventsHub::new(),
             http_addrs: vec![GW_ADDR],
             tailnet: FakeTailnet::unsupported(),
             names_resolve_to_lan: false,
@@ -157,6 +162,7 @@ impl<L: GatewayLink + Clone> RigBuilder<L> {
     }
 
     pub(crate) fn start(self) -> Rig<L> {
+        self.hub.install(&self.routes);
         let clock = TestClock::new();
         let signed = self.signed_peer;
         let ipc = self.with_ipc.then(|| {
@@ -203,6 +209,7 @@ impl<L: GatewayLink + Clone> RigBuilder<L> {
             secrets: self.secrets,
             ipc,
             routes: self.routes,
+            hub: self.hub,
             app,
         }
     }
@@ -247,12 +254,13 @@ async fn app_confirming_turns(mut c: fogar_testkit::FakeIpcClient) {
 pub(crate) fn start_no_ipc<L: GatewayLink + Clone>(
     b: RigBuilder<L>,
 ) -> (Agent<TestClock>, HealthProbe) {
+    b.hub.install(&b.routes);
     let clock = TestClock::new();
-    let ports: AgentPorts<TestClock, L, NoIpc, NoHttp> = AgentPorts {
+    let ports: AgentPorts<TestClock, L, NoIpc, FakeGatewayHttp> = AgentPorts {
         clock: Arc::new(clock),
         link: b.link.clone(),
         ipc: None,
-        http: NoHttp,
+        http: FakeGatewayHttp::at(b.routes.clone(), GatewayAddr::parse(GW_ADDR).unwrap()),
         tailnet: NoTailnet,
         secrets: b.secrets.clone(),
         random: Arc::new(SeededRandom::new(7)),
@@ -312,6 +320,15 @@ pub(crate) async fn say<L: GatewayLink>(rig: &Rig<L>, text: &str) {
         })
         .await;
     assert_eq!(r, Some(IpcResponse::TextAccepted));
+}
+
+/// Every request but the `/events` stream (the link opens it whenever there is an account).
+pub(crate) fn rest(routes: &HttpRoutes) -> Vec<fogar_testkit::gateway::SeenRequest> {
+    routes
+        .seen()
+        .into_iter()
+        .filter(|r| !r.path.starts_with("/events"))
+        .collect()
 }
 
 pub(crate) fn alive_tasks() -> usize {

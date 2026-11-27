@@ -118,7 +118,12 @@ counters! {
     uplink_audio_shed: "utterance audio chunks shed because the uplink queue was full",
     uplink_control_dropped: "control messages that missed their enqueue deadline",
     inbound_audio_shed: "TTS frames shed because the engine queue was full",
-    inbound_invalid: "inbound text frames that failed to decode",
+    inbound_invalid: "inbound text frames or `/events` events that failed to decode",
+    events_received: "`/events` events the engine accepted (not `ready`, `resync`, audio or unknown)",
+    events_resync: "re-fetches asked of the engine (`resync` events and oversize events)",
+    events_oversize: "`/events` events over the reader's cap, skipped",
+    events_audio_dropped: "push `audio` events dropped by the link (nothing plays in 4a)",
+    stream_rotations: "`/events` streams replaced within the grace, invisible above the link",
     mic_chunks: "capture chunks processed",
     utterances: "utterances detected by the VAD while online",
     turns_started: "turn_start received",
@@ -179,7 +184,6 @@ pub struct Health {
     pub last_close: Option<(u16, CloseAction)>,
     pub stats: StatsSnapshot,
     pub boot_mode: &'static str,
-    /// Current depth of the uplink / inbound queues (should be ~0 at idle).
-    pub out_queue_len: usize,
+    /// Current depth of the inbound queue (should be ~0 at idle).
     pub in_queue_len: usize,
 }
