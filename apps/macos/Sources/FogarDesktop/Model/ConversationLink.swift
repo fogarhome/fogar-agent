@@ -17,16 +17,16 @@ enum EnlaceConversacion: Equatable {
     case viva
 }
 
-/// The app's conversation with the agent (IPC v4): ONE long connection that is subscribed to the
-/// conversation and also carries the conversation's requests. It has to be one: the agent only
-/// lets the subscribed connection start a take or confirm a turn as visible, and a take ends with
+/// The app's conversation with the agent (IPC v6): ONE long connection that is subscribed to the
+/// open conversation and to the list, and also carries the conversation's requests. It has to be
+/// one: the agent only lets the subscribed connection start a take, and a take ends with
 /// `discard` when its connection goes. (`request_mic_permission` is the exception: it may wait
 /// for the person at the system prompt, so it goes on a single-use connection of its own and
 /// never holds up a Cancel.)
 ///
 /// No request ids on the wire: the agent answers a connection's requests in order, and the only
-/// frame it sends unasked here is `conversation`. So every other frame answers the oldest request
-/// still waiting. A request that gets no answer in time (counted from when its frame was written)
+/// frames it sends unasked here are `conversation` and `conversations`. So every other frame
+/// answers the oldest request still waiting. A request that gets no answer in time (counted from when its frame was written)
 /// closes the connection (the order could no longer be trusted) and every waiting request fails;
 /// the loop reconnects.
 ///
@@ -38,7 +38,9 @@ final class ConversationLink {
     /// The latest view the agent pushed. Kept after the connection drops (shown as stale) and
     /// replaced by the next subscription's first push.
     private(set) var vista: WireConversation?
-    /// Called on every new view (the model confirms visible turns and takes the draft from here).
+    /// The conversations, newest first, as the agent last pushed them (kept like `vista`).
+    private(set) var lista: [WireSummary] = []
+    /// Called on every new view (the model takes the draft from here).
     @ObservationIgnored var alCambiar: (WireConversation) -> Void = { _ in }
     /// Called when the connection drops (any take on it ended with `discard` in the agent).
     @ObservationIgnored var alPerder: () -> Void = {}
@@ -88,16 +90,29 @@ final class ConversationLink {
                 let v = verificacion
                 let c = try await FramedConnection.connect(path: socketPath, verificacion: v)
                 defer { c.cancel() }
-                try await withDeadline(.seconds(5)) {
+                let primera = try await withDeadline(.seconds(5)) { () -> WireConversation? in
                     try await Self.saludar(c, v)
                     try await c.send(WireCodec.encode(WireRequest.subscribeConversation))
-                    // `conversation_subscribed`, then the first view (read by the loop below).
+                    // `conversation_subscribed`, then the first view.
                     switch try WireCodec.decodeResponse(await c.receive()) {
                     case .conversationSubscribed: break
                     case .refused: throw CommandError.refused // not the signed app (strictly same signer)
                     default: throw CommandError.unexpected
                     }
+                    // The list on the same connection: `list_subscribed`, then the first list (read
+                    // by the loop below). The latest view pushed meanwhile is kept.
+                    try await c.send(WireCodec.encode(WireRequest.listConversations))
+                    var ultima: WireConversation?
+                    while true {
+                        switch try WireCodec.decodeResponseTolerante(await c.receive()) {
+                        case .listSubscribed: return ultima
+                        case .conversation(let vista): ultima = vista
+                        case .refused: throw CommandError.refused
+                        default: throw CommandError.unexpected
+                        }
+                    }
                 }
+                if let primera { recibir(.conversation(primera)) }
                 conexion = c
                 enlace = .viva
                 estuvoViva = true
@@ -125,7 +140,9 @@ final class ConversationLink {
         case .conversation(let v):
             vista = v
             alCambiar(v)
-        case .event, .status, .subscribed, .conversationSubscribed:
+        case .conversations(let l):
+            lista = l.conversations
+        case .event, .status, .subscribed, .conversationSubscribed, .listSubscribed:
             break // nothing asked for these on this connection
         default:
             // The answer to the oldest request waiting. An answer nobody waits for (one that came
@@ -227,7 +244,7 @@ final class ConversationLink {
             return try await withDeadline(plazo) {
                 while true {
                     switch try WireCodec.decodeResponseTolerante(await c.receive()) {
-                    case .event, .status, .conversation: continue // never the answer
+                    case .event, .status, .conversation, .conversations: continue // never the answer
                     case let answer: return answer
                     }
                 }

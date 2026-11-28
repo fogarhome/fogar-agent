@@ -1,6 +1,6 @@
 //! Engine configuration, injected by the composition root (core never reads env or files).
 
-use crate::{backoff::BackoffPolicy, turn::TurnTimeouts, vad::VadConfig};
+use crate::{backoff::BackoffPolicy, vad::VadConfig};
 use fogar_proto::{InputMode, OutputMode, limits};
 use std::time::Duration;
 
@@ -30,9 +30,21 @@ pub struct Config {
     /// `status` is requested for `turn_progress` and the voice services' `status` (S2); it also
     /// brings one `pipeline_event` per STT partial (spec §7), which the engine ignores.
     pub output_mode: Vec<OutputMode>,
+    /// Opening `/events` (dial, request, response head).
     pub connect_timeout: Duration,
-    /// Handshake sent -> `ready` received (the gateway's own handshake limit is 5 s).
+    /// Stream opened -> its `ready` event received.
     pub ready_timeout: Duration,
+    /// No byte at all on `/events` (not even `: ping`, sent every 15 s) for this long: the
+    /// stream is dead, reconnect.
+    pub events_read_timeout: Duration,
+    /// An `/events` stream that lasted this long and ended cleanly was a planned rotation (the
+    /// gateway ends each one after ~25 s): reopen at once. Shorter streams back off. GUESSED.
+    pub stable_stream: Duration,
+    /// A planned rotation that reaches `ready` again within this is invisible above the link;
+    /// a slower one is a real `Down`. GUESSED.
+    pub rotation_grace: Duration,
+    /// Each REST call to the gateway, and reading a non-2xx body.
+    pub http_timeout: Duration,
     /// Each transport write and each enqueue of a must-deliver uplink message.
     pub write_timeout: Duration,
     /// Graceful close handshake on shutdown. Must stay below half the shutdown budget (the egress
@@ -49,7 +61,6 @@ pub struct Config {
     /// clients cannot hold the `IPC_MAX_CONNS` slots (review code#3/sec#5).
     pub ipc_idle_timeout: Duration,
     pub vad: VadConfig,
-    pub turn: TurnTimeouts,
     /// Capture rate the engine streams as-is (f32le 16 kHz mono is all v1 accepts). The adapter
     /// resamples; a capture delivered at another format is closed and the take refused.
     pub upload_rate_hz: u32,
@@ -88,6 +99,10 @@ impl Default for Config {
             output_mode: vec![OutputMode::Audio, OutputMode::Text, OutputMode::Status],
             connect_timeout: Duration::from_secs(10),
             ready_timeout: Duration::from_secs(10),
+            events_read_timeout: Duration::from_secs(40),
+            stable_stream: Duration::from_secs(5),
+            rotation_grace: Duration::from_secs(3),
+            http_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(5),
             close_timeout: Duration::from_secs(1),
             inbound_deadline: Duration::from_secs(5),
@@ -95,7 +110,6 @@ impl Default for Config {
             backoff: BackoffPolicy::default(),
             ipc_idle_timeout: Duration::from_secs(30),
             vad: VadConfig::default(),
-            turn: TurnTimeouts::default(),
             upload_rate_hz: fogar_proto::audio::UPLOAD_RATE_HZ,
             heartbeat_every: Duration::from_secs(10),
             capture_silence_cut: Duration::from_secs(5),

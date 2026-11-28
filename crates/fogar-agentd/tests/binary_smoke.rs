@@ -5,7 +5,7 @@
 
 use fogar_agent_linux::UdsIpcClient;
 use fogar_ports::ipc::{IpcRequest, IpcResponse};
-use fogar_testkit::{MockConfig, MockGateway};
+use fogar_testkit::{EventsHub, MockConfig, MockGateway};
 use std::{
     io::Write,
     process::{Command, Stdio},
@@ -18,6 +18,9 @@ const BIN: &str = env!("CARGO_BIN_EXE_fogar-agentd");
 fn daemon_connects_serves_status_and_stops_cleanly_on_sigterm() {
     fogar_testkit::run_async(async {
         let gw = MockGateway::start(MockConfig::default()).await.unwrap();
+        // The chat link is `GET /events` (S4 PR 4a), served on the same port.
+        let hub = EventsHub::new();
+        hub.install(&gw.routes());
         let dir = std::env::temp_dir().join(format!("fogar-smoke-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -43,10 +46,10 @@ fn daemon_connects_serves_status_and_stops_cleanly_on_sigterm() {
             .unwrap();
 
         let t0 = Instant::now();
-        while gw.log().handshakes_ok == 0 {
+        while hub.subscribers() == 0 {
             assert!(
                 t0.elapsed() < Duration::from_secs(10),
-                "daemon never completed the handshake"
+                "daemon never opened /events"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -93,14 +96,8 @@ fn daemon_connects_serves_status_and_stops_cleanly_on_sigterm() {
             "the client key must never be logged"
         );
 
-        let t2 = Instant::now();
-        while gw.log().client_closes == 0 {
-            assert!(
-                t2.elapsed() < Duration::from_secs(5),
-                "no close frame from the daemon"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // (No close handshake on `/events`; the mock notices a closed socket only at its next
+        // write, so the stream's end is not checked here.)
         let ledger = std::fs::read_to_string(dir.join("boot.ledger")).unwrap();
         let kinds: Vec<_> = ledger
             .lines()

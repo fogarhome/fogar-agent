@@ -1,9 +1,10 @@
 //! S4 end-to-end (the file keeps its S1 name: CI runs it by name): the whole account lifecycle
-//! over the REAL transport. Real HTTP (`fogar_host::HttpGateway`) and real WebSocket
-//! (`WsGatewayLink`), against two gateways:
-//! - the Rust mock (`MockGateway`), which serves `/auth/*` and `/ws/stream` on one loopback port
-//!   like the real one: always runs;
-//! - the REAL fogar-gateway (Python) with its own fake OpenClaw and no STT/TTS, started by
+//! over the REAL transport (`fogar_host::HttpGateway`: `/auth/*` and the `GET /events` link),
+//! against two gateways:
+//! - the Rust mock (`MockGateway` + `EventsHub`), which serves `/auth/*` and `/events` on one
+//!   loopback port like the real one: always runs;
+//! - the REAL fogar-gateway (Python) with its own fake OpenClaw and no STT/TTS (which answers a
+//!   text, so the chat over `/events` is checked there too: send, reply, list, reopen), started by
 //!   `real_gateway/launch.py` from the checkout in `FOGAR_GATEWAY_DIR` (skipped when unset; CI
 //!   job `.github/workflows/e2e-gateway.yml` checks out the commit in `real_gateway/GATEWAY_REF`).
 //!
@@ -12,142 +13,25 @@
 //! cannot accept a test binary). Real sockets, so real time, not paused time.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use fogar_core::{Agent, AgentPorts, Config, HealthProbe, LinkState, crashloop::BootMode};
-use fogar_host::{HttpConfig, HttpGateway, TokioClock, WsConfig, WsGatewayLink};
+mod common;
+use common::*;
+use fogar_core::LinkState;
 use fogar_ports::{
-    ipc::{GatewayInfo, IpcRequest, IpcResponse, LinkPhase, LoginForm, Password},
-    secrets::{SecretCaps, SecretError, SecretKey, SecretStore, SecretString},
+    ipc::{IpcRequest, IpcResponse, LinkPhase, MessageState, TurnOutcome, ViewEntry},
+    secrets::SecretKey,
 };
-use fogar_testkit::{
-    FakeIpc, FakeIpcClient, FakeMic, FakeSpeaker, MemorySecretStore, MockConfig, MockGateway,
-    SeededRandom,
-};
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
-    },
-    time::Duration,
-};
+use fogar_testkit::{EventsHub, MockConfig, MockGateway};
+use std::{sync::atomic::Ordering, time::Duration};
 
-/// Memory store that counts deletions of the account.
-#[derive(Debug, Default)]
-struct CountingStore {
-    inner: MemorySecretStore,
-    account_deletes: AtomicU32,
-}
-
-impl SecretStore for CountingStore {
-    fn capabilities(&self) -> SecretCaps {
-        self.inner.capabilities()
-    }
-    fn get(&self, key: SecretKey) -> Result<Option<SecretString>, SecretError> {
-        self.inner.get(key)
-    }
-    fn put(&self, key: SecretKey, value: SecretString) -> Result<(), SecretError> {
-        self.inner.put(key, value)
-    }
-    fn delete(&self, key: SecretKey) -> Result<(), SecretError> {
-        if key == SecretKey::GatewayAccount && self.inner.contains(key) {
-            self.account_deletes.fetch_add(1, Ordering::SeqCst);
-        }
-        self.inner.delete(key)
-    }
-}
-
-fn fast_config() -> Config {
-    let mut c = Config::default();
-    c.backoff.base = Duration::from_millis(20);
-    c.backoff.cap = Duration::from_millis(200);
-    c.backoff.floor = Duration::from_millis(5);
-    // The mock and the real gateway listen on 127.0.0.1 (the dev-login-over-loopback switch).
-    c.login_over_loopback = true;
-    c
-}
-
-/// The gateway's `201` for `POST /auth/login`, handing out `token`.
-fn login_ok(token: &str) -> String {
-    format!(
-        r#"{{"client_id":"c-1","token":"{token}","scopes":["conversations:read","conversations:write"],"user":{{"id":"u-1","username":"sito","display_name":"Sito","role":"member"}},"home":{{"id":"home","name":"mock"}}}}"#
-    )
-}
-
-async fn within<F: std::future::Future>(d: Duration, f: F) -> F::Output {
-    tokio::time::timeout(d, f).await.expect("timed out")
-}
-
-async fn ready(h: &mut HealthProbe, session: u64) {
-    within(
-        Duration::from_secs(10),
-        h.wait_link(|v| v.state == LinkState::Ready { session }),
-    )
-    .await;
-}
-
-async fn login(c: &mut FakeIpcClient, address: &str, user: &str, password: &str) -> GatewayInfo {
-    let r = c
-        .request(IpcRequest::Login(Box::new(LoginForm {
-            address: address.into(),
-            username: user.into(),
-            password: Password::parse(password),
-        })))
-        .await;
-    match r {
-        Some(IpcResponse::LoggedIn(info)) => *info,
-        other => panic!("{other:?}"),
-    }
-}
-
-async fn logout(c: &mut FakeIpcClient) -> bool {
-    match c.request(IpcRequest::Logout).await {
-        Some(IpcResponse::LoggedOut { gateway_reached }) => gateway_reached,
-        other => panic!("{other:?}"),
-    }
-}
-
-async fn phase(c: &mut FakeIpcClient) -> LinkPhase {
-    match c.request(IpcRequest::Status).await {
-        Some(IpcResponse::Status(s)) => s.phase,
-        other => panic!("expected Status, got {other:?}"),
-    }
-}
-
-fn alive_tasks() -> usize {
-    tokio::runtime::Handle::current()
-        .metrics()
-        .num_alive_tasks()
-}
-
-/// A signed-out agent on the real adapters, with a counting store and a signed fake IPC.
-fn start_agent() -> (Agent<TokioClock>, Arc<CountingStore>, FakeIpc) {
-    let secrets = Arc::new(CountingStore::default());
-    let ipc = FakeIpc::signed();
-    let ports = AgentPorts {
-        clock: Arc::new(TokioClock::new()),
-        link: WsGatewayLink::new(WsConfig::default()),
-        ipc: Some(ipc.clone()),
-        http: HttpGateway::new(HttpConfig::default()),
-        tailnet: fogar_core::NoTailnet,
-        secrets: secrets.clone(),
-        random: Arc::new(SeededRandom::new(11)),
-        audio_in: Arc::new(FakeMic::minimal()),
-        audio_out: Arc::new(FakeSpeaker::minimal()),
-        probe: None,
-    };
-    let agent = Agent::start(ports, fast_config(), BootMode::Normal);
-    (agent, secrets, ipc)
-}
-
-/// signed out -> login -> ready -> gateway restart (1012) -> ready again -> revoked (4200) ->
-/// account deleted once, signed out, no retry -> login again with a new token -> ready ->
-/// logout (gateway told with the token, account deleted) -> signed out.
+/// signed out -> login -> ready -> stream lost -> ready again -> revoked (401) -> account deleted
+/// once, signed out, no retry -> login again with a new token -> ready -> logout (gateway told
+/// with the token, account deleted) -> signed out. The chat link is `GET /events` (S4 PR 4a):
+/// the mock serves it from `EventsHub` on the same port.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn login_lifecycle_against_the_mock_gateway() {
-    let mock = MockConfig {
-        client_key: "key-1".into(),
-        ..MockConfig::default()
-    };
-    let gw = MockGateway::start(mock.clone()).await.unwrap();
+    let gw = MockGateway::start(MockConfig::default()).await.unwrap();
+    let hub = EventsHub::new();
+    hub.install(&gw.routes());
     gw.routes()
         .set("POST", "/auth/login", 201, login_ok("key-1"));
     gw.routes().set("POST", "/auth/logout", 204, "");
@@ -162,16 +46,12 @@ async fn login_lifecycle_against_the_mock_gateway() {
     let mut app = ipc.client().await;
     assert_eq!(phase(&mut app).await, LinkPhase::NotPaired);
 
-    // Sign in over HTTP, then the link comes up over WebSocket with the token it handed out.
+    // Sign in over HTTP, then the link comes up over `/events` with the token it handed out.
     let info = login(&mut app, &gw.addr().to_string(), " sito ", "contraseña-1").await;
     assert_eq!((info.user.as_str(), info.name.as_str()), ("Sito", "mock"));
     ready(&mut h, 1).await;
-    let post = gw
-        .routes()
-        .seen()
-        .into_iter()
-        .find(|r| r.method == "POST")
-        .unwrap();
+    let seen = gw.routes().seen();
+    let post = seen.iter().find(|r| r.method == "POST").unwrap();
     assert_eq!(post.path, "/auth/login");
     assert_eq!(post.authorization, None);
     let body = String::from_utf8_lossy(&post.body);
@@ -179,71 +59,91 @@ async fn login_lifecycle_against_the_mock_gateway() {
         body.contains(r#""username":"sito","password":"contraseña-1""#),
         "{body}"
     );
-    assert_eq!(gw.log().handshakes_ok, 1);
-    assert_eq!(
-        gw.log().connections,
-        1,
-        "the REST calls are not WS sessions"
-    );
+    let events = seen.iter().find(|r| r.path == "/events").unwrap();
+    assert_eq!(events.authorization.as_deref(), Some("Bearer key-1"));
+    assert_eq!(events.accept.as_deref(), Some("text/event-stream"));
+    assert_eq!(hub.subscribers(), 1);
 
-    // Gateway restart: reconnects by itself, keeps the token.
-    assert_eq!(gw.close_all(1012, ""), 1);
-    ready(&mut h, 2).await;
+    // The stream dies (silent): reconnects by itself, resuming, and keeps the token.
+    hub.go_silent();
+    within(
+        Duration::from_secs(60),
+        h.wait_link(|v| v.state == LinkState::Ready { session: 2 }),
+    )
+    .await;
     assert_eq!(secrets.account_deletes.load(Ordering::SeqCst), 0);
-    assert_eq!(gw.log().handshakes_ok, 2);
+    // The read timeout outlasted the IPC idle close: the app reconnects.
+    let mut app = ipc.client().await;
+    let resumed = gw
+        .routes()
+        .seen()
+        .into_iter()
+        .rfind(|r| r.path == "/events");
+    assert!(resumed.unwrap().last_event_id.is_some());
 
-    // The device is removed (web or admin). From now on the gateway only knows the next token,
-    // so a retry with the old one would be refused (and delete again).
-    gw.set_config(MockConfig {
-        client_key: "key-2".into(),
-        ..mock
-    });
+    // The device is removed (web or admin): 401, the account is deleted once, no retry.
     gw.routes()
         .set("POST", "/auth/login", 201, login_ok("key-2"));
-    assert_eq!(gw.close_all(4200, "credential revoked"), 1);
+    hub.revoke();
     within(
         Duration::from_secs(10),
         h.wait_link(|v| v.state == LinkState::NotPaired),
     )
     .await;
     assert_eq!(phase(&mut app).await, LinkPhase::NotPaired);
+    let opens = hub.stream_opens();
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let log = gw.log();
-    assert_eq!(log.connections, 2, "no reconnect after revocation");
-    assert_eq!(log.handshakes_rejected, 0);
+    assert_eq!(hub.stream_opens(), opens, "no reconnect after revocation");
     assert_eq!(secrets.account_deletes.load(Ordering::SeqCst), 1);
     assert!(!secrets.inner.contains(SecretKey::GatewayAccount));
 
-    // Signing in again works and the link comes up with the new token.
+    // Signing in again works and the link comes up with the new token, on a fresh stream.
+    hub.restore();
     login(&mut app, &gw.addr().to_string(), "sito", "contraseña-1").await;
     ready(&mut h, 3).await;
-    assert_eq!(gw.log().handshakes_ok, 3);
+    let fresh = gw
+        .routes()
+        .seen()
+        .into_iter()
+        .rfind(|r| r.path == "/events");
+    let fresh = fresh.unwrap();
+    assert_eq!(
+        (fresh.authorization.as_deref(), fresh.last_event_id),
+        (Some("Bearer key-2"), None)
+    );
 
     // Logout: the gateway hears it with the token, the account is gone, no reconnect.
     assert!(logout(&mut app).await);
-    let out = gw.routes().seen().into_iter().last().unwrap();
-    assert_eq!(
-        (out.path.as_str(), out.authorization.as_deref()),
-        ("/auth/logout", Some("Bearer key-2"))
-    );
+    let out = gw
+        .routes()
+        .seen()
+        .into_iter()
+        .rfind(|r| r.path == "/auth/logout")
+        .unwrap();
+    assert_eq!(out.authorization.as_deref(), Some("Bearer key-2"));
     assert_eq!(secrets.account_deletes.load(Ordering::SeqCst), 2);
     within(
         Duration::from_secs(10),
         h.wait_link(|v| v.state == LinkState::NotPaired),
     )
     .await;
+    let opens = hub.stream_opens();
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(gw.log().connections, 3, "no reconnect after logout");
+    assert_eq!(hub.stream_opens(), opens, "no reconnect after logout");
+    // (The mock notices a closed socket only at its next write: no subscriber check here.)
 
     drop(app);
     assert!(agent.shutdown(Duration::from_secs(5)).await.clean);
+    // The mock's per-stream tasks only end at their next write: stop the mock first, then
+    // nothing of the agent may be left.
+    gw.shutdown().await;
+    drop(hub);
     within(Duration::from_secs(5), async {
-        while alive_tasks() != baseline {
+        while alive_tasks() > baseline {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await;
-    gw.shutdown().await;
 }
 
 /// The real gateway, driven over `launch.py`'s line protocol. Dropping it closes stdin, which
@@ -339,28 +239,76 @@ async fn pairing_lifecycle_against_the_real_gateway() {
     assert!(!info.name.is_empty(), "the home's name: {info:?}");
     ready(&mut h, 1).await;
 
-    // Restart (uvicorn closes with 1012): reconnects by itself once it is back, same token.
+    // S4 PR 4a, the chat over `/events`: with nothing open a text creates a conversation; its
+    // `message` and the turn the gateway's fake OpenClaw answers (`ok`: one delta and a final)
+    // arrive over the stream; the list shows it; «Nueva», then opening it again shows its
+    // history (`GET /conversations/{id}` + `…/messages`).
+    let mut chat = App::open(&ipc).await;
+    assert_eq!(
+        chat.ask(IpcRequest::SendText {
+            text: fogar_ports::ipc::UserText("ok".into()),
+        })
+        .await,
+        IpcResponse::TextAccepted
+    );
+    chat.until("the reply", Duration::from_secs(30), |a| {
+        let mine = a.view.entries.iter().any(|e| {
+            matches!(e, ViewEntry::Message(m) if m.mine && m.text == "ok" && m.state == MessageState::Delivered)
+        });
+        let done = a.view.entries.iter().any(|e| {
+            matches!(e, ViewEntry::Turn(t) if t.outcome == Some(TurnOutcome::Done) && !t.reply.is_empty())
+        });
+        mine && done
+    })
+    .await;
+    let id = chat.view.id.clone().expect("the new conversation is open");
+    chat.until("listed, not running", Duration::from_secs(30), |a| {
+        a.list.iter().any(|c| c.id == id && !c.running)
+    })
+    .await;
+    assert_eq!(
+        chat.ask(IpcRequest::NewConversation).await,
+        IpcResponse::ConversationOpened
+    );
+    chat.until("nothing open", Duration::from_secs(10), |a| {
+        a.view.id.is_none() && a.view.entries.is_empty()
+    })
+    .await;
+    assert_eq!(
+        chat.ask(IpcRequest::OpenConversation { id: id.clone() })
+            .await,
+        IpcResponse::ConversationOpened
+    );
+    chat.until("its history", Duration::from_secs(30), |a| {
+        a.view.id.as_deref() == Some(id.as_str())
+            && a.view.entries.iter().any(|e| {
+                matches!(e, ViewEntry::Message(m) if m.text == "ok" && m.state == MessageState::Past)
+            })
+            && a.view.entries.iter().any(|e| matches!(e, ViewEntry::Turn(t) if !t.reply.is_empty()))
+    })
+    .await;
+    drop(chat);
+
+    // Restart: the `/events` stream ends; the link reconnects by itself once the gateway is
+    // back, same token.
     gw.cmd("restart", "restarted", Duration::from_secs(180))
         .await;
-    let v = within(
+    within(
         Duration::from_secs(30),
         h.wait_link(|v| matches!(v.state, LinkState::Ready { session } if session > 1)),
     )
     .await;
-    assert_eq!(v.last_close.map(|c| c.0), Some(1012));
     assert_eq!(secrets.account_deletes.load(Ordering::SeqCst), 0);
 
-    // The admin removes the device: 4200 on the live session, account deleted once, no retry.
-    assert_eq!(
-        gw.cmd("revoke", "revoked", Duration::from_secs(10)).await,
-        "1"
-    );
+    // The admin removes the device: the stream is cut, the reopen gets 401, the account is
+    // deleted once, no retry.
+    gw.cmd("revoke", "revoked", Duration::from_secs(10)).await;
     let v = within(
         Duration::from_secs(10),
         h.wait_link(|v| v.state == LinkState::NotPaired),
     )
     .await;
-    assert_eq!(v.last_close.map(|c| c.0), Some(4200));
+    assert_eq!(v.last_close.map(|c| c.0), Some(401));
     let attempts = h.snapshot().stats.connect_attempts;
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(phase(&mut app).await, LinkPhase::NotPaired);

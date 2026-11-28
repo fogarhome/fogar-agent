@@ -22,3 +22,5 @@ workspace = true
 
 [dev-dependencies]
 serde_json = { workspace = true, features = ["std"] }
+# Paused-time tests of the /events hub (`start_paused`).
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "test-util"] }

@@ -196,7 +196,8 @@ pub(crate) enum GateEvent {
         reply: Reply,
         why: CaptureRefusal,
     },
-    Chunk(AudioChunk),
+    // shortcut: not streamed anywhere in S4 PR 4a (no uplink); PR 5's dictation link reads it.
+    Chunk(#[allow(dead_code)] AudioChunk),
     /// The take must close (the engine calls [`CaptureGate::close`]).
     Cut(Cut),
     /// The answer to an explicit permission request, for every waiter.
@@ -319,6 +320,8 @@ impl CaptureGate {
         self.mic.mic_permission()
     }
 
+    // shortcut: only the partials of a take used it; PR 5 (dictation) calls it again.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_open(&self) -> bool {
         matches!(self.take, Take::Open(_))
     }
@@ -424,6 +427,8 @@ impl CaptureGate {
     /// previous one counts as "heard something new" (GUESSED: whether the `fogar` transcriber
     /// repeats or empties partials in silence is not measured yet; repeats must not keep a
     /// forgotten take alive).
+    // shortcut: no partials arrive in S4 PR 4a (dictation is off); PR 5 calls it again.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn on_partial(&mut self, text: &str, now: Mono) {
         if let Take::Open(t) = &mut self.take {
             let text = text.trim();

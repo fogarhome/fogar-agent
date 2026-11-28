@@ -165,8 +165,16 @@ pub enum IpcRequest {
     CaptureEnd { then: CaptureThen },
     /// Cancel button. Answered with `TurnCancelSent`.
     CancelTurn,
-    /// The UI is showing this turn: its audio may play. Answered with `TurnVisibleNoted`.
-    TurnVisible { turn_id: String },
+    // ---- the conversations (v6). Same-signer only, like the conversation above. ----
+    /// From now on the agent pushes `IpcResponse::Conversations` (latest list only). Answered
+    /// with `ListSubscribed` + one `Conversations`.
+    ListConversations,
+    /// Show this conversation (an id from the list). Answered with `ConversationOpened`; what it
+    /// holds arrives in the next `Conversation` pushes.
+    OpenConversation { id: String },
+    /// Nothing open: the next `SendText` starts a new conversation. Answered with
+    /// `ConversationOpened`.
+    NewConversation,
     /// The person asked to allow the microphone (may show the system prompt). Answered with
     /// `MicPermission` once decided.
     RequestMicPermission,
@@ -246,12 +254,18 @@ pub struct StatusReport {
     /// The gateway's transcriber and TTS as last heard (`Unknown` until a session is ready).
     pub transcriber: ServiceState,
     pub tts: ServiceState,
+    /// The account lacks `conversations:write` (`/auth/me`, or a `403 missing_scope`).
+    pub read_only: bool,
 }
 
 impl StatusReport {
     pub fn with_voice(mut self, transcriber: ServiceState, tts: ServiceState) -> Self {
         self.transcriber = transcriber;
         self.tts = tts;
+        self
+    }
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
         self
     }
     pub fn new(
@@ -273,6 +287,7 @@ impl StatusReport {
             peer_check,
             transcriber: ServiceState::Unknown,
             tts: ServiceState::Unknown,
+            read_only: false,
         }
     }
 }
@@ -364,18 +379,26 @@ pub enum IpcResponse {
     CaptureEnded,
     TextAccepted,
     TextRefused(TextRefusal),
-    /// `CancelTurn` handled: `cancel` sent if a turn or a wait was open, audio stopped.
+    /// `CancelTurn` handled: `cancel` sent if a turn of the open conversation may run.
     TurnCancelSent,
-    /// `TurnVisible` recorded.
-    TurnVisibleNoted,
+    /// `CancelTurn` with a conversation open but no link to the gateway: nothing was sent.
+    TurnCancelNotReady,
+    /// `ListConversations` accepted; one `Conversations` follows, then one per change.
+    ListSubscribed,
+    /// Pushed WITHOUT a request after `ListConversations`: the latest list (watch, no backlog).
+    Conversations(Vec<ConversationSummary>),
+    /// `OpenConversation` / `NewConversation` handled.
+    ConversationOpened,
     /// Answer to `RequestMicPermission` (after the system prompt, if one was shown).
     MicPermission(crate::audio::MicPermission),
 }
 
 /// IPC protocol version spoken by this build. 2 = S1 (subscribe, discover, pair, unpair);
 /// 3 = reconnect; 4 = conversation (S2); 5 = account (login/logout, `GatewayInfo::user`;
-/// pair/unpair removed).
-pub const IPC_VERSION: u32 = 5;
+/// pair/unpair removed); 6 = the conversations over `/events` (list, open, new; messages and
+/// turns as separate entries; `TurnVisible`, `speaking`, `awaiting_visible` and the view's
+/// `tts` removed).
+pub const IPC_VERSION: u32 = 6;
 
 // ---- conversation (IPC v4, spec S2) ------------------------------------------------------
 //
@@ -453,6 +476,9 @@ pub enum TextRefusal {
     NotReady,
     /// A take is open: end it first.
     Recording,
+    /// The account may read but not write conversations (`conversations:write` missing): the
+    /// administrator has to grant it. Never retried on its own.
+    MissingScope,
 }
 
 /// A gateway service as the agent last heard about it (`ready.live_capabilities` + `status`).
@@ -526,29 +552,18 @@ pub enum TurnOutcome {
     Closed,
 }
 
-/// Whether the reply was heard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub enum TurnAudio {
-    /// No audio (yet, or the turn had none).
-    #[default]
-    None,
-    Played,
-    /// Audio arrived but was not played (nobody confirmed the turn was on screen): text only.
-    Muted,
-}
-
-/// One turn of the conversation. Built by the core; fields are public so it can fill a
-/// `default()` value (the struct is `non_exhaustive`).
+/// One turn of the agent (v6: the person's message is its own [`MessageView`]). Built by the
+/// core; fields are public so it can fill a `default()` value (the struct is `non_exhaustive`).
 #[derive(Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct TurnView {
+    /// Empty for a turn from history.
     pub turn_id: String,
-    /// The gateway conversation this turn ran in (a change = a new day); `None` when unknown.
-    pub conversation: Option<String>,
     pub source: TurnSource,
-    /// What I typed or said (empty for a push).
-    pub mine: String,
+    /// The device that started it (a person's turn), as the gateway names it.
+    pub by_name: Option<String>,
+    /// Started from this device.
+    pub by_self: bool,
     /// Fogar's reply so far.
     pub reply: String,
     /// Current progress while no text is arriving; `None` once tokens flow or the turn ended.
@@ -558,7 +573,6 @@ pub struct TurnView {
     pub outcome: Option<TurnOutcome>,
     /// The gateway's stable code when `outcome` is `Error`.
     pub error_code: Option<String>,
-    pub audio: TurnAudio,
 }
 
 impl std::fmt::Debug for TurnView {
@@ -566,11 +580,88 @@ impl std::fmt::Debug for TurnView {
         f.debug_struct("TurnView")
             .field("turn_id", &self.turn_id)
             .field("source", &self.source)
-            .field("mine_bytes", &self.mine.len())
+            .field("by_name_bytes", &self.by_name.as_ref().map(String::len))
+            .field("by_self", &self.by_self)
             .field("reply_bytes", &self.reply.len())
             .field("progress", &self.progress)
             .field("outcome", &self.outcome)
-            .field("audio", &self.audio)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where a person's message is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum MessageState {
+    /// Waiting behind a running turn.
+    Pending,
+    /// Reached the agent.
+    #[default]
+    Delivered,
+    /// From history.
+    Past,
+    /// Our send failed (`MessageView::error_code` says why). Code `unknown`: no answer in
+    /// time, it may have reached the gateway; any other code: it did not.
+    Failed,
+}
+
+/// A person's message (this device's or another's).
+#[derive(Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct MessageView {
+    /// The gateway's id of a live message; empty for history and failures.
+    pub id: String,
+    pub text: String,
+    /// Sent from this device.
+    pub mine: bool,
+    /// The sending device's name when another device sent it.
+    pub from_name: Option<String>,
+    pub state: MessageState,
+    pub error_code: Option<String>,
+}
+
+impl std::fmt::Debug for MessageView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessageView")
+            .field("id", &self.id)
+            .field("text_bytes", &self.text.len())
+            .field("mine", &self.mine)
+            .field("from_name_bytes", &self.from_name.as_ref().map(String::len))
+            .field("state", &self.state)
+            .field("error_code", &self.error_code)
+            .finish()
+    }
+}
+
+/// One line of the conversation, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ViewEntry {
+    Message(MessageView),
+    Turn(TurnView),
+}
+
+/// One conversation of the list. `Debug` hides the title (derived from user text).
+#[derive(Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct ConversationSummary {
+    pub id: String,
+    pub title: Option<String>,
+    /// Private to one person, else the home's.
+    pub private: bool,
+    /// As the gateway gave it (ISO 8601); `None` when it never had a turn.
+    pub last_turn_at: Option<String>,
+    /// A turn runs in it now (any device): «en marcha».
+    pub running: bool,
+}
+
+impl std::fmt::Debug for ConversationSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConversationSummary")
+            .field("id", &self.id)
+            .field("title_bytes", &self.title.as_ref().map(String::len))
+            .field("private", &self.private)
+            .field("running", &self.running)
             .finish_non_exhaustive()
     }
 }
@@ -580,36 +671,35 @@ impl std::fmt::Debug for TurnView {
 #[derive(Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct ConversationView {
+    /// The open conversation; `None` = nothing open (the next text starts one).
+    pub id: Option<String>,
     pub activity: UserActivity,
     /// The live `transcription_partial` while recording.
     pub live: String,
     /// The transcript waiting for review in the text box.
     pub draft: Option<String>,
-    /// Oldest first, at most `CONVERSATION_MAX_TURNS`.
-    pub turns: Vec<TurnView>,
-    /// Audio is playing now.
-    pub speaking: bool,
-    /// A turn whose audio waits for `TurnVisible` before it may play.
-    pub awaiting_visible: Option<String>,
+    /// Oldest first, bounded by `CONVERSATION_MAX_TURNS` exchanges and
+    /// `CONVERSATION_MAX_TEXT_BYTES` of text.
+    pub entries: Vec<ViewEntry>,
     pub mic: crate::audio::MicPermission,
     pub transcriber: ServiceState,
-    pub tts: ServiceState,
     pub notice: Option<Notice>,
+    /// The account lacks `conversations:write`: it can read, not send.
+    pub read_only: bool,
 }
 
 impl std::fmt::Debug for ConversationView {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConversationView")
+            .field("id", &self.id)
             .field("activity", &self.activity)
             .field("live_bytes", &self.live.len())
             .field("draft_bytes", &self.draft.as_ref().map(String::len))
-            .field("turns", &self.turns)
-            .field("speaking", &self.speaking)
-            .field("awaiting_visible", &self.awaiting_visible)
+            .field("entries", &self.entries)
             .field("mic", &self.mic)
             .field("transcriber", &self.transcriber)
-            .field("tts", &self.tts)
             .field("notice", &self.notice)
+            .field("read_only", &self.read_only)
             .finish()
     }
 }

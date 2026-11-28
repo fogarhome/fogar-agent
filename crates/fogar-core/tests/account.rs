@@ -127,7 +127,7 @@ async fn login_stores_the_account_and_connects() {
     );
     // What went over the wire: the well-known probe, then the login (username trimmed, the
     // password as typed, our device name, the app type and the two scopes we need).
-    let seen = rig.routes.seen();
+    let seen = rest(&rig.routes);
     assert_eq!(seen[0].path, "/.well-known/fogar-gateway");
     let post = seen.iter().find(|r| r.method == "POST").unwrap();
     assert_eq!(post.path, "/auth/login");
@@ -146,7 +146,7 @@ async fn login_stores_the_account_and_connects() {
 
     // The link starts on the new account and the subscriber sees it.
     ready_promptly(&mut rig.health).await;
-    assert_eq!(rig.link.log().handshakes_ok, 1, "the account token works");
+    assert_eq!(rig.hub.subscribers(), 1, "the account token works");
     event_until(&mut c, |r| {
         r.phase == LinkPhase::Ready && r.gateway.as_deref() == Some(&*info)
     })
@@ -174,7 +174,7 @@ async fn login_deletes_legacy_pairing_items() {
     let mut rig = b.start();
     wait_state(&mut rig.health, |v| v.state == LinkState::NotPaired).await;
     tokio::time::sleep(Duration::from_secs(600)).await;
-    assert_eq!(rig.link.log().connections, 0, "legacy items are never used");
+    assert_eq!(rig.hub.stream_opens(), 0, "legacy items are never used");
     let mut c = client(&rig).await;
     let r = c.request(login_ok("127.0.0.1")).await;
     assert!(matches!(r, Some(IpcResponse::LoggedIn(_))), "{r:?}");
@@ -360,7 +360,7 @@ async fn input_and_discovery_failures() {
             Some(IpcResponse::LoginFailed(*expected)),
             "{address} {username:?}"
         );
-        assert_eq!(rig.routes.seen().len(), *n_seen, "{expected:?}");
+        assert_eq!(rest(&rig.routes).len(), *n_seen, "{expected:?}");
         assert_eq!(posts(&rig.routes), 0);
         assert!(!rig.secrets.contains(SecretKey::GatewayAccount));
         assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
@@ -394,7 +394,7 @@ async fn lan_address_needs_secure_without_network() {
             Some(IpcResponse::LoginFailed(LoginFailure::NeedsSecureAddress)),
             "{address}"
         );
-        assert!(rig.routes.seen().is_empty(), "{address}: no request at all");
+        assert!(rest(&rig.routes).is_empty(), "{address}: no request at all");
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert!(!rig.secrets.contains(SecretKey::GatewayAccount));
         assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
@@ -426,7 +426,7 @@ async fn loopback_needs_secure_without_network() {
             Some(IpcResponse::LoginFailed(LoginFailure::NeedsSecureAddress)),
             "{address}"
         );
-        assert!(rig.routes.seen().is_empty(), "{address}: no request at all");
+        assert!(rest(&rig.routes).is_empty(), "{address}: no request at all");
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert!(!rig.secrets.contains(SecretKey::GatewayAccount));
         assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
@@ -465,7 +465,7 @@ async fn tailnet_ip_needs_tailscale_to_list_it() {
                 r,
                 Some(IpcResponse::LoginFailed(LoginFailure::NeedsSecureAddress))
             );
-            assert!(rig.routes.seen().is_empty());
+            assert!(rest(&rig.routes).is_empty());
         }
         assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
     }
@@ -486,7 +486,7 @@ async fn adapter_refusal_after_the_core_check_needs_secure() {
         Some(IpcResponse::LoginFailed(LoginFailure::NeedsSecureAddress))
     );
     // Discovery answered; the login never reached the gateway.
-    assert_eq!(rig.routes.seen().len(), 1);
+    assert_eq!(rest(&rig.routes).len(), 1);
     assert_eq!(posts(&rig.routes), 0);
     assert!(!rig.secrets.contains(SecretKey::GatewayAccount));
     assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
@@ -542,7 +542,7 @@ async fn already_signed_in_and_busy() {
         r,
         Some(IpcResponse::LoginFailed(LoginFailure::AlreadySignedIn))
     );
-    assert!(rig.routes.seen().is_empty());
+    assert!(rest(&rig.routes).is_empty());
     assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
 
     // One sign-in at a time.
@@ -634,7 +634,7 @@ async fn logout_calls_the_gateway_and_clears() {
             gateway_reached: true
         })
     );
-    let out = rig.routes.seen().into_iter().last().unwrap();
+    let out = rest(&rig.routes).into_iter().last().unwrap();
     assert_eq!(
         (out.method.as_str(), out.path.as_str()),
         ("POST", "/auth/logout")
@@ -643,9 +643,10 @@ async fn logout_calls_the_gateway_and_clears() {
     assert!(!rig.secrets.contains(SecretKey::GatewayAccount));
     let v = wait_state(&mut rig.health, |v| v.state == LinkState::NotPaired).await;
     assert_eq!(v.gateway, None);
-    eventually(Duration::from_secs(5), || rig.link.log().client_closes >= 1).await;
+    eventually(Duration::from_secs(5), || rig.hub.subscribers() == 0).await;
+    let opens = rig.hub.stream_opens();
     tokio::time::sleep(Duration::from_secs(600)).await;
-    assert_eq!(rig.link.log().connections, 1, "signed out: no reconnect");
+    assert_eq!(rig.hub.stream_opens(), opens, "signed out: no reconnect");
 
     // Signing in again works at once; a second logout with nothing stored still answers.
     let mut c = client(&rig).await; // the first one was closed for being idle
@@ -687,7 +688,10 @@ async fn logout_with_gateway_down_still_clears() {
             _ => b.http_addrs = vec!["127.0.0.1:9"],
         }
         let mut rig = b.start();
-        wait_ready(&mut rig.health).await;
+        // "dead": no gateway answers at all, so the link never gets up either.
+        if broken != "dead" {
+            wait_ready(&mut rig.health).await;
+        }
         let mut c = client(&rig).await;
         let r = within(
             timeout + Duration::from_secs(5),
@@ -707,22 +711,24 @@ async fn logout_with_gateway_down_still_clears() {
     }
 }
 
-/// 4010/4200: the account is deleted and the link waits for a new sign-in (no retry); signing in
-/// again brings it back at once.
+/// `401 not_authenticated` on `/events`: the account is deleted and the link waits for a new
+/// sign-in (no retry); signing in again brings it back at once.
 #[tokio::test(start_paused = true)]
 async fn revocation_deletes_the_account() {
-    for code in [4010, 4200] {
+    {
         let mut b = RigBuilder::fake(MockConfig::default());
         b.with_ipc = true;
         b.routes.set("POST", "/auth/login", 201, LOGIN_OK);
         let mut rig = b.start();
         wait_ready(&mut rig.health).await;
-        assert_eq!(rig.link.close_all(code, "credential revoked"), 1);
+        rig.hub.revoke();
         wait_state(&mut rig.health, |v| v.state == LinkState::NotPaired).await;
-        assert!(!rig.secrets.contains(SecretKey::GatewayAccount), "{code}");
+        assert!(!rig.secrets.contains(SecretKey::GatewayAccount));
         // Past the post-revocation backoff: the link sits in the timer-less signed-out wait.
+        let opens = rig.hub.stream_opens();
         tokio::time::sleep(Duration::from_secs(90)).await;
-        assert_eq!(rig.health.snapshot().stats.connect_attempts, 1, "{code}");
+        assert_eq!(rig.hub.stream_opens(), opens);
+        rig.hub.restore();
         let mut c = client(&rig).await;
         let r = c.request(login_ok("127.0.0.1")).await;
         assert!(matches!(r, Some(IpcResponse::LoggedIn(_))), "{r:?}");
@@ -803,7 +809,7 @@ async fn uid_only_peers_cannot_login_or_logout() {
             "{req:?}: {r:?}"
         );
     }
-    assert!(rig.routes.seen().is_empty());
+    assert!(rest(&rig.routes).is_empty());
     assert!(rig.secrets.contains(SecretKey::GatewayAccount));
     let s = c.request(IpcRequest::Status).await;
     assert!(
@@ -817,7 +823,7 @@ async fn uid_only_peers_cannot_login_or_logout() {
     let mut c2 = client(&rig2).await;
     let r = c2.request(login_ok("127.0.0.1")).await;
     assert!(matches!(r, Some(IpcResponse::Refused { .. })), "{r:?}");
-    assert!(rig2.routes.seen().is_empty());
+    assert!(rest(&rig2.routes).is_empty());
     assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
     assert!(rig2.agent.shutdown(Duration::from_secs(4)).await.clean);
 }
@@ -928,7 +934,7 @@ async fn discover_tries_the_saved_address_then_this_machine() {
     assert!(
         matches!(c.request(IpcRequest::Discover).await, Some(IpcResponse::Discovered(f)) if f.len() == 1)
     );
-    assert_eq!(rig.routes.seen().len(), 1);
+    assert_eq!(rest(&rig.routes).len(), 1);
     assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
 
     // Nothing Fogar anywhere: empty, both well-known paths asked, within the probe deadline.
@@ -943,7 +949,7 @@ async fn discover_tries_the_saved_address_then_this_machine() {
     )
     .await;
     assert_eq!(r, Some(IpcResponse::Discovered(Vec::new())));
-    assert_eq!(rig.routes.seen().len(), 2);
+    assert_eq!(rest(&rig.routes).len(), 2);
     assert!(rig.agent.shutdown(Duration::from_secs(4)).await.clean);
 }
 
@@ -981,7 +987,7 @@ async fn subscription_pushes_changes_and_is_exempt_from_the_idle_close() {
     assert_eq!(first.phase, LinkPhase::Ready);
     // Silent for 10 idle periods: still subscribed (no request needed).
     tokio::time::sleep(idle * 10).await;
-    assert_eq!(rig.link.close_all(1012, ""), 1);
+    rig.hub.go_silent(); // a dead stream: a real reconnect
     event_until(&mut c, |r| r.phase == LinkPhase::Reconnecting).await;
     event_until(&mut c, |r| r.phase == LinkPhase::Ready && r.sessions == 2).await;
     // Requests still work on a subscribed connection.
@@ -1009,7 +1015,7 @@ async fn slow_subscriber_is_closed() {
     );
     // Plenty of state changes while `slow` reads nothing (its buffer holds 8 messages).
     for session in 1..=6u64 {
-        assert_eq!(rig.link.close_all(1012, ""), 1);
+        rig.hub.go_silent(); // a dead stream: a real reconnect
         wait_state(
             &mut rig.health,
             |v| matches!(v.state, LinkState::Ready { session: s } if s == session + 1),

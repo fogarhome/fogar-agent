@@ -1,0 +1,11 @@
+retry: 1000
+
+id: 1795689600000001
+data: {"type":"ready","protocol":5,"device_id":"…"}
+
+id: 1795689600000002
+data: {"type":"message","id":"run-1","conversation":"c1","text":"hola","from":{"source":"device","device_id":"…","name":"Mac","self":true},"state":"pending"}
+
+id: 1795689600000003
+data: {"type":"turn_start","turn_id":"9f3c…","conversation":"c1","origin":"user","by":{"device_id":"…","name":"Mac","self":true}}
+

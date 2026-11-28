@@ -5,19 +5,21 @@
 //! |---|---|---|
 //! | `data` | engine | `ingress` |
 //! | `edge` | IPC service (+ its per-connection JoinSet) | `ingress` |
-//! | `io` | link supervisor | `egress` |
+//! | `io` | link supervisor (`/events`) | `egress` |
 //! | `ops` | liveness heartbeat | `ops` |
 //!
 //! Shutdown: (1) cancel `ingress` -> engine stops playback, IPC stops; wait `data`+`edge`
-//! (budget/4). (2) cancel `egress` -> the session sends a close frame (bounded by
-//! `close_timeout`) and the supervisor stops; wait `io` (the rest minus budget/4, so >= budget/2).
+//! (budget/4). (2) cancel `egress` -> the supervisor drops its stream (the connection closes, no
+//! handshake) and stops; wait `io` (the rest minus budget/4, so >= budget/2).
 //! (3) cancel `ops`; wait (budget/4). Each wait has its own deadline; the report says what overran.
-//! Invariant: `Config::close_timeout` < budget/2 (1 s vs 2 s for the daemon's 4 s budget).
+//! Invariant: `Config::close_timeout` < budget/2 (1 s vs 2 s for the daemon's 4 s budget), kept
+//! for the voice link of PR 5.
 
 use crate::{
     account::Account,
     capture::CaptureGate,
     config::Config,
+    conversation::Chat,
     crashloop::BootMode,
     engine::Engine,
     heartbeat::Heartbeat,
@@ -30,7 +32,7 @@ use crate::{
 use fogar_ports::{
     audio::{AudioSink, AudioSource},
     clock::Clock,
-    gateway::{Frame, GatewayAddr, GatewayLink},
+    gateway::{GatewayAddr, GatewayLink},
     gateway_http::{GatewayHttp, HttpCall, HttpError, HttpReply},
     ipc::{
         ConversationView, IpcCaps, IpcConn, IpcError, IpcRequest, IpcResponse, IpcServer,
@@ -49,11 +51,13 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 #[allow(missing_debug_implementations)] // holds trait objects without Debug
 pub struct AgentPorts<C, L, I, H = NoHttp, T = NoTailnet> {
     pub clock: Arc<C>,
+    /// The voice WebSocket. Not used since S4 PR 4a (the chat goes over `http`); kept for the
+    /// voice link of PR 5.
     pub link: L,
     /// `None` = no local UI socket on this platform/build.
     pub ipc: Option<I>,
-    /// Discovery and the account (`/.well-known`, `/auth/login`, `/auth/logout`); used by the
-    /// IPC service only.
+    /// The gateway over HTTP: discovery and the account (IPC service), and the chat link
+    /// (`GET /events`).
     pub http: H,
     /// Tailnet peers for discovery; `NoTailnet` where there is no adapter.
     pub tailnet: T,
@@ -72,8 +76,11 @@ pub struct HealthProbe {
     pub(crate) boot_mode: &'static str,
     /// The conversation view the engine publishes (also the voice state for `StatusReport`).
     pub(crate) conversation: watch::Receiver<ConversationView>,
+    /// The conversation list as the UI draws it (IPC v6 `Conversations`).
+    pub(crate) list: watch::Receiver<Vec<fogar_ports::ipc::ConversationSummary>>,
+    /// The conversation store: the list and the open conversation (for tests).
+    chat: watch::Receiver<Chat>,
     probe_caps: Option<ProbeCaps>,
-    out_tx: mpsc::WeakSender<Frame>,
     in_tx: mpsc::WeakSender<Inbound>,
 }
 
@@ -85,7 +92,6 @@ impl HealthProbe {
             last_close: v.last_close,
             stats: self.stats.snapshot(),
             boot_mode: self.boot_mode,
-            out_queue_len: queue_len(&self.out_tx),
             in_queue_len: queue_len(&self.in_tx),
         }
     }
@@ -93,6 +99,11 @@ impl HealthProbe {
     /// Latest conversation view (for the composition root and tests).
     pub fn conversation(&self) -> ConversationView {
         self.conversation.borrow().clone()
+    }
+
+    /// Latest conversation store (the list, the open conversation).
+    pub fn chat(&self) -> Chat {
+        self.chat.borrow().clone()
     }
 
     pub fn probe_caps(&self) -> Option<ProbeCaps> {
@@ -145,6 +156,9 @@ pub struct Agent<C> {
     health: HealthProbe,
     heartbeat: Arc<Heartbeat>,
     view_tx: watch::Sender<LinkView>,
+    /// In-crate tests drive engine commands directly.
+    #[cfg(test)]
+    pub(crate) cmds: mpsc::Sender<crate::engine::Command>,
 }
 
 impl<C: Clock> Agent<C> {
@@ -167,17 +181,23 @@ impl<C: Clock> Agent<C> {
         let (account_tx, account_rx) = watch::channel(());
         // IPC reconnect -> parked link (`queues`: watch, coalescing).
         let (reconnect_tx, reconnect_rx) = watch::channel(());
-        let (out_tx, out_rx) = mpsc::channel::<Frame>(queues::OUTBOUND);
         let (in_tx, in_rx) = mpsc::channel::<Inbound>(queues::INBOUND);
         let (cmd_tx, cmd_rx) = mpsc::channel(queues::ENGINE_COMMANDS);
+        #[cfg(test)]
+        let cmds = cmd_tx.clone();
         let (conv_tx, conv_rx) = watch::channel(ConversationView::default());
+        // The conversation store (`queues`: watch, coalescing).
+        let (chat_tx, chat_rx) = watch::channel(Chat::default());
+        // The list as the UI draws it (`queues`: watch, coalescing).
+        let (list_tx, list_rx) = watch::channel(Vec::new());
         let health = HealthProbe {
             stats: stats.clone(),
             view: view_rx,
             boot_mode: boot.label(),
             conversation: conv_rx,
+            list: list_rx,
+            chat: chat_rx,
             probe_caps: ports.probe.as_ref().map(|p| p.capabilities()),
-            out_tx: out_tx.downgrade(),
             in_tx: in_tx.downgrade(),
         };
         let root = CancellationToken::new();
@@ -192,14 +212,17 @@ impl<C: Clock> Agent<C> {
         );
         let heartbeat = Arc::new(Heartbeat::new(ms(&*ports.clock)));
 
+        let http = Arc::new(ports.http);
         let engine = Engine {
             clock: ports.clock.clone(),
             cfg: cfg.clone(),
             stats: stats.clone(),
-            out_tx,
+            http: http.clone(),
             in_rx,
             cmd_rx,
             conv: conv_tx,
+            chat: chat_tx,
+            list: list_tx,
         };
         // The microphone goes straight to the consent gate: the engine never holds it.
         let capture = CaptureGate::new(ports.audio_in, &cfg, stats.clone());
@@ -209,7 +232,7 @@ impl<C: Clock> Agent<C> {
 
         let link = LinkCtx {
             clock: ports.clock.clone(),
-            link: ports.link,
+            http: http.clone(),
             secrets: ports.secrets.clone(),
             random: ports.random,
             cfg: cfg.clone(),
@@ -221,12 +244,12 @@ impl<C: Clock> Agent<C> {
             reconnect: reconnect_rx,
             _reconnect_keep: reconnect_tx.clone(),
         };
-        io.spawn(link.run(out_rx, in_tx, egress.clone()));
+        io.spawn(link.run(in_tx, egress.clone()));
 
         if let Some(server) = ports.ipc {
             let account = Account {
                 clock: ports.clock.clone(),
-                http: Arc::new(ports.http),
+                http,
                 tailnet: Arc::new(ports.tailnet),
                 secrets: ports.secrets,
                 cfg: cfg.clone(),
@@ -273,6 +296,8 @@ impl<C: Clock> Agent<C> {
             health,
             heartbeat,
             view_tx,
+            #[cfg(test)]
+            cmds,
         }
     }
 
@@ -295,7 +320,7 @@ impl<C: Clock> Agent<C> {
         self.view_tx
             .send_modify(|v| v.state = LinkState::ShuttingDown);
         // Phase split (review code#2): ingress and ops get a quarter each; egress gets the
-        // rest (>= half), because it contains the WebSocket close handshake, bounded by
+        // rest (>= half), room for PR 5's WebSocket close handshake, bounded by
         // `Config::close_timeout` (1 s default) so a hung peer still fits the budget.
         let started = self.clock.now();
         let quarter = budget / 4;
@@ -345,6 +370,30 @@ async fn beat<C: Clock>(
             () = clock.sleep(every) => hb.beat(ms(&*clock)),
         }
     }
+}
+
+/// In-crate tests: the agent over in-memory fakes (the ports are handed over here only, archtest
+/// R11/R12).
+#[cfg(test)]
+pub(crate) fn start_for_test(
+    http: fogar_testkit::FakeGatewayHttp,
+    secrets: Arc<dyn SecretStore>,
+    mic: fogar_testkit::FakeMic,
+    speaker: fogar_testkit::FakeSpeaker,
+) -> Agent<fogar_testkit::TestClock> {
+    let ports: AgentPorts<_, _, NoIpc, _, NoTailnet> = AgentPorts {
+        clock: Arc::new(fogar_testkit::TestClock::new()),
+        link: fogar_testkit::FakeGatewayLink::new(fogar_testkit::MockConfig::default()),
+        ipc: None,
+        http,
+        tailnet: NoTailnet,
+        secrets,
+        random: Arc::new(fogar_testkit::SeededRandom::new(7)),
+        audio_in: Arc::new(mic),
+        audio_out: Arc::new(speaker),
+        probe: None,
+    };
+    Agent::start(ports, Config::default(), BootMode::Normal)
 }
 
 /// For builds without a local UI socket: `accept` never resolves.

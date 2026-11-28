@@ -58,9 +58,9 @@ impl core::error::Error for EncodeError {}
 
 /// Only the `type` tag; every other field is skipped without allocating.
 #[derive(Deserialize)]
-struct Tag<'a> {
+pub(crate) struct Tag<'a> {
     #[serde(borrow, rename = "type")]
-    ty: Cow<'a, str>,
+    pub(crate) ty: Cow<'a, str>,
 }
 
 /// Decodes one server text frame. Never panics on any input (proptest-checked).

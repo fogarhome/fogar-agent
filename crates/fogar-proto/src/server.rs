@@ -84,10 +84,10 @@ pub struct Ready {
 // the wrong shape becomes the default. Only the strings that are actually kept are allocated.
 
 /// Visits one JSON value: `Some(T)` if it is a string `T` accepts, `None` for anything else.
-struct Lenient<T>(PhantomData<T>);
+pub(crate) struct Lenient<T>(pub(crate) PhantomData<T>);
 
 /// How a string becomes the field's type.
-trait FromJsonStr: Sized {
+pub(crate) trait FromJsonStr: Sized {
     fn from_json_str<E: de::Error>(s: &str) -> Option<Self>;
 }
 
@@ -125,15 +125,19 @@ impl FromJsonStr for TurnEndReason {
     }
 }
 
-fn lenient_origin<'de, D: Deserializer<'de>>(d: D) -> Result<Option<TurnOrigin>, D::Error> {
+pub(crate) fn lenient_origin<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<TurnOrigin>, D::Error> {
     d.deserialize_any(Lenient::<TurnOrigin>(PhantomData))
 }
 
-fn lenient_end_reason<'de, D: Deserializer<'de>>(d: D) -> Result<Option<TurnEndReason>, D::Error> {
+pub(crate) fn lenient_end_reason<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<TurnEndReason>, D::Error> {
     d.deserialize_any(Lenient::<TurnEndReason>(PhantomData))
 }
 
-fn drain_seq<'de, A: SeqAccess<'de>>(mut a: A) -> Result<(), A::Error> {
+pub(crate) fn drain_seq<'de, A: SeqAccess<'de>>(mut a: A) -> Result<(), A::Error> {
     while a.next_element::<IgnoredAny>()?.is_some() {}
     Ok(())
 }
@@ -166,6 +170,7 @@ macro_rules! lenient_other {
         }
     };
 }
+pub(crate) use lenient_other;
 
 impl<'de, T: FromJsonStr> Visitor<'de> for Lenient<T> {
     type Value = Option<T>;
@@ -196,12 +201,14 @@ impl<'de, T: FromJsonStr> de::DeserializeSeed<'de> for Lenient<T> {
     }
 }
 
-fn lenient_string<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+pub(crate) fn lenient_string<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     Ok(d.deserialize_any(Lenient::<String>(PhantomData))?
         .unwrap_or_default())
 }
 
-fn lenient_opt_string<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+pub(crate) fn lenient_opt_string<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
     d.deserialize_any(Lenient::<String>(PhantomData))
 }
 
@@ -247,7 +254,7 @@ impl<'de> Visitor<'de> for LenientU32 {
     }
 }
 
-fn lenient_u32<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+pub(crate) fn lenient_u32<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
     d.deserialize_any(LenientU32)
 }
 
@@ -369,6 +376,11 @@ impl<'de> de::DeserializeSeed<'de> for LenientBool {
     }
 }
 
+/// A JSON `true`/`false`; anything else is `false`.
+pub(crate) fn lenient_bool<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    d.deserialize_any(LenientBool)
+}
+
 impl<'de> Visitor<'de> for LenientCaps {
     type Value = Capabilities;
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -435,7 +447,7 @@ pub struct Transcription {
 }
 
 /// `<redacted N bytes>`: user content never reaches `{:?}` (review sec#7, LOG-1).
-struct Redacted(usize);
+pub(crate) struct Redacted(pub(crate) usize);
 
 impl fmt::Debug for Redacted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -502,7 +514,7 @@ impl FromJsonStr for ProgressPhase {
     }
 }
 
-fn lenient_phase<'de, D: Deserializer<'de>>(d: D) -> Result<ProgressPhase, D::Error> {
+pub(crate) fn lenient_phase<'de, D: Deserializer<'de>>(d: D) -> Result<ProgressPhase, D::Error> {
     Ok(d.deserialize_any(Lenient::<ProgressPhase>(PhantomData))?
         .unwrap_or(ProgressPhase::Working))
 }
@@ -524,11 +536,11 @@ pub struct TurnProgress {
 /// Longest tool name the gateway sends (3.0.1 §5).
 pub const TOOL_NAME_MAX: usize = 128;
 
-fn working() -> ProgressPhase {
+pub(crate) fn working() -> ProgressPhase {
     ProgressPhase::Working
 }
 
-fn lenient_tool<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+pub(crate) fn lenient_tool<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
     Ok(lenient_opt_string(d)?.filter(|t| {
         !t.is_empty()
             && t.len() <= TOOL_NAME_MAX

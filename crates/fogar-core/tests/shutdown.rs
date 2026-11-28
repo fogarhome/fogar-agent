@@ -1,24 +1,21 @@
 //! Ordered graceful shutdown: no leaked tasks (runtime live-task count returns to baseline), the
-//! gateway gets a close frame, the mic and speaker are released, IPC served until ingress closes.
+//! `/events` stream is closed, the mic and speaker are released, IPC served until ingress closes.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)] // the harness drives tokio's paused clock directly
 
 mod common;
 use common::*;
 use fogar_core::LinkState;
 use fogar_ports::ipc::{IPC_VERSION, IpcRequest, IpcResponse};
-use fogar_testkit::MockConfig;
+use fogar_testkit::{MockConfig, StreamStep};
 use std::time::Duration;
 
 #[tokio::test(start_paused = true)]
 async fn graceful_shutdown_returns_to_the_task_baseline() {
     let baseline = alive_tasks();
-    let mut b = RigBuilder::fake(MockConfig {
-        tts_frames: 1000,
-        frame_interval: Duration::from_millis(20),
-        ..MockConfig::default()
-    });
+    let mut b = RigBuilder::fake(MockConfig::default());
     b.with_ipc = true;
     let mut rig = b.app_on_screen().start();
+    rig.hub.seed_conversation("c-1", "Serie");
     wait_ready(&mut rig.health).await;
     assert!(alive_tasks() > baseline);
     assert_eq!(rig.mic.opens(), 0, "S2 Decision 1: no microphone at start");
@@ -47,13 +44,13 @@ async fn graceful_shutdown_returns_to_the_task_baseline() {
         })
     );
 
-    // Shut down in the middle of a streaming turn.
-    say(&rig, "pon la serie").await;
+    // Shut down while another device's turn streams in.
+    rig.hub.set_reply(&["a"; 50], Duration::from_millis(100));
+    rig.hub.other_device_send("c-1", "pon la serie");
     eventually(Duration::from_secs(30), || {
-        rig.health.snapshot().stats.tts_frames_played > 3
+        rig.health.snapshot().stats.events_received > 3
     })
     .await;
-    let link = rig.link.clone();
     let mic = rig.mic.clone();
     let speaker = rig.speaker.clone();
     let mut health = rig.health.clone();
@@ -65,13 +62,10 @@ async fn graceful_shutdown_returns_to_the_task_baseline() {
     assert_eq!(health.wait_link(|_| true).await.state, LinkState::Stopped);
     assert_eq!(mic.opens(), 0, "the microphone was never opened");
     assert_eq!(speaker.snapshot().open_now, 0, "output device released");
-    assert_eq!(
-        link.log().client_closes,
-        1,
-        "gateway received a close frame"
-    );
+    assert_eq!(rig.hub.subscribers(), 0, "the stream was closed");
     drop(client);
-    eventually(Duration::from_secs(5), || link.live_server_tasks() == 0).await;
+    // The hub's turn driver ends with its reply.
+    tokio::time::sleep(Duration::from_secs(10)).await;
     eventually(Duration::from_secs(5), || alive_tasks() == baseline).await;
     drop(ipc);
 }
@@ -79,7 +73,7 @@ async fn graceful_shutdown_returns_to_the_task_baseline() {
 #[tokio::test(start_paused = true)]
 async fn shutdown_while_parked_or_backing_off_is_prompt() {
     let b = RigBuilder::fake(MockConfig::default());
-    b.link.fail_next_connects(u32::MAX);
+    b.routes.set("GET", "/events", 503, "");
     let mut rig = b.start();
     wait_state(
         &mut rig.health,
@@ -94,49 +88,23 @@ async fn shutdown_while_parked_or_backing_off_is_prompt() {
     );
 }
 
-/// Review code#2: a peer that never completes the WebSocket close handshake (gateway hung,
-/// network gone) must not make an ordinary stop unclean within the daemon's 4 s budget.
-mod hung_close {
-    use fogar_ports::gateway::{Frame, GatewayLink, LinkError, LinkEvent, LinkSession};
-    use fogar_testkit::FakeGatewayLink;
-
-    #[derive(Clone)]
-    pub(super) struct HungClose(pub(super) FakeGatewayLink);
-    pub(super) struct HungSess(<FakeGatewayLink as GatewayLink>::Session);
-
-    impl LinkSession for HungSess {
-        fn max_frame(&self) -> usize {
-            self.0.max_frame()
-        }
-        async fn send(&mut self, f: Frame) -> Result<(), LinkError> {
-            self.0.send(f).await
-        }
-        async fn recv(&mut self) -> Option<LinkEvent> {
-            self.0.recv().await
-        }
-        async fn close(&mut self, _c: u16, _r: &str) -> Result<(), LinkError> {
-            std::future::pending().await
-        }
-    }
-
-    impl GatewayLink for HungClose {
-        type Session = HungSess;
-        async fn connect(
-            &self,
-            addr: &fogar_ports::gateway::GatewayAddr,
-            route: fogar_ports::gateway::WsRoute,
-        ) -> Result<HungSess, LinkError> {
-            Ok(HungSess(self.0.connect(addr, route).await?))
-        }
-    }
-}
-
+/// A stream that never sends another byte (gateway hung, network gone) must not make an
+/// ordinary stop unclean within the daemon's 4 s budget: the stream is just dropped.
 #[tokio::test(start_paused = true)]
-async fn hung_peer_close_still_fits_the_daemon_budget() {
-    let link = hung_close::HungClose(fogar_testkit::FakeGatewayLink::new(MockConfig::default()));
-    let mut rig = RigBuilder::with_link(link, &MockConfig::default().client_key).start();
+async fn hung_stream_still_fits_the_daemon_budget() {
+    let mut rig = RigBuilder::fake(MockConfig::default()).start();
+    rig.routes.set_stream(
+        "GET",
+        "/events",
+        200,
+        vec![
+            StreamStep::Bytes(b"id: 7\ndata: {\"type\":\"ready\",\"protocol\":5}\n\n".to_vec()),
+            StreamStep::HoldOpen,
+        ],
+    );
     wait_ready(&mut rig.health).await;
     // fogar-agentd's SHUTDOWN_BUDGET.
     let r = rig.agent.shutdown(Duration::from_secs(4)).await;
     assert!(r.clean, "{r:?}");
+    eventually(Duration::from_secs(1), || rig.routes.disconnects() == 1).await;
 }

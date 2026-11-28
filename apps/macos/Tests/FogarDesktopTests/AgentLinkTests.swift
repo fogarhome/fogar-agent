@@ -68,7 +68,7 @@ nonisolated final class FakeAgent: @unchecked Sendable {
 
 nonisolated let ready = WireStatus(link: "ready", phase: .ready,
                        gateway: WireGateway(address: "http://green-house:8004", name: "green-house", version: "1.29.0", client_name: "Mac", user: ""),
-                       sessions: 1, turns_completed: 2, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown)
+                       sessions: 1, turns_completed: 2, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown, read_only: false)
 
 func answers(version: UInt32 = ipcVersion, login: WireResponse = .loggedIn(ready.gateway!),
              logout: WireResponse = .loggedOut(WireLoggedOut(gateway_reached: true))) -> @Sendable (WireRequest) -> [WireResponse] {
@@ -82,7 +82,7 @@ func answers(version: UInt32 = ipcVersion, login: WireResponse = .loggedIn(ready
         case .reconnect: [.event(ready), .reconnecting]
         case .status: [.status(ready)]
         case .subscribeConversation, .sendText, .captureStart, .captureEnd, .cancelTurn,
-             .turnVisible, .requestMicPermission:
+             .requestMicPermission, .listConversations, .openConversation, .newConversation:
             [.refused(WireRefused(reason: "not in these tests"))]
         }
     }
@@ -233,7 +233,7 @@ extension AgentLinkOverASocket {
     @Test func readyNamesThePersonAndTheHome() {
         let conPersona = WireGateway(address: "https://casa.ts.net", name: "green-house", version: "5.0.0", client_name: "Mac", user: "Sito")
         let s = WireStatus(link: "ready", phase: .ready, gateway: conPersona, sessions: 1, turns_completed: 0,
-                           boot_mode: "normal", peer_check: .sameSigner, transcriber: .up, tts: .up)
+                           boot_mode: "normal", peer_check: .sameSigner, transcriber: .up, tts: .up, read_only: false)
         let t = Textos.titular(.live(s))
         #expect(t.titulo == "Conectado a green-house")
         #expect(t.sub.contains("Sito"))
@@ -243,7 +243,7 @@ extension AgentLinkOverASocket {
     @Test func everyPhaseHasAHeadline() {
         for phase: WirePhase in [.notPaired, .connecting, .ready, .reconnecting, .parked, .stopping] {
             let s = WireStatus(link: phase.rawValue, phase: phase, gateway: ready.gateway, sessions: 0,
-                               turns_completed: 0, boot_mode: "normal", peer_check: .uidOnly, transcriber: .unknown, tts: .unknown)
+                               turns_completed: 0, boot_mode: "normal", peer_check: .uidOnly, transcriber: .unknown, tts: .unknown, read_only: false)
             #expect(!Textos.titular(.live(s)).titulo.isEmpty)
         }
         #expect(Textos.titular(.versionMismatch(agent: 1)).titulo == "Actualiza el agente de Fogar")
@@ -251,14 +251,14 @@ extension AgentLinkOverASocket {
 
     @Test func upgradeParkSaysToUpdate() {
         let s = WireStatus(link: "parked_upgrade_client", phase: .parked, gateway: ready.gateway, sessions: 0,
-                           turns_completed: 0, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown)
+                           turns_completed: 0, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown, read_only: false)
         #expect(Textos.titular(.live(s)).sub == "El gateway habla una versión nueva. Actualiza Fogar Desktop; si ya lo hiciste, pulsa Reconectar.")
     }
 
     /// Gateway 5.0 close 4011: the key still works; the admin grants the scope, then Reconectar.
     @Test func missingScopeParkSaysToAskForPermission() {
         let s = WireStatus(link: "parked_missing_scope", phase: .parked, gateway: ready.gateway, sessions: 0,
-                           turns_completed: 0, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown)
+                           turns_completed: 0, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown, read_only: false)
         #expect(Textos.titular(.live(s)).sub == "Este Mac no tiene permiso para conversar con Fogar. Pide a quien administra Fogar que se lo dé y pulsa Reconectar.")
     }
 
@@ -266,7 +266,7 @@ extension AgentLinkOverASocket {
     @Test func pausesWithReconnectSayReconectar() {
         for link in ["parked_missing_scope", "parked_agent_refused", "parked_upgrade_client"] {
             let s = WireStatus(link: link, phase: .parked, gateway: ready.gateway, sessions: 0,
-                               turns_completed: 0, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown)
+                               turns_completed: 0, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown, read_only: false)
             let sub = Textos.titular(.live(s)).sub
             #expect(sub.contains("Reconectar"))
             #expect(!sub.contains("einicia"))
@@ -275,7 +275,7 @@ extension AgentLinkOverASocket {
 }
 
 nonisolated let notPaired = WireStatus(link: "not_paired", phase: .notPaired, gateway: nil, sessions: 1,
-                                       turns_completed: 2, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown)
+                                       turns_completed: 2, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown, read_only: false)
 
 /// Revocation (gateway 4200/4010): the agent goes from signed in to `not_paired` by itself.
 @Suite struct AccesoRetirado {
@@ -292,7 +292,7 @@ nonisolated let notPaired = WireStatus(link: "not_paired", phase: .notPaired, ga
         #expect(!AgentLink.retirado(antes: .notRunning, despues: .live(notPaired), cerrandoSesion: false, yaRetirado: false))
         // Keychain error at boot: `reconnecting` with no gateway, then `not_paired`.
         let sinClave = WireStatus(link: "backoff", phase: .reconnecting, gateway: nil, sessions: 0,
-                                  turns_completed: 0, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown)
+                                  turns_completed: 0, boot_mode: "normal", peer_check: .sameSigner, transcriber: .unknown, tts: .unknown, read_only: false)
         #expect(!AgentLink.retirado(antes: .live(sinClave), despues: .live(notPaired), cerrandoSesion: false, yaRetirado: false))
     }
 

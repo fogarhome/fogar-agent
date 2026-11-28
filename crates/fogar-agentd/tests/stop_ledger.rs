@@ -4,7 +4,6 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use futures_util::{SinkExt, StreamExt};
 use std::{
     io::{BufRead, Write},
     path::{Path, PathBuf},
@@ -12,12 +11,31 @@ use std::{
     sync::mpsc,
     time::{Duration, Instant},
 };
-use tokio::net::TcpListener;
-use tokio_tungstenite::tungstenite::Message;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
 
 const BIN: &str = env!("CARGO_BIN_EXE_fogar-agentd");
 const KEY: &str = "stop-ledger-key";
-const READY: &str = r#"{"type":"ready","session_id":"c:1","agent":"main","input_mode":"audio","output_mode":["audio","text"],"requested_capabilities":{},"live_capabilities":{}}"#;
+/// A `GET /events` answer up to its `ready` (close-delimited body: no length, no chunking).
+const READY_STREAM: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\nretry: 1000\n\nid: 1\ndata: {\"type\":\"ready\",\"protocol\":5}\n\n";
+
+/// Reads a request head (the daemon sends no body on `GET /events`). `false`: not a request.
+async fn read_head(s: &mut TcpStream) -> bool {
+    let mut buf = Vec::new();
+    let mut b = [0u8; 1024];
+    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        match s.read(&mut b).await {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => buf.extend_from_slice(&b[..n]),
+        }
+        if buf.len() > 64 * 1024 {
+            return false;
+        }
+    }
+    true
+}
 
 fn state_dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("fogar-stop-{name}-{}", std::process::id()));
@@ -108,19 +126,17 @@ fn hung_gateway_close_still_records_a_clean_stop() {
         .unwrap();
     let listener = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
     let port = listener.local_addr().unwrap().port();
-    // Gateway: handshake, `ready`, then never reads again (the close is never answered).
+    // Gateway: `/events` answers `ready`, then never sends nor reads again.
     rt.spawn(async move {
         let mut held = Vec::new();
         loop {
-            let Ok((s, _)) = listener.accept().await else {
+            let Ok((mut s, _)) = listener.accept().await else {
                 return;
             };
-            let Ok(mut ws) = tokio_tungstenite::accept_async(s).await else {
-                continue;
-            };
-            let _ = ws.next().await;
-            let _ = ws.send(Message::Text(READY.into())).await;
-            held.push(ws);
+            if read_head(&mut s).await {
+                let _ = s.write_all(READY_STREAM.as_bytes()).await;
+                held.push(s);
+            }
         }
     });
     let dir = state_dir("hung");
@@ -186,27 +202,25 @@ fn rate_limit_never_swallows_parked_and_reports_suppressed_lines() {
     rt.spawn(async move {
         let mut n = 0u32;
         loop {
-            let Ok((s, _)) = listener.accept().await else {
+            let Ok((mut s, _)) = listener.accept().await else {
                 return;
             };
-            let Ok(mut ws) = tokio_tungstenite::accept_async(s).await else {
+            if !read_head(&mut s).await {
                 continue;
-            };
-            let _ = ws.next().await;
-            let _ = ws.send(Message::Text(READY.into())).await;
+            }
             n += 1;
-            let (code, reason) = if n <= FLAPS {
-                (1000u16, "")
+            // `ready`, then the stream ends at once (a flap); then the device is revoked (401).
+            let reply = if n <= FLAPS {
+                READY_STREAM.to_owned()
             } else {
-                (4200u16, "credential revoked")
+                let body = r#"{"detail":"not_authenticated"}"#;
+                format!(
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
             };
-            let _ = ws
-                .close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
-                    code: code.into(),
-                    reason: reason.into(),
-                }))
-                .await;
-            while ws.next().await.is_some() {}
+            let _ = s.write_all(reply.as_bytes()).await;
+            let _ = s.shutdown().await;
         }
     });
     let dir = state_dir("ratelimit");
@@ -224,7 +238,7 @@ fn rate_limit_never_swallows_parked_and_reports_suppressed_lines() {
         let parked = l.contains("link not_paired");
         if parked {
             // The revocation names its close, like the backoff lines do.
-            assert!(l.contains("(last close 4200 -> Repair)"), "{l}");
+            assert!(l.contains("(last close 401 -> Repair)"), "{l}");
         }
         all.push((Instant::now(), l));
         // Before the fix this line never came once the flaps had used up the burst.

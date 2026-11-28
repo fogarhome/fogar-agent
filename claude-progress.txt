@@ -422,3 +422,23 @@ ws:// LAN + wss:// rustls, macOS UDS IPC with peer check, SwiftUI menu-bar app i
   hardware contract tests fail here with «audio backend failure», unrelated); gen-wire --check
   up to date; swift build + swift test (110) green; real-gateway E2E against 290efa0 passed.
 - NOT verified: Keychain on the real Mac with the signed app, the app by eye, anything on the M2.
+
+## S4 — PR 4a: the chat over /events (list, open, send, stop; IPC v6) (2026-11-28)
+- Link: one GET /events stream (SSE reader; 128 KiB per event GUESSED), 25 s rotation
+  invisible, resume by Last-Event-ID, resync re-fetches. Engine: list / open / send / create /
+  stop over REST, bounded (writes <= 4, one list, one /auth/me, one open step). IPC v6.
+  Dictation off until PR 5 (takes refused NoTranscriber); nothing plays.
+- Review fix wave: one /auth/me at a time (resync flood); `unknown` sends not doubled and
+  shown «Puede que se enviara…»; a failed create never lands in another conversation; a text
+  during a create is busy; stop with no link says so (TurnCancelNotReady); names/titles
+  cleaned of control/bidi characters; a missed SignedOut is sent before the next Up; SSE
+  strict UTF-8, ids <= 20 bytes, only a too-big data line drops its event, the dropped
+  event's id becomes the resume point; tokens re-mark a running turn after a resync; the mock
+  E2E now really rotates (stable_stream 1 s < stream_for 2 s, session stays 1).
+- features.json: the S0 rows whose evidence named deleted WS tests (slice0_e2e WS tests,
+  slice0_turns.rs) now say so; WS-only features (turn over WS, barge-in, push playback,
+  WS closes, keepalive) are passes=false until PR 5.
+- Verified (macOS, local): fmt, clippy -D warnings, `cargo test --workspace --exclude
+  fogar-agent-macos` green (soak bounds unchanged); fuzz check; gen-wire --check; swift build
+  + swift test (108) green; real-gateway E2E against the gw290 snapshot passed.
+- NOT verified: Linux CI, the app by eye, idle cost (energy), anything on the M2.

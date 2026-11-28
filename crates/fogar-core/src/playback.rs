@@ -4,9 +4,8 @@
 //! - [`PlaybackGate`] is the only owner of the speaker port: `AgentPorts` hands it the
 //!   `AudioSink` and the engine keeps only the gate (archtest R12: no other file names the port).
 //! - A turn's audio reaches the speaker only after the app confirms it is SHOWING that turn
-//!   (`IpcRequest::TurnVisible`, from a same-signer connection subscribed to the conversation;
-//!   `ipc.rs` checks both). The app confirms its own turns at `turn_start`, and a push only while
-//!   the conversation window is on screen; the core treats both alike.
+//!   (IPC v5's `TurnVisible`; IPC v6 has no confirmation and nothing feeds the gate until PR 5,
+//!   which decides how the app confirms). [`PlaybackGate::visible`] is that one entry.
 //! - Until then the turn's audio waits in a bounded buffer of [`UNSEEN_MAX_SAMPLES`] (3 s at
 //!   24 kHz, ~144 KB). If no confirmation arrives within [`VISIBLE_DEADLINE`] (2 s from the
 //!   `turn_start`), or the buffer fills, the turn's audio is discarded (counted in
@@ -39,13 +38,22 @@ use crate::{capture::spawn_device_job, conversation, stats::Stats, time::sleep_u
 use fogar_ports::{
     audio::{ActivePlayback, AudioError, AudioFormat, AudioSink, OPEN_BLOCK_MAX},
     clock::{Clock, Mono},
-    ipc::TurnAudio,
 };
+
+/// Whether a turn's reply was heard (IPC v5 showed it; v6 has no audio mark until PR 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnAudio {
+    Played,
+    /// Audio arrived but nobody confirmed the turn was on screen: text only.
+    Muted,
+}
 use fogar_proto::audio::{TTS_RATE_HZ, TtsFrame};
 use std::{sync::Arc, time::Duration};
 use tokio::task::JoinSet;
 
 /// How long a turn's audio may wait for `TurnVisible`, from its `turn_start` (spec S2).
+// shortcut: no turn is followed until PR 5 (nothing feeds the gate in S4 PR 4a).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const VISIBLE_DEADLINE: Duration = Duration::from_secs(2);
 /// Unconfirmed (or not yet writable) audio kept per turn: 3 s at 24 kHz (spec S2, ~144 KB).
 pub(crate) const UNSEEN_MAX_SAMPLES: usize = 3 * TTS_RATE_HZ as usize;
@@ -65,6 +73,8 @@ const OPEN_BACKOFF_CAP: Duration = Duration::from_secs(8);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Visible {
     /// Not yet; the audio waits (bounded) until `until`.
+    // shortcut: built only by `follow`, idle until PR 5.
+    #[cfg_attr(not(test), allow(dead_code))]
     Waiting { until: Mono },
     /// Confirmed in time: its audio plays.
     Seen,
@@ -75,7 +85,6 @@ enum Visible {
 /// The turn whose audio the gate handles (the turn machine's current or last turn).
 #[derive(Debug)]
 struct TurnPlay {
-    turn_id: String,
     turn_seq: u16,
     /// The id as the view shows it (and the app confirms it).
     view_id: String,
@@ -121,8 +130,6 @@ pub(crate) struct PlaybackGate {
     speaking: bool,
     drain_at: Option<Mono>,
     idle_close_at: Option<Mono>,
-    /// A view change the engine must publish (turn id as the view shows it).
-    mark: Option<(String, TurnAudio)>,
 }
 
 impl std::fmt::Debug for PlaybackGate {
@@ -177,33 +184,26 @@ impl PlaybackGate {
             speaking: false,
             drain_at: None,
             idle_close_at: None,
-            mark: None,
         }
     }
 
     /// Audio is playing or about to (for barge-in: a new text or take cuts it).
+    // shortcut: barge-in has nothing to cut in S4 PR 4a; Task 4 / PR 5 call it again.
+    #[allow(dead_code)]
     pub(crate) fn playing(&self) -> bool {
         self.speaking
             || self.device.as_ref().is_some_and(|d| d.queued_samples() > 0)
             || (self.seen() && !self.pending.is_empty())
     }
 
-    /// For the view: audio is playing now.
-    pub(crate) fn speaking(&self) -> bool {
-        self.speaking
-    }
-
     /// For the view: the turn whose audio waits for `TurnVisible`.
+    // shortcut: IPC v6 shows no playback state until PR 5.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn awaiting_visible(&self) -> Option<&str> {
         self.turn
             .as_ref()
             .filter(|t| matches!(t.visible, Visible::Waiting { .. }))
             .map(|t| t.view_id.as_str())
-    }
-
-    /// A turn's audio changed state (played or muted) since the last call.
-    pub(crate) fn take_mark(&mut self) -> Option<(String, TurnAudio)> {
-        self.mark.take()
     }
 
     fn seen(&self) -> bool {
@@ -214,11 +214,15 @@ impl PlaybackGate {
 
     /// Follows the turn machine's current turn (`None` = no turn open). A new turn starts
     /// waiting for its confirmation now; whatever the previous one still had waiting is dropped.
+    // shortcut: no turn is followed until PR 5 (nothing feeds the gate in S4 PR 4a).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn follow(&mut self, turn: Option<(&str, u16)>, now: Mono) {
         // Review F1 of #32: a `turn_start` repeating the (id, seq) of a turn that already ended
         // (turn_end, Cancel, barge-in) is a NEW turn: it waits for its own confirmation.
         let same = match (turn, self.turn.as_ref()) {
-            (Some((id, seq)), Some(t)) => t.turn_seq == seq && t.turn_id == id && !t.over,
+            (Some((id, seq)), Some(t)) => {
+                t.turn_seq == seq && t.view_id == conversation::bounded(id) && !t.over
+            }
             _ => false,
         };
         match turn {
@@ -226,9 +230,8 @@ impl PlaybackGate {
             Some((id, seq)) => {
                 self.discard_pending();
                 self.turn = Some(TurnPlay {
-                    turn_id: id.to_owned(),
                     turn_seq: seq,
-                    view_id: conversation::bounded_id(id).to_owned(),
+                    view_id: conversation::bounded(id).to_owned(),
                     visible: Visible::Waiting {
                         until: now.saturating_add(VISIBLE_DEADLINE),
                     },
@@ -247,6 +250,8 @@ impl PlaybackGate {
 
     /// The app confirmed `view_id` is on screen. Only the current turn, only while it waits:
     /// a late or unknown confirmation changes nothing.
+    // shortcut: IPC v6 has no visibility confirmation until PR 5.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn visible(&mut self, view_id: &str, now: Mono) {
         let Some(t) = self.turn.as_mut() else {
             return;
@@ -268,6 +273,8 @@ impl PlaybackGate {
     }
 
     /// One TTS frame of the current turn (the engine already checked its `turn_seq`).
+    // shortcut: nothing feeds the gate in S4 PR 4a (no audio is played); PR 5 calls it again.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn on_frame(&mut self, frame: &TtsFrame<'_>, now: Mono) {
         self.scratch.clear();
         self.scratch.extend(frame.samples());
@@ -389,7 +396,6 @@ impl PlaybackGate {
         {
             t.marked = Some(TurnAudio::Muted);
             Stats::inc(&self.stats.tts_turns_muted);
-            self.mark = Some((t.view_id.clone(), TurnAudio::Muted));
         }
     }
 
@@ -398,7 +404,6 @@ impl PlaybackGate {
             && t.marked.is_none()
         {
             t.marked = Some(TurnAudio::Played);
-            self.mark = Some((t.view_id.clone(), TurnAudio::Played));
         }
     }
 
@@ -531,7 +536,6 @@ impl PlaybackGate {
         {
             t.marked = Some(TurnAudio::Muted);
             Stats::inc(&self.stats.tts_turns_unplayed);
-            self.mark = Some((t.view_id.clone(), TurnAudio::Muted));
         }
     }
 

@@ -14,10 +14,11 @@
 use fogar_ports::{
     audio::MicPermission,
     ipc::{
-        CaptureGesture, CaptureRefusal, CaptureThen, ConversationView, GatewayCandidate,
-        GatewayInfo, IpcError, IpcRequest, IpcResponse, LinkPhase, LoginFailure, LoginForm,
-        MAX_FRAME_BYTES, Notice, Password, PeerCheck, ProgressKind, ServiceState, StatusReport,
-        TextRefusal, TurnAudio, TurnOutcome, TurnSource, TurnView, UserActivity, UserText,
+        CaptureGesture, CaptureRefusal, CaptureThen, ConversationSummary, ConversationView,
+        GatewayCandidate, GatewayInfo, IpcError, IpcRequest, IpcResponse, LinkPhase, LoginFailure,
+        LoginForm, MAX_FRAME_BYTES, MessageState, MessageView, Notice, Password, PeerCheck,
+        ProgressKind, ServiceState, StatusReport, TextRefusal, TurnOutcome, TurnSource, TurnView,
+        UserActivity, UserText, ViewEntry,
     },
 };
 use secrecy::zeroize::{Zeroize, Zeroizing};
@@ -85,8 +86,10 @@ pub enum WireRequest {
     CaptureStart(WireCaptureStart),
     CaptureEnd(WireCaptureEnd),
     CancelTurn,
-    TurnVisible(WireTurnVisible),
     RequestMicPermission,
+    ListConversations,
+    OpenConversation(WireOpen),
+    NewConversation,
 }
 
 // ---- conversation (v4): user content. Redacted `Debug` on everything that holds text. ----
@@ -138,8 +141,8 @@ pub struct WireCaptureEnd {
 #[cfg_attr(typeshare, typeshare)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WireTurnVisible {
-    pub turn_id: String,
+pub struct WireOpen {
+    pub id: String,
 }
 
 #[cfg_attr(typeshare, typeshare)]
@@ -170,6 +173,7 @@ pub enum WireTextRefusal {
     TooLong,
     NotReady,
     Recording,
+    MissingScope,
 }
 
 #[cfg_attr(typeshare, typeshare)]
@@ -258,38 +262,95 @@ pub enum WireOutcome {
 }
 
 #[cfg_attr(typeshare, typeshare)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WireAudio {
-    None,
-    Played,
-    Muted,
-}
-
-#[cfg_attr(typeshare, typeshare)]
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireTurn {
     pub turn_id: String,
-    pub conversation: Option<String>,
     pub source: WireSource,
-    pub mine: String,
+    pub by_name: Option<String>,
+    pub by_self: bool,
     pub reply: String,
     pub progress: Option<WireProgress>,
     pub tool: Option<String>,
     pub outcome: Option<WireOutcome>,
     pub error_code: Option<String>,
-    pub audio: WireAudio,
 }
 
 impl std::fmt::Debug for WireTurn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "WireTurn({}, mine {} B, reply {} B)",
+            "WireTurn({}, reply {} B)",
             self.turn_id,
-            self.mine.len(),
             self.reply.len()
+        )
+    }
+}
+
+#[cfg_attr(typeshare, typeshare)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireMessageState {
+    Pending,
+    Delivered,
+    Past,
+    Failed,
+}
+
+#[cfg_attr(typeshare, typeshare)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireMessage {
+    pub id: String,
+    pub text: String,
+    pub mine: bool,
+    pub from_name: Option<String>,
+    pub state: WireMessageState,
+    pub error_code: Option<String>,
+}
+
+impl std::fmt::Debug for WireMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WireMessage({:?}, {} B)", self.state, self.text.len())
+    }
+}
+
+#[cfg_attr(typeshare, typeshare)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    content = "data",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum WireEntry {
+    Message(WireMessage),
+    Turn(WireTurn),
+}
+
+#[cfg_attr(typeshare, typeshare)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireConversation {
+    pub id: Option<String>,
+    pub activity: WireActivity,
+    pub live: String,
+    pub draft: Option<String>,
+    pub entries: Vec<WireEntry>,
+    pub mic: WireMic,
+    pub transcriber: WireService,
+    pub notice: Option<WireNotice>,
+    pub read_only: bool,
+}
+
+impl std::fmt::Debug for WireConversation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "WireConversation({:?}, {} entries, live {} B)",
+            self.activity,
+            self.entries.len(),
+            self.live.len()
         )
     }
 }
@@ -297,29 +358,25 @@ impl std::fmt::Debug for WireTurn {
 #[cfg_attr(typeshare, typeshare)]
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WireConversation {
-    pub activity: WireActivity,
-    pub live: String,
-    pub draft: Option<String>,
-    pub turns: Vec<WireTurn>,
-    pub speaking: bool,
-    pub awaiting_visible: Option<String>,
-    pub mic: WireMic,
-    pub transcriber: WireService,
-    pub tts: WireService,
-    pub notice: Option<WireNotice>,
+pub struct WireSummary {
+    pub id: String,
+    pub title: Option<String>,
+    pub private: bool,
+    pub last_turn_at: Option<String>,
+    pub running: bool,
 }
 
-impl std::fmt::Debug for WireConversation {
+impl std::fmt::Debug for WireSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "WireConversation({:?}, {} turns, live {} B)",
-            self.activity,
-            self.turns.len(),
-            self.live.len()
-        )
+        write!(f, "WireSummary({}, running {})", self.id, self.running)
     }
+}
+
+#[cfg_attr(typeshare, typeshare)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireConversations {
+    pub conversations: Vec<WireSummary>,
 }
 
 #[cfg_attr(typeshare, typeshare)]
@@ -395,6 +452,7 @@ pub struct WireStatus {
     pub peer_check: WirePeerCheck,
     pub transcriber: WireService,
     pub tts: WireService,
+    pub read_only: bool,
 }
 
 #[cfg_attr(typeshare, typeshare)]
@@ -452,8 +510,11 @@ pub enum WireResponse {
     TextAccepted,
     TextRefused(WireTextRefused),
     TurnCancelSent,
-    TurnVisibleNoted,
+    TurnCancelNotReady,
     MicPermission(WireMicPermission),
+    ListSubscribed,
+    Conversations(WireConversations),
+    ConversationOpened,
 }
 
 // ---- framing -----------------------------------------------------------------------------
@@ -531,8 +592,10 @@ pub fn decode_request(body: &[u8]) -> Result<IpcRequest, IpcError> {
                 },
             },
             WireRequest::CancelTurn => IpcRequest::CancelTurn,
-            WireRequest::TurnVisible(v) => IpcRequest::TurnVisible { turn_id: v.turn_id },
             WireRequest::RequestMicPermission => IpcRequest::RequestMicPermission,
+            WireRequest::ListConversations => IpcRequest::ListConversations,
+            WireRequest::OpenConversation(o) => IpcRequest::OpenConversation { id: o.id },
+            WireRequest::NewConversation => IpcRequest::NewConversation,
         },
     )
 }
@@ -575,10 +638,12 @@ pub fn encode_request(r: &IpcRequest) -> Result<Zeroizing<Vec<u8>>, IpcError> {
             },
         }),
         IpcRequest::CancelTurn => WireRequest::CancelTurn,
-        IpcRequest::TurnVisible { turn_id } => WireRequest::TurnVisible(WireTurnVisible {
-            turn_id: turn_id.clone(),
-        }),
         IpcRequest::RequestMicPermission => WireRequest::RequestMicPermission,
+        IpcRequest::ListConversations => WireRequest::ListConversations,
+        IpcRequest::OpenConversation { id } => {
+            WireRequest::OpenConversation(WireOpen { id: id.clone() })
+        }
+        IpcRequest::NewConversation => WireRequest::NewConversation,
         _ => return Err(IpcError::Unsupported("request not in the wire vocabulary")),
     };
     // Pre-sized for the worst case (every byte escaped as `\uXXXX`): a reallocation would free
@@ -734,6 +799,7 @@ fn text_refusal_to_wire(r: TextRefusal) -> WireTextRefusal {
         TextRefusal::Empty => WireTextRefusal::Empty,
         TextRefusal::TooLong => WireTextRefusal::TooLong,
         TextRefusal::Recording => WireTextRefusal::Recording,
+        TextRefusal::MissingScope => WireTextRefusal::MissingScope,
         _ => WireTextRefusal::NotReady,
     }
 }
@@ -744,18 +810,19 @@ fn text_refusal_from_wire(r: WireTextRefusal) -> TextRefusal {
         WireTextRefusal::TooLong => TextRefusal::TooLong,
         WireTextRefusal::NotReady => TextRefusal::NotReady,
         WireTextRefusal::Recording => TextRefusal::Recording,
+        WireTextRefusal::MissingScope => TextRefusal::MissingScope,
     }
 }
 
 fn turn_to_wire(t: TurnView) -> WireTurn {
     WireTurn {
         turn_id: t.turn_id,
-        conversation: t.conversation,
         source: match t.source {
             TurnSource::Push => WireSource::Push,
             _ => WireSource::Mine,
         },
-        mine: t.mine,
+        by_name: t.by_name,
+        by_self: t.by_self,
         reply: t.reply,
         progress: t.progress.map(|p| match p {
             ProgressKind::Preparing => WireProgress::Preparing,
@@ -774,23 +841,18 @@ fn turn_to_wire(t: TurnView) -> WireTurn {
             _ => WireOutcome::Error,
         }),
         error_code: t.error_code,
-        audio: match t.audio {
-            TurnAudio::Played => WireAudio::Played,
-            TurnAudio::Muted => WireAudio::Muted,
-            _ => WireAudio::None,
-        },
     }
 }
 
 fn turn_from_wire(t: WireTurn) -> TurnView {
     let mut v = TurnView::default();
     v.turn_id = t.turn_id;
-    v.conversation = t.conversation;
     v.source = match t.source {
         WireSource::Mine => TurnSource::Mine,
         WireSource::Push => TurnSource::Push,
     };
-    v.mine = t.mine;
+    v.by_name = t.by_name;
+    v.by_self = t.by_self;
     v.reply = t.reply;
     v.progress = t.progress.map(|p| match p {
         WireProgress::Preparing => ProgressKind::Preparing,
@@ -809,16 +871,75 @@ fn turn_from_wire(t: WireTurn) -> TurnView {
         WireOutcome::Closed => TurnOutcome::Closed,
     });
     v.error_code = t.error_code;
-    v.audio = match t.audio {
-        WireAudio::None => TurnAudio::None,
-        WireAudio::Played => TurnAudio::Played,
-        WireAudio::Muted => TurnAudio::Muted,
-    };
     v
+}
+
+fn entry_to_wire(e: ViewEntry) -> Option<WireEntry> {
+    Some(match e {
+        ViewEntry::Message(m) => WireEntry::Message(WireMessage {
+            id: m.id,
+            text: m.text,
+            mine: m.mine,
+            from_name: m.from_name,
+            state: match m.state {
+                MessageState::Pending => WireMessageState::Pending,
+                MessageState::Past => WireMessageState::Past,
+                MessageState::Failed => WireMessageState::Failed,
+                // Delivered and any future state: it reached the gateway.
+                _ => WireMessageState::Delivered,
+            },
+            error_code: m.error_code,
+        }),
+        ViewEntry::Turn(t) => WireEntry::Turn(turn_to_wire(t)),
+        // A future kind of entry this wire version cannot carry.
+        _ => return None,
+    })
+}
+
+fn entry_from_wire(e: WireEntry) -> ViewEntry {
+    match e {
+        WireEntry::Message(m) => {
+            let mut v = MessageView::default();
+            v.id = m.id;
+            v.text = m.text;
+            v.mine = m.mine;
+            v.from_name = m.from_name;
+            v.state = match m.state {
+                WireMessageState::Pending => MessageState::Pending,
+                WireMessageState::Delivered => MessageState::Delivered,
+                WireMessageState::Past => MessageState::Past,
+                WireMessageState::Failed => MessageState::Failed,
+            };
+            v.error_code = m.error_code;
+            ViewEntry::Message(v)
+        }
+        WireEntry::Turn(t) => ViewEntry::Turn(turn_from_wire(t)),
+    }
+}
+
+fn summary_to_wire(c: ConversationSummary) -> WireSummary {
+    WireSummary {
+        id: c.id,
+        title: c.title,
+        private: c.private,
+        last_turn_at: c.last_turn_at,
+        running: c.running,
+    }
+}
+
+fn summary_from_wire(c: WireSummary) -> ConversationSummary {
+    let mut s = ConversationSummary::default();
+    s.id = c.id;
+    s.title = c.title;
+    s.private = c.private;
+    s.last_turn_at = c.last_turn_at;
+    s.running = c.running;
+    s
 }
 
 fn conversation_to_wire(c: ConversationView) -> WireConversation {
     WireConversation {
+        id: c.id,
         activity: match c.activity {
             UserActivity::Idle => WireActivity::Idle,
             UserActivity::Transcribing => WireActivity::Transcribing,
@@ -828,22 +949,21 @@ fn conversation_to_wire(c: ConversationView) -> WireConversation {
         },
         live: c.live,
         draft: c.draft,
-        turns: c.turns.into_iter().map(turn_to_wire).collect(),
-        speaking: c.speaking,
-        awaiting_visible: c.awaiting_visible,
+        entries: c.entries.into_iter().filter_map(entry_to_wire).collect(),
         mic: mic_to_wire(c.mic),
         transcriber: service_to_wire(c.transcriber),
-        tts: service_to_wire(c.tts),
         notice: c.notice.map(|n| match n {
             Notice::PhraseLost => WireNotice::PhraseLost,
             Notice::SilenceCut => WireNotice::SilenceCut,
             _ => WireNotice::SafetyCut,
         }),
+        read_only: c.read_only,
     }
 }
 
 fn conversation_from_wire(c: WireConversation) -> ConversationView {
     let mut v = ConversationView::default();
+    v.id = c.id;
     v.activity = match c.activity {
         WireActivity::Idle => UserActivity::Idle,
         WireActivity::Recording => UserActivity::Recording,
@@ -852,17 +972,15 @@ fn conversation_from_wire(c: WireConversation) -> ConversationView {
     };
     v.live = c.live;
     v.draft = c.draft;
-    v.turns = c.turns.into_iter().map(turn_from_wire).collect();
-    v.speaking = c.speaking;
-    v.awaiting_visible = c.awaiting_visible;
+    v.entries = c.entries.into_iter().map(entry_from_wire).collect();
     v.mic = mic_from_wire(c.mic);
     v.transcriber = service_from_wire(c.transcriber);
-    v.tts = service_from_wire(c.tts);
     v.notice = c.notice.map(|n| match n {
         WireNotice::PhraseLost => Notice::PhraseLost,
         WireNotice::SilenceCut => Notice::SilenceCut,
         WireNotice::SafetyCut => Notice::SafetyCut,
     });
+    v.read_only = c.read_only;
     v
 }
 
@@ -876,7 +994,7 @@ fn halve(s: &mut String) {
 }
 
 /// Encodes a conversation so the frame ALWAYS fits `MAX_FRAME_BYTES`, whatever the content
-/// (JSON escaping can make text up to 6x larger): drops the oldest turns first, then halves the
+/// (JSON escaping can make text up to 6x larger): drops the oldest entries first, then halves the
 /// longest text field. Lossy only in that extreme; the core keeps its own budget well below.
 fn encode_conversation(mut c: WireConversation) -> Result<Vec<u8>, IpcError> {
     loop {
@@ -885,17 +1003,19 @@ fn encode_conversation(mut c: WireConversation) -> Result<Vec<u8>, IpcError> {
         if body.len() <= MAX_FRAME_BYTES {
             return Ok(body);
         }
-        if c.turns.len() > 1 {
-            c.turns.remove(0);
+        if c.entries.len() > 1 {
+            c.entries.remove(0);
             continue;
         }
         let mut fields: Vec<&mut String> = vec![&mut c.live];
         if let Some(d) = c.draft.as_mut() {
             fields.push(d);
         }
-        for t in &mut c.turns {
-            fields.push(&mut t.mine);
-            fields.push(&mut t.reply);
+        for e in &mut c.entries {
+            fields.push(match e {
+                WireEntry::Message(m) => &mut m.text,
+                WireEntry::Turn(t) => &mut t.reply,
+            });
         }
         if let Some(longest) = fields
             .into_iter()
@@ -905,14 +1025,30 @@ fn encode_conversation(mut c: WireConversation) -> Result<Vec<u8>, IpcError> {
             halve(longest);
             continue;
         }
-        // Only gateway-controlled ids and codes left (unbounded up to the gateway's 1 MiB frame):
-        // drop them rather than fail the push forever. A turn whose id is dropped stays muted:
-        // the UI cannot confirm it (fails safe).
-        if !c.turns.is_empty() {
-            c.turns.clear();
-        } else if c.awaiting_visible.is_some() {
-            c.awaiting_visible = None;
+        // Only gateway-controlled ids, names and codes left: drop them rather than fail the push
+        // forever (the core bounds them, so this is defence in depth).
+        if !c.entries.is_empty() {
+            c.entries.clear();
+        } else if c.id.is_some() {
+            c.id = None;
         } else {
+            return Err(IpcError::TooLarge {
+                len: body.len(),
+                max: MAX_FRAME_BYTES,
+            });
+        }
+    }
+}
+
+/// Encodes the list so the frame ALWAYS fits: the last (oldest) conversations go first.
+fn encode_list(mut c: WireConversations) -> Result<Vec<u8>, IpcError> {
+    loop {
+        let body = serde_json::to_vec(&WireResponse::Conversations(c.clone()))
+            .map_err(|_| IpcError::Malformed)?;
+        if body.len() <= MAX_FRAME_BYTES {
+            return Ok(body);
+        }
+        if c.conversations.pop().is_none() {
             return Err(IpcError::TooLarge {
                 len: body.len(),
                 max: MAX_FRAME_BYTES,
@@ -935,6 +1071,7 @@ fn status_to_wire(s: StatusReport) -> WireStatus {
         },
         transcriber: service_to_wire(s.transcriber),
         tts: service_to_wire(s.tts),
+        read_only: s.read_only,
     }
 }
 
@@ -952,6 +1089,7 @@ fn status_from_wire(s: WireStatus) -> StatusReport {
         },
     )
     .with_voice(service_from_wire(s.transcriber), service_from_wire(s.tts))
+    .with_read_only(s.read_only)
 }
 
 /// Server side: port response -> frame body.
@@ -994,10 +1132,17 @@ pub fn encode_response(r: IpcResponse) -> Result<Vec<u8>, IpcError> {
             reason: text_refusal_to_wire(r),
         }),
         IpcResponse::TurnCancelSent => WireResponse::TurnCancelSent,
-        IpcResponse::TurnVisibleNoted => WireResponse::TurnVisibleNoted,
+        IpcResponse::TurnCancelNotReady => WireResponse::TurnCancelNotReady,
         IpcResponse::MicPermission(m) => WireResponse::MicPermission(WireMicPermission {
             state: mic_to_wire(m),
         }),
+        IpcResponse::ListSubscribed => WireResponse::ListSubscribed,
+        IpcResponse::Conversations(l) => {
+            return encode_list(WireConversations {
+                conversations: l.into_iter().map(summary_to_wire).collect(),
+            });
+        }
+        IpcResponse::ConversationOpened => WireResponse::ConversationOpened,
         _ => WireResponse::Refused(WireRefused {
             reason: "unsupported response".to_owned(),
         }),
@@ -1041,8 +1186,13 @@ pub fn decode_response(body: &[u8]) -> Result<IpcResponse, IpcError> {
                 IpcResponse::TextRefused(text_refusal_from_wire(r.reason))
             }
             WireResponse::TurnCancelSent => IpcResponse::TurnCancelSent,
-            WireResponse::TurnVisibleNoted => IpcResponse::TurnVisibleNoted,
+            WireResponse::TurnCancelNotReady => IpcResponse::TurnCancelNotReady,
             WireResponse::MicPermission(m) => IpcResponse::MicPermission(mic_from_wire(m.state)),
+            WireResponse::ListSubscribed => IpcResponse::ListSubscribed,
+            WireResponse::Conversations(l) => IpcResponse::Conversations(
+                l.conversations.into_iter().map(summary_from_wire).collect(),
+            ),
+            WireResponse::ConversationOpened => IpcResponse::ConversationOpened,
         },
     )
 }
@@ -1073,10 +1223,14 @@ mod tests {
     }
 
     fn conversation() -> ConversationView {
+        let mut m = MessageView::default();
+        m.id = "r-1".into();
+        m.text = "¿qué tiempo hace?".into();
+        m.from_name = Some("Cocina".into());
+        m.state = MessageState::Pending;
         let mut t = TurnView::default();
         t.turn_id = "t-3".into();
-        t.conversation = Some("0b9d".into());
-        t.mine = "¿qué tiempo hace?".into();
+        t.by_name = Some("Cocina".into());
         t.reply = "Soleado.".into();
         t.progress = Some(ProgressKind::Tool);
         t.tool = Some("ha_call_service".into());
@@ -1086,19 +1240,39 @@ mod tests {
         push.reply = "Recuerda la cita.".into();
         push.outcome = Some(TurnOutcome::Error);
         push.error_code = Some("TURN_ERROR".into());
-        push.audio = TurnAudio::Muted;
+        let mut failed = MessageView::default();
+        failed.text = "otra".into();
+        failed.mine = true;
+        failed.state = MessageState::Failed;
+        failed.error_code = Some("missing_scope".into());
         let mut c = ConversationView::default();
+        c.id = Some("0b9d".into());
         c.activity = UserActivity::Recording;
         c.live = "pon la".into();
         c.draft = Some("borrador".into());
-        c.turns = vec![t, push];
-        c.speaking = true;
-        c.awaiting_visible = Some("t-4".into());
+        c.entries = vec![
+            ViewEntry::Message(m),
+            ViewEntry::Turn(t),
+            ViewEntry::Turn(push),
+            ViewEntry::Message(failed),
+        ];
         c.mic = MicPermission::Granted;
         c.transcriber = ServiceState::Degraded;
-        c.tts = ServiceState::Up;
         c.notice = Some(Notice::SilenceCut);
+        c.read_only = true;
         c
+    }
+
+    fn list() -> Vec<ConversationSummary> {
+        let mut a = ConversationSummary::default();
+        a.id = "0b9d".into();
+        a.title = Some("La serie".into());
+        a.last_turn_at = Some("2026-11-27T10:00:00Z".into());
+        a.running = true;
+        let mut b = ConversationSummary::default();
+        b.id = "c-2".into();
+        b.private = true;
+        vec![a, b]
     }
 
     fn v4_requests() -> Vec<IpcRequest> {
@@ -1123,10 +1297,10 @@ mod tests {
                 then: CaptureThen::Discard,
             },
             IpcRequest::CancelTurn,
-            IpcRequest::TurnVisible {
-                turn_id: "t-4".into(),
-            },
             IpcRequest::RequestMicPermission,
+            IpcRequest::ListConversations,
+            IpcRequest::OpenConversation { id: "0b9d".into() },
+            IpcRequest::NewConversation,
         ]
     }
 
@@ -1186,9 +1360,13 @@ mod tests {
             br#"{"type":"capture_start","data":{"gesture":"wake_word"}}"#,
             br#"{"type":"capture_end","data":{"then":"upload"}}"#,
             br#"{"type":"capture_start"}"#,
-            br#"{"type":"turn_visible","data":{}}"#,
             br#"{"type":"cancel_turn","data":{"turn_id":"t-1"}}"#,
             br#"{"type":"open_microphone"}"#,
+            // v6: confirming a turn left the vocabulary; opening needs exactly an id.
+            br#"{"type":"turn_visible","data":{"turn_id":"t-1"}}"#,
+            br#"{"type":"open_conversation"}"#,
+            br#"{"type":"open_conversation","data":{"id":"c","agent":"root"}}"#,
+            br#"{"type":"new_conversation","data":{"agent":"root"}}"#,
         ] {
             assert!(
                 decode_request(bad).is_err(),
@@ -1242,7 +1420,11 @@ mod tests {
             IpcResponse::CaptureEnded,
             IpcResponse::TextAccepted,
             IpcResponse::TurnCancelSent,
-            IpcResponse::TurnVisibleNoted,
+            IpcResponse::TurnCancelNotReady,
+            IpcResponse::ListSubscribed,
+            IpcResponse::Conversations(list()),
+            IpcResponse::Conversations(Vec::new()),
+            IpcResponse::ConversationOpened,
         ]
         .into_iter()
         .chain(
@@ -1280,6 +1462,7 @@ mod tests {
                 TextRefusal::TooLong,
                 TextRefusal::NotReady,
                 TextRefusal::Recording,
+                TextRefusal::MissingScope,
             ]
             .map(IpcResponse::TextRefused),
         )
@@ -1307,22 +1490,20 @@ mod tests {
         let quotes = "\"".repeat(60 * 1024); // 2x when escaped
         let controls = "\u{1}".repeat(60 * 1024); // 6x when escaped
         let wide = "ñ".repeat(30 * 1024);
+        let turn = |reply: &str| {
+            let mut t = TurnView::default();
+            t.reply = reply.to_owned();
+            ViewEntry::Turn(t)
+        };
         for text in [quotes, controls, wide] {
-            // One huge reply (dropping old turns cannot help) ...
+            // One huge reply (dropping old entries cannot help) ...
             let mut c = conversation();
-            c.turns[1].reply = text.clone();
-            // ... and many big turns, plus big live/draft.
+            c.entries[2] = turn(&text);
+            // ... and many big entries, plus big live/draft.
             let mut many = conversation();
             many.live = text.clone();
             many.draft = Some(text.clone());
-            many.turns = (0..20)
-                .map(|i| {
-                    let mut t = TurnView::default();
-                    t.turn_id = format!("t-{i}");
-                    t.reply = text.clone();
-                    t
-                })
-                .collect();
+            many.entries = (0..40).map(|_| turn(&text)).collect();
             for view in [c, many] {
                 let body = encode_response(IpcResponse::Conversation(view)).unwrap();
                 assert!(body.len() <= MAX_FRAME_BYTES, "{} B", body.len());
@@ -1330,26 +1511,24 @@ mod tests {
                 let IpcResponse::Conversation(back) = decode_response(&body).unwrap() else {
                     panic!("not a conversation")
                 };
-                assert!(!back.turns.is_empty(), "the newest turn survives");
+                assert!(!back.entries.is_empty(), "the newest entry survives");
             }
         }
-        // Gateway-controlled ids (a 70 KB turn_id, conversation or error code) never block a
-        // push either.
-        let huge_id = "\u{1}".repeat(70 * 1024);
+        // Gateway-controlled ids, names and codes (70 KB each) never block a push either.
+        let huge = "\u{1}".repeat(70 * 1024);
         let mut ids = conversation();
-        ids.awaiting_visible = Some(huge_id.clone());
-        ids.turns[0].turn_id = huge_id.clone();
-        ids.turns[0].conversation = Some(huge_id.clone());
-        ids.turns[1].error_code = Some(huge_id);
+        ids.id = Some(huge.clone());
+        if let ViewEntry::Message(m) = &mut ids.entries[0] {
+            m.id = huge.clone();
+            m.from_name = Some(huge.clone());
+        }
+        ids.entries.truncate(1);
         let body = encode_response(IpcResponse::Conversation(ids)).unwrap();
         assert!(body.len() <= MAX_FRAME_BYTES);
         let IpcResponse::Conversation(back) = decode_response(&body).unwrap() else {
             panic!()
         };
-        assert_eq!(
-            back.awaiting_visible, None,
-            "an id the UI could not echo is dropped"
-        );
+        assert_eq!((back.id, back.entries.len()), (None, 0));
         // A view that fits is sent untouched.
         let small = conversation();
         let IpcResponse::Conversation(back) =
@@ -1359,6 +1538,27 @@ mod tests {
             panic!()
         };
         assert_eq!(back, small);
+    }
+
+    /// The list too: 50 titles that escape 6x would be ~75 KiB; the oldest go until it fits.
+    #[test]
+    fn conversation_list_always_fits_a_frame() {
+        let title = "\u{1}".repeat(256);
+        let big: Vec<ConversationSummary> = (0..50)
+            .map(|i| {
+                let mut c = ConversationSummary::default();
+                c.id = format!("{i:0>128}");
+                c.title = Some(title.clone());
+                c
+            })
+            .collect();
+        let body = encode_response(IpcResponse::Conversations(big.clone())).unwrap();
+        assert!(body.len() <= MAX_FRAME_BYTES, "{} B", body.len());
+        let IpcResponse::Conversations(back) = decode_response(&body).unwrap() else {
+            panic!()
+        };
+        assert!(!back.is_empty() && back.len() < 50);
+        assert_eq!(back[..], big[..back.len()], "the newest kept, untouched");
     }
 
     #[test]
@@ -1371,11 +1571,22 @@ mod tests {
         let mut c = conversation();
         c.live = secret.into();
         c.draft = Some(secret.into());
-        c.turns[0].mine = secret.into();
-        c.turns[0].reply = secret.into();
+        if let ViewEntry::Message(m) = &mut c.entries[0] {
+            m.text = secret.into();
+            m.from_name = Some(secret.into());
+        }
+        if let ViewEntry::Turn(t) = &mut c.entries[1] {
+            t.reply = secret.into();
+            t.by_name = Some(secret.into());
+        }
         let resp = IpcResponse::Conversation(c.clone());
         assert!(!format!("{resp:?}").contains(secret));
         assert!(!format!("{:?}", conversation_to_wire(c)).contains(secret));
+        let mut l = list();
+        l[0].title = Some(secret.into());
+        assert!(!format!("{:?}", IpcResponse::Conversations(l.clone())).contains(secret));
+        let w: Vec<WireSummary> = l.into_iter().map(summary_to_wire).collect();
+        assert!(!format!("{w:?}").contains(secret));
         let w: WireRequest = serde_json::from_slice(&encode_request(&r).unwrap()).unwrap();
         assert!(!format!("{w:?}").contains(secret));
     }
@@ -1386,14 +1597,14 @@ mod tests {
         let s = String::from_utf8(encode_response(IpcResponse::Event(report())).unwrap()).unwrap();
         assert_eq!(
             s,
-            r#"{"type":"event","data":{"link":"ready","phase":"ready","gateway":{"address":"http://green-house:8004","name":"green-house","version":"1.29.0","client_name":"Mac de Sito","user":"Sito"},"sessions":3,"turns_completed":7,"boot_mode":"normal","peer_check":"same_signer","transcriber":"up","tts":"down"}}"#
+            r#"{"type":"event","data":{"link":"ready","phase":"ready","gateway":{"address":"http://green-house:8004","name":"green-house","version":"1.29.0","client_name":"Mac de Sito","user":"Sito"},"sessions":3,"turns_completed":7,"boot_mode":"normal","peer_check":"same_signer","transcriber":"up","tts":"down","read_only":false}}"#
         );
         let s =
             String::from_utf8(encode_response(IpcResponse::Conversation(conversation())).unwrap())
                 .unwrap();
         assert_eq!(
             s,
-            r#"{"type":"conversation","data":{"activity":"recording","live":"pon la","draft":"borrador","turns":[{"turn_id":"t-3","conversation":"0b9d","source":"mine","mine":"¿qué tiempo hace?","reply":"Soleado.","progress":"tool","tool":"ha_call_service","outcome":null,"error_code":null,"audio":"none"},{"turn_id":"t-4","conversation":null,"source":"push","mine":"","reply":"Recuerda la cita.","progress":null,"tool":null,"outcome":"error","error_code":"TURN_ERROR","audio":"muted"}],"speaking":true,"awaiting_visible":"t-4","mic":"granted","transcriber":"degraded","tts":"up","notice":"silence_cut"}}"#
+            r#"{"type":"conversation","data":{"id":"0b9d","activity":"recording","live":"pon la","draft":"borrador","entries":[{"type":"message","data":{"id":"r-1","text":"¿qué tiempo hace?","mine":false,"from_name":"Cocina","state":"pending","error_code":null}},{"type":"turn","data":{"turn_id":"t-3","source":"mine","by_name":"Cocina","by_self":false,"reply":"Soleado.","progress":"tool","tool":"ha_call_service","outcome":null,"error_code":null}},{"type":"turn","data":{"turn_id":"t-4","source":"push","by_name":null,"by_self":false,"reply":"Recuerda la cita.","progress":null,"tool":null,"outcome":"error","error_code":"TURN_ERROR"}},{"type":"message","data":{"id":"","text":"otra","mine":true,"from_name":null,"state":"failed","error_code":"missing_scope"}}],"mic":"granted","transcriber":"degraded","notice":"silence_cut","read_only":true}}"#
         );
         for (resp, json) in [
             (
@@ -1416,8 +1627,21 @@ mod tests {
                 r#"{"type":"turn_cancel_sent"}"#,
             ),
             (
-                IpcResponse::TurnVisibleNoted,
-                r#"{"type":"turn_visible_noted"}"#,
+                IpcResponse::TurnCancelNotReady,
+                r#"{"type":"turn_cancel_not_ready"}"#,
+            ),
+            (IpcResponse::ListSubscribed, r#"{"type":"list_subscribed"}"#),
+            (
+                IpcResponse::ConversationOpened,
+                r#"{"type":"conversation_opened"}"#,
+            ),
+            (
+                IpcResponse::Conversations(list()),
+                r#"{"type":"conversations","data":{"conversations":[{"id":"0b9d","title":"La serie","private":false,"last_turn_at":"2026-11-27T10:00:00Z","running":true},{"id":"c-2","title":null,"private":true,"last_turn_at":null,"running":false}]}}"#,
+            ),
+            (
+                IpcResponse::TextRefused(TextRefusal::MissingScope),
+                r#"{"type":"text_refused","data":{"reason":"missing_scope"}}"#,
             ),
             (
                 IpcResponse::MicPermission(MicPermission::NotDetermined),
@@ -1438,8 +1662,10 @@ mod tests {
             r#"{"type":"capture_end","data":{"then":"review"}}"#,
             r#"{"type":"capture_end","data":{"then":"discard"}}"#,
             r#"{"type":"cancel_turn"}"#,
-            r#"{"type":"turn_visible","data":{"turn_id":"t-4"}}"#,
             r#"{"type":"request_mic_permission"}"#,
+            r#"{"type":"list_conversations"}"#,
+            r#"{"type":"open_conversation","data":{"id":"0b9d"}}"#,
+            r#"{"type":"new_conversation"}"#,
         ]) {
             assert_eq!(
                 std::str::from_utf8(&encode_request(req).unwrap()).unwrap(),

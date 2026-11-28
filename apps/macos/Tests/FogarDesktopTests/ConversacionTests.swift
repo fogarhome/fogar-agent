@@ -4,43 +4,58 @@ import Foundation
 import Testing
 @testable import FogarDesktop
 
-nonisolated func turno(_ id: String, _ source: WireSource = .mine, outcome: WireOutcome? = nil, conversacion: String? = "c1") -> WireTurn {
-    WireTurn(turn_id: id, conversation: conversacion, source: source, mine: source == .mine ? "hola" : "", reply: "",
-             progress: outcome == nil ? .thinking : nil, tool: nil, outcome: outcome, error_code: nil, audio: .none)
+nonisolated func turno(_ id: String, _ source: WireSource = .mine, outcome: WireOutcome? = nil, reply: String = "") -> WireTurn {
+    WireTurn(turn_id: id, source: source, by_name: nil, by_self: source == .mine, reply: reply,
+             progress: outcome == nil ? .thinking : nil, tool: nil, outcome: outcome, error_code: nil)
 }
 
-nonisolated func vista(_ turns: [WireTurn] = [], activity: WireActivity = .idle, live: String = "", draft: String? = nil,
-                       speaking: Bool = false, esperando: String? = nil, mic: WireMic = .granted,
-                       transcriber: WireService = .up, notice: WireNotice? = nil) -> WireConversation {
-    WireConversation(activity: activity, live: live, draft: draft, turns: turns, speaking: speaking,
-                     awaiting_visible: esperando, mic: mic, transcriber: transcriber, tts: .up, notice: notice)
+nonisolated func mensaje(_ texto: String, _ state: WireMessageState = .delivered, mio: Bool = true,
+                         de: String? = nil, codigo: String? = nil) -> WireMessage {
+    WireMessage(id: "m-\(texto)", text: texto, mine: mio, from_name: de, state: state, error_code: codigo)
 }
 
-/// The rule «Fogar never sounds without something visible», on the app's side.
-@Suite struct ConfirmarVisible {
-    @Test func misTurnosSiempre() {
-        let v = vista([turno("t1"), turno("t2", outcome: .done)])
-        #expect(Conversacion.porConfirmar(v, aLaVista: false, ya: []) == ["t1"])
-    }
+/// A view: `entradas` in order (messages and turns), or just `turns`.
+nonisolated func vista(_ turns: [WireTurn] = [], entradas: [WireEntry] = [], id: String? = "c1",
+                       activity: WireActivity = .idle, live: String = "", draft: String? = nil,
+                       mic: WireMic = .granted, transcriber: WireService = .up, notice: WireNotice? = nil,
+                       soloLectura: Bool = false) -> WireConversation {
+    WireConversation(id: id, activity: activity, live: live, draft: draft, entries: entradas + turns.map { .turn($0) },
+                     mic: mic, transcriber: transcriber, notice: notice, read_only: soloLectura)
+}
 
-    @Test func unPushSoloConLaConversacionDelante() {
-        let v = vista([turno("p1", .push)], esperando: "p1")
-        #expect(Conversacion.porConfirmar(v, aLaVista: false, ya: []).isEmpty)
-        #expect(Conversacion.porConfirmar(v, aLaVista: true, ya: []) == ["p1"])
-    }
+nonisolated func resumen(_ id: String, _ titulo: String?, enMarcha: Bool = false) -> WireSummary {
+    WireSummary(id: id, title: titulo, private: true, last_turn_at: nil, running: enMarcha)
+}
 
-    @Test func nadaDosVecesNiDesconocido() {
-        let v = vista([turno("t1")], esperando: "t1")
-        #expect(Conversacion.porConfirmar(v, aLaVista: true, ya: ["t1"]).isEmpty)
-        // A turn the view does not hold (dropped by the bound) is never confirmed blindly.
-        #expect(Conversacion.porConfirmar(vista([], esperando: "x9"), aLaVista: true, ya: []).isEmpty)
-    }
-
+@Suite struct Cancelar {
     @Test func cancelarTieneSentido() {
         #expect(!Conversacion.cancelable(vista([turno("t1", outcome: .done)])))
         #expect(Conversacion.cancelable(vista([turno("t1")])))
         #expect(Conversacion.cancelable(vista(activity: .awaitingReply)))
-        #expect(Conversacion.cancelable(vista([turno("t1", outcome: .done)], speaking: true)))
+        // A message waiting behind a turn (that turn may run on another device).
+        #expect(Conversacion.cancelable(vista(entradas: [.message(mensaje("otra", .pending))])))
+        // A turn from history has no id and is never «running».
+        #expect(!Conversacion.cancelable(vista([turno("", outcome: nil)])))
+    }
+}
+
+/// What a message says under its bubble.
+@Suite struct Mensajes {
+    @Test func notas() {
+        #expect(Textos.notaMensaje(mensaje("hola")) == nil)
+        #expect(Textos.notaMensaje(mensaje("hola", .past, mio: false)) == nil)
+        #expect(Textos.notaMensaje(mensaje("hola", mio: false, de: "Cocina")) == "Enviado desde Cocina")
+        #expect(Textos.notaMensaje(mensaje("hola", mio: false, de: "   ")) == nil)
+        #expect(Textos.notaMensaje(mensaje("hola", .pending)) == "Pendiente: va cuando Fogar termine.")
+        #expect(Textos.notaMensaje(mensaje("hola", .failed, codigo: "missing_scope"))?.contains("no puede escribir") == true)
+        #expect(Textos.notaMensaje(mensaje("hola", .failed, codigo: "not_sent"))?.hasPrefix("No se envió") == true)
+        #expect(Textos.notaMensaje(mensaje("hola", .failed, codigo: "unknown"))
+            == "Puede que se enviara: Fogar tardó en contestar. Mira si aparece antes de volver a escribirlo.")
+        #expect(Textos.tituloConversacion(resumen("c", "  La serie ")) == "La serie")
+        #expect(Textos.tituloConversacion(resumen("c", nil)) == "Conversación sin título")
+        #expect(Textos.tituloConversacion(resumen("c", " ")) == "Conversación sin título")
+        #expect(Textos.autorMensaje(mensaje("x")) == "Tú")
+        #expect(Textos.autorMensaje(mensaje("x", mio: false, de: String(repeating: "a", count: 60))).count == 40)
     }
 }
 
@@ -57,7 +72,8 @@ nonisolated func vista(_ turns: [WireTurn] = [], activity: WireActivity = .idle,
             (.viva, vista(mic: .restricted), true, .denegado),
             (.viva, vista(mic: .unknown), true, .desconocido),
             (.viva, vista(transcriber: .down), true, .sinTranscriptor),
-            (.viva, vista(transcriber: .unknown), true, .listo),
+            // Dictation is off until PR 5: no transcriber reported `up`, no take offered.
+            (.viva, vista(transcriber: .unknown), true, .sinTranscriptor),
             (.viva, vista(), true, .listo),
         ]
         for (enlace, v, listo, esperado) in casos {
@@ -70,15 +86,15 @@ nonisolated func vista(_ turns: [WireTurn] = [], activity: WireActivity = .idle,
         #expect(Textos.progreso(.tool, herramienta: "ha_call_service") == "Usando ha_call_service…")
         #expect(Textos.progreso(.tool, herramienta: "Tu Mac está en peligro, llama al 900") == "Usando una herramienta…")
         #expect(Textos.progreso(.tool, herramienta: String(repeating: "a", count: 65)) == "Usando una herramienta…")
-        let raro = WireTurn(turn_id: "t", conversation: nil, source: .mine, mine: "", reply: "", progress: nil, tool: nil,
-                            outcome: .error, error_code: "x\ny", audio: .none)
+        let raro = WireTurn(turn_id: "t", source: .mine, by_name: nil, by_self: true, reply: "", progress: nil, tool: nil,
+                            outcome: .error, error_code: "x\ny")
         #expect(Textos.desenlace(raro) == "Algo falló en el gateway.")
     }
 
     @Test func erroresDelOrquestadorConSuFrase() {
         func turno(_ code: String) -> WireTurn {
-            WireTurn(turn_id: "t", conversation: nil, source: .mine, mine: "", reply: "", progress: nil, tool: nil,
-                     outcome: .error, error_code: code, audio: .none)
+            WireTurn(turn_id: "t", source: .mine, by_name: nil, by_self: true, reply: "", progress: nil, tool: nil,
+                     outcome: .error, error_code: code)
         }
         let codigos = ["orchestrator_auth_failed", "orchestrator_model_unavailable", "orchestrator_rate_limited",
                        "orchestrator_timeout", "orchestrator_agent_unavailable"]
@@ -96,14 +112,20 @@ nonisolated func vista(_ turns: [WireTurn] = [], activity: WireActivity = .idle,
 /// A newer agent must not cost the connection: unknown values read as their closest meaning.
 @Suite struct LecturaTolerante {
     @Test func valoresDesconocidosEnLaVista() throws {
-        let json = #"{"type":"conversation","data":{"activity":"dancing","live":"","draft":null,"turns":[{"turn_id":"t1","conversation":null,"source":"robot","mine":"","reply":"hola","progress":"juggling","tool":null,"outcome":null,"error_code":null,"audio":"loud"},{"turn_id":"t2","conversation":null,"source":"mine","mine":"a","reply":"b","progress":null,"tool":null,"outcome":"exploded","error_code":null,"audio":"played"}],"speaking":false,"awaiting_visible":null,"mic":"maybe","transcriber":"sleepy","tts":"up","notice":"new_notice"}}"#
+        let json = #"{"type":"conversation","data":{"id":"c1","activity":"dancing","live":"","draft":null,"entries":[{"type":"turn","data":{"turn_id":"t1","source":"robot","by_name":null,"by_self":false,"reply":"hola","progress":"juggling","tool":null,"outcome":null,"error_code":null}},{"type":"photo","data":{"url":"x"}},{"type":"message","data":{"id":"m","text":"a","mine":true,"from_name":null,"state":"queued","error_code":null}},{"type":"turn","data":{"turn_id":"t2","source":"mine","by_name":"Cocina","by_self":false,"reply":"b","progress":null,"tool":null,"outcome":"exploded","error_code":null}}],"mic":"maybe","transcriber":"sleepy","notice":"new_notice","read_only":false}}"#
         guard case .conversation(let v) = try WireCodec.decodeResponseTolerante(Data(json.utf8)) else {
             Issue.record("not a conversation")
             return
         }
         #expect(v.activity == .awaitingReply && v.mic == .unknown && v.transcriber == .unknown && v.notice == nil)
-        #expect(v.turns[0].source == .push && v.turns[0].progress == .working && v.turns[0].audio == WireAudio.none)
-        #expect(v.turns[1].outcome == .error)
+        #expect(v.entries.count == 3, "an unknown kind of entry is left out")
+        guard case .turn(let t1) = v.entries[0], case .message(let m) = v.entries[1], case .turn(let t2) = v.entries[2] else {
+            Issue.record("entries out of order")
+            return
+        }
+        #expect(t1.source == .push && t1.progress == .working)
+        #expect(m.state == .delivered)
+        #expect(t2.outcome == .error && t2.by_name == "Cocina")
     }
 
     @Test func unaRespuestaIlegibleSigueSiendoRespuesta() throws {
@@ -127,8 +149,10 @@ nonisolated final class Registro: @unchecked Sendable {
 /// A conversation agent that answers like the core. `vistaDespues`: the changed view is pushed
 /// after the answer (the core's order); otherwise before it. The app must handle both.
 nonisolated func agenteConversacion(_ registro: Registro, inicial: WireConversation = vista(),
+                                    lista: [WireSummary] = [resumen("c1", "La serie")],
                                     captura: WireResponse = .captureStarted,
                                     texto: WireResponse = .textAccepted,
+                                    cancelar: WireResponse = .turnCancelSent,
                                     vistaDespues: Bool = true) -> @Sendable (WireRequest) -> [WireResponse] {
     { req in
         registro.anotar(req)
@@ -138,14 +162,16 @@ nonisolated func agenteConversacion(_ registro: Registro, inicial: WireConversat
         switch req {
         case .hello: return [.hello(WireHello(version: ipcVersion))]
         case .subscribeConversation: return [.conversationSubscribed, .conversation(inicial)]
+        case .listConversations: return [.listSubscribed, .conversations(WireConversations(conversations: lista))]
+        case .openConversation(let o): return con(vista(id: o.id), .conversationOpened)
+        case .newConversation: return con(vista(id: nil), .conversationOpened)
         case .sendText: return con(vista(activity: .awaitingReply), texto)
         case .captureStart:
             if case .captureStarted = captura { return con(vista(activity: .recording), captura) }
             return [captura]
         case .captureEnd(let e):
             return con(vista(draft: e.then == .review ? "enciende la luz" : nil), .captureEnded)
-        case .cancelTurn: return [.turnCancelSent]
-        case .turnVisible: return [.turnVisibleNoted]
+        case .cancelTurn: return [cancelar]
         case .requestMicPermission: return [.micPermission(WireMicPermission(state: .granted))]
         default: return [.refused(WireRefused(reason: "x"))]
         }
@@ -177,10 +203,36 @@ nonisolated func agenteConversacion(_ registro: Registro, inicial: WireConversat
         let agent = try FakeAgent(agenteConversacion(registro, inicial: vista([turno("t1", outcome: .done)]), vistaDespues: vistaDespues))
         let (link, _) = try await conectar(agent)
         defer { link.stop() }
-        #expect(await esperar { link.vista?.turns.count == 1 })
+        #expect(await esperar { link.vista?.entries.count == 1 })
+        #expect(link.lista == [resumen("c1", "La serie")])
         #expect(try await link.pedir(.sendText(WireSendText(text: "hola"))) == .textAccepted)
         #expect(await esperar { link.vista?.activity == .awaitingReply })
         #expect(try await link.pedir(.cancelTurn) == .turnCancelSent)
+        #expect(try await link.pedir(.newConversation) == .conversationOpened)
+        #expect(await esperar { link.vista?.id == nil })
+    }
+
+    /// The list is pushed unasked, like the view: a push between a request and its answer never
+    /// takes the answer's place.
+    @Test func laListaLlegaSinPedirla() async throws {
+        let registro = Registro()
+        let base = agenteConversacion(registro)
+        let agent = try FakeAgent { req in
+            if case .openConversation = req {
+                registro.anotar(req)
+                return [.conversations(WireConversations(conversations: [resumen("c2", "Nueva", enMarcha: true)])),
+                        .conversationOpened, .conversation(vista(id: "c2"))]
+            }
+            return base(req)
+        }
+        let (link, conv) = try await conectar(agent)
+        defer { link.stop() }
+        await conv.abrir("c2")
+        #expect(conv.aviso == nil)
+        #expect(await esperar { link.vista?.id == "c2" && link.lista.first?.running == true })
+        // Opening what is already open sends nothing.
+        await conv.abrir("c2")
+        #expect(registro.cuantos(.openConversation(WireOpen(id: "c2"))) == 1)
     }
 
     /// ADR-0002 mirrored: a server of the same user that is not the signed agent gets nothing.
@@ -287,6 +339,15 @@ nonisolated func agenteConversacion(_ registro: Registro, inicial: WireConversat
         #expect(conv.texto == "  enciende la luz  ")
         #expect(conv.aviso == Textos.rechazoTexto(.notReady))
         #expect(registro.pedidos.contains(.sendText(WireSendText(text: "enciende la luz"))))
+    }
+
+    /// Stop while the agent has no link: an honest line, not silence.
+    @Test func pararSinConexionLoDice() async throws {
+        let agent = try FakeAgent(agenteConversacion(Registro(), cancelar: .turnCancelNotReady))
+        let (link, conv) = try await conectar(agent)
+        defer { link.stop() }
+        await conv.cancelar()
+        #expect(conv.aviso == "Fogar no está conectado: no se pudo parar.")
     }
 
     /// Click the microphone, then stop: the transcript waits in the box (`review`), never sent.
@@ -498,12 +559,12 @@ nonisolated func agenteConversacion(_ registro: Registro, inicial: WireConversat
         #expect(!registro.pedidos.contains { if case .captureEnd = $0 { true } else { false } })
     }
 
-    /// #33: ⌘. cancels while Fogar speaks, whatever has focus and even with the conversation out of
-    /// sight (menu bar panel, another section): the app itself sends `cancel_turn`. Before, ⌘.
+    /// #33: ⌘. cancels while Fogar answers, whatever has focus and even with the conversation out
+    /// of sight (menu bar panel, another section): the app itself sends `cancel_turn`. Before, ⌘.
     /// lived only on an in-window button and nothing in the app reached the agent.
-    @Test func comandoPuntoCancelaMientrasHabla() async throws {
+    @Test func comandoPuntoCancelaMientrasResponde() async throws {
         let registro = Registro()
-        let agent = try FakeAgent(agenteConversacion(registro, inicial: vista([turno("t1", outcome: .done)], speaking: true)))
+        let agent = try FakeAgent(agenteConversacion(registro, inicial: vista([turno("t1")])))
         let (link, conv) = try await conectar(agent)
         defer { link.stop() }
         #expect(await esperar { conv.cancelable })
@@ -519,85 +580,10 @@ nonisolated func agenteConversacion(_ registro: Registro, inicial: WireConversat
         let agent = try FakeAgent(agenteConversacion(registro, inicial: vista([turno("t1", outcome: .done)])))
         let (link, conv) = try await conectar(agent)
         defer { link.stop() }
-        #expect(await esperar { link.vista?.turns.count == 1 })
+        #expect(await esperar { link.vista?.entries.count == 1 })
         #expect(!conv.tecla(.cancelar))
         try await Task.sleep(for: .milliseconds(200))
         #expect(registro.cuantos(.cancelTurn) == 0)
-    }
-
-    @Test func miTurnoSeConfirmaSinVentanaYUnPushNo() async throws {
-        let registro = Registro()
-        let agent = try FakeAgent(agenteConversacion(registro, inicial: vista([turno("t1"), turno("p1", .push)], esperando: "p1")))
-        let (link, conv) = try await conectar(agent)
-        defer { link.stop() }
-        #expect(await esperar { registro.pedidos.contains(.turnVisible(WireTurnVisible(turn_id: "t1"))) })
-        try await Task.sleep(for: .milliseconds(300))
-        #expect(!registro.pedidos.contains(.turnVisible(WireTurnVisible(turn_id: "p1"))))
-        conv.aLaVista = true
-        #expect(await esperar { registro.pedidos.contains(.turnVisible(WireTurnVisible(turn_id: "p1"))) })
-    }
-
-    /// A busy agent gets a bounded number of tries; a refusal that will not change gets one.
-    @Test(arguments: [("engine busy", Conversacion.maxIntentosVisible), ("unsupported request", 1)])
-    func turnVisibleRechazadoEsAcotado(motivo: String, maximo: Int) async throws {
-        let registro = Registro()
-        let abierta = vista([turno("t1")])
-        let agent = try FakeAgent { req in
-            registro.anotar(req)
-            switch req {
-            case .hello: return [.hello(WireHello(version: ipcVersion))]
-            case .subscribeConversation: return [.conversationSubscribed, .conversation(abierta)]
-            case .turnVisible: return [.refused(WireRefused(reason: motivo))]
-            case .cancelTurn: return [.turnCancelSent, .conversation(abierta)]
-            default: return [.refused(WireRefused(reason: "x"))]
-            }
-        }
-        let (link, conv) = try await conectar(agent)
-        defer { link.stop() }
-        let visible = WireRequest.turnVisible(WireTurnVisible(turn_id: "t1"))
-        #expect(await esperar { registro.cuantos(visible) >= 1 })
-        // New views keep arriving meanwhile; the backoff is 0.5 s, then 1 s.
-        for _ in 0..<6 {
-            try await Task.sleep(for: .milliseconds(500))
-            await conv.cancelar()
-        }
-        #expect(registro.cuantos(visible) == maximo)
-    }
-
-    @Test func traConfirmar() {
-        #expect(Conversacion.tras(.turnVisibleNoted, intentos: 0) == .anotado)
-        #expect(Conversacion.tras(nil, intentos: 0) == .siguienteVista)
-        #expect(Conversacion.tras(.refused(WireRefused(reason: "engine busy")), intentos: 0) == .reintentar(.milliseconds(500)))
-        #expect(Conversacion.tras(.refused(WireRefused(reason: "engine busy")), intentos: 1) == .reintentar(.seconds(1)))
-        #expect(Conversacion.tras(.refused(WireRefused(reason: "engine busy")), intentos: 2) == .descartar)
-        #expect(Conversacion.tras(.refused(WireRefused(reason: "needs the signed Fogar app")), intentos: 0) == .descartar)
-    }
-
-    /// A confirmation the agent did not note is retried on the next view, and only once noted.
-    @Test func turnVisibleSeReintenta() async throws {
-        let registro = Registro()
-        let abierta = vista([turno("t1")])
-        let agent = try FakeAgent { req in
-            registro.anotar(req)
-            switch req {
-            case .hello: return [.hello(WireHello(version: ipcVersion))]
-            case .subscribeConversation: return [.conversationSubscribed, .conversation(abierta)]
-            case .turnVisible:
-                return registro.cuantos(req) == 1 ? [.refused(WireRefused(reason: "engine busy"))] : [.turnVisibleNoted]
-            case .cancelTurn: return [.turnCancelSent, .conversation(abierta)]
-            default: return [.refused(WireRefused(reason: "x"))]
-            }
-        }
-        let (link, conv) = try await conectar(agent)
-        defer { link.stop() }
-        let visible = WireRequest.turnVisible(WireTurnVisible(turn_id: "t1"))
-        #expect(await esperar { registro.cuantos(visible) == 1 })
-        try await Task.sleep(for: .milliseconds(200))
-        await conv.cancelar() // any request that brings a new view
-        #expect(await esperar { registro.cuantos(visible) == 2 })
-        await conv.cancelar()
-        try await Task.sleep(for: .milliseconds(300))
-        #expect(registro.cuantos(visible) == 2)
     }
 }
 

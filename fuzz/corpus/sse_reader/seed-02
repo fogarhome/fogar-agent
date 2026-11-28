@@ -1,0 +1,6 @@
+data: {"type":"ready"}
+
+: ping
+
+data: {"type":"resync"}
+

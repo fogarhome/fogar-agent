@@ -1,49 +1,86 @@
-//! The engine task: IPC commands (typed text, cancel) -> turn machine -> uplink; inbound events
-//! -> turn machine + conversation view -> playback. Single task, single owner of all turn and
-//! conversation state (no locks). Every await is either a cancel-safe `select!` branch or
-//! bounded by a deadline.
+//! The engine task: IPC commands (typed text, cancel, takes) and `/events` events -> the
+//! conversation store ([`Chat`]) and the view; REST calls to the gateway; capture and playback
+//! gates. Single task, single owner of all conversation state (no locks). Every await is either
+//! a cancel-safe `select!` branch or bounded by a deadline.
+//!
+//! S4 PR 4a (Task 4), the chat over HTTP:
+//! - REST calls run in one owned `JoinSet` (`queues`: writes ≤ `REST_IN_FLIGHT`, reads one per
+//!   kind), each under `Config::http_timeout`, bodies capped by the port; results come back
+//!   through a `select!` branch and are dropped when stale (account epoch, open sequence).
+//!   Nothing is called before the first `ready` (`Inbound::Up`).
+//! - A fresh link (`Up` not resumed: first connect or account change) fetches `/auth/me` (the
+//!   write scope), the list and the open conversation; `resync` fetches the list and the open
+//!   conversation. A resumed link and the 25 s rotation fetch nothing (the gateway replays).
+//! - `SendText`: with a conversation open `POST …/messages`; with none `POST /conversations
+//!   {message}` and the new one opens. Answered once the call is admitted (`TextAccepted` =
+//!   "accepted by the agent"); my text then appears from its `message` event (no local echo); a
+//!   failed post shows as a failed message. `CancelTurn`: `POST …/cancel` of the open one.
+//! - `403 missing_scope` on a write (or `/auth/me` without `conversations:write`) is
+//!   remembered: later texts are refused `MissingScope` without a call; the view says
+//!   `read_only`.
+//! - Dictation is off until PR 5: no link reports a transcriber, so the consent gate refuses
+//!   every take `NoTranscriber`. Nothing plays: no path feeds the playback gate.
 //!
 //! S2 Decision 1: the microphone is never opened at start. The engine does not hold the
 //! microphone at all: it owns the consent gate (`capture.rs`), the single point that can open a
 //! take, and only on a `Command::CaptureStart` carrying the person's `UserAct`. Gateway events
-//! can end a take (silence warnings, a dropped link) but never start one.
+//! can end a take (a dropped link) but never start one.
 //!
-//! S2 3c: the engine does not hold the speaker either. TTS goes through the playback gate
-//! (`playback.rs`), the single output point: a turn's audio plays only once the app confirmed
-//! the turn is on screen (`Command::TurnVisible`), within 2 s of its `turn_start`.
+//! S2 3c: the engine does not hold the speaker either. Output goes through the playback gate
+//! (`playback.rs`), the single output point.
 
 use crate::{
     capture::{CaptureGate, Cut, GateEvent, Owner, Readiness, Reply, Start},
     config::Config,
-    conversation,
-    link::Inbound,
+    conversation::{self, Chat, Effect, HISTORY_LIMIT},
+    link::{Api, HttpClass, Inbound, classify_http},
     playback::PlaybackGate,
+    queues,
     stats::Stats,
     time::{deadline, sleep_until_opt},
-    turn::{ClientCmd, Effects, TurnMachine, UserPhase},
 };
 use fogar_ports::{
     audio::MicPermission,
-    clock::Clock,
-    gateway::Frame,
+    clock::{Clock, Mono},
+    gateway_http::{GatewayHttp, HttpCall, HttpReply, PathId},
     ipc::{
-        CaptureRefusal, CaptureThen, ConversationView, Notice, TextRefusal, TurnOutcome,
+        CaptureRefusal, CaptureThen, ConversationSummary, ConversationView, Notice, TextRefusal,
         UserActivity,
     },
 };
 use fogar_proto::{
-    ClientMsg, encode_client, encode_upload_f32le, parse_tts_frame, server::ServerMsg,
+    account::{Me, Scope},
+    conversations::{Conversation, ConversationState, CreateConversation, History, PostMessage},
+    events::Event,
 };
-use std::{borrow::Cow, sync::Arc};
-use tokio::sync::{mpsc, oneshot, watch};
+use secrecy::zeroize::Zeroizing;
+use std::{borrow::Cow, sync::Arc, time::Duration};
+use tokio::{
+    sync::{mpsc, oneshot, watch},
+    task::{AbortHandle, JoinSet},
+};
 use tokio_util::sync::CancellationToken;
+
+/// An unknown conversation in an event: the list is fetched once this much later (several
+/// events of a new conversation make one call).
+const LIST_DEBOUNCE: Duration = Duration::from_secs(1);
+/// ... and never more often than this for unknown conversations.
+const UNKNOWN_REFRESH_EVERY: Duration = Duration::from_secs(30);
+/// A failed open step is tried again after this (the conversation stays on screen as it was).
+const REOPEN_AFTER: Duration = Duration::from_secs(5);
 
 /// IPC -> engine (`queues::ENGINE_COMMANDS`). Each carries the reply channel; the IPC side waits
 /// for it under `write_timeout` and drops it on expiry, and the engine then skips the command
 /// (`is_closed`) instead of acting on a request the UI was told failed.
 pub(crate) enum Command {
     SendText(String, oneshot::Sender<Result<(), TextRefusal>>),
-    Cancel(oneshot::Sender<()>),
+    /// `true`: handled (sent, or nothing to stop); `false`: a conversation is open but there is
+    /// no link, so nothing could be asked to stop.
+    Cancel(oneshot::Sender<bool>),
+    /// Show this conversation (state + history, then live).
+    Open(String, oneshot::Sender<()>),
+    /// Nothing open: the next text starts a new conversation.
+    New(oneshot::Sender<()>),
     /// The person pressed the microphone button (only `ipc.rs` can build the `Start`). `owner`
     /// closes when the connection that asked goes away.
     CaptureStart {
@@ -53,9 +90,6 @@ pub(crate) enum Command {
     },
     CaptureEnd(CaptureThen, oneshot::Sender<()>),
     RequestMicPermission(oneshot::Sender<MicPermission>),
-    /// The app shows this turn (its id as the view carries it): its audio may play. Answered
-    /// `false` when the id names more than one entry of the view (ambiguous: refused).
-    TurnVisible(String, oneshot::Sender<bool>),
 }
 
 /// Redacting `Debug`: the text is the user's.
@@ -64,37 +98,106 @@ impl std::fmt::Debug for Command {
         match self {
             Command::SendText(t, _) => write!(f, "SendText(<redacted {} bytes>)", t.len()),
             Command::Cancel(_) => f.write_str("Cancel"),
+            Command::Open(id, _) => write!(f, "Open({id})"),
+            Command::New(_) => f.write_str("New"),
             Command::CaptureStart { start, .. } => write!(f, "CaptureStart({start:?})"),
             Command::CaptureEnd(then, _) => write!(f, "CaptureEnd({then:?})"),
             Command::RequestMicPermission(_) => f.write_str("RequestMicPermission"),
-            Command::TurnVisible(id, _) => write!(f, "TurnVisible({} bytes)", id.len()),
         }
     }
 }
 
-pub(crate) struct Engine<C> {
+pub(crate) struct Engine<C, H> {
     pub(crate) clock: Arc<C>,
     pub(crate) cfg: Arc<Config>,
     pub(crate) stats: Arc<Stats>,
-    pub(crate) out_tx: mpsc::Sender<Frame>,
+    pub(crate) http: Arc<H>,
     pub(crate) in_rx: mpsc::Receiver<Inbound>,
     pub(crate) cmd_rx: mpsc::Receiver<Command>,
     pub(crate) conv: watch::Sender<ConversationView>,
+    pub(crate) chat: watch::Sender<Chat>,
+    /// The list as the UI draws it (its own watch: a token never wakes a list subscriber).
+    pub(crate) list: watch::Sender<Vec<ConversationSummary>>,
 }
 
-struct State {
-    turns: TurnMachine,
-    capture: CaptureGate,
-    playback: PlaybackGate,
+/// What a REST call was for. Holds the user's text for a write (never printed).
+enum Job {
+    List,
+    Me,
+    State {
+        id: String,
+        seq: u64,
+    },
+    History {
+        id: String,
+        seq: u64,
+    },
+    /// `conv`: where it was posted (a failure shows only there).
+    /// `seen`: its own arrived copies already shown when it started ([`Chat::own_sent`]).
+    Send {
+        conv: String,
+        text: String,
+        seen: usize,
+    },
+    Create {
+        text: String,
+    },
+    Cancel,
 }
 
-impl State {
-    fn playing(&self) -> bool {
-        self.playback.playing()
+impl Job {
+    fn is_write(&self) -> bool {
+        matches!(self, Job::Send { .. } | Job::Create { .. } | Job::Cancel)
     }
 }
 
-impl<C: Clock> Engine<C> {
+/// A finished call: `reply` is `None` on a transport failure or a missed deadline.
+struct Done {
+    epoch: u64,
+    job: Job,
+    reply: Option<HttpReply>,
+}
+
+struct State {
+    capture: CaptureGate,
+    playback: PlaybackGate,
+    /// The link is up (`Up` seen, no `Down`/`SignedOut` since).
+    online: bool,
+    /// The latest account handle (one token copy).
+    api: Option<Api>,
+    /// Bumped on every fresh link and sign-out: older results are dropped.
+    epoch: u64,
+    /// Bumped on every open: older open steps are dropped.
+    open_seq: u64,
+    rest: JoinSet<Done>,
+    writes: usize,
+    open_step: Option<AbortHandle>,
+    list_in_flight: bool,
+    list_again: bool,
+    list_at: Option<Mono>,
+    /// One `/auth/me` at a time (`queues`); one asked meanwhile runs after it.
+    me_in_flight: bool,
+    me_again: bool,
+    /// When the last refresh asked by an unknown conversation was due.
+    unknown_refreshed: Option<Mono>,
+    reopen_at: Option<Mono>,
+    creating: bool,
+    /// A write got `403 missing_scope` (or `/auth/me` lacks `conversations:write`).
+    write_denied: bool,
+}
+
+fn decode<T: serde::de::DeserializeOwned>(r: &HttpReply) -> Option<T> {
+    serde_json::from_slice(&r.body).ok()
+}
+
+fn min_opt(a: Option<Mono>, b: Option<Mono>) -> Option<Mono> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (a, b) => a.or(b),
+    }
+}
+
+impl<C: Clock, H: GatewayHttp> Engine<C, H> {
     /// `capture` is the single consent point, the only holder of the microphone; `playback`
     /// the single output point, the only holder of the speaker. Both live in the task's state
     /// (not in `Engine`, which `&self` methods share across awaits).
@@ -105,85 +208,95 @@ impl<C: Clock> Engine<C> {
         ingress: CancellationToken,
     ) {
         let mut st = State {
-            turns: TurnMachine::new(self.cfg.turn),
             capture,
             playback,
+            online: false,
+            api: None,
+            epoch: 0,
+            open_seq: 0,
+            rest: JoinSet::new(),
+            writes: 0,
+            open_step: None,
+            list_in_flight: false,
+            list_again: false,
+            list_at: None,
+            me_in_flight: false,
+            me_again: false,
+            unknown_refreshed: None,
+            reopen_at: None,
+            creating: false,
+            write_denied: false,
         };
         self.refresh_mic(&st);
         // No IPC (or it stopped): the closed channel must not turn the branch into a hot loop.
         let mut cmds_open = true;
         loop {
-            let wake_at = st.turns.next_deadline();
+            let wake_at = min_opt(st.list_at, st.reopen_at);
             tokio::select! {
                 biased;
                 () = ingress.cancelled() => break,
                 // Review M3: the take before the gateway. A gateway that keeps `in_rx` full must
-                // never starve the take's cuts (safety, silence, owner gone) or its device jobs;
-                // the take's own events are bounded by the device (50 chunks/s) and its timers.
-                ev = st.capture.next(&*self.clock) => self.on_capture(&mut st, ev).await,
-                // The output's own timers and device jobs (visibility deadline, open, release,
-                // drain, idle close) are not starved by a busy gateway either.
+                // never starve the take's cuts (safety, silence, owner gone) or its device jobs.
+                ev = st.capture.next(&*self.clock) => self.on_capture(&mut st, ev),
+                // The output's own timers and device jobs are not starved by a busy gateway.
                 () = st.playback.next(&*self.clock) => {}
+                // An empty set resolves `None` at once: only polled while calls run.
+                Some(done) = st.rest.join_next(), if !st.rest.is_empty() => {
+                    if let Ok(done) = done {
+                        self.on_done(&mut st, done);
+                    }
+                }
                 ev = self.in_rx.recv() => match ev {
                     None => break,
-                    Some(ev) => self.on_inbound(&mut st, ev).await,
+                    Some(ev) => self.on_inbound(&mut st, ev),
                 },
                 cmd = self.cmd_rx.recv(), if cmds_open => match cmd {
                     None => cmds_open = false,
-                    Some(cmd) => self.on_command(&mut st, cmd).await,
+                    Some(cmd) => self.on_command(&mut st, cmd),
                 },
                 () = sleep_until_opt(&*self.clock, wake_at), if wake_at.is_some() => {
-                    let transcribing = matches!(st.turns.phase(), UserPhase::AwaitTranscription { .. });
-                    if let Some(fx) = st.turns.on_tick(self.clock.now()) {
-                        if transcribing {
-                            Stats::inc(&self.stats.transcriptions_timed_out);
-                            self.publish(&st, |_| false);
-                        } else {
-                            Stats::inc(&self.stats.user_waits_timed_out);
-                            self.publish(&st, |v| conversation::wait_ended(v, TurnOutcome::Timeout));
-                        }
-                        self.apply(&mut st, fx).await;
-                    }
+                    self.on_timer(&mut st);
                 }
             }
-            self.follow_turn(&mut st);
         }
-        // Agent stop (`ingress`): the take closes, the output goes silent, and both devices are
-        // released off the runtime.
+        // Agent stop (`ingress`): calls in flight are dropped, the take closes, the output goes
+        // silent, and both devices are released off the runtime.
+        st.rest.abort_all();
         let clock = &*self.clock;
         tokio::join!(st.capture.shutdown(clock), st.playback.shutdown(clock));
     }
 
-    /// The playback gate follows the turn machine's turn (a new turn starts its 2 s wait for
-    /// `TurnVisible`), and the view follows the gate.
-    fn follow_turn(&self, st: &mut State) {
-        let now = self.clock.now();
-        st.playback.follow(
-            st.turns.turn().map(|t| (t.turn_id.as_str(), t.turn_seq)),
-            now,
-        );
-        let mark = st.playback.take_mark();
-        let speaking = st.playback.speaking();
-        let awaiting = st.playback.awaiting_visible();
-        self.conv.send_if_modified(|v| {
-            let m = mark
-                .as_ref()
-                .is_some_and(|(id, a)| conversation::turn_audio(v, id, *a));
-            conversation::playback(v, speaking, awaiting) | m
+    /// Applies `f` to the store; when it says it changed, publishes the store and the view.
+    fn store<R: Default>(&self, f: impl FnOnce(&mut Chat) -> (R, bool)) -> R {
+        let mut out = R::default();
+        let changed = self.chat.send_if_modified(|c| {
+            let (r, changed) = f(c);
+            out = r;
+            changed
         });
+        if changed {
+            let chat = self.chat.borrow();
+            self.conv.send_if_modified(|v| chat.render(v));
+            self.list.send_if_modified(|l| chat.render_list(l));
+        }
+        out
     }
 
-    /// Applies `f` to the view and publishes it if anything changed (activity follows the turn
-    /// machine). The view lives inside the `watch`: no copy per token.
-    fn publish(&self, st: &State, f: impl FnOnce(&mut ConversationView) -> bool) {
-        let activity = match st.turns.phase() {
-            UserPhase::Recording => UserActivity::Recording,
-            UserPhase::AwaitTranscription { .. } => UserActivity::Transcribing,
-            UserPhase::AwaitTurn { .. } => UserActivity::AwaitingReply,
-            UserPhase::Offline | UserPhase::Idle => UserActivity::Idle,
+    /// `write_denied` changed (or may have): the view and the status say so.
+    fn publish_read_only(&self, st: &State) {
+        let r = st.write_denied;
+        self.conv
+            .send_if_modified(|v| conversation::set_read_only(v, r));
+    }
+
+    fn publish_activity(&self, st: &State) {
+        let a = if st.capture.is_active() {
+            UserActivity::Recording
+        } else {
+            UserActivity::Idle
         };
         self.conv
-            .send_if_modified(|v| f(v) | conversation::set_activity(v, activity));
+            .send_if_modified(|v| conversation::set_activity(v, a));
     }
 
     /// The permission STATUS only (the port guarantees it never prompts).
@@ -192,7 +305,122 @@ impl<C: Clock> Engine<C> {
         self.conv.send_if_modified(|v| conversation::set_mic(v, m));
     }
 
-    async fn on_command(&self, st: &mut State, cmd: Command) {
+    /// Starts one REST call. `false` = not started (offline, or writes at their cap).
+    fn call(&self, st: &mut State, job: Job, call: HttpCall, body: Option<Vec<u8>>) -> bool {
+        let Some(api) = st.api.clone().filter(|_| st.online) else {
+            return false;
+        };
+        if job.is_write() {
+            if st.writes >= queues::REST_IN_FLIGHT {
+                Stats::inc(&self.stats.rest_busy);
+                return false;
+            }
+            st.writes += 1;
+        }
+        Stats::inc(&self.stats.rest_calls);
+        let (clock, http, d, epoch) = (
+            self.clock.clone(),
+            self.http.clone(),
+            self.cfg.http_timeout,
+            st.epoch,
+        );
+        let open = matches!(job, Job::State { .. } | Job::History { .. });
+        let handle = st.rest.spawn(async move {
+            let req = http.request(&api.addr, &call, Some(&api.token), body.map(Zeroizing::new));
+            let reply = deadline(&*clock, d, req).await.and_then(Result::ok);
+            Done { epoch, job, reply }
+        });
+        if open && let Some(old) = st.open_step.replace(handle) {
+            old.abort();
+        }
+        true
+    }
+
+    fn refresh_list(&self, st: &mut State) {
+        st.list_at = None;
+        if st.list_in_flight {
+            st.list_again = true;
+            return;
+        }
+        Stats::inc(&self.stats.list_refreshes);
+        st.list_in_flight = self.call(st, Job::List, HttpCall::ListConversations, None);
+    }
+
+    /// `/auth/me` (the write scope); one asked while one runs is folded into one more after it.
+    fn refresh_me(&self, st: &mut State) {
+        if st.me_in_flight {
+            st.me_again = true;
+            return;
+        }
+        st.me_in_flight = self.call(st, Job::Me, HttpCall::Me, None);
+    }
+
+    /// (Re)opens `id`: its state is asked first.
+    fn open(&self, st: &mut State, id: &str) {
+        st.reopen_at = None;
+        st.open_seq += 1;
+        self.store(|c| ((), c.open(id)));
+        let Some(path) = PathId::new(id) else {
+            // Not an id the gateway could have given: nothing to show.
+            self.store(|c| ((), c.close()));
+            return;
+        };
+        let job = Job::State {
+            id: id.to_owned(),
+            seq: st.open_seq,
+        };
+        if !self.call(st, job, HttpCall::GetConversation { id: path }, None) {
+            self.retry_open(st);
+        }
+    }
+
+    /// Tries the open again later; offline, the next `Up` does it (no timer while offline).
+    fn retry_open(&self, st: &mut State) {
+        if st.online {
+            st.reopen_at = Some(self.clock.now().saturating_add(REOPEN_AFTER));
+        }
+    }
+
+    fn reopen(&self, st: &mut State) {
+        let id = self.chat.borrow().open_id().map(str::to_owned);
+        if let Some(id) = id {
+            self.open(st, &id);
+        }
+    }
+
+    fn on_timer(&self, st: &mut State) {
+        let now = self.clock.now();
+        if st.list_at.is_some_and(|t| t.0 <= now.0) {
+            self.refresh_list(st);
+        }
+        if st.reopen_at.is_some_and(|t| t.0 <= now.0) {
+            self.reopen(st);
+        }
+    }
+
+    fn effect(&self, st: &mut State, fx: Effect) {
+        if fx.refresh_list && st.list_at.is_none() {
+            // A conversation that stays unlisted (beyond `LIST_MAX`, or one the gateway does
+            // not list us) while it streams asks again at most every `UNKNOWN_REFRESH_EVERY`.
+            let now = self.clock.now();
+            let soon = now.saturating_add(LIST_DEBOUNCE);
+            let at = match st.unknown_refreshed {
+                Some(last) => {
+                    let next = last.saturating_add(UNKNOWN_REFRESH_EVERY);
+                    if next.0 > soon.0 { next } else { soon }
+                }
+                None => soon,
+            };
+            st.list_at = Some(at);
+            st.unknown_refreshed = Some(at);
+        }
+        if fx.reopen {
+            Stats::inc(&self.stats.open_overflows);
+            self.reopen(st);
+        }
+    }
+
+    fn on_command(&self, st: &mut State, cmd: Command) {
         match cmd {
             Command::SendText(text, reply) => {
                 // The IPC gave up (and counted it as busy): never act on it late.
@@ -200,36 +428,114 @@ impl<C: Clock> Engine<C> {
                     return;
                 }
                 // Also while the device is opening (review B4): the take is already the person's.
-                if st.turns.phase() == UserPhase::Recording || st.capture.is_active() {
+                if st.capture.is_active() {
                     let _ = reply.send(Err(TextRefusal::Recording));
                     return;
                 }
-                let playing = st.playing();
-                let Some(fx) = st.turns.send_text(text, playing, self.clock.now()) else {
+                if st.write_denied {
+                    let _ = reply.send(Err(TextRefusal::MissingScope));
+                    return;
+                }
+                if !st.online {
                     let _ = reply.send(Err(TextRefusal::NotReady));
                     return;
-                };
-                let _ = reply.send(Ok(()));
-                if let Some(ClientCmd::Send(t)) = &fx.send {
-                    self.publish(st, |v| conversation::sent(v, t));
                 }
-                Stats::inc(&self.stats.texts_sent);
-                self.apply(st, fx).await;
+                // A create in flight: the dropped reply is "busy" for the IPC (try again soon).
+                if st.creating {
+                    return;
+                }
+                let open = self.chat.borrow().open_id().map(str::to_owned);
+                let started = match open {
+                    Some(id) => {
+                        let body = serde_json::to_vec(&PostMessage {
+                            text: Cow::Borrowed(&text),
+                            interrupt: None,
+                        });
+                        let seen = self.chat.borrow().own_sent(&id, &text);
+                        match (PathId::new(&id), body) {
+                            (Some(path), Ok(body)) => self.call(
+                                st,
+                                Job::Send {
+                                    conv: id,
+                                    text,
+                                    seen,
+                                },
+                                HttpCall::PostMessage { id: path },
+                                Some(body),
+                            ),
+                            _ => false,
+                        }
+                    }
+                    None => {
+                        let body = serde_json::to_vec(&CreateConversation {
+                            agent: self.cfg.agent.as_deref().map(Cow::Borrowed),
+                            message: Some(Cow::Borrowed(&text)),
+                        });
+                        let ok = body.is_ok_and(|b| {
+                            self.call(
+                                st,
+                                Job::Create { text },
+                                HttpCall::CreateConversation,
+                                Some(b),
+                            )
+                        });
+                        if ok {
+                            st.creating = true;
+                            self.store(|c| {
+                                c.begin_create();
+                                ((), false)
+                            });
+                        }
+                        ok
+                    }
+                };
+                if started {
+                    Stats::inc(&self.stats.texts_sent);
+                    let _ = reply.send(Ok(()));
+                }
+                // Not started (writes at their cap): the dropped reply is "busy" for the IPC.
             }
             Command::Cancel(reply) => {
-                // The IPC gave up (and counted it as busy): never act on it late.
                 if reply.is_closed() {
                     return;
                 }
-                let _ = reply.send(());
-                let playing = st.playing();
-                let fx = st.turns.cancel(playing, self.clock.now());
-                if fx.send.is_some() {
-                    Stats::inc(&self.stats.cancels_sent);
+                let open = self.chat.borrow().open_id().and_then(PathId::new);
+                match open {
+                    Some(_) if !st.online && !st.write_denied => {
+                        let _ = reply.send(false);
+                    }
+                    Some(id) if !st.write_denied => {
+                        if self.call(st, Job::Cancel, HttpCall::Cancel { id }, None) {
+                            Stats::inc(&self.stats.cancels_sent);
+                            let _ = reply.send(true);
+                        }
+                        // Not started (writes at their cap): the dropped reply is "busy".
+                    }
+                    // Nothing to cancel (or no right to): handled.
+                    _ => {
+                        let _ = reply.send(true);
+                    }
                 }
-                // A wait with no turn yet ends here; a streaming turn ends with its turn_end.
-                self.publish(st, |v| conversation::wait_ended(v, TurnOutcome::Cancelled));
-                self.apply(st, fx).await;
+            }
+            Command::Open(id, reply) => {
+                if reply.is_closed() {
+                    return;
+                }
+                self.open(st, &id);
+                let _ = reply.send(());
+            }
+            Command::New(reply) => {
+                if reply.is_closed() {
+                    return;
+                }
+                // A late state, history or reopen of the old one must not bring it back.
+                st.open_seq += 1;
+                st.reopen_at = None;
+                if let Some(step) = st.open_step.take() {
+                    step.abort();
+                }
+                self.store(|c| ((), c.close()));
+                let _ = reply.send(());
             }
             Command::CaptureStart {
                 start,
@@ -241,7 +547,7 @@ impl<C: Clock> Engine<C> {
                     return;
                 }
                 let ready = Readiness {
-                    link_ready: st.turns.phase() != UserPhase::Offline,
+                    link_ready: st.online,
                     transcriber: self.conv.borrow().transcriber,
                 };
                 st.capture
@@ -252,40 +558,17 @@ impl<C: Clock> Engine<C> {
             Command::CaptureEnd(then, reply) => {
                 // Ending is always safe: done even if the IPC already gave up waiting.
                 let _ = reply.send(());
-                self.end_take(st, then, None).await;
+                self.end_take(st, then, None);
             }
             Command::RequestMicPermission(reply) => {
                 if !reply.is_closed() {
                     st.capture.ask_permission(reply);
                 }
             }
-            Command::TurnVisible(id, reply) => {
-                // The IPC gave up (and counted it as busy): never act on it late.
-                if reply.is_closed() {
-                    return;
-                }
-                // Review F2 of #32: the confirmation must name ONE entry of the view without
-                // ambiguity (ids are compared as the view shows them, truncated included).
-                // Follow-up: a per-entry nonce in TurnView/TurnVisible (protocol change).
-                let entries = self
-                    .conv
-                    .borrow()
-                    .turns
-                    .iter()
-                    .filter(|t| !id.is_empty() && t.turn_id == id)
-                    .count();
-                if entries > 1 {
-                    Stats::inc(&self.stats.turn_visible_refused);
-                    let _ = reply.send(false);
-                    return;
-                }
-                let _ = reply.send(true);
-                st.playback.visible(&id, self.clock.now());
-            }
         }
     }
 
-    async fn on_capture(&self, st: &mut State, ev: GateEvent) {
+    fn on_capture(&self, st: &mut State, ev: GateEvent) {
         match ev {
             GateEvent::Nothing => {}
             GateEvent::Refused { reply, why } => {
@@ -293,36 +576,16 @@ impl<C: Clock> Engine<C> {
                 self.refresh_mic(st);
             }
             GateEvent::Opened { reply } => {
+                // Unreachable while no link reports a transcriber (the gate refuses first);
+                // kept so a take that did open is closed, never left on.
                 let now = self.clock.now();
-                let was_waiting = matches!(st.turns.phase(), UserPhase::AwaitTurn { .. });
-                let playing = st.playing();
-                let Some(fx) = st.turns.utterance_start(playing, now) else {
-                    // The link dropped meanwhile (SessionDown closes takes; defensive).
-                    st.capture.close(now, CaptureRefusal::NotReady);
-                    let _ = reply.send(Err(CaptureRefusal::NotReady));
-                    return;
-                };
-                if fx.send.is_some() {
-                    Stats::inc(&self.stats.cancels_sent);
-                }
-                // Issue #26: the recording view is published BEFORE `CaptureStarted` goes back,
-                // so no push of an older view can follow the answer.
-                self.publish(st, |v| {
-                    let w = was_waiting && conversation::wait_ended(v, TurnOutcome::Cancelled);
-                    conversation::take_started(v) | w
-                });
-                let answered = reply.send(Ok(())).is_ok();
-                self.apply(st, fx).await;
-                if !answered {
-                    // Nobody heard the answer: the microphone must not stay on.
-                    self.end_take(st, CaptureThen::Discard, None).await;
-                }
+                st.capture.close(now, CaptureRefusal::NotReady);
+                let _ = reply.send(Err(CaptureRefusal::NoTranscriber));
+                self.refresh_mic(st);
             }
-            GateEvent::Chunk(c) => {
+            GateEvent::Chunk(_) => {
+                // No uplink in 4a: nothing to stream to.
                 Stats::inc(&self.stats.mic_chunks);
-                if st.turns.phase() == UserPhase::Recording {
-                    self.send_audio(&c.samples);
-                }
             }
             GateEvent::Cut(cut) => {
                 match cut {
@@ -330,7 +593,7 @@ impl<C: Clock> Engine<C> {
                     Cut::Safety => Stats::inc(&self.stats.captures_safety_cut),
                     Cut::OwnerGone | Cut::DeviceEnded => {}
                 }
-                self.end_take(st, cut.then(), cut.notice()).await;
+                self.end_take(st, cut.then(), cut.notice());
             }
             GateEvent::Permission(p, waiters) => {
                 for w in waiters {
@@ -341,1028 +604,286 @@ impl<C: Clock> Engine<C> {
         }
     }
 
-    /// Closes the take (if any): the device is released off the runtime, `end` goes out and
-    /// `then` decides what the final transcript becomes. A take shorter than `capture_min` is
-    /// discarded whatever was asked.
-    async fn end_take(&self, st: &mut State, then: CaptureThen, notice: Option<Notice>) {
+    /// Closes the take (if any): the device is released off the runtime. A take shorter than
+    /// `capture_min` is discarded whatever was asked; nothing is ever sent (no dictation in 4a).
+    fn end_take(&self, st: &mut State, then: CaptureThen, notice: Option<Notice>) {
         let now = self.clock.now();
         let Some(closed) = st.capture.close(now, CaptureRefusal::Busy) else {
             return;
         };
-        let then = if closed.duration < self.cfg.capture_min {
-            CaptureThen::Discard
-        } else {
-            then
-        };
-        if then == CaptureThen::Discard {
+        if then == CaptureThen::Discard || closed.duration < self.cfg.capture_min {
             Stats::inc(&self.stats.captures_discarded);
         }
-        let fx = st.turns.utterance_end(then, now);
-        self.publish(st, |v| conversation::take_ended(v, notice));
-        self.apply(st, fx).await;
+        self.conv
+            .send_if_modified(|v| conversation::take_ended(v, notice));
+        self.publish_activity(st);
     }
 
-    /// Best effort: shed the newest chunk when the uplink queue is full.
-    fn send_audio(&self, samples: &[f32]) {
-        let mut buf = Vec::with_capacity(samples.len() * 4);
-        encode_upload_f32le(samples, &mut buf);
-        match self.out_tx.try_send(Frame::Binary(buf)) {
-            Ok(()) => Stats::hwm(
-                &self.stats.out_queue_hwm,
-                self.out_tx.max_capacity() - self.out_tx.capacity(),
-            ),
-            Err(mpsc::error::TrySendError::Full(_)) => Stats::inc(&self.stats.uplink_audio_shed),
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
-        }
-    }
-
-    async fn on_inbound(&self, st: &mut State, ev: Inbound) {
+    fn on_inbound(&self, st: &mut State, ev: Inbound) {
         match ev {
-            Inbound::SessionUp(caps) => {
-                st.turns.link_up();
+            Inbound::Up { api, resumed } => {
+                st.online = true;
+                st.api = Some(api);
                 self.refresh_mic(st);
-                self.publish(st, |v| conversation::link_up(v, caps));
+                if !resumed {
+                    // A fresh stream (first connect, new account, lost place): fetch all once.
+                    st.epoch += 1;
+                    st.list_in_flight = false;
+                    st.me_in_flight = false;
+                    st.me_again = false;
+                    st.creating = false;
+                    st.write_denied = false;
+                    // Nothing shown may come from before (another account, a lost place): the
+                    // store starts empty and the open conversation is fetched again.
+                    let open = self.chat.borrow().open_id().map(str::to_owned);
+                    self.store(|c| ((), c.clear()));
+                    self.publish_read_only(st);
+                    self.refresh_me(st);
+                    self.refresh_list(st);
+                    if let Some(id) = open {
+                        self.open(st, &id);
+                    }
+                } else if st.open_step.is_none()
+                    && self
+                        .chat
+                        .borrow()
+                        .open
+                        .as_ref()
+                        .is_some_and(|o| !o.is_live())
+                {
+                    // An open that failed while offline (no retry timer then) goes on now.
+                    self.reopen(st);
+                }
             }
-            Inbound::SessionDown => {
-                // The session that heard the take is gone: close it (no `end` to send).
-                let took = st.capture.close(self.clock.now(), CaptureRefusal::NotReady);
-                let fx = st.turns.link_down();
-                self.publish(st, |v| {
-                    let t = took.is_some() && conversation::take_ended(v, None);
-                    conversation::link_down(v) | t
+            Inbound::Down => {
+                // The open turns stay: a resumed stream replays what was missed (or `resync`).
+                st.online = false;
+                self.close_take(st);
+            }
+            Inbound::SignedOut => {
+                st.online = false;
+                st.api = None;
+                st.epoch += 1;
+                st.rest.abort_all();
+                st.writes = 0;
+                st.open_step = None;
+                st.list_in_flight = false;
+                st.list_again = false;
+                st.me_in_flight = false;
+                st.me_again = false;
+                st.list_at = None;
+                st.reopen_at = None;
+                st.creating = false;
+                st.write_denied = false;
+                self.close_take(st);
+                self.publish_read_only(st);
+                self.store(|c| ((), c.clear()));
+            }
+            Inbound::Resync => {
+                // Missed `turn_end`s would leave marks for good; the open one's state marks it
+                // again.
+                self.store(|c| {
+                    let changed = c.forget_running();
+                    ((), changed)
                 });
-                self.apply(st, fx).await;
-                // Silence, and release the output device while offline (energy).
-                st.playback.link_down(self.clock.now());
+                // A scope granted meanwhile shows on `/auth/me` (once per resync, only then).
+                if st.write_denied {
+                    self.refresh_me(st);
+                }
+                self.refresh_list(st);
+                self.reopen(st);
             }
-            Inbound::Server(msg, _charge) => {
-                let now = self.clock.now();
-                if st.turns.phase() == UserPhase::Recording
-                    && st.capture.is_open()
-                    && let ServerMsg::TranscriptionPartial(p) = &msg
-                {
-                    st.capture.on_partial(&p.text, now);
-                    self.conv
-                        .send_if_modified(|v| conversation::partial(v, &p.text));
+            Inbound::Event {
+                ev,
+                id,
+                bytes,
+                charge,
+            } => {
+                match &ev {
+                    Event::TurnStart(_) => Stats::inc(&self.stats.turns_started),
+                    Event::TurnEnd(_) => Stats::inc(&self.stats.turns_completed),
+                    _ => {}
                 }
-                let was_waiting = matches!(st.turns.phase(), UserPhase::AwaitTurn { .. });
-                let fx = st.turns.on_server(&msg, now);
-                if let Some(ClientCmd::Send(t)) = &fx.send {
-                    // A take ended with `Send`: its final transcript is my turn now.
-                    self.publish(st, |v| conversation::sent(v, t));
-                }
-                if let Some(text) = &fx.review {
-                    self.publish(st, |v| conversation::draft(v, &text.0));
-                }
-                if fx.turn_started {
-                    Stats::inc(&self.stats.turns_started);
-                }
-                // `None` for a turn_start the machine ignored (late answer to an abandoned send).
-                let origin = st
-                    .turns
-                    .turn()
-                    .filter(|_| fx.turn_started)
-                    .map(|t| t.origin);
-                self.publish(st, |v| conversation::on_server(v, &msg, origin));
-                if was_waiting
-                    && !fx.turn_started
-                    && !matches!(st.turns.phase(), UserPhase::AwaitTurn { .. })
-                {
-                    // The machine gave up the wait (a TURN_ERROR): the view's entry follows,
-                    // whatever the error named, so the two never disagree.
-                    self.publish(st, |v| conversation::wait_ended(v, TurnOutcome::Error));
-                }
-                self.apply(st, fx).await;
-            }
-            Inbound::Audio(buf, _charge) => {
-                let Ok(frame) = parse_tts_frame(&buf) else {
-                    Stats::inc(&self.stats.tts_frames_invalid);
-                    return;
-                };
-                if !st.turns.accept_audio(frame.turn_seq) {
-                    Stats::inc(&self.stats.tts_frames_stale);
-                    return;
-                }
-                // The gate learns about a turn_start handled in this same loop turn first.
-                self.follow_turn(st);
-                st.playback.on_frame(&frame, self.clock.now());
+                let fx = self.store(|c| {
+                    let fx = c.on_event_sized(id, ev, bytes);
+                    (fx, fx.view || fx.list)
+                });
+                // The store copied what it keeps: the queued bytes are released.
+                drop(charge);
+                self.effect(st, fx);
             }
         }
     }
 
-    async fn apply(&self, st: &mut State, fx: Effects) {
-        if fx.stop_playback {
-            st.playback.stop(self.clock.now());
-        }
-        if fx.barge_in {
-            Stats::inc(&self.stats.barge_ins);
-        }
-        if fx.turn_completed {
-            Stats::inc(&self.stats.turns_completed);
-        }
-        let turn_cut = fx.turn_cut;
-        if let Some(cmd) = fx.send
-            && !self.send_control(&cmd).await
+    /// The link that heard the take is gone: close it.
+    fn close_take(&self, st: &mut State) {
+        if st
+            .capture
+            .close(self.clock.now(), CaptureRefusal::NotReady)
+            .is_some()
         {
-            let was_waiting = matches!(st.turns.phase(), UserPhase::AwaitTurn { .. });
-            st.turns.uplink_failed();
-            if was_waiting {
-                self.publish(st, |v| conversation::wait_ended(v, TurnOutcome::Error));
+            self.conv
+                .send_if_modified(|v| conversation::take_ended(v, None));
+            self.publish_activity(st);
+        }
+        // Silence, and release the output device while offline (energy).
+        st.playback.link_down(self.clock.now());
+    }
+
+    fn on_done(&self, st: &mut State, done: Done) {
+        let Done { epoch, job, reply } = done;
+        if job.is_write() {
+            st.writes = st.writes.saturating_sub(1);
+        }
+        if epoch != st.epoch {
+            if job.is_write() {
+                Stats::inc(&self.stats.rest_stale_writes);
             }
-            if turn_cut {
-                // No `turn_end` will come for the turn we cut: close its entry here.
-                self.publish(st, |v| conversation::end_open(v, TurnOutcome::Interrupted));
+            return;
+        }
+        let class = reply.as_ref().map_or(HttpClass::Retry, |r| {
+            classify_http(r.status, Some(r.body.as_slice()))
+        });
+        // No answer at all (our deadline, a cut connection): the gateway may have it.
+        let code = if reply.is_none() {
+            "unknown"
+        } else {
+            failure_code(class)
+        };
+        let ok = class == HttpClass::Ok;
+        if !ok {
+            Stats::inc(&self.stats.rest_failures);
+        }
+        if class == HttpClass::MissingScope && job.is_write() {
+            Stats::inc(&self.stats.writes_missing_scope);
+            st.write_denied = true;
+            self.publish_read_only(st);
+        }
+        let reply = reply.filter(|_| ok);
+        match job {
+            Job::List => {
+                st.list_in_flight = false;
+                if let Some(list) = reply.as_ref().and_then(decode::<Vec<Conversation>>) {
+                    self.store(|c| ((), c.set_list(&list)));
+                }
+                if std::mem::take(&mut st.list_again) {
+                    self.refresh_list(st);
+                }
             }
+            Job::Me => {
+                st.me_in_flight = false;
+                // Unknown scopes (an old gateway, an odd body) deny nothing.
+                if let Some(me) = reply.as_ref().and_then(decode::<Me>)
+                    && !me.scopes.is_empty()
+                {
+                    st.write_denied = !me.scopes.contains(&Scope::ConversationsWrite);
+                    self.publish_read_only(st);
+                }
+                if std::mem::take(&mut st.me_again) && st.write_denied {
+                    self.refresh_me(st);
+                }
+            }
+            Job::State { id, seq } if seq == st.open_seq => {
+                st.open_step = None;
+                match reply.as_ref().and_then(decode::<ConversationState>) {
+                    Some(state) => {
+                        // Not a view change yet (the history comes next); the list may mark it.
+                        if !self.store(|c| {
+                            let ok = c.on_state(&id, state);
+                            (ok, ok)
+                        }) {
+                            return;
+                        }
+                        let path = PathId::new(&id);
+                        let next = Job::History { id, seq };
+                        let started = path.is_some_and(|id| {
+                            self.call(
+                                st,
+                                next,
+                                HttpCall::GetMessages {
+                                    id,
+                                    before: None,
+                                    limit: HISTORY_LIMIT,
+                                },
+                                None,
+                            )
+                        });
+                        if !started {
+                            self.retry_open(st);
+                        }
+                    }
+                    None => self.open_failed(st, class),
+                }
+            }
+            Job::History { id, seq } if seq == st.open_seq => {
+                st.open_step = None;
+                match reply.as_ref().and_then(decode::<History>) {
+                    Some(h) => {
+                        self.store(|c| {
+                            let changed = c.on_history(&id, h);
+                            (changed, changed)
+                        });
+                    }
+                    None => self.open_failed(st, class),
+                }
+            }
+            // A newer open replaced it.
+            Job::State { .. } | Job::History { .. } => {}
+            Job::Send { conv, text, seen } => {
+                // Shown only in its own conversation (else counted in `rest_failures` only);
+                // if it did arrive, its `message` replaces the failed entry.
+                if reply.is_none() {
+                    self.store(|c| {
+                        let changed = c.send_failed_in(&conv, &text, code, seen);
+                        (changed, changed)
+                    });
+                }
+            }
+            Job::Create { text } => {
+                st.creating = false;
+                match reply.as_ref().and_then(decode::<Conversation>) {
+                    Some(conv) => {
+                        // The person's text started it: the view switches to the new
+                        // conversation even if another was opened meanwhile.
+                        let fx = self.store(|c| (c.created(&conv), true));
+                        st.open_seq += 1;
+                        self.effect(st, fx);
+                    }
+                    None => {
+                        // Shown as a failed message only while nothing is open (opened
+                        // meanwhile: counted in `rest_failures` only, never shown in another).
+                        self.store(|c| {
+                            c.create_failed();
+                            let changed = c.open_id().is_none() && c.send_failed(&text, code);
+                            ((), changed)
+                        });
+                    }
+                }
+            }
+            Job::Cancel => {}
         }
     }
 
-    /// Must-deliver while connected: wait for queue space up to `write_timeout`.
-    async fn send_control(&self, cmd: &ClientCmd) -> bool {
-        let msg = match cmd {
-            ClientCmd::Cancel => ClientMsg::Cancel,
-            ClientCmd::End => ClientMsg::End,
-            ClientCmd::Send(text) => ClientMsg::Send {
-                text: Cow::Borrowed(text),
-            },
-        };
-        let Ok(text) = encode_client(&msg) else {
-            Stats::inc(&self.stats.uplink_control_dropped);
-            return false;
-        };
-        match deadline(&*self.clock, self.cfg.write_timeout, self.out_tx.reserve()).await {
-            Some(Ok(permit)) => {
-                permit.send(Frame::Text(text));
-                Stats::hwm(
-                    &self.stats.out_queue_hwm,
-                    self.out_tx.max_capacity() - self.out_tx.capacity(),
-                );
-                true
-            }
-            Some(Err(_)) | None => {
-                Stats::inc(&self.stats.uplink_control_dropped);
-                false
-            }
+    /// An open step failed: a gone conversation closes, anything else is tried again later.
+    fn open_failed(&self, st: &mut State, class: HttpClass) {
+        if class == HttpClass::Fatal {
+            self.store(|c| ((), c.close()));
+            self.refresh_list(st);
+        } else {
+            self.retry_open(st);
         }
+    }
+}
+
+/// The code a failed post shows with.
+fn failure_code(class: HttpClass) -> &'static str {
+    match class {
+        HttpClass::MissingScope => "missing_scope",
+        HttpClass::Revoked => "not_authenticated",
+        HttpClass::Fatal => "refused",
+        HttpClass::Ok | HttpClass::Retry => "not_sent",
     }
 }
 
 #[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
-    use super::*;
-    use crate::{capture::CaptureGate, queues, queues::ByteBudget};
-    use fogar_ports::ipc::CaptureGesture;
-    use fogar_proto::server::Capabilities;
-    use fogar_testkit::{FakeMic, FakeSpeaker, TestClock};
-    use std::convert::Infallible;
-    use std::time::Duration;
-    use tokio::sync::{mpsc, watch};
-    use tokio::task::JoinSet;
-
-    // ---- property: the gateway alone never opens the microphone (spec S2) ----------------
-
-    struct Rng(u64);
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            // xorshift64*
-            self.0 ^= self.0 >> 12;
-            self.0 ^= self.0 << 25;
-            self.0 ^= self.0 >> 27;
-            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-        }
-        fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
-            &xs[(self.next() % xs.len() as u64) as usize]
-        }
-    }
-
-    fn random_server_json(r: &mut Rng) -> String {
-        let id = *r.pick(&["t-1", "t-2", "", "x"]);
-        let seq = r.next() % 4;
-        let text = *r.pick(&["", "pon la serie", "hola", "  "]);
-        match r.next() % 17 {
-            14 => r#"{"type":"transcription_partial","text":"#.into(),
-            15 => r#"{"type":"status","service":"transcriber","state":"degraded"}"#.into(),
-            16 => r#"not json at all {{{"#.into(),
-            0 => format!(r#"{{"type":"transcription_partial","text":"{text}"}}"#),
-            1 => format!(r#"{{"type":"transcription","text":"{text}"}}"#),
-            2 => {
-                let origin = r.pick(&["push", "user", "other"]);
-                format!(
-                    r#"{{"type":"turn_start","turn_id":"{id}","turn_seq":{seq},"origin":"{origin}"}}"#
-                )
-            }
-            3 => format!(r#"{{"type":"token","turn_id":"{id}","text":"{text}"}}"#),
-            4 => {
-                let reason = r.pick(&["done", "cancelled", "interrupted", "replaced", "error"]);
-                format!(r#"{{"type":"turn_end","turn_id":"{id}","reason":"{reason}"}}"#)
-            }
-            5 | 6 => {
-                let service = r.pick(&["transcriber", "tts", "orchestrator"]);
-                let state = r.pick(&["degraded", "restored", "unavailable", "reconnecting"]);
-                let code = r.pick(&["", r#","code":"phrase_interrupted""#, r#","code":"x""#]);
-                format!(r#"{{"type":"status","service":"{service}","state":"{state}"{code}}}"#)
-            }
-            7 => format!(
-                r#"{{"type":"error","code":"TURN_ERROR","message":"orchestrator_unavailable","fatal":false,"turn_id":"{id}"}}"#
-            ),
-            8 => format!(r#"{{"type":"interrupted","turn_id":"{id}"}}"#),
-            9 => {
-                format!(r#"{{"type":"turn_progress","turn_id":"{id}","phase":"tool","tool":"x"}}"#)
-            }
-            10 => r#"{"type":"ready","live_capabilities":{"transcriber":true,"tts":true}}"#.into(),
-            11 => r#"{"type":"capture_start"}"#.into(),
-            12 => r#"{"type":"start_recording","open_mic":true}"#.into(),
-            _ => format!(r#"{{"type":"pipeline_event","stage":"stt","turn_id":"{id}"}}"#),
-        }
-    }
-
-    /// The engine wired to fakes, driven directly (no link, no IPC adapter).
-    struct Harness {
-        mic: FakeMic,
-        speaker: FakeSpeaker,
-        stats: Arc<Stats>,
-        conv: watch::Receiver<ConversationView>,
-        in_tx: mpsc::Sender<Inbound>,
-        cmd_tx: mpsc::Sender<Command>,
-        out_rx: mpsc::Receiver<Frame>,
-        budget: ByteBudget,
-        stop: CancellationToken,
-        tasks: JoinSet<()>,
-    }
-
-    fn harness(mic: FakeMic, cfg: Config) -> Harness {
-        harness_with(mic, FakeSpeaker::healthy(), cfg)
-    }
-
-    fn harness_with(mic: FakeMic, speaker: FakeSpeaker, cfg: Config) -> Harness {
-        let clock = Arc::new(TestClock::new());
-        let cfg = Arc::new(cfg);
-        let stats = Arc::new(Stats::default());
-        let (out_tx, out_rx) = mpsc::channel(queues::OUTBOUND);
-        let (in_tx, in_rx) = mpsc::channel(queues::INBOUND);
-        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(queues::ENGINE_COMMANDS);
-        let (conv_tx, conv) = watch::channel(ConversationView::default());
-        let engine = Engine {
-            clock,
-            cfg: cfg.clone(),
-            stats: stats.clone(),
-            out_tx,
-            in_rx,
-            cmd_rx,
-            conv: conv_tx,
-        };
-        let capture = CaptureGate::new(Arc::new(mic.clone()), &cfg, stats.clone());
-        let playback = PlaybackGate::new(Arc::new(speaker.clone()), stats.clone());
-        let stop = CancellationToken::new();
-        let mut tasks = JoinSet::new();
-        tasks.spawn(engine.run(capture, playback, stop.clone()));
-        Harness {
-            mic,
-            speaker,
-            stats,
-            conv,
-            in_tx,
-            cmd_tx,
-            out_rx,
-            budget: ByteBudget::new(1 << 20),
-            stop,
-            tasks,
-        }
-    }
-
-    impl Harness {
-        async fn server(&self, json: &str) {
-            if let Ok(msg) = fogar_proto::decode_server(json) {
-                let charge = self.budget.try_charge(1).unwrap();
-                let _ = self.in_tx.send(Inbound::Server(msg, charge)).await;
-            }
-        }
-        async fn up(&self) {
-            let caps = Capabilities {
-                transcriber: true,
-                tts: true,
-                ..Capabilities::default()
-            };
-            self.in_tx.send(Inbound::SessionUp(caps)).await.unwrap();
-        }
-        /// The person's take, as only the IPC module could ask for it.
-        async fn press(&self) -> (oneshot::Sender<Infallible>, Result<(), CaptureRefusal>) {
-            let (owner_tx, owner) = oneshot::channel();
-            let (reply, answer) = oneshot::channel();
-            let start = Start::UserAct(crate::ipc::UserAct::for_test(CaptureGesture::Toggle));
-            self.cmd_tx
-                .send(Command::CaptureStart {
-                    start,
-                    owner,
-                    reply,
-                })
-                .await
-                .unwrap();
-            let got = tokio::time::timeout(Duration::from_secs(30), answer)
-                .await
-                .unwrap()
-                .unwrap();
-            (owner_tx, got)
-        }
-        async fn release(&self, then: CaptureThen) {
-            let (tx, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::CaptureEnd(then, tx))
-                .await
-                .unwrap();
-            rx.await.unwrap();
-        }
-        fn drain(&mut self) {
-            while self.out_rx.try_recv().is_ok() {}
-        }
-        /// One TTS frame for `turn_seq`, as the link would hand it over.
-        async fn audio(&self, turn_seq: u16, pcm: &[i16]) {
-            let mut b = Vec::new();
-            fogar_proto::audio::encode_tts_frame(turn_seq, pcm, &mut b);
-            let charge = self.budget.try_charge(1).unwrap();
-            self.in_tx.send(Inbound::Audio(b, charge)).await.unwrap();
-        }
-        async fn turn_start(&self, id: &str, seq: u16, origin: &str) {
-            self.server(&format!(
-                r#"{{"type":"turn_start","turn_id":"{id}","turn_seq":{seq},"origin":"{origin}"}}"#
-            ))
-            .await;
-        }
-        async fn turn_end(&self, id: &str) {
-            self.server(&format!(
-                r#"{{"type":"turn_end","turn_id":"{id}","reason":"done"}}"#
-            ))
-            .await;
-        }
-        /// The app says it shows `id` (as only the IPC module would ask).
-        async fn visible(&self, id: &str) -> bool {
-            let (tx, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::TurnVisible(id.into(), tx))
-                .await
-                .unwrap();
-            rx.await.unwrap()
-        }
-        async fn cancel(&self) {
-            let (tx, rx) = oneshot::channel();
-            self.cmd_tx.send(Command::Cancel(tx)).await.unwrap();
-            rx.await.unwrap();
-        }
-        fn audio_of(&self, id: &str) -> Option<fogar_ports::ipc::TurnAudio> {
-            self.conv
-                .borrow()
-                .turns
-                .iter()
-                .rev()
-                .find(|t| t.turn_id == id)
-                .map(|t| t.audio)
-        }
-        async fn stop(mut self) {
-            self.stop.cancel();
-            while self.tasks.join_next().await.is_some() {}
-        }
-    }
-
-    /// «Cualquier secuencia aleatoria de mensajes del gateway (ServerMsg, tramas de audio,
-    /// cierres, reconexiones), sin capture_start, deja FakeMic::opens() == 0»: after one or more
-    /// legitimate takes (whose traffic includes partials and silence warnings), no random mix of
-    /// gateway traffic and IPC commands other than `CaptureStart` (texts and cancels that really
-    /// run, capture ends, permission requests) opens the microphone again.
-    #[tokio::test(start_paused = true)]
-    async fn no_gateway_sequence_opens_the_microphone() {
-        for seed in 1..=64u64 {
-            let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-            let mic = if seed % 4 == 3 {
-                FakeMic::not_determined()
-            } else {
-                FakeMic::healthy()
-            };
-            let mut h = harness(mic, Config::default());
-            h.up().await;
-            // Legitimate takes first (none for a not-determined mic: refused).
-            for _ in 0..(1 + seed % 3) {
-                let (owner, answer) = h.press().await;
-                if answer.is_ok() {
-                    h.mic.push_all(fogar_testkit::tone_chunks(5, 0.3));
-                    h.server(r#"{"type":"transcription_partial","text":"pon"}"#)
-                        .await;
-                    h.server(r#"{"type":"status","service":"transcriber","state":"degraded"}"#)
-                        .await;
-                    for _ in 0..8 {
-                        h.server(&random_server_json(&mut r)).await;
-                    }
-                    h.release(*r.pick(&[CaptureThen::Send, CaptureThen::Review]))
-                        .await;
-                }
-                drop(owner);
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                h.drain();
-            }
-            let baseline = h.mic.opens();
-            assert_eq!(baseline == 0, seed % 4 == 3, "seed {seed}");
-            let mut texts = Vec::new();
-            let mut cancels = Vec::new();
-            let mut ends = Vec::new();
-            let mut permission_asks = 0u32;
-            for _ in 0..60 {
-                match r.next() % 10 {
-                    0 => {
-                        let caps = Capabilities {
-                            transcriber: r.next().is_multiple_of(2),
-                            tts: r.next().is_multiple_of(2),
-                            ..Capabilities::default()
-                        };
-                        let _ = h.in_tx.send(Inbound::SessionUp(caps)).await;
-                    }
-                    1 => {
-                        let _ = h.in_tx.send(Inbound::SessionDown).await;
-                    }
-                    2 => {
-                        let mut b = vec![0xA1, 0, (r.next() % 4) as u8];
-                        b.extend((0..(r.next() % 64)).map(|_| r.next() as u8));
-                        let charge = h.budget.try_charge(1).unwrap();
-                        let _ = h.in_tx.send(Inbound::Audio(b, charge)).await;
-                    }
-                    3 => match r.next() % 4 {
-                        0 => {
-                            let (tx, rx) = oneshot::channel();
-                            if h.cmd_tx
-                                .try_send(Command::SendText("hola".into(), tx))
-                                .is_ok()
-                            {
-                                texts.push(rx);
-                            }
-                        }
-                        1 => {
-                            let (tx, rx) = oneshot::channel();
-                            if h.cmd_tx.try_send(Command::Cancel(tx)).is_ok() {
-                                cancels.push(rx);
-                            }
-                        }
-                        2 => {
-                            let then = *r.pick(&[
-                                CaptureThen::Send,
-                                CaptureThen::Review,
-                                CaptureThen::Discard,
-                            ]);
-                            let (tx, rx) = oneshot::channel();
-                            if h.cmd_tx.try_send(Command::CaptureEnd(then, tx)).is_ok() {
-                                ends.push(rx);
-                            }
-                        }
-                        _ => {
-                            let (tx, rx) = oneshot::channel();
-                            h.cmd_tx
-                                .send(Command::RequestMicPermission(tx))
-                                .await
-                                .unwrap();
-                            permission_asks += 1;
-                            // Answered before the next one, so none coalesce.
-                            tokio::time::timeout(Duration::from_secs(5), rx)
-                                .await
-                                .unwrap()
-                                .unwrap();
-                        }
-                    },
-                    _ => h.server(&random_server_json(&mut r)).await,
-                }
-                if r.next().is_multiple_of(4) {
-                    tokio::time::sleep(Duration::from_millis(r.next() % 20_000)).await;
-                }
-                h.drain();
-                tokio::task::yield_now().await;
-                assert_eq!(h.mic.opens(), baseline, "seed {seed}");
-            }
-            tokio::time::sleep(Duration::from_secs(400)).await;
-            assert_eq!(h.mic.opens(), baseline, "seed {seed}");
-            assert_eq!(h.mic.permission_requests(), permission_asks, "seed {seed}");
-            assert_ne!(
-                h.conv.borrow().activity,
-                UserActivity::Recording,
-                "seed {seed}"
-            );
-            assert_eq!(
-                h.stats.snapshot().captures_opened,
-                u64::from(baseline),
-                "seed {seed}"
-            );
-            // The commands really ran (their replies were kept, so none was skipped).
-            for rx in texts {
-                assert!(rx.await.is_ok(), "seed {seed}: text answered");
-            }
-            for rx in cancels {
-                assert!(rx.await.is_ok(), "seed {seed}: cancel answered");
-            }
-            for rx in ends {
-                assert!(rx.await.is_ok(), "seed {seed}: end answered");
-            }
-            h.stop().await;
-        }
-    }
-
-    /// Review M3: a gateway that keeps the inbound queue full must not starve the take. Real
-    /// (not paused) time: a busy runtime never auto-advances a paused clock.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_flooding_gateway_cannot_starve_the_safety_cut() {
-        let cfg = Config {
-            capture_safety_cut: Duration::from_millis(200),
-            ..Config::default()
-        };
-        let mut h = harness(FakeMic::healthy(), cfg);
-        h.up().await;
-        let (_owner, answer) = h.press().await;
-        assert_eq!(answer, Ok(()));
-        let in_tx = h.in_tx.clone();
-        let budget = h.budget.clone();
-        let flood = async move {
-            let msg = r#"{"type":"status","service":"tts","state":"restored"}"#;
-            loop {
-                let m = fogar_proto::decode_server(msg).unwrap();
-                let Some(charge) = budget.try_charge(1) else {
-                    tokio::task::yield_now().await;
-                    continue;
-                };
-                if in_tx.send(Inbound::Server(m, charge)).await.is_err() {
-                    break;
-                }
-            }
-        };
-        let mic = h.mic.clone();
-        let stats = h.stats.clone();
-        let watch = async move {
-            while mic.is_open() || stats.snapshot().captures_safety_cut == 0 {
-                tokio::task::yield_now().await;
-            }
-        };
-        tokio::select! {
-            () = flood => panic!("flood stopped"),
-            r = tokio::time::timeout(Duration::from_secs(5), watch) => {
-                assert!(r.is_ok(), "the safety cut never came under the flood");
-            }
-        }
-        assert_eq!(h.stats.snapshot().captures_safety_cut, 1);
-        h.drain();
-        h.stop().await;
-    }
-
-    const DEGRADED: &str = r#"{"type":"status","service":"transcriber","state":"degraded"}"#;
-
-    /// 5.0 (#417): `degraded` is one notice per silent stretch and never closes the session, so
-    /// the client no longer cuts the take on the second one.
-    #[tokio::test(start_paused = true)]
-    async fn degraded_warnings_no_longer_cut_the_take() {
-        let mut h = harness(FakeMic::healthy(), Config::default());
-        h.up().await;
-        let (_owner, answer) = h.press().await;
-        assert_eq!(answer, Ok(()));
-        for i in 0..3 {
-            h.server(&format!(
-                r#"{{"type":"transcription_partial","text":"p{i}"}}"#
-            ))
-            .await;
-            h.server(DEGRADED).await;
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        assert!(h.mic.is_open(), "three degraded did not cut the take");
-        assert_eq!(h.stats.snapshot().captures_silence_cut, 0);
-        h.drain();
-        h.stop().await;
-    }
-
-    /// The agent's own 5 s without partials still cuts the take (to review, never to send).
-    #[tokio::test(start_paused = true)]
-    async fn own_silence_cut_still_reviews() {
-        let mut h = harness(FakeMic::healthy(), Config::default());
-        h.up().await;
-        let (_owner, answer) = h.press().await;
-        assert_eq!(answer, Ok(()));
-        h.server(DEGRADED).await;
-        tokio::time::sleep(Duration::from_secs(6)).await;
-        assert!(!h.mic.is_open());
-        assert_eq!(h.stats.snapshot().captures_silence_cut, 1);
-        h.drain();
-        h.stop().await;
-    }
-
-    // ---- the output suite (spec S2 «Punto único de salida de audio», S2 3c) -------------
-
-    use fogar_ports::ipc::TurnAudio;
-
-    /// Lets the engine handle what was sent (paused time only advances when all are idle).
-    async fn settle() {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-
-    fn pcm(base: i16, n: usize) -> Vec<i16> {
-        (0..n).map(|i| base.wrapping_add(i as i16)).collect()
-    }
-
-    /// «Ninguna secuencia de mensajes del gateway sin turn_visible hace sonar FakeSpeaker»: random
-    /// gateway traffic with VALID audio frames for the turns it starts, link drops, texts and
-    /// cancels never open the output. Then, as a control that the rig can sound, a confirmed
-    /// turn does.
-    #[tokio::test(start_paused = true)]
-    async fn no_gateway_sequence_sounds_without_turn_visible() {
-        // Review H5 of #32: the traffic must really reach the gate (frames of a live turn).
-        let mut muted_total = 0u64;
-        for seed in 1..=48u64 {
-            let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-            let mut h = harness(FakeMic::healthy(), Config::default());
-            h.up().await;
-            for _ in 0..80 {
-                match r.next() % 8 {
-                    0 => {
-                        let _ = h.in_tx.send(Inbound::SessionDown).await;
-                        h.up().await;
-                    }
-                    1..=3 => {
-                        let seq = (r.next() % 4) as u16;
-                        let n = 1 + (r.next() % 2000) as usize;
-                        h.audio(seq, &pcm(7, n)).await;
-                    }
-                    4 => {
-                        let (tx, _rx) = oneshot::channel();
-                        let _ = h.cmd_tx.try_send(Command::SendText("hola".into(), tx));
-                    }
-                    5 => {
-                        let (tx, _rx) = oneshot::channel();
-                        let _ = h.cmd_tx.try_send(Command::Cancel(tx));
-                    }
-                    _ => h.server(&random_server_json(&mut r)).await,
-                }
-                if r.next().is_multiple_of(5) {
-                    tokio::time::sleep(Duration::from_millis(r.next() % 3_000)).await;
-                }
-                h.drain();
-                settle().await;
-                let sp = h.speaker.snapshot();
-                assert_eq!((sp.opens, sp.accepted), (0, 0), "seed {seed}");
-            }
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            let s = h.stats.snapshot();
-            assert_eq!(
-                (s.tts_frames_played, s.playback_opens),
-                (0, 0),
-                "seed {seed}"
-            );
-            assert_eq!(h.speaker.snapshot().opens, 0, "seed {seed}");
-            muted_total += s.tts_samples_muted;
-            // Control: the same rig sounds once the app confirms a turn.
-            h.turn_start("ok", 9, "user").await;
-            assert!(h.visible("ok").await);
-            h.audio(9, &pcm(1, 480)).await;
-            settle().await;
-            assert_eq!(h.speaker.snapshot().accepted, 480, "seed {seed}");
-            h.stop().await;
-        }
-        assert!(muted_total > 0, "no frame ever reached the gate");
-    }
-
-    /// A confirmed turn plays the audio that waited for the confirmation, in order, then the
-    /// rest directly; the view says it played.
-    #[tokio::test(start_paused = true)]
-    async fn confirmed_turn_plays_what_waited_in_order() {
-        let h = harness(FakeMic::healthy(), Config::default());
-        h.up().await;
-        h.turn_start("t-1", 1, "user").await;
-        settle().await;
-        assert_eq!(h.conv.borrow().awaiting_visible.as_deref(), Some("t-1"));
-        h.audio(1, &pcm(100, 480)).await;
-        h.audio(1, &pcm(2000, 480)).await;
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert_eq!(
-            h.speaker.snapshot().opens,
-            0,
-            "nothing opened before the confirmation"
-        );
-        h.visible("t-1").await;
-        settle().await;
-        h.audio(1, &pcm(5000, 240)).await;
-        settle().await;
-        let want: Vec<i16> = [pcm(100, 480), pcm(2000, 480), pcm(5000, 240)].concat();
-        assert_eq!(h.speaker.played_samples(), want);
-        let s = h.stats.snapshot();
-        assert_eq!(
-            (s.tts_frames_played, s.tts_turns_seen, s.tts_turns_muted),
-            (3, 1, 0)
-        );
-        assert_eq!(h.audio_of("t-1"), Some(TurnAudio::Played));
-        let v = h.conv.borrow().clone();
-        assert!(v.speaking && v.awaiting_visible.is_none());
-        h.stop().await;
-    }
-
-    /// «Una confirmación tardía (más de 2 s) hace que se tire el audio».
-    #[tokio::test(start_paused = true)]
-    async fn late_confirmation_discards_the_audio() {
-        let h = harness(FakeMic::healthy(), Config::default());
-        h.up().await;
-        h.turn_start("t-1", 1, "user").await;
-        h.audio(1, &pcm(1, 480)).await;
-        tokio::time::sleep(Duration::from_millis(2100)).await;
-        h.visible("t-1").await;
-        h.audio(1, &pcm(1, 480)).await;
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        let sp = h.speaker.snapshot();
-        assert_eq!((sp.opens, sp.accepted), (0, 0));
-        let s = h.stats.snapshot();
-        assert_eq!((s.tts_turns_muted, s.tts_samples_muted), (1, 960));
-        assert_eq!((s.tts_turns_seen, s.tts_frames_played), (0, 0));
-        assert_eq!(h.audio_of("t-1"), Some(TurnAudio::Muted));
-        assert_eq!(h.conv.borrow().awaiting_visible, None);
-        h.stop().await;
-    }
-
-    /// The 2 s run from the `turn_start`, not from the first audio: a confirmation at 1.9 s
-    /// still plays.
-    #[tokio::test(start_paused = true)]
-    async fn confirmation_just_in_time_plays() {
-        let h = harness(FakeMic::healthy(), Config::default());
-        h.up().await;
-        h.turn_start("t-1", 1, "user").await;
-        tokio::time::sleep(Duration::from_millis(1900)).await;
-        h.audio(1, &pcm(1, 480)).await;
-        h.visible("t-1").await;
-        settle().await;
-        assert_eq!(h.speaker.snapshot().accepted, 480);
-        h.stop().await;
-    }
-
-    /// «Un push sin la ventana a la vista no suena»: the app never confirms it.
-    #[tokio::test(start_paused = true)]
-    async fn push_without_the_window_on_screen_never_sounds() {
-        let h = harness(FakeMic::healthy(), Config::default());
-        h.up().await;
-        h.turn_start("p-1", 2, "push").await;
-        for _ in 0..20 {
-            h.audio(2, &pcm(1, 480)).await;
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        h.turn_end("p-1").await;
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        assert_eq!(h.speaker.snapshot().opens, 0);
-        assert_eq!(h.stats.snapshot().tts_samples_muted, 20 * 480);
-        assert_eq!(h.audio_of("p-1"), Some(TurnAudio::Muted));
-        h.stop().await;
-    }
-
-    /// More than 3 s of audio before the confirmation: the turn is muted at once.
-    #[tokio::test(start_paused = true)]
-    async fn a_full_unseen_buffer_mutes_the_turn() {
-        let h = harness(FakeMic::healthy(), Config::default());
-        h.up().await;
-        h.turn_start("t-1", 1, "user").await;
-        for _ in 0..151 {
-            h.audio(1, &pcm(1, 480)).await;
-        }
-        settle().await;
-        assert_eq!(h.audio_of("t-1"), Some(TurnAudio::Muted));
-        h.visible("t-1").await;
-        h.audio(1, &pcm(1, 480)).await;
-        settle().await;
-        assert_eq!(h.speaker.snapshot().opens, 0);
-        let s = h.stats.snapshot();
-        assert_eq!((s.tts_turns_muted, s.tts_samples_muted), (1, 152 * 480));
-        h.stop().await;
-    }
-
-    /// A confirmation for another turn (or for nothing) unlocks nothing.
-    #[tokio::test(start_paused = true)]
-    async fn a_confirmation_for_another_turn_unlocks_nothing() {
-        let h = harness(FakeMic::healthy(), Config::default());
-        h.up().await;
-        h.turn_start("t-1", 1, "user").await;
-        h.visible("t-0").await;
-        h.visible("").await;
-        h.audio(1, &pcm(1, 480)).await;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        assert_eq!(h.speaker.snapshot().opens, 0);
-        assert_eq!(h.audio_of("t-1"), Some(TurnAudio::Muted));
-        h.stop().await;
-    }
-
-    /// «Cancelar en mitad de una respuesta»: silence at once, and the turn's later frames do
-    /// not play.
-    #[tokio::test(start_paused = true)]
-    async fn cancel_mid_answer_silences_at_once() {
-        let h = harness(FakeMic::healthy(), Config::default());
-        h.up().await;
-        h.turn_start("t-1", 1, "user").await;
-        h.visible("t-1").await;
-        for _ in 0..5 {
-            h.audio(1, &pcm(1, 480)).await;
-        }
-        settle().await;
-        assert_eq!(h.speaker.snapshot().queued, 5 * 480);
-        h.cancel().await;
-        settle().await;
-        let sp = h.speaker.snapshot();
-        assert_eq!(sp.queued, 0, "silence at once");
-        assert!(sp.stops >= 1);
-        h.audio(1, &pcm(1, 480)).await;
-        settle().await;
-        assert_eq!(h.speaker.snapshot().accepted, 5 * 480);
-        assert!(!h.conv.borrow().speaking);
-        assert_eq!(h.stats.snapshot().barge_ins, 1);
-        h.stop().await;
-    }
-
-    /// Issue #25: a dead output is released and reopened (with backoff) without waiting for
-    /// `SessionDown`, and audio refused by it is not counted as played.
-    #[tokio::test(start_paused = true)]
-    async fn a_dead_output_is_released_and_reopened() {
-        let h = harness(FakeMic::healthy(), Config::default());
-        h.up().await;
-        h.turn_start("t-1", 1, "user").await;
-        h.visible("t-1").await;
-        h.audio(1, &pcm(1, 480)).await;
-        settle().await;
-        assert_eq!(h.speaker.snapshot().opens, 1);
-        h.speaker.kill();
-        h.audio(1, &pcm(1, 480)).await;
-        settle().await;
-        let s = h.stats.snapshot();
-        assert_eq!((s.playback_dead, s.tts_frames_played), (1, 1));
-        assert_eq!(
-            h.speaker.snapshot().open_now,
-            0,
-            "the dead output was released"
-        );
-        // The frame waits for the reopen, after the backoff.
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let sp = h.speaker.snapshot();
-        assert_eq!((sp.opens, sp.open_now), (2, 1));
-        assert_eq!(
-            sp.accepted, 960,
-            "the waiting frame played on the new output"
-        );
-        h.audio(1, &pcm(1, 480)).await;
-        settle().await;
-        assert_eq!(h.stats.snapshot().tts_frames_played, 3);
-        assert_eq!(h.stats.snapshot().playback_opens, 2);
-        h.stop().await;
-    }
-
-    /// Issue #25: a device that stays broken is retried with growing backoff, never in a loop.
-    #[tokio::test(start_paused = true)]
-    async fn a_broken_output_backs_off() {
-        let h = harness(FakeMic::healthy(), Config::default());
-        h.up().await;
-        h.turn_start("t-1", 1, "user").await;
-        h.visible("t-1").await;
-        h.speaker.set_open_dead(true);
-        for _ in 0..1500 {
-            h.audio(1, &pcm(1, 480)).await;
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        // 30 s: opens at ~0, then backoff 0.5, 1, 2, 4, 8, 8, 8 s.
-        let opens = h.speaker.snapshot().opens;
-        assert!((3..=9).contains(&opens), "opens {opens}");
-        let s = h.stats.snapshot();
-        assert_eq!(s.tts_frames_played, 0, "nothing reached a live output");
-        assert_eq!(s.playback_dead, u64::from(opens));
-        assert_eq!(h.speaker.snapshot().open_now, 0);
-        // The device comes back: the next frames play.
-        h.speaker.set_open_dead(false);
-        for _ in 0..500 {
-            h.audio(1, &pcm(1, 480)).await;
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(h.stats.snapshot().tts_frames_played > 0);
-        h.stop().await;
-    }
-
-    /// Energy (spec S2 B): the output closes 2 s after it drained with no turn open.
-    #[tokio::test(start_paused = true)]
-    async fn the_output_closes_two_seconds_after_draining_with_no_turn() {
-        let h = harness(FakeMic::healthy(), Config::default());
-        h.up().await;
-        h.turn_start("t-1", 1, "user").await;
-        h.visible("t-1").await;
-        h.audio(1, &pcm(1, 4800)).await;
-        h.turn_end("t-1").await;
-        settle().await;
-        assert_eq!(h.speaker.snapshot().open_now, 1);
-        // Still queued: never closed under the audio.
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        assert_eq!(h.speaker.snapshot().open_now, 1);
-        assert!(h.conv.borrow().speaking);
-        h.speaker.drain();
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert!(!h.conv.borrow().speaking);
-        assert_eq!(h.speaker.snapshot().open_now, 1, "not before 2 s");
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(h.speaker.snapshot().open_now, 0);
-        assert_eq!(h.stats.snapshot().playback_idle_closes, 1);
-        h.stop().await;
-    }
-
-    /// The link going down silences and releases the output (energy), and the next session's
-    /// turns still need their own confirmation.
-    #[tokio::test(start_paused = true)]
-    async fn link_down_releases_the_output() {
-        let h = harness(FakeMic::healthy(), Config::default());
-        h.up().await;
-        h.turn_start("t-1", 1, "user").await;
-        h.visible("t-1").await;
-        h.audio(1, &pcm(1, 480)).await;
-        settle().await;
-        h.in_tx.send(Inbound::SessionDown).await.unwrap();
-        settle().await;
-        assert_eq!(h.speaker.snapshot().open_now, 0);
-        h.up().await;
-        h.turn_start("t-1", 1, "user").await;
-        h.audio(1, &pcm(1, 480)).await;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        assert_eq!(
-            h.speaker.snapshot().opens,
-            1,
-            "a new session's turn waits for its own"
-        );
-        h.stop().await;
-    }
-
-    /// Review H3 of #32: a turn waiting for its confirmation (or muted) does not keep the
-    /// output open.
-    #[tokio::test(start_paused = true)]
-    async fn an_unconfirmed_turn_does_not_keep_the_output_open() {
-        let h = harness(FakeMic::healthy(), Config::default());
-        h.up().await;
-        h.turn_start("t-1", 1, "user").await;
-        h.visible("t-1").await;
-        h.audio(1, &pcm(1, 480)).await;
-        h.turn_end("t-1").await;
-        settle().await;
-        h.speaker.drain();
-        h.turn_start("t-2", 2, "push").await;
-        h.audio(2, &pcm(1, 480)).await;
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        let sp = h.speaker.snapshot();
-        assert_eq!((sp.opens, sp.open_now), (1, 0), "released while t-2 waited");
-        h.stop().await;
-    }
-
-    /// Review H4 of #32: confirmed audio lost because no output could open shows in the view.
-    #[tokio::test(start_paused = true)]
-    async fn confirmed_audio_lost_without_an_output_shows_in_the_view() {
-        let h = harness_with(
-            FakeMic::healthy(),
-            FakeSpeaker::minimal(),
-            Config::default(),
-        );
-        h.up().await;
-        h.turn_start("t-1", 1, "user").await;
-        h.visible("t-1").await;
-        h.audio(1, &pcm(1, 480)).await;
-        settle().await;
-        assert_eq!(h.audio_of("t-1"), Some(TurnAudio::Muted));
-        let s = h.stats.snapshot();
-        assert_eq!((s.tts_turns_unplayed, s.tts_samples_dropped), (1, 480));
-        h.stop().await;
-    }
-
-    /// Review F1/F2 of #32: a `turn_start` repeating the (id, seq) of a cut turn is a new
-    /// turn and inherits nothing; a confirmation naming two entries of the view is refused.
-    #[tokio::test(start_paused = true)]
-    async fn a_repeated_turn_start_after_cancel_needs_its_own_confirmation() {
-        let h = harness(FakeMic::healthy(), Config::default());
-        h.up().await;
-        h.turn_start("t-1", 1, "user").await;
-        assert!(h.visible("t-1").await);
-        h.audio(1, &pcm(1, 480)).await;
-        settle().await;
-        assert_eq!(h.speaker.snapshot().accepted, 480);
-        h.cancel().await;
-        h.turn_start("t-1", 1, "user").await;
-        h.audio(1, &pcm(1, 480)).await;
-        settle().await;
-        assert_eq!(
-            h.speaker.snapshot().accepted,
-            480,
-            "no inherited confirmation"
-        );
-        assert_eq!(h.conv.borrow().awaiting_visible.as_deref(), Some("t-1"));
-        // Two entries named "t-1" in the view: ambiguous, refused.
-        assert!(!h.visible("t-1").await);
-        assert_eq!(h.stats.snapshot().turn_visible_refused, 1);
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        assert_eq!(h.speaker.snapshot().accepted, 480);
-        assert_eq!(h.stats.snapshot().tts_turns_muted, 1);
-        h.stop().await;
-    }
-
-    /// Review F2 of #32: a new seq under an id already shown is ambiguous too.
-    #[tokio::test(start_paused = true)]
-    async fn the_same_id_with_another_seq_is_not_confirmed() {
-        let h = harness(FakeMic::healthy(), Config::default());
-        h.up().await;
-        h.turn_start("t-1", 1, "push").await;
-        h.turn_end("t-1").await;
-        h.turn_start("t-1", 2, "push").await;
-        h.audio(2, &pcm(1, 480)).await;
-        assert!(!h.visible("t-1").await);
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        assert_eq!(h.speaker.snapshot().opens, 0);
-        h.stop().await;
-    }
-}
+mod tests;

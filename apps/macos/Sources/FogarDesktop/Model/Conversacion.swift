@@ -56,8 +56,8 @@ nonisolated enum Tecla: Equatable, Sendable {
     }
 }
 
-/// The conversation section's model: the text box, the take, the visible-turn
-/// confirmations and the one-line feedback. Everything it shows comes from the agent's view.
+/// The conversation section's model: the list, the text box, the take and the one-line
+/// feedback. Everything it shows comes from the agent's view and list.
 @Observable
 final class Conversacion {
     /// `fogar_ports::ipc::SEND_TEXT_MAX_BYTES`.
@@ -72,22 +72,11 @@ final class Conversacion {
     private(set) var enviando = false
     /// The system's microphone prompt may be open: no second request meanwhile.
     private(set) var pidiendoPermiso = false
-    /// Whether the conversation is on screen (section selected, window visible): only then is a
-    /// push confirmed, so only then can it sound.
-    var aLaVista = false {
-        didSet { if aLaVista, !oldValue, let v = link.vista { confirmar(v) } }
-    }
+    /// Whether the conversation is on screen (section selected, window visible): Esc and Return
+    /// only end a take then.
+    var aLaVista = false
     /// The draft last copied into the box, so the same draft is not copied twice.
     @ObservationIgnored private var ultimoBorrador: String?
-    /// Turn ids the agent noted as visible (`turn_visible_noted`), bounded; and those in flight.
-    @ObservationIgnored private var confirmados: [String] = []
-    @ObservationIgnored private var confirmando: Set<String> = []
-    /// Refused for good (`unsupported request`, not the signed app…): never asked again.
-    @ObservationIgnored private var descartados: [String] = []
-    /// Transient refusals (`engine busy`) so far, per turn.
-    @ObservationIgnored private var intentos: [String: Int] = [:]
-    /// At most this many `turn_visible` per turn when the agent is busy, 0.5 s, 1 s, 2 s apart.
-    nonisolated static let maxIntentosVisible = 3
     /// Bumped when the draft lands in the box (the view focuses the field).
     private(set) var borradorNuevo = 0
     /// Every task this model starts (forgotten when done), so none is left without an owner.
@@ -101,6 +90,7 @@ final class Conversacion {
     }
 
     var vista: WireConversation? { link.vista }
+    var lista: [WireSummary] { link.lista }
 
     // MARK: Derived state
 
@@ -110,14 +100,20 @@ final class Conversacion {
     /// The agent's microphone is open (its own word, never this app's guess).
     var grabando: Bool { vivo && vista?.activity == .recording }
 
-    /// A turn is open, a reply is awaited or audio plays: «Cancelar» makes sense.
+    /// A turn of the open conversation runs (on any device) or a message waits: «Cancelar» makes
+    /// sense.
     var cancelable: Bool {
         guard vivo, let v = vista else { return false }
         return Self.cancelable(v)
     }
 
     static func cancelable(_ v: WireConversation) -> Bool {
-        v.speaking || v.activity == .awaitingReply || v.awaiting_visible != nil || v.turns.contains { $0.outcome == nil }
+        v.activity == .awaitingReply || v.entries.contains {
+            switch $0 {
+            case .turn(let t): t.outcome == nil && !t.turn_id.isEmpty
+            case .message(let m): m.state == .pending
+            }
+        }
     }
 
     func estadoMicro(listo: Bool) -> EstadoMicro {
@@ -138,7 +134,9 @@ final class Conversacion {
         case .unknown: return .desconocido
         case .granted: break
         }
-        return v.transcriber == .down ? .sinTranscriptor : .listo
+        // Dictation is off until PR 5: only a transcriber the gateway reports `up` offers a take
+        // (over `/events` none is reported, so the button says «sin transcriptor»).
+        return v.transcriber == .up ? .listo : .sinTranscriptor
     }
 
     /// Text that may be sent now (trimmed, within the agent's limit, no take open).
@@ -170,89 +168,41 @@ final class Conversacion {
             default: break
             }
         }
-        confirmar(v)
     }
 
-    /// `turn_visible` for what is on screen: my turns always (I just wrote or spoke, and the menu
-    /// bar says «hablando»), a push only while the conversation is in view. A turn counts as
-    /// confirmed only once the agent noted it; a failed confirmation is retried on the next view.
-    private func confirmar(_ v: WireConversation) {
-        let ya = Set(confirmados).union(confirmando).union(descartados)
-        for id in Self.porConfirmar(v, aLaVista: aLaVista, ya: ya) {
-            confirmando.insert(id)
-            lanzar { [weak self] in
-                guard let self else { return }
-                let r = try? await self.link.pedir(.turnVisible(WireTurnVisible(turn_id: id)))
-                switch Self.tras(r, intentos: self.intentos[id, default: 0]) {
-                case .anotado:
-                    self.confirmando.remove(id)
-                    self.anotar(id)
-                case .descartar:
-                    self.confirmando.remove(id)
-                    self.descartar(id)
-                case .reintentar(let espera):
-                    // Still «in flight» while waiting, so new views do not ask again meanwhile.
-                    self.intentos[id, default: 0] += 1
-                    try? await Task.sleep(for: espera)
-                    guard self.confirmando.remove(id) != nil else { return } // reset by a reconnection
-                    if let v = self.link.vista { self.confirmar(v) }
-                case .siguienteVista:
-                    self.confirmando.remove(id) // the connection dropped: the new one starts over
-                }
-            }
-        }
-    }
-
-    enum TrasConfirmar: Equatable {
-        case anotado, descartar, siguienteVista
-        case reintentar(Duration)
-    }
-
-    /// What to do after a `turn_visible` answer (`nil`: no answer, the connection dropped).
-    static func tras(_ r: WireResponse?, intentos: Int) -> TrasConfirmar {
-        switch r {
-        case .turnVisibleNoted?: return .anotado
-        case nil: return .siguienteVista
-        case .refused(let x)? where x.reason == "engine busy":
-            guard intentos + 1 < maxIntentosVisible else { return .descartar }
-            return .reintentar(.milliseconds(500 << intentos))
-        default: return .descartar // not transient: another answer will not change it
-        }
-    }
-
-    private func anotar(_ id: String) {
-        intentos[id] = nil
-        confirmados.append(id)
-        if confirmados.count > 64 { confirmados.removeFirst(confirmados.count - 64) }
-    }
-
-    private func descartar(_ id: String) {
-        intentos[id] = nil
-        descartados.append(id)
-        if descartados.count > 64 { descartados.removeFirst(descartados.count - 64) }
-    }
-
-    static func porConfirmar(_ v: WireConversation, aLaVista: Bool, ya: Set<String>) -> [String] {
-        var ids: [String] = []
-        func elegible(_ t: WireTurn) -> Bool { t.source == .mine || aLaVista }
-        for t in v.turns where t.outcome == nil && elegible(t) && !ya.contains(t.turn_id) {
-            ids.append(t.turn_id)
-        }
-        if let id = v.awaiting_visible, !ya.contains(id), !ids.contains(id),
-           let t = v.turns.first(where: { $0.turn_id == id }), elegible(t) {
-            ids.append(id)
-        }
-        return ids
-    }
-
-    /// The conversation connection dropped: the agent ended any take with it (`discard`), and a
-    /// new subscription starts its confirmations from scratch.
+    /// The conversation connection dropped: the agent ended any take with it (`discard`).
     private func perdido() {
         toma = .ninguna
-        confirmados.removeAll()
-        confirmando.removeAll()
-        descartados.removeAll()
-        intentos.removeAll()
+    }
+
+    // MARK: The list
+
+    /// Show conversation `id` (from the list); its history arrives in the next views.
+    func abrir(_ id: String) async {
+        guard vivo, vista?.id != id else { return }
+        aviso = nil
+        await pedirSimple(.openConversation(WireOpen(id: id)))
+    }
+
+    /// «Nueva»: nothing open; the next text starts a conversation.
+    func nueva() async {
+        guard vivo else { return }
+        aviso = nil
+        texto = ""
+        await pedirSimple(.newConversation)
+    }
+
+    /// A request answered `conversation_opened`; anything else is said in the line.
+    private func pedirSimple(_ r: WireRequest) async {
+        do {
+            switch try await link.pedir(r) {
+            case .conversationOpened: break
+            case .refused(let x): aviso = Textos.rechazo(x.reason)
+            default: aviso = Textos.fallo(CommandError.unexpected)
+            }
+        } catch {
+            aviso = Textos.fallo(error)
+        }
     }
 
     // MARK: Text
@@ -283,6 +233,7 @@ final class Conversacion {
         do {
             switch try await link.pedir(.cancelTurn) {
             case .turnCancelSent: break
+            case .turnCancelNotReady: aviso = Textos.cancelarSinConexion
             case .refused(let r): aviso = Textos.rechazo(r.reason)
             default: aviso = Textos.fallo(CommandError.unexpected)
             }
@@ -447,6 +398,8 @@ final class Conversacion {
     func enviarAhora() { lanzar { [weak self] in await self?.enviar() } }
     func cancelarAhora() { lanzar { [weak self] in await self?.cancelar() } }
     func pedirPermisoAhora() { lanzar { [weak self] in await self?.pedirPermiso() } }
+    func abrirAhora(_ id: String) { lanzar { [weak self] in await self?.abrir(id) } }
+    func nuevaAhora() { lanzar { [weak self] in await self?.nueva() } }
 
     // MARK: The keyboard
 

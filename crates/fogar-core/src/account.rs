@@ -167,7 +167,7 @@ impl AccountRecord {
         })
     }
 
-    fn same_as(&self, other: &AccountRecord) -> bool {
+    pub(crate) fn same_as(&self, other: &AccountRecord) -> bool {
         self.client_id == other.client_id
             && self.address == other.address
             // Both tokens are our own copies (no remote timing oracle, SEC-4 n/a).

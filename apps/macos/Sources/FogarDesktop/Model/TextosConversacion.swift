@@ -31,12 +31,16 @@ extension Textos {
         }
     }
 
+    /// `CancelTurn` while the agent has no link: nothing could be asked to stop.
+    static let cancelarSinConexion = "Fogar no está conectado: no se pudo parar."
+
     static func rechazoTexto(_ r: WireTextRefusal) -> String {
         switch r {
         case .empty: "Escribe algo antes de enviarlo."
         case .tooLong: "Es demasiado largo para un mensaje. Pártelo en dos."
         case .notReady: "Fogar no está conectado al gateway ahora. Tu texto sigue en la caja."
         case .recording: "Termina de grabar antes de enviar texto."
+        case .missingScope: soloLectura
         }
     }
 
@@ -58,7 +62,7 @@ extension Textos {
         case .listo: "Pulsa para hablar: verás el texto mientras hablas."
         case .sinConexion: "Sin conexión con Fogar: ahora no se puede grabar."
         case .soloAppFirmada: "La conversación solo funciona con la app de Fogar firmada como el agente."
-        case .sinTranscriptor: "El gateway no tiene transcriptor ahora. Puedes escribir."
+        case .sinTranscriptor: "Sin transcriptor: dictar llegará más adelante. De momento, escribe."
         case .pedirPermiso: "Fogar necesita tu permiso para usar el micrófono."
         case .denegado: microDenegado
         case .desconocido: "Fogar aún no sabe si puede usar el micrófono de este Mac. Puedes escribir."
@@ -124,6 +128,41 @@ extension Textos {
     }
 
     static let pushEtiqueta = "Fogar te escribió"
-    static let pushSinSonido = "Sin sonido: no tenías la conversación delante."
-    static let otroDia = "Otro día"
+
+    /// A conversation's name in the list (OpenClaw titles it from the first message).
+    static func tituloConversacion(_ c: WireSummary) -> String {
+        let t = c.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return t.isEmpty ? "Conversación sin título" : t
+    }
+
+    /// Who wrote a message, for VoiceOver.
+    static func autorMensaje(_ m: WireMessage) -> String {
+        if m.mine { return "Tú" }
+        return m.from_name.flatMap(nombreDispositivo) ?? "Alguien de casa"
+    }
+
+    /// The line under a message, when there is something to say.
+    static func notaMensaje(_ m: WireMessage) -> String? {
+        switch m.state {
+        case .pending: return "Pendiente: va cuando Fogar termine."
+        case .failed:
+            switch m.error_code {
+            case "missing_scope": return "No se envió: tu cuenta no puede escribir."
+            // Our deadline passed with no answer: the gateway may have it.
+            case "unknown": return "Puede que se enviara: Fogar tardó en contestar. Mira si aparece antes de volver a escribirlo."
+            default: return "No se envió. Escríbelo otra vez cuando Fogar vuelva."
+            }
+        case .delivered, .past:
+            guard !m.mine, let nombre = m.from_name.flatMap(nombreDispositivo) else { return nil }
+            return "Enviado desde \(nombre)"
+        }
+    }
+
+    /// A device name is the person's own text (they named the device): shown as it is, cut to
+    /// 40 characters, never empty.
+    static func nombreDispositivo(_ s: String) -> String? {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? nil : String(t.prefix(40))
+    }
+    static let soloLectura = "Tu cuenta puede leer las conversaciones, pero no escribir. Pídeselo a quien administra Fogar."
 }

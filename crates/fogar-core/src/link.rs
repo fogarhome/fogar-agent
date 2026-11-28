@@ -1,56 +1,86 @@
-//! Gateway connection supervisor + session loop (fogar-longrun-reliability "WebSocket connection
-//! supervisor"). Protocol v1 specifics: handshake JSON without `type`, `status` frames may precede
-//! `ready`, no application ping (keepalive = `{"type":"keepalive"}` after client silence), closes
-//! are classified by code + reason (spec §11).
+//! Gateway link supervisor over `GET /events` (gateway 5.0, client-protocol §16): ONE SSE stream
+//! per device, open whenever there is an account (fogar-longrun-reliability "connection
+//! supervisor", with an HTTP stream instead of a WebSocket).
 //!
-//! Ownership: ONE supervisor task owns the uplink `Receiver` across sessions; each session is run
-//! inline (no per-session tasks to leak). Cancellation: the `egress` token ends the current
-//! session with a close frame (under `close_timeout`) and stops reconnecting.
+//! - Attempt: `open_stream` under `connect_timeout`; a non-2xx status is read with
+//!   [`read_capped`] and classified by [`classify_http`] (401 signs out through
+//!   `revoke_if_current`, `403 missing_scope` parks, the rest backs off or parks). Then only
+//!   `ready` counts, within `ready_timeout`; a `ready.protocol` other than ours parks
+//!   (`UpgradeClient`).
+//! - Read loop: every `chunk()` runs under `events_read_timeout` (any byte, `: ping` included,
+//!   resets it). Events go to the engine must-deliver (byte charge + slot, each under
+//!   `inbound_deadline`); `last_id` advances only once the engine accepted the event, survives
+//!   reconnects and is dropped when the account changes.
+//! - Rotation: the gateway ends every stream after ~25 s. A clean end after `ready` on a stream
+//!   that lasted `stable_stream` reopens at once with `Last-Event-ID`; if that reaches `ready`
+//!   within `rotation_grace`, nothing above the link sees it (no `Down`, no `Up`, no state or
+//!   status change). Anything else is a real `Down`, then the jittered backoff.
+//! - `resync` events and oversize events (skipped by the reader) ask the engine to re-fetch
+//!   (`Inbound::Resync`). Push `audio` is dropped here (counted): nothing plays in 4a.
+//!
+//! Ownership: ONE supervisor task, no per-stream task: the body is read inline and dropped (the
+//! connection closes) when the stream ends. Cancellation: `egress` drops the stream and stops.
 
 use crate::{
     account::{self, AccountRecord},
     config::Config,
     queues::{ByteBudget, Charge},
     stats::{LinkState, Stats},
-    time::{deadline, sleep_until_opt},
+    time::deadline,
 };
 use fogar_ports::{
     clock::{Clock, Mono},
-    gateway::{Frame, GatewayLink, LinkEvent, LinkSession, WsRoute},
+    gateway::GatewayAddr,
+    gateway_http::{GatewayHttp, HttpCall, MAX_BODY_BYTES, ResponseBody},
     ipc::GatewayInfo,
     random::Random,
-    secrets::{ExposeSecret, SecretError, SecretStore},
+    secrets::{SecretError, SecretStore, SecretString},
 };
 use fogar_proto::{
-    ClientMsg, CloseAction, Handshake, ServerMsg, classify_close, client::PROTOCOL_VERSION,
-    close::CLOSE_ABNORMAL, close::CLOSE_NORMAL, decode_server, encode_client, encode_handshake,
-    server::Capabilities,
+    CloseAction,
+    account::ApiError,
+    client::PROTOCOL_VERSION,
+    events::{Event, decode_event},
+    sse::{SseItem, SseReader},
 };
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-/// Session -> engine events. Frames carry the [`Charge`] of their bytes against
-/// `queues::INBOUND_BYTES`; it is released when the engine drops the message.
-pub(crate) enum Inbound {
-    /// The session reached `ready`; carries its `live_capabilities` (voice services up).
-    SessionUp(Capabilities),
-    SessionDown,
-    Server(ServerMsg, Charge),
-    /// Raw binary frame (0xA1 + turn_seq + PCM16); the engine parses it zero-copy.
-    Audio(Vec<u8>, Charge),
+/// What the engine needs to make REST calls for the signed-in account. `Debug` shows the
+/// address only.
+#[derive(Clone)]
+pub(crate) struct Api {
+    pub(crate) addr: GatewayAddr,
+    pub(crate) token: SecretString,
 }
 
-/// Redacting `Debug` (review sec#7, LOG-1): transcripts, tokens and audio never reach a log line.
-impl std::fmt::Debug for Inbound {
+impl std::fmt::Debug for Api {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Inbound::SessionUp(c) => f.debug_tuple("SessionUp").field(c).finish(),
-            Inbound::SessionDown => f.write_str("SessionDown"),
-            Inbound::Server(m, _) => f.debug_tuple("Server").field(m).finish(),
-            Inbound::Audio(b, _) => write!(f, "Audio(<{} bytes>)", b.len()),
-        }
+        f.debug_struct("Api").field("addr", &self.addr).finish()
     }
+}
+
+/// Link -> engine. `Event` carries the [`Charge`] of its bytes against `queues::INBOUND_BYTES`;
+/// it is released when the engine drops the message. `Debug` hides every text (`Event`'s own).
+#[derive(Debug)]
+pub(crate) enum Inbound {
+    /// A stream reached `ready` after a `Down` (or for the first time). `resumed`: it was asked
+    /// to resume (`Last-Event-ID`); a `Resync` follows if the gateway could not.
+    Up { api: Api, resumed: bool },
+    /// The stream is gone and the planned rotation could not replace it in time.
+    Down,
+    /// `id`: the SSE id (`None` for events without one); `bytes`: its SSE data length.
+    Event {
+        ev: Event,
+        id: Option<u64>,
+        bytes: usize,
+        charge: Charge,
+    },
+    /// Re-fetch what is shown: the gateway lost our place, or an event was too big to read.
+    Resync,
+    /// There is no account (signed out, revoked): forget everything shown.
+    SignedOut,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,9 +91,65 @@ pub struct LinkView {
     pub gateway: Option<GatewayInfo>,
 }
 
-pub(crate) struct LinkCtx<C, L> {
+/// What a REST status means for the caller (the link and, in Task 4, the engine's calls).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HttpClass {
+    Ok,
+    /// `401 not_authenticated`: the token is dead: sign out.
+    Revoked,
+    /// `403 missing_scope`: the token is valid but lacks the scope; never retried.
+    MissingScope,
+    /// 5xx, 408, 425, 429, or a body that cannot be read or decoded: back off and retry.
+    Retry,
+    /// Any other answer: the same request fails the same way, do not retry.
+    Fatal,
+}
+
+/// One shared reading of a REST status (+ its capped body, `None` if it could not be read).
+pub(crate) fn classify_http(status: u16, body: Option<&[u8]>) -> HttpClass {
+    match status {
+        200..=299 => HttpClass::Ok,
+        // Only the gateway's own answer signs out; any other 401 (a proxy page) backs off.
+        401 => match body.and_then(|b| serde_json::from_slice::<ApiError>(b).ok()) {
+            Some(e) if e.code() == Some("not_authenticated") => HttpClass::Revoked,
+            _ => HttpClass::Retry,
+        },
+        403 => match body.and_then(|b| serde_json::from_slice::<ApiError>(b).ok()) {
+            Some(e) if e.code() == Some("missing_scope") => HttpClass::MissingScope,
+            Some(_) => HttpClass::Fatal,
+            // Undecodable (a proxy page?): back off, never a tight loop.
+            None => HttpClass::Retry,
+        },
+        408 | 425 | 429 | 500..=599 => HttpClass::Retry,
+        300..=499 => HttpClass::Fatal,
+        _ => HttpClass::Retry,
+    }
+}
+
+/// Reads a whole (non-2xx) body of at most `max` bytes, every `chunk()` inside the one deadline
+/// `d`. `None`: larger, broken or too slow.
+pub(crate) async fn read_capped<C: Clock, B: ResponseBody>(
+    clock: &C,
+    body: &mut B,
+    max: usize,
+    d: Duration,
+) -> Option<Vec<u8>> {
+    let read = async {
+        let mut out = Vec::new();
+        loop {
+            match body.chunk().await {
+                Ok(Some(c)) if out.len() + c.len() <= max => out.extend_from_slice(&c),
+                Ok(Some(_)) | Err(_) => return None,
+                Ok(None) => return Some(out),
+            }
+        }
+    };
+    deadline(clock, d, read).await.flatten()
+}
+
+pub(crate) struct LinkCtx<C, H> {
     pub(crate) clock: Arc<C>,
-    pub(crate) link: L,
+    pub(crate) http: Arc<H>,
     pub(crate) secrets: Arc<dyn SecretStore>,
     pub(crate) random: Arc<dyn Random>,
     pub(crate) cfg: Arc<Config>,
@@ -72,7 +158,7 @@ pub(crate) struct LinkCtx<C, L> {
     /// Byte budget of the inbound queue (`queues::INBOUND_BYTES`).
     pub(crate) budget: ByteBudget,
     /// Bumped whenever the account is written or deleted: the link drops what it is
-    /// doing (session, backoff, park) and starts over from the stored account.
+    /// doing (stream, backoff, park) and starts over from the stored account.
     pub(crate) account: watch::Receiver<()>,
     /// Keeps the account channel open while the link runs: a closed `watch` would make every
     /// `changed()` branch above resolve at once (a hot loop).
@@ -83,35 +169,69 @@ pub(crate) struct LinkCtx<C, L> {
     pub(crate) _reconnect_keep: watch::Sender<()>,
 }
 
-/// The token is dead: delete the account and show the sign-in screen. 4010 (invalid or inactive
-/// credential) or 4200 (revoked, logged out elsewhere), whatever the text (client-protocol §13).
-/// Nothing else deletes it; 4.x 1008 texts are gone with 4.x.
-fn is_revocation(code: u16) -> bool {
-    matches!(code, 4010 | 4200)
-}
-
-/// Why a connection attempt / session ended.
+/// Why an attempt ended.
 #[derive(Debug)]
 enum Outcome {
     Shutdown,
     /// Engine dropped its end: nothing left to serve.
     EngineGone,
-    /// Transport connect / handshake write / ready wait failed before `ready`.
-    ConnectFailed,
-    /// Our handshake cannot be encoded (e.g. over 4096 chars): retrying cannot help.
-    ClientBug,
-    /// The peer closed (or the transport died: 1006).
-    Closed {
-        code: u16,
-        reason: String,
-    },
-    /// We ended the session: the engine stalled or a write failed / timed out.
-    LocalFault,
     /// The account changed (signed in or out): start over without backoff.
     AccountChanged,
+    /// No `ready`: unreachable, refused, a retryable status, EOF / silence before `ready`.
+    ConnectFailed,
+    /// The stream ended after `ready` (EOF, error, silence) or the engine stalled past its
+    /// deadline: back off and resume.
+    Ended,
+    /// 401 `not_authenticated`.
+    Revoked,
+    /// Retrying cannot help: wait for the person (or a new account).
+    Park(CloseAction),
 }
 
-impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
+/// One thing read from the stream, owned (the reader's items borrow its buffer).
+enum Item {
+    Ev {
+        ev: Event,
+        id: Option<u64>,
+        bytes: usize,
+    },
+    /// A dropped event, with its id when it came before the drop.
+    Oversize(Option<u64>),
+}
+
+/// Feeds `bytes` to the reader and appends what it found. One chunk is at most
+/// `MAX_CHUNK_BYTES`, so `items` stays small; the caller reuses it.
+fn collect(reader: &mut SseReader, bytes: &[u8], items: &mut Vec<Item>) {
+    reader.feed(bytes, &mut |it| match it {
+        SseItem::Event { id, data } => items.push(Item::Ev {
+            ev: decode_event(data),
+            id: id.and_then(|s| s.parse().ok()),
+            bytes: data.len(),
+        }),
+        SseItem::Oversize { id } => items.push(Item::Oversize(id.and_then(|s| s.parse().ok()))),
+        SseItem::Comment => {}
+    });
+}
+
+/// An open stream past its `ready`.
+struct Stream<B> {
+    body: B,
+    reader: SseReader,
+    opened: Mono,
+    /// The `ready` event's id (a fresh stream names the current id there).
+    ready_id: Option<u64>,
+    /// Items that came after `ready` in the same chunk.
+    rest: Vec<Item>,
+}
+
+/// How a read loop ended.
+enum ReadEnd {
+    /// The gateway ended the stream cleanly.
+    Eof,
+    Other(Outcome),
+}
+
+impl<C: Clock, H: GatewayHttp> LinkCtx<C, H> {
     fn set_state(&self, state: LinkState) {
         self.view.send_modify(|v| v.state = state);
     }
@@ -127,13 +247,20 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
         }
     }
 
-    pub(crate) async fn run(
-        mut self,
-        mut out_rx: mpsc::Receiver<Frame>,
-        in_tx: mpsc::Sender<Inbound>,
-        egress: CancellationToken,
-    ) {
+    fn backoff(&self, attempt: &mut u32) -> Duration {
+        let d = self.cfg.backoff.delay(*attempt, &*self.random);
+        *attempt = attempt.saturating_add(1);
+        d
+    }
+
+    pub(crate) async fn run(mut self, in_tx: mpsc::Sender<Inbound>, egress: CancellationToken) {
         let mut attempt: u32 = 0;
+        // The account the resume point belongs to, and the resume point.
+        let mut owner: Option<AccountRecord> = None;
+        let mut last_id: Option<u64> = None;
+        // A `SignedOut` the stalled engine missed: delivered before the next `Up`, so the
+        // engine never keeps the old account's handle or conversation into a new one.
+        let mut signed_out_owed = false;
         loop {
             if egress.is_cancelled() || in_tx.is_closed() {
                 break;
@@ -145,13 +272,45 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                 // A store this build cannot use (e.g. a stub) will not start working by
                 // retrying: show "signed out" instead of "reconnecting" forever.
                 Ok(None) | Err(SecretError::Unsupported(_)) => {
+                    owner = None;
+                    last_id = None;
                     self.view.send_modify(|v| {
                         v.state = LinkState::NotPaired;
                         v.gateway = None;
                     });
-                    // No timer: the only writers are `Login` (signals the watch) and the CLI dev
-                    // path at boot. A signed-out Mac costs no wakeups and no Keychain reads.
+                    signed_out_owed = !self.forward(&in_tx, Inbound::SignedOut, &egress).await;
+                    if signed_out_owed
+                        && !matches!(self.not_delivered(&in_tx, &egress), Outcome::Ended)
+                    {
+                        break;
+                    }
+                    // No timer once delivered: the only writers are `Login` (signals the watch)
+                    // and the CLI dev path at boot. A signed-out Mac costs no wakeups and no
+                    // Keychain reads. While owed, retried on the backoff so a recovered engine
+                    // drops the old account without waiting for the next login.
                     let mut account = self.account.clone();
+                    while signed_out_owed {
+                        let d = self.backoff(&mut attempt);
+                        tokio::select! {
+                            biased;
+                            () = egress.cancelled() => break,
+                            r = account.changed() => if r.is_ok() { break } else { return },
+                            () = self.clock.sleep(d) => {
+                                signed_out_owed =
+                                    !self.forward(&in_tx, Inbound::SignedOut, &egress).await;
+                                if signed_out_owed
+                                    && !matches!(self.not_delivered(&in_tx, &egress), Outcome::Ended)
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    if signed_out_owed {
+                        // Shutdown or the account changed: the top of the loop decides.
+                        continue;
+                    }
+                    attempt = 0;
                     tokio::select! {
                         biased;
                         () = egress.cancelled() => break,
@@ -159,8 +318,7 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                     }
                 }
                 Err(_) => {
-                    let d = self.cfg.backoff.delay(attempt, &*self.random);
-                    attempt = attempt.saturating_add(1);
+                    let d = self.backoff(&mut attempt);
                     self.set_state(LinkState::Backoff {
                         attempt,
                         last_close: None,
@@ -171,6 +329,23 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                     break;
                 }
             };
+            if signed_out_owed {
+                if !self.forward(&in_tx, Inbound::SignedOut, &egress).await {
+                    if !matches!(self.not_delivered(&in_tx, &egress), Outcome::Ended) {
+                        break;
+                    }
+                    let d = self.backoff(&mut attempt);
+                    if self.wait(d, &egress).await {
+                        continue;
+                    }
+                    break;
+                }
+                signed_out_owed = false;
+            }
+            if !owner.as_ref().is_some_and(|o| o.same_as(&record)) {
+                last_id = None;
+            }
+            let record = owner.insert(record);
             let info = record.info();
             self.view.send_modify(|v| {
                 v.state = LinkState::Connecting { attempt };
@@ -179,98 +354,59 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
                 }
             });
             Stats::inc(&self.stats.connect_attempts);
-            let started = self.clock.now();
-            let (outcome, was_ready) = self.attempt(&record, &mut out_rx, &in_tx, &egress).await;
-            if was_ready {
-                Stats::inc(&self.stats.sessions_ended);
-                let up_for = self.clock.now().saturating_since(started);
-                if up_for >= self.cfg.backoff.stable_after {
-                    attempt = 0;
-                }
-                // An engine merely busy past the deadline misses this SessionDown; its next
-                // SessionUp resets it. Only shutdown or a dead engine end the supervisor.
-                if !self.forward(&in_tx, Inbound::SessionDown, &egress).await
-                    && !matches!(self.not_delivered(&in_tx, &egress), Outcome::LocalFault)
-                {
-                    break;
-                }
+            let (outcome, stable) = self.attempt(record, &mut last_id, &in_tx, &egress).await;
+            if stable {
+                attempt = 0;
             }
-            let (delay, close) = match outcome {
+            let delay = match outcome {
                 Outcome::Shutdown | Outcome::EngineGone => break,
                 Outcome::AccountChanged => {
                     attempt = 0;
                     continue;
                 }
-                Outcome::ClientBug => {
-                    if self.park(CloseAction::FixClient, &egress).await {
+                Outcome::Park(action) => {
+                    if self.park(action, &egress).await {
+                        attempt = 0;
                         continue;
                     }
                     break;
                 }
-                Outcome::ConnectFailed | Outcome::LocalFault => {
-                    if !was_ready {
-                        Stats::inc(&self.stats.connect_failures);
-                    }
-                    let d = self.cfg.backoff.delay(attempt, &*self.random);
-                    attempt = attempt.saturating_add(1);
-                    (d, None)
-                }
-                Outcome::Closed { code, reason } => {
-                    let action = classify_close(code, &reason);
-                    self.view
-                        .send_modify(|v| v.last_close = Some((code, action)));
-                    if !was_ready {
-                        Stats::inc(&self.stats.connect_failures);
-                    }
-                    if is_revocation(code) && account::revoke_if_current(&*self.secrets, &record) {
-                        // Signed out; never retry this token. Still through the backoff:
-                        // a store whose delete silently fails must not turn a gateway that
-                        // revokes every connect into back-to-back reconnects (NET-4).
-                        self.view.send_modify(|v| {
-                            v.state = LinkState::NotPaired;
-                            v.gateway = None;
-                        });
-                        let d = self.cfg.backoff.delay(attempt, &*self.random);
-                        attempt = attempt.saturating_add(1);
-                        if self.wait(d, &egress).await {
+                Outcome::Revoked => {
+                    if !account::revoke_if_current(&*self.secrets, record) {
+                        // The store cannot be read or the delete failed: never retry a dead
+                        // token.
+                        if self.park(CloseAction::Repair, &egress).await {
+                            attempt = 0;
                             continue;
                         }
                         break;
                     }
-                    match action {
-                        // Any other Repair (e.g. a 4.x 1008 text) keeps the token (spec §0).
-                        CloseAction::Repair
-                        | CloseAction::AgentRefused
-                        | CloseAction::FixClient
-                        // 4003 (CERTAIN (5.0, #417)): never retried; the label tells the app to update.
-                        | CloseAction::UpgradeClient
-                        | CloseAction::MissingScope => {
-                            if self.park(action, &egress).await {
-                                attempt = 0;
-                                continue;
-                            }
-                            break;
-                        }
-                        // Idle close (300 s without client messages), a normal close or a
-                        // server restart: not an error, but only a session that stayed up for
-                        // `stable_after` has reset `attempt` above, so a gateway that closes
-                        // every session at once escalates the backoff like any other failure
-                        // (review code#1/sec#2: no reconnect storm, NET-4). After a stable
-                        // session this is `delay(0)`: prompt, jittered reconnect.
-                        CloseAction::IdleOrNormal
-                        | CloseAction::ServerRestart
-                        | CloseAction::RetryBackoff
-                        | CloseAction::Unknown => {
-                            let d = self.cfg.backoff.delay(attempt, &*self.random);
-                            attempt = attempt.saturating_add(1);
-                            (d, Some(action))
-                        }
+                    // Signed out; never retry this token. Still through the backoff: a store
+                    // whose delete silently fails must not turn a gateway that refuses every
+                    // stream into back-to-back attempts (NET-4).
+                    self.view.send_modify(|v| {
+                        v.state = LinkState::NotPaired;
+                        v.gateway = None;
+                        // The status log names the revocation (as it did for WS 4010/4200).
+                        v.last_close = Some((401, CloseAction::Repair));
+                    });
+                    let d = self.backoff(&mut attempt);
+                    if self.wait(d, &egress).await {
+                        continue;
                     }
+                    break;
                 }
+                Outcome::ConnectFailed => {
+                    Stats::inc(&self.stats.connect_failures);
+                    self.backoff(&mut attempt)
+                }
+                // A stable stream reset `attempt` above: a prompt, jittered reconnect. A gateway
+                // that ends every stream at once escalates like any other failure (NET-4).
+                Outcome::Ended => self.backoff(&mut attempt),
             };
             self.set_state(LinkState::Backoff {
                 attempt,
-                last_close: close,
+                last_close: None,
             });
             if !self.wait(delay, &egress).await {
                 break;
@@ -301,49 +437,18 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
         }
     }
 
-    /// One connect + handshake + session. Returns the outcome and whether `ready` was reached.
+    /// One stream (and the rotations that replace it in time). Returns the outcome and whether
+    /// a stream lasted `stable_stream` (the backoff resets).
     async fn attempt(
         &self,
         record: &AccountRecord,
-        out_rx: &mut mpsc::Receiver<Frame>,
+        last_id: &mut Option<u64>,
         in_tx: &mpsc::Sender<Inbound>,
         egress: &CancellationToken,
     ) -> (Outcome, bool) {
-        let clock = &*self.clock;
-        let mut account = self.account.clone();
-        let connect = tokio::select! {
-            biased;
-            () = egress.cancelled() => return (Outcome::Shutdown, false),
-            _ = account.changed() => return (Outcome::AccountChanged, false),
-            r = deadline(clock, self.cfg.connect_timeout, self.link.connect(record.address(), WsRoute::Stream)) => r,
-        };
-        let Some(Ok(mut sess)) = connect else {
-            return (Outcome::ConnectFailed, false);
-        };
-        let hs = Handshake {
-            client_key: Cow::Borrowed(record.token().expose_secret()),
-            protocol: PROTOCOL_VERSION,
-            input_mode: self.cfg.input_mode,
-            output_mode: self.cfg.output_mode.clone(),
-            agent: self.cfg.agent.as_deref().map(Cow::Borrowed),
-        };
-        let Ok(text) = encode_handshake(&hs) else {
-            return (Outcome::ClientBug, false);
-        };
-        drop(hs);
-        if !matches!(
-            deadline(clock, self.cfg.write_timeout, sess.send(Frame::Text(text))).await,
-            Some(Ok(()))
-        ) {
-            self.close_quietly(&mut sess, CLOSE_NORMAL).await;
-            return (Outcome::ConnectFailed, false);
-        }
-        // Frames queued for a previous session belong to a turn that no longer exists.
-        while out_rx.try_recv().is_ok() {
-            Stats::inc(&self.stats.stale_outbound_discarded);
-        }
-        let caps = match self.await_ready(&mut sess, in_tx, egress).await {
-            Ok(caps) => caps,
+        let resumed = last_id.is_some();
+        let mut stream = match self.open(record, *last_id, egress).await {
+            Ok(s) => s,
             Err(o) => return (o, false),
         };
         Stats::inc(&self.stats.sessions_started);
@@ -352,210 +457,268 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
             .sessions_started
             .load(std::sync::atomic::Ordering::Relaxed);
         self.set_state(LinkState::Ready { session });
-        if !self.forward(in_tx, Inbound::SessionUp(caps), egress).await {
-            self.close_quietly(&mut sess, CLOSE_NORMAL).await;
-            return (self.not_delivered(in_tx, egress), true);
+        let api = Api {
+            addr: record.address().clone(),
+            token: record.token().clone(),
+        };
+        if !self
+            .forward(in_tx, Inbound::Up { api, resumed }, egress)
+            .await
+        {
+            return (self.not_delivered(in_tx, egress), false);
         }
-        (self.session(&mut sess, out_rx, in_tx, egress).await, true)
+        // Only a fresh stream's id is a resume point here: on a failed resume the `resync` that
+        // follows carries the same id, and committing it first could skip that `resync`.
+        if !resumed && let Some(id) = stream.ready_id {
+            *last_id = Some(id);
+        }
+        let mut stable = false;
+        let outcome = loop {
+            let end = self.read(&mut stream, last_id, in_tx, egress).await;
+            let lasted = self.clock.now().saturating_since(stream.opened);
+            stable |= lasted >= self.cfg.stable_stream;
+            match end {
+                ReadEnd::Eof if lasted >= self.cfg.stable_stream => {}
+                // EOF of a short stream: not a rotation, back off.
+                ReadEnd::Eof => break Outcome::Ended,
+                ReadEnd::Other(o) => break o,
+            }
+            // A planned rotation: the old connection goes first (one stream per device).
+            drop(stream);
+            stream = match deadline(
+                &*self.clock,
+                self.cfg.rotation_grace,
+                self.open(record, *last_id, egress),
+            )
+            .await
+            {
+                Some(Ok(s)) => s,
+                Some(Err(o)) => break o,
+                None => break Outcome::Ended,
+            };
+            Stats::inc(&self.stats.stream_rotations);
+        };
+        Stats::inc(&self.stats.sessions_ended);
+        if !matches!(outcome, Outcome::Shutdown | Outcome::EngineGone)
+            && !self.forward(in_tx, Inbound::Down, egress).await
+        {
+            // An engine merely busy past the deadline misses this Down; its next Up resets it.
+            // Only shutdown or a dead engine end the supervisor.
+            let why = self.not_delivered(in_tx, egress);
+            if !matches!(why, Outcome::Ended) {
+                return (why, stable);
+            }
+        }
+        (outcome, stable)
     }
 
-    /// Waits for `ready`, tolerating (and forwarding) `status` frames before it (spec §5).
-    async fn await_ready(
+    /// Opens `/events` (resuming after `last_id`) and waits for its `ready`.
+    async fn open(
         &self,
-        sess: &mut L::Session,
+        record: &AccountRecord,
+        last_id: Option<u64>,
+        egress: &CancellationToken,
+    ) -> Result<Stream<H::Body>, Outcome> {
+        let clock = &*self.clock;
+        let mut account = self.account.clone();
+        let resume = last_id.map(|n| n.to_string());
+        let call = HttpCall::Events { audio: false };
+        let open = self.http.open_stream(
+            record.address(),
+            &call,
+            record.token(),
+            resume.as_deref(),
+            None,
+        );
+        let reply = tokio::select! {
+            biased;
+            () = egress.cancelled() => return Err(Outcome::Shutdown),
+            _ = account.changed() => return Err(Outcome::AccountChanged),
+            r = deadline(clock, self.cfg.connect_timeout, open) => r,
+        };
+        let Some(Ok(reply)) = reply else {
+            return Err(Outcome::ConnectFailed);
+        };
+        let opened = clock.now();
+        let mut body = reply.body;
+        if !(200..300).contains(&reply.status) {
+            let read = read_capped(clock, &mut body, MAX_BODY_BYTES, self.cfg.http_timeout);
+            let bytes = tokio::select! {
+                biased;
+                () = egress.cancelled() => return Err(Outcome::Shutdown),
+                b = read => b,
+            };
+            return Err(match classify_http(reply.status, bytes.as_deref()) {
+                HttpClass::Revoked => Outcome::Revoked,
+                HttpClass::MissingScope => Outcome::Park(CloseAction::MissingScope),
+                // A proxy's 404 while the gateway restarts must not park the daemon for good:
+                // anything but 401/403 backs off (capped, jittered).
+                HttpClass::Fatal | HttpClass::Ok | HttpClass::Retry => Outcome::ConnectFailed,
+            });
+        }
+        let ready_by = opened.saturating_add(self.cfg.ready_timeout);
+        let mut reader = SseReader::new();
+        let mut items = Vec::new();
+        loop {
+            // `chunk()` is cancel-safe (port contract): a valid looping branch.
+            let chunk = tokio::select! {
+                biased;
+                () = egress.cancelled() => return Err(Outcome::Shutdown),
+                _ = account.changed() => return Err(Outcome::AccountChanged),
+                c = body.chunk() => c,
+                () = clock.sleep_until(ready_by) => return Err(Outcome::ConnectFailed),
+            };
+            let Ok(Some(bytes)) = chunk else {
+                return Err(Outcome::ConnectFailed);
+            };
+            collect(&mut reader, &bytes, &mut items);
+            // Before `ready` only `ready` counts.
+            let Some(pos) = items.iter().position(|i| {
+                matches!(
+                    i,
+                    Item::Ev {
+                        ev: Event::Ready { .. },
+                        ..
+                    }
+                )
+            }) else {
+                items.clear();
+                continue;
+            };
+            let rest = items.split_off(pos + 1);
+            let Some(Item::Ev {
+                ev: Event::Ready { protocol, .. },
+                id,
+                ..
+            }) = items.pop()
+            else {
+                return Err(Outcome::ConnectFailed);
+            };
+            if protocol.is_some_and(|p| p != PROTOCOL_VERSION) {
+                return Err(Outcome::Park(CloseAction::UpgradeClient));
+            }
+            return Ok(Stream {
+                body,
+                reader,
+                opened,
+                ready_id: id,
+                rest,
+            });
+        }
+    }
+
+    /// Reads one stream until it ends, delivering every item.
+    async fn read(
+        &self,
+        s: &mut Stream<H::Body>,
+        last_id: &mut Option<u64>,
         in_tx: &mpsc::Sender<Inbound>,
         egress: &CancellationToken,
-    ) -> Result<Capabilities, Outcome> {
+    ) -> ReadEnd {
         let clock = &*self.clock;
-        let ready_by = clock.now().saturating_add(self.cfg.ready_timeout);
         let mut account = self.account.clone();
+        let mut items = std::mem::take(&mut s.rest);
         loop {
-            tokio::select! {
+            for item in items.drain(..) {
+                if !self.deliver(item, last_id, in_tx, egress).await {
+                    return ReadEnd::Other(self.not_delivered(in_tx, egress));
+                }
+            }
+            let chunk = tokio::select! {
                 biased;
-                () = egress.cancelled() => {
-                    self.close_quietly(sess, CLOSE_NORMAL).await;
-                    return Err(Outcome::Shutdown);
-                }
-                _ = account.changed() => {
-                    self.close_quietly(sess, CLOSE_NORMAL).await;
-                    return Err(Outcome::AccountChanged);
-                }
-                ev = sess.recv() => match ev {
-                    None => return Err(Outcome::Closed { code: CLOSE_ABNORMAL, reason: String::new() }),
-                    Some(LinkEvent::Closed { code, reason }) => return Err(Outcome::Closed { code, reason }),
-                    Some(LinkEvent::Frame(Frame::Text(t))) => match decode_server(&t) {
-                        Ok(ServerMsg::Ready(r)) => return Ok(r.live_capabilities),
-                        Ok(msg @ ServerMsg::Status(_)) => {
-                            let delivered = match self.charge(t.len(), egress).await {
-                                Some(charge) => self.forward(in_tx, Inbound::Server(msg, charge), egress).await,
-                                None => false,
-                            };
-                            if !delivered {
-                                self.close_quietly(sess, CLOSE_NORMAL).await;
-                                return Err(self.not_delivered(in_tx, egress));
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(_) => Stats::inc(&self.stats.inbound_invalid),
-                    },
-                    Some(LinkEvent::Frame(Frame::Binary(_))) => {}
-                },
-                () = clock.sleep_until(ready_by) => {
-                    self.close_quietly(sess, CLOSE_NORMAL).await;
-                    return Err(Outcome::ConnectFailed);
-                }
+                () = egress.cancelled() => return ReadEnd::Other(Outcome::Shutdown),
+                _ = account.changed() => return ReadEnd::Other(Outcome::AccountChanged),
+                c = deadline(clock, self.cfg.events_read_timeout, s.body.chunk()) => c,
+            };
+            match chunk {
+                Some(Ok(Some(bytes))) => collect(&mut s.reader, &bytes, &mut items),
+                Some(Ok(None)) => return ReadEnd::Eof,
+                // Silent past the read timeout (dead peer, half-open) or broken.
+                None | Some(Err(_)) => return ReadEnd::Other(Outcome::Ended),
             }
         }
     }
 
-    async fn session(
+    /// Hands one item to the engine (must-deliver) and then moves the resume point. `false` =
+    /// not delivered (shutdown, engine gone or stalled).
+    async fn deliver(
         &self,
-        sess: &mut L::Session,
-        out_rx: &mut mpsc::Receiver<Frame>,
+        item: Item,
+        last_id: &mut Option<u64>,
         in_tx: &mpsc::Sender<Inbound>,
         egress: &CancellationToken,
-    ) -> Outcome {
-        let clock = &*self.clock;
-        let mut last_sent: Mono = clock.now();
-        let mut account = self.account.clone();
-        loop {
-            // One armed timer at most (energy rule 1): the keepalive deadline, pushed forward by
-            // every frame we send.
-            let keepalive_due = self
-                .cfg
-                .keepalive_after
-                .map(|d| last_sent.saturating_add(d));
-            tokio::select! {
-                biased;
-                () = egress.cancelled() => {
-                    self.close_quietly(sess, CLOSE_NORMAL).await;
-                    return Outcome::Shutdown;
+    ) -> bool {
+        let (ev, id, bytes) = match item {
+            Item::Oversize(id) => {
+                Stats::inc(&self.stats.events_oversize);
+                if !self.forward(in_tx, Inbound::Resync, egress).await {
+                    return false;
                 }
-                _ = account.changed() => {
-                    self.close_quietly(sess, CLOSE_NORMAL).await;
-                    return Outcome::AccountChanged;
+                Stats::inc(&self.stats.events_resync);
+                // Resume past it: the resync re-fetched what it carried, and the gateway would
+                // replay the same too-big event at every rotation.
+                if let Some(id) = id
+                    && last_id.is_none_or(|l| id > l)
+                {
+                    *last_id = Some(id);
                 }
-                ev = sess.recv() => match ev {
-                    None => return Outcome::Closed { code: CLOSE_ABNORMAL, reason: String::new() },
-                    Some(LinkEvent::Closed { code, reason }) => return Outcome::Closed { code, reason },
-                    Some(LinkEvent::Frame(Frame::Text(t))) => match decode_server(&t) {
-                        Ok(ServerMsg::Unknown) => {}
-                        Ok(msg) => {
-                            let delivered = self
-                                .deliver_draining(sess, out_rx, in_tx, msg, t.len(), egress, &mut last_sent)
-                                .await;
-                            if !delivered {
-                                self.close_quietly(sess, CLOSE_NORMAL).await;
-                                return self.not_delivered(in_tx, egress);
-                            }
-                        }
-                        Err(_) => Stats::inc(&self.stats.inbound_invalid),
-                    },
-                    Some(LinkEvent::Frame(Frame::Binary(b))) => match self.budget.try_charge(b.len()) {
-                        None => Stats::inc(&self.stats.inbound_audio_shed),
-                        Some(charge) => match in_tx.try_send(Inbound::Audio(b, charge)) {
-                        Ok(()) => Stats::hwm(&self.stats.in_queue_hwm, in_tx.max_capacity() - in_tx.capacity()),
-                        Err(mpsc::error::TrySendError::Full(_)) => Stats::inc(&self.stats.inbound_audio_shed),
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            self.close_quietly(sess, CLOSE_NORMAL).await;
-                            return Outcome::EngineGone;
-                        }
+                return true;
+            }
+            Item::Ev { ev, id, bytes } => (ev, id, bytes),
+        };
+        match ev {
+            // Only a stream's first `ready` counts (handled by `open`).
+            Event::Ready { .. } => return true,
+            Event::Audio => Stats::inc(&self.stats.events_audio_dropped),
+            Event::Unknown => Stats::inc(&self.stats.inbound_invalid),
+            Event::Resync => {
+                if !self.forward(in_tx, Inbound::Resync, egress).await {
+                    return false;
+                }
+                Stats::inc(&self.stats.events_resync);
+            }
+            ev => {
+                let Some(charge) = self.charge(bytes, egress).await else {
+                    return false;
+                };
+                if !self
+                    .forward(
+                        in_tx,
+                        Inbound::Event {
+                            ev,
+                            id,
+                            bytes,
+                            charge,
                         },
-                    },
-                },
-                out = out_rx.recv() => match out {
-                    None => {
-                        self.close_quietly(sess, CLOSE_NORMAL).await;
-                        return Outcome::EngineGone;
-                    }
-                    Some(frame) => {
-                        if !matches!(deadline(clock, self.cfg.write_timeout, sess.send(frame)).await, Some(Ok(()))) {
-                            self.close_quietly(sess, CLOSE_NORMAL).await;
-                            return Outcome::LocalFault;
-                        }
-                        Stats::inc(&self.stats.frames_sent);
-                        last_sent = clock.now();
-                    }
-                },
-                () = sleep_until_opt(clock, keepalive_due), if keepalive_due.is_some() => {
-                    let Ok(text) = encode_client(&ClientMsg::Keepalive) else {
-                        return Outcome::ClientBug;
-                    };
-                    if !matches!(deadline(clock, self.cfg.write_timeout, sess.send(Frame::Text(text))).await, Some(Ok(()))) {
-                        self.close_quietly(sess, CLOSE_NORMAL).await;
-                        return Outcome::LocalFault;
-                    }
-                    Stats::inc(&self.stats.keepalives_sent);
-                    last_sent = clock.now();
+                        egress,
+                    )
+                    .await
+                {
+                    return false;
                 }
+                Stats::inc(&self.stats.events_received);
             }
         }
+        if id.is_some() {
+            *last_id = id;
+        }
+        true
     }
 
     /// Why a must-deliver enqueue failed: shutdown, the engine is gone, or (the engine is only
-    /// busy past `inbound_deadline`) a local fault that ends this session and reconnects.
+    /// busy past `inbound_deadline`) the stream ends and resumes after a backoff.
     fn not_delivered(&self, in_tx: &mpsc::Sender<Inbound>, egress: &CancellationToken) -> Outcome {
         if egress.is_cancelled() {
             Outcome::Shutdown
         } else if in_tx.is_closed() {
             Outcome::EngineGone
         } else {
-            Outcome::LocalFault
+            Outcome::Ended
         }
     }
 
-    async fn close_quietly(&self, sess: &mut L::Session, code: u16) {
-        let _ = deadline(&*self.clock, self.cfg.close_timeout, sess.close(code, "")).await;
-    }
-}
-
-impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
-    /// Must-deliver enqueue of one JSON event (byte charge + queue slot, each under
-    /// `inbound_deadline`) that KEEPS DRAINING the uplink queue while it waits (review code#6).
-    /// The link is the only reader of `out_rx`; if it waited for inbound room without draining,
-    /// an engine waiting for outbound room (must-deliver control) and the link would wait on each
-    /// other until both deadlines fired. `false` = not delivered (shutdown, engine gone, engine
-    /// stalled, or an uplink write failed / timed out); the caller classifies and closes.
-    #[allow(clippy::too_many_arguments)]
-    async fn deliver_draining(
-        &self,
-        sess: &mut L::Session,
-        out_rx: &mut mpsc::Receiver<Frame>,
-        in_tx: &mpsc::Sender<Inbound>,
-        msg: ServerMsg,
-        bytes: usize,
-        egress: &CancellationToken,
-        last_sent: &mut Mono,
-    ) -> bool {
-        let enqueue = async {
-            match self.charge(bytes, egress).await {
-                Some(c) => self.forward(in_tx, Inbound::Server(msg, c), egress).await,
-                None => false,
-            }
-        };
-        tokio::pin!(enqueue);
-        let mut out_open = true;
-        loop {
-            tokio::select! {
-                biased;
-                ok = &mut enqueue => return ok,
-                out = out_rx.recv(), if out_open => match out {
-                    // Engine gone: the enqueue notices (closed channel) and returns false.
-                    None => out_open = false,
-                    Some(frame) => {
-                        if !matches!(deadline(&*self.clock, self.cfg.write_timeout, sess.send(frame)).await, Some(Ok(()))) {
-                            return false;
-                        }
-                        Stats::inc(&self.stats.frames_sent);
-                        *last_sent = self.clock.now();
-                    }
-                },
-            }
-        }
-    }
-
-    /// Charges a must-deliver JSON frame's bytes against `INBOUND_BYTES`, waiting up to
-    /// `inbound_deadline`. `None` = shutdown or the engine stalled past the deadline.
+    /// Charges an event's bytes against `INBOUND_BYTES`, waiting up to `inbound_deadline`.
+    /// `None` = shutdown or the engine stalled past the deadline.
     async fn charge(&self, bytes: usize, egress: &CancellationToken) -> Option<Charge> {
         tokio::select! {
             biased;
@@ -591,98 +754,73 @@ impl<C: Clock, L: GatewayLink> LinkCtx<C, L> {
     }
 }
 
-/// Round-2 review F6: the link must charge every queued inbound frame (TTS audio and JSON)
-/// against `INBOUND_BYTES`. These tests drive `LinkCtx::run` with an engine that never consumes
-/// and read the shared budget directly; a link that charged 0 (or 1) byte per frame would let
-/// the queue hold 128 x 1 MiB.
 #[cfg(test)]
-mod budget_tests {
+mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use crate::queues::{INBOUND, INBOUND_BYTES};
-    use fogar_ports::{gateway::LinkError, secrets::SecretKey};
-    use fogar_testkit::{MemorySecretStore, SeededRandom, TestClock};
+    use fogar_ports::secrets::SecretKey;
+    use fogar_testkit::{
+        EventsHub, FakeGatewayHttp, HttpRoutes, MemorySecretStore, SeededRandom, TestClock,
+    };
 
-    /// A store signed in at `addr` with `key` (through the dev-key path: archtest R14 keeps the
-    /// account's item name in `account.rs`).
+    #[test]
+    fn statuses_are_classified() {
+        let scope = Some(br#"{"detail":"missing_scope"}"#.as_slice());
+        let other = Some(br#"{"detail":"forbidden"}"#.as_slice());
+        let auth = Some(br#"{"detail":"not_authenticated"}"#.as_slice());
+        for (status, body, want) in [
+            (200, None, HttpClass::Ok),
+            (202, None, HttpClass::Ok),
+            (401, auth, HttpClass::Revoked),
+            (401, None, HttpClass::Retry),
+            (401, other, HttpClass::Retry),
+            (401, Some(b"<html>".as_slice()), HttpClass::Retry),
+            (403, scope, HttpClass::MissingScope),
+            (403, other, HttpClass::Fatal),
+            (403, Some(b"<html>".as_slice()), HttpClass::Retry),
+            (403, None, HttpClass::Retry),
+            (404, None, HttpClass::Fatal),
+            (302, None, HttpClass::Fatal),
+            (429, None, HttpClass::Retry),
+            (500, None, HttpClass::Retry),
+            (503, other, HttpClass::Retry),
+        ] {
+            assert_eq!(classify_http(status, body), want, "{status}");
+        }
+    }
+
+    /// A store signed in at the hub's address with `key` (through the dev-key path: archtest
+    /// R14 keeps the account's item name in `account.rs`).
     fn paired_store(addr: &str, key: &str) -> MemorySecretStore {
         let s = MemorySecretStore::default();
         s.put(SecretKey::GatewayClientKey, key.to_owned().into())
             .unwrap();
-        let addr = fogar_ports::gateway::GatewayAddr::parse(addr).unwrap();
+        let addr = GatewayAddr::parse(addr).unwrap();
         account::adopt_stored_token(&s, addr).unwrap();
         assert!(account::load(&s).unwrap().is_some());
         s
-    }
-    use std::{collections::VecDeque, sync::Mutex};
-
-    const READY: &str = r#"{"type":"ready","session_id":"c:1"}"#;
-
-    /// One session: `ready`, then the scripted frames, then silence.
-    #[derive(Clone)]
-    struct Scripted(Arc<Mutex<Option<VecDeque<Frame>>>>);
-    struct Sess(VecDeque<Frame>);
-
-    impl LinkSession for Sess {
-        fn max_frame(&self) -> usize {
-            fogar_proto::limits::WS_MAX_FRAME_BYTES
-        }
-        async fn send(&mut self, _: Frame) -> Result<(), LinkError> {
-            Ok(())
-        }
-        async fn recv(&mut self) -> Option<LinkEvent> {
-            match self.0.pop_front() {
-                Some(f) => Some(LinkEvent::Frame(f)),
-                None => std::future::pending().await,
-            }
-        }
-        async fn close(&mut self, _: u16, _: &str) -> Result<(), LinkError> {
-            Ok(())
-        }
-    }
-
-    impl GatewayLink for Scripted {
-        type Session = Sess;
-        async fn connect(
-            &self,
-            _: &fogar_ports::gateway::GatewayAddr,
-            _: fogar_ports::gateway::WsRoute,
-        ) -> Result<Sess, LinkError> {
-            let taken = self.0.lock().unwrap().take();
-            match taken {
-                Some(frames) => Ok(Sess(frames)),
-                None => std::future::pending().await,
-            }
-        }
     }
 
     struct Run {
         budget: ByteBudget,
         stats: Arc<Stats>,
         clock: Arc<TestClock>,
+        hub: EventsHub,
         in_rx: mpsc::Receiver<Inbound>,
         egress: CancellationToken,
         tasks: tokio_util::task::TaskTracker,
         view_rx: watch::Receiver<LinkView>,
-        /// Held so the uplink stays open (no `EngineGone`).
-        _out_tx: mpsc::Sender<Frame>,
-    }
-
-    fn start(frames: Vec<Frame>) -> Run {
-        start_with(frames, INBOUND, 0, Arc::new(paired_store("127.0.0.1", "k")))
+        /// Signals "the account changed" (as `Login` does).
+        account: watch::Sender<()>,
     }
 
     /// `in_cap`: inbound queue capacity; `prefill`: messages already queued (an engine that
     /// is not draining).
-    fn start_with(
-        frames: Vec<Frame>,
-        in_cap: usize,
-        prefill: usize,
-        secrets: Arc<dyn SecretStore>,
-    ) -> Run {
-        let mut script: VecDeque<Frame> = VecDeque::new();
-        script.push_back(Frame::Text(READY.into()));
-        script.extend(frames);
+    fn start(in_cap: usize, prefill: usize, secrets: Arc<dyn SecretStore>) -> Run {
+        let routes = HttpRoutes::new();
+        let hub = EventsHub::new();
+        hub.install(&routes);
         let clock = Arc::new(TestClock::new());
         let stats = Arc::new(Stats::default());
         let budget = ByteBudget::new(INBOUND_BYTES);
@@ -695,7 +833,7 @@ mod budget_tests {
         let (reconnect_keep, reconnect) = watch::channel(());
         let ctx = LinkCtx {
             clock: clock.clone(),
-            link: Scripted(Arc::new(Mutex::new(Some(script)))),
+            http: Arc::new(FakeGatewayHttp::new(routes)),
             secrets,
             random: Arc::new(SeededRandom::new(7)),
             cfg: Arc::new(Config::default()),
@@ -707,25 +845,77 @@ mod budget_tests {
             reconnect,
             _reconnect_keep: reconnect_keep,
         };
-        let (out_tx, out_rx) = mpsc::channel(8);
+        let account_tx = ctx._account_keep.clone();
         let (in_tx, in_rx) = mpsc::channel(in_cap);
         for _ in 0..prefill {
-            in_tx.try_send(Inbound::SessionDown).unwrap();
+            in_tx.try_send(Inbound::Down).unwrap();
         }
         let egress = CancellationToken::new();
         let tasks = tokio_util::task::TaskTracker::new();
-        tasks.spawn(ctx.run(out_rx, in_tx, egress.clone()));
+        tasks.spawn(ctx.run(in_tx, egress.clone()));
         tasks.close();
         Run {
             budget,
             stats,
             clock,
+            hub,
             in_rx,
             egress,
             tasks,
             view_rx,
-            _out_tx: out_tx,
+            account: account_tx,
         }
+    }
+
+    /// Review L2 (security): a `SignedOut` the stalled engine missed is not lost: it arrives
+    /// before the next account's `Up`.
+    #[tokio::test(start_paused = true)]
+    async fn a_missed_sign_out_comes_before_the_next_up() {
+        let store = Arc::new(MemorySecretStore::default());
+        let mut r = start(1, 1, store.clone());
+        r.clock.sleep(Duration::from_secs(30)).await; // past `inbound_deadline`: missed
+        assert!(
+            matches!(r.in_rx.recv().await, Some(Inbound::Down)),
+            "prefill"
+        );
+        store
+            .put(SecretKey::GatewayClientKey, "k".to_owned().into())
+            .unwrap();
+        account::adopt_stored_token(&*store, GatewayAddr::parse("127.0.0.1:8004").unwrap())
+            .unwrap();
+        r.account.send_replace(());
+        assert!(matches!(r.in_rx.recv().await, Some(Inbound::SignedOut)));
+        assert!(matches!(r.in_rx.recv().await, Some(Inbound::Up { .. })));
+        stop(r).await;
+    }
+
+    /// PR 4a review L: an owed `SignedOut` is retried on the backoff, so an engine that recovers
+    /// drops the old account without waiting for a login.
+    #[tokio::test(start_paused = true)]
+    async fn a_missed_sign_out_is_retried_without_a_login() {
+        let mut r = start(1, 1, Arc::new(MemorySecretStore::default()));
+        r.clock.sleep(Duration::from_secs(30)).await; // past `inbound_deadline`: missed
+        assert!(
+            matches!(r.in_rx.recv().await, Some(Inbound::Down)),
+            "prefill"
+        );
+        // No account change: the retry timer alone delivers it (within the backoff cap).
+        let got = tokio::time::timeout(Duration::from_secs(120), r.in_rx.recv()).await;
+        assert!(matches!(got, Ok(Some(Inbound::SignedOut))), "{got:?}");
+        // Delivered: no further timer, nothing more is sent.
+        let more = tokio::time::timeout(Duration::from_secs(3600), r.in_rx.recv()).await;
+        assert!(more.is_err(), "{more:?}");
+        stop(r).await;
+    }
+
+    fn signed_in() -> Arc<dyn SecretStore> {
+        Arc::new(paired_store("127.0.0.1:8004", "k"))
+    }
+
+    async fn stop(r: Run) {
+        r.egress.cancel();
+        drop(r.in_rx);
+        r.tasks.wait().await;
     }
 
     /// Audit #2: a store this build cannot use is "not paired", not "reconnecting" forever.
@@ -736,38 +926,29 @@ mod budget_tests {
             fn capabilities(&self) -> fogar_ports::secrets::SecretCaps {
                 fogar_ports::secrets::SecretCaps::NONE
             }
-            fn get(
-                &self,
-                _: SecretKey,
-            ) -> Result<Option<fogar_ports::secrets::SecretString>, SecretError> {
+            fn get(&self, _: SecretKey) -> Result<Option<SecretString>, SecretError> {
                 Err(SecretError::Unsupported("stub"))
             }
-            fn put(
-                &self,
-                _: SecretKey,
-                _: fogar_ports::secrets::SecretString,
-            ) -> Result<(), SecretError> {
+            fn put(&self, _: SecretKey, _: SecretString) -> Result<(), SecretError> {
                 Err(SecretError::Unsupported("stub"))
             }
             fn delete(&self, _: SecretKey) -> Result<(), SecretError> {
                 Err(SecretError::Unsupported("stub"))
             }
         }
-        let r = start_with(Vec::new(), INBOUND, 0, Arc::new(Stub));
+        let r = start(INBOUND, 0, Arc::new(Stub));
         r.clock.sleep(Duration::from_secs(3600)).await;
         assert_eq!(r.view_rx.borrow().state, LinkState::NotPaired);
         assert_eq!(r.stats.snapshot().connect_attempts, 0);
-        r.egress.cancel();
-        drop(r.in_rx);
-        r.tasks.wait().await;
+        stop(r).await;
     }
 
     /// Audit #1: an engine busy past `inbound_deadline` exactly when `ready` arrives must not
-    /// end the supervisor (nothing respawns it): the session is dropped as a local fault and
-    /// the link reconnects after a backoff.
+    /// end the supervisor (nothing respawns it): the stream is dropped and the link reconnects
+    /// after a backoff.
     #[tokio::test(start_paused = true)]
-    async fn engine_busy_at_ready_is_a_local_fault_not_a_shutdown() {
-        let r = start_with(Vec::new(), 1, 1, Arc::new(paired_store("127.0.0.1", "k")));
+    async fn engine_busy_at_ready_is_not_a_shutdown() {
+        let r = start(1, 1, signed_in());
         r.clock.sleep(Duration::from_secs(30)).await;
         assert_eq!(r.tasks.len(), 1, "the link supervisor must still run");
         assert!(
@@ -776,70 +957,81 @@ mod budget_tests {
             r.view_rx.borrow().state
         );
         assert!(r.stats.snapshot().connect_attempts >= 2, "reconnects");
-        r.egress.cancel();
-        drop(r.in_rx);
-        r.tasks.wait().await;
+        assert!(r.hub.subscribers() <= 1);
+        stop(r).await;
     }
 
-    async fn settle(r: &Run) {
-        // Well below `inbound_deadline` (5 s): the link has done all it can without waiting.
+    /// Review round-2 F6, carried over: every queued event is charged by its bytes against
+    /// `INBOUND_BYTES`, so 128 slots of 100 KiB events cannot hold 12.8 MiB.
+    #[tokio::test(start_paused = true)]
+    async fn events_are_charged_and_wait_for_room() {
+        let mut r = start(INBOUND, 0, signed_in());
+        r.hub.seed_conversation("c-1", "x");
         r.clock.sleep(Duration::from_millis(500)).await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn audio_frames_are_charged_and_shed_when_the_budget_is_full() {
-        let mib = 1 << 20;
-        let r = start((0..10).map(|_| Frame::Binary(vec![0xA1; mib])).collect());
-        settle(&r).await;
-        assert_eq!(
-            r.budget.in_use(),
-            INBOUND_BYTES,
-            "4 x 1 MiB queued and charged"
-        );
-        assert_eq!(r.stats.snapshot().inbound_audio_shed, 6, "the rest is shed");
+        assert!(matches!(r.in_rx.recv().await, Some(Inbound::Up { .. })));
+        let big = "x".repeat(100 * 1024);
+        for _ in 0..60 {
+            r.hub.other_device_send("c-1", &big);
+        }
+        r.clock.sleep(Duration::from_millis(500)).await;
         let queued = r.in_rx.len();
-        assert_eq!(queued, 1 + 4, "SessionUp + 4 audio frames");
-        r.egress.cancel();
-        drop(r.in_rx);
-        r.tasks.wait().await;
+        assert!(queued < 60, "{queued} queued: the byte budget binds first");
+        assert!(r.budget.in_use() > INBOUND_BYTES - 100 * 1024 - 1024);
+        // Dropping one releases its bytes: the link goes on.
+        let first = r.in_rx.recv().await;
+        assert!(matches!(first, Some(Inbound::Event { .. })));
+        drop(first);
+        r.clock.sleep(Duration::from_millis(500)).await;
+        assert!(
+            r.in_rx.len() >= queued,
+            "the next event was queued once there was room"
+        );
+        stop(r).await;
     }
 
     #[tokio::test(start_paused = true)]
-    async fn json_frames_are_charged_and_wait_for_room() {
-        // Just under 1 MiB each: 4 fit into the 4 MiB budget, the 5th must wait.
-        let text = |i: usize| {
-            let head = format!(r#"{{"type":"token","turn_id":"t-{i}","text":""#);
-            let n = (1 << 20) - head.len() - 100;
-            format!("{head}{}\"}}", "x".repeat(n))
-        };
-        let frames: Vec<String> = (0..6).map(text).collect();
-        let len = frames[0].len();
-        assert!(5 * len > INBOUND_BYTES && 4 * len < INBOUND_BYTES);
-        let mut r = start(frames.into_iter().map(Frame::Text).collect());
-        settle(&r).await;
-        // 4 frames charged by their length; the waiting 5th already holds the remainder (tokio's
-        // semaphore hands permits to the queued waiter as they come free).
-        assert_eq!(r.budget.in_use(), INBOUND_BYTES);
-        assert_eq!(r.in_rx.len(), 1 + 4, "the 5th waits for room");
-        assert!(matches!(r.in_rx.recv().await, Some(Inbound::SessionUp(_))));
-        let first = r.in_rx.recv().await;
-        assert!(matches!(first, Some(Inbound::Server(..))));
-        settle(&r).await;
-        assert_eq!(r.in_rx.len(), 3, "a dequeued frame still holds its charge");
-        drop(first); // releases `len` bytes: now the 5th fits
-        settle(&r).await;
+    async fn read_capped_stops_at_the_cap_and_the_deadline() {
+        let clock = TestClock::new();
+        let routes = HttpRoutes::new();
+        let http = FakeGatewayHttp::new(routes.clone());
+        let addr = http.addr();
+        let t = SecretString::from("t");
+        let call = HttpCall::Events { audio: false };
+        routes.set("GET", "/events", 503, vec![b'x'; 100]);
+        let mut b = http
+            .open_stream(&addr, &call, &t, None, None)
+            .await
+            .unwrap()
+            .body;
         assert_eq!(
-            r.in_rx.len(),
-            4,
-            "the 5th was queued once its bytes were free"
+            read_capped(&clock, &mut b, 100, Duration::from_secs(1))
+                .await
+                .map(|v| v.len()),
+            Some(100)
         );
+        let mut b = http
+            .open_stream(&addr, &call, &t, None, None)
+            .await
+            .unwrap()
+            .body;
         assert_eq!(
-            r.budget.in_use(),
-            INBOUND_BYTES,
-            "and the 6th waits in turn"
+            read_capped(&clock, &mut b, 99, Duration::from_secs(1)).await,
+            None
         );
-        r.egress.cancel();
-        drop(r.in_rx);
-        r.tasks.wait().await;
+        routes.set_stream(
+            "GET",
+            "/events",
+            503,
+            vec![fogar_testkit::StreamStep::HoldOpen],
+        );
+        let mut b = http
+            .open_stream(&addr, &call, &t, None, None)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(
+            read_capped(&clock, &mut b, 99, Duration::from_secs(1)).await,
+            None
+        );
     }
 }
