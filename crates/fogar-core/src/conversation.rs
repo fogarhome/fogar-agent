@@ -873,21 +873,34 @@ impl Chat {
 
     /// A post to `conv` failed: shown only while `conv` is the open conversation. `false` =
     /// another one is open (the caller counts it).
-    /// An `unknown` outcome whose own `message` already arrived (a live entry of mine with that
-    /// text) did reach the gateway: nothing to add.
-    pub fn send_failed_in(&mut self, conv: &str, text: &str, code: &str) -> bool {
-        let Some(open) = self.open.as_ref().filter(|o| o.id == bounded(conv)) else {
+    /// An `unknown` outcome whose own `message` arrived after the send started (more live
+    /// entries of mine with that text than `seen`, from [`Chat::own_sent`]) did reach the
+    /// gateway: nothing to add. An earlier same text (a repeated «sí») does not count.
+    pub fn send_failed_in(&mut self, conv: &str, text: &str, code: &str, seen: usize) -> bool {
+        if self.open_id() != Some(bounded(conv)) {
             return false;
-        };
-        if code == "unknown"
-            && open
-                .entries
-                .iter()
-                .any(|e| matches!(e, Entry::Msg(m) if m.mine && !m.id.is_empty() && m.text == text))
-        {
+        }
+        if code == "unknown" && self.own_sent(conv, text) > seen {
             return false;
         }
         self.send_failed(text, code)
+    }
+
+    /// How many live (arrived, not failed) messages of mine with `text` `conv` shows; 0 if it is
+    /// not open. Taken when a send starts, for [`Chat::send_failed_in`].
+    /// shortcut: a trim or a resync (history rows are not "mine") can lower the count, so an
+    /// arrived repeat may still show as «Puede que se enviara» (errs toward showing, never
+    /// hiding); store the matching ids at start if that ever matters.
+    pub fn own_sent(&self, conv: &str, text: &str) -> usize {
+        self.open
+            .as_ref()
+            .filter(|o| o.id == bounded(conv))
+            .map_or(0, |o| {
+                o.entries
+                    .iter()
+                    .filter(|e| matches!(e, Entry::Msg(m) if m.mine && !m.id.is_empty() && m.text == text))
+                    .count()
+            })
     }
 
     /// Our `POST` of `text` failed with `code`: shown as failed instead of vanishing. With
@@ -1643,9 +1656,9 @@ mod tests {
     #[test]
     fn a_failed_send_shows_only_in_its_conversation() {
         let mut c = opened(1, &[]);
-        assert!(!c.send_failed_in("c-2", "hola", "not_sent"));
+        assert!(!c.send_failed_in("c-2", "hola", "not_sent", 0));
         assert!(order(&c).is_empty());
-        assert!(c.send_failed_in("c-1", "hola", "not_sent"));
+        assert!(c.send_failed_in("c-1", "hola", "not_sent", 0));
         assert_eq!(order(&c), ["hola"]);
     }
 
@@ -1694,12 +1707,32 @@ mod tests {
     #[test]
     fn an_unknown_send_that_arrived_is_not_doubled() {
         let mut c = opened(1, &[]);
+        let seen = c.own_sent("c-1", "hola");
         c.on_event(Some(2), msg("c-1", "r-1", "hola", "delivered", true));
-        assert!(!c.send_failed_in("c-1", "hola", "unknown"));
+        assert!(!c.send_failed_in("c-1", "hola", "unknown", seen));
         assert_eq!(order(&c), ["hola"]);
-        assert!(c.send_failed_in("c-1", "otra", "unknown"), "not arrived");
-        assert!(c.send_failed_in("c-1", "hola", "not_sent"));
+        assert!(c.send_failed_in("c-1", "otra", "unknown", 0), "not arrived");
+        assert!(c.send_failed_in("c-1", "hola", "not_sent", 1));
         assert_eq!(order(&c), ["hola", "otra", "hola"]);
+    }
+
+    /// PR 4a review (last round): a lost repeat of a short reply is shown as failed even though
+    /// the same text was sent (and arrived) earlier.
+    #[test]
+    fn a_lost_repeat_of_an_earlier_text_is_shown_failed() {
+        let mut c = opened(1, &[]);
+        c.on_event(Some(2), msg("c-1", "r-1", "sí", "delivered", true));
+        let seen = c.own_sent("c-1", "sí");
+        assert_eq!(seen, 1);
+        assert!(c.send_failed_in("c-1", "sí", "unknown", seen));
+        assert_eq!(order(&c), ["sí", "sí"]);
+        // A repeat that did arrive (one more than when it started) is not doubled.
+        let mut c = opened(1, &[]);
+        c.on_event(Some(2), msg("c-1", "r-1", "sí", "delivered", true));
+        let seen = c.own_sent("c-1", "sí");
+        c.on_event(Some(3), msg("c-1", "r-2", "sí", "delivered", true));
+        assert!(!c.send_failed_in("c-1", "sí", "unknown", seen));
+        assert_eq!(order(&c), ["sí", "sí"]);
     }
 
     /// PR 4a security L1: gateway names and titles lose control, bidi and invisible characters

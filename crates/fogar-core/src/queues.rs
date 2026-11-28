@@ -1,6 +1,6 @@
 //! Every queue in the agent, its capacity and its full-policy (fogar-longrun-reliability rule 2).
-//! Changing a capacity or a policy is a reviewed change: update this table and the tests in
-//! `tests/backpressure.rs`.
+//! Changing a capacity or a policy is a reviewed change: update this table and the tests that
+//! prove it (`queues::tests`, `link::tests`, `tests/events_link.rs`, `tests/soak.rs`).
 //!
 //! | Queue | Producer -> consumer | Capacity | When full |
 //! |---|---|---|---|

@@ -133,9 +133,11 @@ enum Job {
         seq: u64,
     },
     /// `conv`: where it was posted (a failure shows only there).
+    /// `seen`: its own arrived copies already shown when it started ([`Chat::own_sent`]).
     Send {
         conv: String,
         text: String,
+        seen: usize,
     },
     Create {
         text: String,
@@ -449,10 +451,15 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
                             text: Cow::Borrowed(&text),
                             interrupt: None,
                         });
+                        let seen = self.chat.borrow().own_sent(&id, &text);
                         match (PathId::new(&id), body) {
                             (Some(path), Ok(body)) => self.call(
                                 st,
-                                Job::Send { conv: id, text },
+                                Job::Send {
+                                    conv: id,
+                                    text,
+                                    seen,
+                                },
                                 HttpCall::PostMessage { id: path },
                                 Some(body),
                             ),
@@ -822,12 +829,12 @@ impl<C: Clock, H: GatewayHttp> Engine<C, H> {
             }
             // A newer open replaced it.
             Job::State { .. } | Job::History { .. } => {}
-            Job::Send { conv, text } => {
+            Job::Send { conv, text, seen } => {
                 // Shown only in its own conversation (else counted in `rest_failures` only);
                 // if it did arrive, its `message` replaces the failed entry.
                 if reply.is_none() {
                     self.store(|c| {
-                        let changed = c.send_failed_in(&conv, &text, code);
+                        let changed = c.send_failed_in(&conv, &text, code, seen);
                         (changed, changed)
                     });
                 }

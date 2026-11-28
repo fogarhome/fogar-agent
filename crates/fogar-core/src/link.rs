@@ -284,9 +284,33 @@ impl<C: Clock, H: GatewayHttp> LinkCtx<C, H> {
                     {
                         break;
                     }
-                    // No timer: the only writers are `Login` (signals the watch) and the CLI dev
-                    // path at boot. A signed-out Mac costs no wakeups and no Keychain reads.
+                    // No timer once delivered: the only writers are `Login` (signals the watch)
+                    // and the CLI dev path at boot. A signed-out Mac costs no wakeups and no
+                    // Keychain reads. While owed, retried on the backoff so a recovered engine
+                    // drops the old account without waiting for the next login.
                     let mut account = self.account.clone();
+                    while signed_out_owed {
+                        let d = self.backoff(&mut attempt);
+                        tokio::select! {
+                            biased;
+                            () = egress.cancelled() => break,
+                            r = account.changed() => if r.is_ok() { break } else { return },
+                            () = self.clock.sleep(d) => {
+                                signed_out_owed =
+                                    !self.forward(&in_tx, Inbound::SignedOut, &egress).await;
+                                if signed_out_owed
+                                    && !matches!(self.not_delivered(&in_tx, &egress), Outcome::Ended)
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    if signed_out_owed {
+                        // Shutdown or the account changed: the top of the loop decides.
+                        continue;
+                    }
+                    attempt = 0;
                     tokio::select! {
                         biased;
                         () = egress.cancelled() => break,
@@ -862,6 +886,25 @@ mod tests {
         r.account.send_replace(());
         assert!(matches!(r.in_rx.recv().await, Some(Inbound::SignedOut)));
         assert!(matches!(r.in_rx.recv().await, Some(Inbound::Up { .. })));
+        stop(r).await;
+    }
+
+    /// PR 4a review L: an owed `SignedOut` is retried on the backoff, so an engine that recovers
+    /// drops the old account without waiting for a login.
+    #[tokio::test(start_paused = true)]
+    async fn a_missed_sign_out_is_retried_without_a_login() {
+        let mut r = start(1, 1, Arc::new(MemorySecretStore::default()));
+        r.clock.sleep(Duration::from_secs(30)).await; // past `inbound_deadline`: missed
+        assert!(
+            matches!(r.in_rx.recv().await, Some(Inbound::Down)),
+            "prefill"
+        );
+        // No account change: the retry timer alone delivers it (within the backoff cap).
+        let got = tokio::time::timeout(Duration::from_secs(120), r.in_rx.recv()).await;
+        assert!(matches!(got, Ok(Some(Inbound::SignedOut))), "{got:?}");
+        // Delivered: no further timer, nothing more is sent.
+        let more = tokio::time::timeout(Duration::from_secs(3600), r.in_rx.recv()).await;
+        assert!(more.is_err(), "{more:?}");
         stop(r).await;
     }
 
